@@ -1,4 +1,5 @@
-// Package report 定义各场景的输出数据结构，并渲染 HTML 报告。
+// Package report 定义各场景的 JSON 输出结构。
+// 本工具只负责产出原始 JSON；HTML/图表等报告呈现由外部工具（如 WorkBuddy）基于 JSON 二次加工。
 package report
 
 import (
@@ -13,8 +14,8 @@ import (
 
 // SingleRow：一个模型在一个 token 档位下的多次 run。
 type SingleRow struct {
-	Model        string              `json:"model"`
-	PromptTokens int                 `json:"prompt_tokens"`
+	Model        string                `json:"model"`
+	PromptTokens int                   `json:"prompt_tokens"`
 	Runs         []*engine.TurnMetrics `json:"runs"`
 }
 
@@ -34,37 +35,32 @@ type ConcurrentLevel struct {
 	ThroughputTPS float64               `json:"throughput_tps"` // 整体 completion tokens/s
 }
 
-// Report 是一次场景执行的完整数据，落盘为 report.json。
+// Report 是一次场景执行的完整数据，整体落盘为单个 JSON 文件。
 type Report struct {
-	Scenario    string           `json:"scenario"`
-	GeneratedAt time.Time        `json:"generated_at"`
-	Endpoint    string           `json:"endpoint"`
-	Note        string           `json:"note,omitempty"`
-	Single      []SingleRow      `json:"single,omitempty"`
-	Multiturn   []MultiturnRun   `json:"multiturn,omitempty"`
+	Scenario    string            `json:"scenario"`
+	GeneratedAt time.Time         `json:"generated_at"`
+	Endpoint    string            `json:"endpoint"`
+	Note        string            `json:"note,omitempty"`
+	Single      []SingleRow       `json:"single,omitempty"`
+	Multiturn   []MultiturnRun    `json:"multiturn,omitempty"`
 	Concurrent  []ConcurrentLevel `json:"concurrent,omitempty"`
 }
 
-// Save 将 Report 与渲染后的 HTML 写入 dir。
-func (r *Report) Save(dir string) error {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
+// SaveJSON 将报告写入单个 JSON 文件（自动创建父目录）。
+func (r *Report) SaveJSON(path string) error {
 	rj, err := json.MarshalIndent(r, "", "  ")
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(dir, "report.json"), rj, 0o644); err != nil {
-		return err
+	if dir := filepath.Dir(path); dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
 	}
-	html, err := r.RenderHTML()
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(filepath.Join(dir, "report.html"), []byte(html), 0o644)
+	return os.WriteFile(path, rj, 0o644)
 }
 
-// ScenarioDir 生成形如 20260904-2118-single 的目录名。
-func ScenarioDir(outputRoot, scenario string) string {
-	return filepath.Join(outputRoot, fmt.Sprintf("%s-%s", time.Now().Format("20060102-150405"), scenario))
+// DefaultName 生成默认输出文件名：<scenario>-<timestamp>.json
+func DefaultName(scenario string) string {
+	return fmt.Sprintf("%s-%s.json", scenario, time.Now().Format("20060102-150405"))
 }

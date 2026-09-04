@@ -16,7 +16,7 @@ import (
 
 // Single 跑单请求基线：模型 × token 档位 × runs。
 // fixed_seed=true 时各 run 使用相同 prompt（观察前缀缓存命中，Run2+ 的 TTFT 应明显低于 Run1）。
-func Single(ctx context.Context, cfg *config.Config, client *engine.Client, modelFilter, outRoot string) (string, error) {
+func Single(ctx context.Context, cfg *config.Config, client *engine.Client, modelFilter string) (*report.Report, error) {
 	rep := &report.Report{
 		Scenario:    "single",
 		GeneratedAt: time.Now(),
@@ -47,13 +47,12 @@ func Single(ctx context.Context, cfg *config.Config, client *engine.Client, mode
 			rep.Single = append(rep.Single, row)
 		}
 	}
-	dir := report.ScenarioDir(outRoot, "single")
-	return dir, rep.Save(dir)
+	return rep, nil
 }
 
 // Multiturn 跑多轮会话重放：system + tool defs + 逐轮滚大的 history，模拟真实 agent。
 // 判定：turn N 的 TTFT 若只比 turn N-1 增加一小截 ⇒ 前缀缓存命中；若接近全量 prefill ⇒ 未命中。
-func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, modelFilter, outRoot string) (string, error) {
+func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, modelFilter string) (*report.Report, error) {
 	mt := cfg.Multiturn
 	rep := &report.Report{
 		Scenario:    "multiturn",
@@ -92,13 +91,12 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 			rep.Multiturn = append(rep.Multiturn, run)
 		}
 	}
-	dir := report.ScenarioDir(outRoot, "multiturn")
-	return dir, rep.Save(dir)
+	return rep, nil
 }
 
 // Concurrent 跑阶梯并发：每个档位 level 个虚拟用户同时发起独立请求。
 // 各用户 prompt 用不同 seed，避免伪缓存命中。
-func Concurrent(ctx context.Context, cfg *config.Config, client *engine.Client, modelFilter, outRoot string) (string, error) {
+func Concurrent(ctx context.Context, cfg *config.Config, client *engine.Client, modelFilter string) (*report.Report, error) {
 	cc := cfg.Concurrent
 	rep := &report.Report{
 		Scenario:    "concurrent",
@@ -147,8 +145,7 @@ func Concurrent(ctx context.Context, cfg *config.Config, client *engine.Client, 
 			rep.Concurrent = append(rep.Concurrent, lv)
 		}
 	}
-	dir := report.ScenarioDir(outRoot, "concurrent")
-	return dir, rep.Save(dir)
+	return rep, nil
 }
 
 func filterModels(models []string, filter string) []string {

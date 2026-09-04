@@ -2,8 +2,11 @@
 
 客户自部署 LLM 推理服务性能评测工具（Go，单二进制，无运行时依赖）。
 
+**契约：输入 YAML 配置，输出 JSON 原始数据。** 工具不做任何报告渲染——把 JSON 拿回来
+用 WorkBuddy 等工具二次加工出报告。
+
 面向堡垒机/内网交付场景：本机交叉编译出 linux/amd64 二进制，连同配置三件套
-（`bench` + `config.yaml` + `.env`）拷贝到客户环境执行，跑完把 `output/` 目录拉回来分析。
+（`bench` + `config.yaml` + `.env`）拷贝到客户环境执行，跑完把 JSON 拉回来分析。
 
 ## 三个场景
 
@@ -43,7 +46,18 @@ export LLM_PERF_API_KEY=...         # 如服务需要
 ./bench all -c example.yaml
 ```
 
-结果在 `output/<时间戳>-<场景>/` 下：`report.json`（原始数据）+ `report.html`（图表报告）。
+## 输出
+
+每场景落一个 JSON 文件（含全部原始数据：逐 run 计时、逐 chunk 派生指标、usage token）：
+
+```bash
+./bench all -c example.yaml                 # → output/single-<ts>.json 等 3 个文件
+./bench single -c example.yaml -o r1.json   # → 指定输出文件名
+./bench all -c example.yaml -o results/     # → 指定输出目录
+```
+
+JSON 结构见 `internal/report/report.go`：`single` / `multiturn` / `concurrent` 三个数组，
+元素分别为档位 / 会话 / 并发档位，每条请求是 `engine.TurnMetrics`。
 
 ## 配置
 
