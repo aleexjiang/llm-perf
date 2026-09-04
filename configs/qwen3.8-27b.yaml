@@ -1,0 +1,57 @@
+# llm-perf 配置：Qwen3.8-27B 直连 vLLM 实例（客户环境）
+#
+# 服务端配置要点（docker-compose，vllm/vllm-openai:v0.27.1）：
+#   --enable-prefix-caching          前缀缓存已开启 → single fixed_seed 的 Run1 vs Run2 对照有效
+#   --max-num-seqs 2                 同时刻最多 2 条序列在跑 → 并发档位 >2 的部分实测的是排队
+#   --reasoning-parser qwen3         流式响应带 reasoning_content → 思考三段拆分可用
+#   --kv-cache-dtype fp8 + MTP 3token 投机解码 → decode 段会明显偏快，属预期
+#   --max-model-len 262144           支持到 200k 档
+#
+# 端点说明：172.17.0.3 是 docker 网桥内网 IP，仅宿主机可达；
+#   宿主机上跑 bench → 127.0.0.1:8849；其他机器跑 → <宿主机内网IP>:8849
+
+endpoint: "http://127.0.0.1:8849/v1"
+api_key_env: ""                   # 该实例未启用 API key 校验，留空即不带认证头
+output_dir: "output"
+timeout_seconds: 600              # 长档位 + max-num-seqs=2 排队，放宽超时
+include_usage: true
+filler_lang: "en"
+stream: true
+
+models:
+  - "qwen3.8-27b"
+
+# Qwen3 思考开关：vLLM qwen3 模板走 chat_template_kwargs.enable_thinking
+thinking:
+  mode: "both"
+  extra_body_on:
+    chat_template_kwargs: {enable_thinking: true}
+  extra_body_off:
+    chat_template_kwargs: {enable_thinking: false}
+  max_tokens_floor: 2048
+
+# 场景一：单发单轮（fixed_seed 复用同一 prompt，观察前缀缓存命中幅度）
+single:
+  runs: 3
+  prompt_tokens: [4096, 10240, 20480, 40960, 102400]
+  max_tokens: 512
+  fixed_seed: true
+
+# 场景二：单发多轮（模拟 WorkBuddy agent：system + tool defs + 逐轮滚大的 history）
+multiturn:
+  sessions: 2
+  turns: 8
+  system_tokens: 1000
+  tool_defs_tokens: 2000
+  turn_tokens: 2000
+  max_tokens: 256
+  keep_assistant: true
+
+# 场景三：并发。注意服务端 --max-num-seqs 2：
+#   level 1-2 反映真实并行能力，4/8 反映排队压力下的 TTFT 衰减与吞吐上限
+concurrent:
+  multiturn: false
+  levels: [1, 2, 4, 8]
+  runs_per_worker: 2
+  prompt_tokens: 10240
+  max_tokens: 256
