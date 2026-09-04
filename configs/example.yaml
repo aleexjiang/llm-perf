@@ -1,0 +1,37 @@
+# llm-perf 配置示例
+# 环境变量覆盖：LLM_PERF_ENDPOINT、LLM_PERF_API_KEY（.env 或 shell 均可）
+
+endpoint: "http://10.0.201.1:30082/router/v1"
+api_key_env: "LLM_PERF_API_KEY"   # 从哪个环境变量读 key；留空则不带认证头
+output_dir: "output"
+timeout_seconds: 300
+include_usage: true               # 请求 stream_options.include_usage，从 usage 字段取精确 token 数
+filler_lang: "en"                 # 填充文本语言：en（约 1 word ≈ 0.75 token）/ zh（约 1 字 ≈ 1 token）
+
+models:
+  - "/models/DeepSeek-V4-Flash-0731"
+  - "/models/Qwen3.8-27B"
+
+# 场景一：单请求基线（同 prompt 重复 runs 次，用于观察前缀缓存命中）
+single:
+  runs: 3
+  prompt_tokens: [4000, 10000, 20000, 40000]
+  max_tokens: 512
+  fixed_seed: true                # true=各 run 用同一 prompt（测缓存）；false=每次换 prompt（测冷启动）
+
+# 场景二：多轮会话重放（模拟 agent：system + tool defs + 逐轮滚大的 history）
+multiturn:
+  sessions: 2                     # 跑几个独立会话
+  turns: 8                        # 每个会话几轮
+  system_tokens: 1000
+  tool_defs_tokens: 2000          # 模拟 agent 的 tool definitions 持续开销
+  turn_tokens: 2000               # 每轮新增的 user 消息 token
+  max_tokens: 256
+  keep_assistant: true            # assistant 回复保留进 history（真实 agent 行为）
+
+# 场景三：阶梯并发
+concurrent:
+  levels: [1, 2, 4, 8, 16]
+  runs_per_worker: 2              # 每个虚拟用户连续发几次
+  prompt_tokens: 10000
+  max_tokens: 256

@@ -1,0 +1,28 @@
+endpoint: "http://127.0.0.1:18099/router/v1"
+api_key_env: ""
+output_dir: "output-smoke"
+timeout_seconds: 30
+filler_lang: "en"
+
+models: ["mock-model-a", "mock-model-b"]
+
+single:
+  runs: 2
+  prompt_tokens: [500, 1000]
+  max_tokens: 64
+  fixed_seed: true
+
+multiturn:
+  sessions: 1
+  turns: 3
+  system_tokens: 100
+  tool_defs_tokens: 100
+  turn_tokens: 200
+  max_tokens: 32
+  keep_assistant: true
+
+concurrent:
+  levels: [1, 2]
+  runs_per_worker: 2
+  prompt_tokens: 300
+  max_tokens: 32

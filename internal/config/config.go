@@ -1,0 +1,132 @@
+// Package config 负责加载 yaml 配置并用环境变量覆盖。
+package config
+
+import (
+	"fmt"
+	"os"
+	"time"
+
+	"gopkg.in/yaml.v3"
+)
+
+type Single struct {
+	Runs         int   `yaml:"runs"`
+	PromptTokens []int `yaml:"prompt_tokens"`
+	MaxTokens    int   `yaml:"max_tokens"`
+	FixedSeed    bool  `yaml:"fixed_seed"`
+}
+
+type Multiturn struct {
+	Sessions       int  `yaml:"sessions"`
+	Turns          int  `yaml:"turns"`
+	SystemTokens   int  `yaml:"system_tokens"`
+	ToolDefsTokens int  `yaml:"tool_defs_tokens"`
+	TurnTokens     int  `yaml:"turn_tokens"`
+	MaxTokens      int  `yaml:"max_tokens"`
+	KeepAssistant  bool `yaml:"keep_assistant"`
+}
+
+type Concurrent struct {
+	Levels        []int `yaml:"levels"`
+	RunsPerWorker int   `yaml:"runs_per_worker"`
+	PromptTokens  int   `yaml:"prompt_tokens"`
+	MaxTokens     int   `yaml:"max_tokens"`
+}
+
+type Config struct {
+	Endpoint       string `yaml:"endpoint"`
+	APIKeyEnv      string `yaml:"api_key_env"`
+	OutputDir      string `yaml:"output_dir"`
+	TimeoutSeconds int    `yaml:"timeout_seconds"`
+	IncludeUsage   *bool  `yaml:"include_usage"`
+	FillerLang     string `yaml:"filler_lang"`
+	Models         []string `yaml:"models"`
+
+	Single     Single     `yaml:"single"`
+	Multiturn  Multiturn  `yaml:"multiturn"`
+	Concurrent Concurrent `yaml:"concurrent"`
+
+	// 运行时解析
+	APIKey string `yaml:"-"`
+}
+
+// Load 读取配置文件，应用默认值，再用环境变量覆盖。
+// 环境变量优先级最高：LLM_PERF_ENDPOINT、LLM_PERF_API_KEY。
+func Load(path string) (*Config, error) {
+	cfg := &Config{
+		OutputDir:      "output",
+		TimeoutSeconds: 300,
+		FillerLang:     "en",
+	}
+	if path != "" {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read config: %w", err)
+		}
+		if err := yaml.Unmarshal(data, cfg); err != nil {
+			return nil, fmt.Errorf("parse config: %w", err)
+		}
+	}
+
+	// env 覆盖
+	if v := os.Getenv("LLM_PERF_ENDPOINT"); v != "" {
+		cfg.Endpoint = v
+	}
+	if cfg.Endpoint == "" {
+		return nil, fmt.Errorf("endpoint 未配置（yaml endpoint 或 LLM_PERF_ENDPOINT）")
+	}
+	if cfg.APIKeyEnv != "" {
+		cfg.APIKey = os.Getenv(cfg.APIKeyEnv)
+	}
+	if v := os.Getenv("LLM_PERF_API_KEY"); v != "" {
+		cfg.APIKey = v
+	}
+	if len(cfg.Models) == 0 {
+		return nil, fmt.Errorf("models 未配置")
+	}
+	if cfg.IncludeUsage == nil {
+		t := true
+		cfg.IncludeUsage = &t
+	}
+	// 各场景默认值
+	if cfg.Single.Runs <= 0 {
+		cfg.Single.Runs = 3
+	}
+	if len(cfg.Single.PromptTokens) == 0 {
+		cfg.Single.PromptTokens = []int{4000, 10000, 20000, 40000}
+	}
+	if cfg.Single.MaxTokens <= 0 {
+		cfg.Single.MaxTokens = 512
+	}
+	if cfg.Multiturn.Sessions <= 0 {
+		cfg.Multiturn.Sessions = 2
+	}
+	if cfg.Multiturn.Turns <= 0 {
+		cfg.Multiturn.Turns = 8
+	}
+	if cfg.Multiturn.TurnTokens <= 0 {
+		cfg.Multiturn.TurnTokens = 2000
+	}
+	if cfg.Multiturn.MaxTokens <= 0 {
+		cfg.Multiturn.MaxTokens = 256
+	}
+	if len(cfg.Concurrent.Levels) == 0 {
+		cfg.Concurrent.Levels = []int{1, 2, 4, 8, 16}
+	}
+	if cfg.Concurrent.RunsPerWorker <= 0 {
+		cfg.Concurrent.RunsPerWorker = 2
+	}
+	if cfg.Concurrent.PromptTokens <= 0 {
+		cfg.Concurrent.PromptTokens = 10000
+	}
+	if cfg.Concurrent.MaxTokens <= 0 {
+		cfg.Concurrent.MaxTokens = 256
+	}
+	return cfg, nil
+}
+
+// Timeout 返回超时 Duration。
+func (c *Config) Timeout() time.Duration { return time.Duration(c.TimeoutSeconds) * time.Second }
+
+// Fillers 返回填充文本语言设置。
+func (c *Config) Fillers() string { return c.FillerLang }
