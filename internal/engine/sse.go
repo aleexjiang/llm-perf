@@ -212,6 +212,8 @@ func ingestSSEBody(m *TurnMetrics, body io.Reader, clock func() time.Time, inclu
 	}
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	badLines := 0
+	var lastBad string
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		m.appendRaw(line + "\n")
@@ -225,10 +227,15 @@ func ingestSSEBody(m *TurnMetrics, body io.Reader, clock func() time.Time, inclu
 		}
 		ev, err := parseSSEData([]byte(data))
 		if err != nil {
-			m.warn("unparseable_stream_line: %.120s", data)
+			// 聚合告警：魔改流可能几十行都解析失败，逐条记会刷屏
+			badLines++
+			lastBad = data
 			continue
 		}
 		m.ingestEvent(ev, clock())
+	}
+	if badLines > 0 {
+		m.warn("unparseable_stream_line ×%d, last=%.80s", badLines, lastBad)
 	}
 	if err := scanner.Err(); err != nil {
 		m.warn("stream_read_error: %v", err)

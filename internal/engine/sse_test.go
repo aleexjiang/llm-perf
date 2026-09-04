@@ -162,7 +162,7 @@ func TestIngestSSE_MutatedEngine_Warnings(t *testing.T) {
 		t.Errorf("ReasoningChars = %d", m.ReasoningChars)
 	}
 	// 垃圾行留下证据
-	if !hasWarning(m, "unparseable_stream_line") {
+	if !hasWarning(m, "unparseable_stream_line ×1") {
 		t.Errorf("want unparseable_stream_line warning, got %v", m.Warnings)
 	}
 	// keep-alive 注释行进 raw 转储

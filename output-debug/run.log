@@ -1,0 +1,2 @@
+2026/09/05 01:50:10 [single] qwen3.8-27b thinking=off 500tk run1
+2026/09/05 01:50:11     TTFT=311ms think=0ms decode=1047ms tok/s=61 finish=length

@@ -92,13 +92,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 排查模式：debug=true 时日志同步写 run.log，原始响应留 raw/
-	if cfg.Debug {
-		if err := os.MkdirAll(cfg.OutputDir, 0o755); err == nil {
-			if lf, err := os.Create(filepath.Join(cfg.OutputDir, "run.log")); err == nil {
-				log.SetOutput(io.MultiWriter(os.Stderr, lf))
-				defer lf.Close()
-			}
+	// 排查基础能力：run.log 始终写（现场排查时日志永远拿得到）；raw 转储由 debug 控制
+	if err := os.MkdirAll(cfg.OutputDir, 0o755); err == nil {
+		if lf, err := os.Create(filepath.Join(cfg.OutputDir, "run.log")); err == nil {
+			log.SetOutput(io.MultiWriter(os.Stderr, lf))
+			defer lf.Close()
 		}
 	}
 
@@ -108,6 +106,12 @@ func main() {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// bench all 的 -o 只接受目录：三个场景各自落一个文件，给 .json 会互相覆盖
+	if cmd == "all" && strings.HasSuffix(*outFlag, ".json") {
+		fmt.Fprintln(os.Stderr, "bench all 的 -o 请给目录（三场景各落一个 JSON），不要指定单个 .json 文件")
+		os.Exit(1)
+	}
 
 	// ── probe：兼容性探测（不需要场景配置） ──
 	if cmd == "probe" {

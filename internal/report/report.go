@@ -40,8 +40,12 @@ type ConcurrentLevel struct {
 	ThroughputTPS float64               `json:"throughput_tps"` // 整体 completion tokens/s
 }
 
+// Version 是工具版本，随每个 JSON 输出落盘（报告追溯用）。
+const Version = "llm-perf/0.2"
+
 // Report 是一次场景执行的完整数据，整体落盘为单个 JSON 文件。
 type Report struct {
+	Tool        string            `json:"tool"`
 	Scenario    string            `json:"scenario"`
 	GeneratedAt time.Time         `json:"generated_at"`
 	Endpoint    string            `json:"endpoint"`

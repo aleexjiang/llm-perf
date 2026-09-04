@@ -50,6 +50,7 @@ func runOne(ctx context.Context, client *engine.Client, cfg *config.Config, mode
 // Single 单发单轮：模型 × 思考变体 × token 档位 × runs。
 func Single(ctx context.Context, cfg *config.Config, client *engine.Client, modelFilter string) (*report.Report, error) {
 	rep := &report.Report{
+		Tool:       report.Version,
 		Scenario:    "single",
 		GeneratedAt: time.Now(),
 		Endpoint:    cfg.Endpoint,
@@ -83,6 +84,7 @@ func Single(ctx context.Context, cfg *config.Config, client *engine.Client, mode
 func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, modelFilter string) (*report.Report, error) {
 	mt := cfg.Multiturn
 	rep := &report.Report{
+		Tool:       report.Version,
 		Scenario:    "multiturn",
 		GeneratedAt: time.Now(),
 		Endpoint:    cfg.Endpoint,
@@ -129,6 +131,7 @@ func Concurrent(ctx context.Context, cfg *config.Config, client *engine.Client, 
 		mode = "多轮会话重放"
 	}
 	rep := &report.Report{
+		Tool:       report.Version,
 		Scenario:    "concurrent",
 		GeneratedAt: time.Now(),
 		Endpoint:    cfg.Endpoint,
