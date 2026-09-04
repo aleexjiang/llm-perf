@@ -44,11 +44,23 @@ type Client struct {
 
 // NewClient 创建客户端。timeout 作用于整个请求（含流式读取）。
 func NewClient(baseURL, apiKey string, timeout time.Duration, includeUsage bool) *Client {
+	// 自定义连接池：默认 Transport 的 MaxIdleConnsPerHost=2，
+	// 并发压测时会反复建连（TIME_WAIT 堆积 + 建连耗时混进 TTFT 污染数据）
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		MaxIdleConns:          256,
+		MaxIdleConnsPerHost:   128,
+		MaxConnsPerHost:       0, // 不限：并发度由场景层控制
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		DisableCompression:    true, // 压缩会让 chunk 攒批，破坏 ITL 计时精度
+	}
 	return &Client{
 		BaseURL:      strings.TrimRight(baseURL, "/"),
 		APIKey:       apiKey,
 		IncludeUsage: includeUsage,
-		HTTP:         &http.Client{Timeout: timeout},
+		HTTP:         &http.Client{Timeout: timeout, Transport: transport},
 	}
 }
 

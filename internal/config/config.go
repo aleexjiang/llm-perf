@@ -2,6 +2,7 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"time"
@@ -107,7 +108,11 @@ func Load(path string) (*Config, error) {
 		if err != nil {
 			return nil, fmt.Errorf("read config: %w", err)
 		}
-		if err := yaml.Unmarshal(data, cfg); err != nil {
+		// KnownFields(true)：未知字段报错——配置项拼错（如 maxtokens）会被静默忽略，
+		// 现场跑完才发现没生效是最贵的错误
+		dec := yaml.NewDecoder(bytes.NewReader(data))
+		dec.KnownFields(true)
+		if err := dec.Decode(cfg); err != nil {
 			return nil, fmt.Errorf("parse config: %w", err)
 		}
 	}
@@ -138,6 +143,11 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Thinking.Mode == "" {
 		cfg.Thinking.Mode = "both"
+	}
+	switch cfg.Thinking.Mode {
+	case "both", "on", "off":
+	default:
+		return nil, fmt.Errorf("thinking.mode 无效值 %q（可选 both/on/off）", cfg.Thinking.Mode)
 	}
 	if cfg.Thinking.MaxTokensFloor <= 0 {
 		cfg.Thinking.MaxTokensFloor = 2048
