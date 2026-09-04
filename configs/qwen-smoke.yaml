@@ -1,0 +1,42 @@
+# llm-perf 冒烟配置：Qwen3.8-27B @ 172.17.0.3:8849（小档位，验证解析正确性用）
+# 注意：本机跑 bench 需绕过本地代理 —— env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy
+
+endpoint: "http://172.17.0.3:8849/v1"
+api_key_env: ""
+output_dir: "output-qwen-smoke"
+timeout_seconds: 300
+include_usage: true
+filler_lang: "en"
+stream: true
+
+models: ["qwen3.8-27b"]
+
+thinking:
+  mode: both
+  extra_body_on:
+    chat_template_kwargs: {enable_thinking: true}
+  extra_body_off:
+    chat_template_kwargs: {enable_thinking: false}
+  max_tokens_floor: 4096   # Qwen3 思考普遍 1500-2500 token，2048 会被吃光导致无 content
+
+single:
+  runs: 2
+  prompt_tokens: [1000, 4096]
+  max_tokens: 256
+  fixed_seed: true
+
+multiturn:
+  sessions: 1
+  turns: 3
+  system_tokens: 500
+  tool_defs_tokens: 500
+  turn_tokens: 500
+  max_tokens: 128
+  keep_assistant: true
+
+concurrent:
+  multiturn: false
+  levels: [1, 2]
+  runs_per_worker: 1
+  prompt_tokens: 1024
+  max_tokens: 128

@@ -48,13 +48,26 @@ func NewClient(baseURL, apiKey string, timeout time.Duration, includeUsage bool)
 }
 
 type deltaPayload struct {
-	Content          string `json:"content"`
+	Content string `json:"content"`
+	// 思考增量字段两代命名并存：
+	//   reasoning_content — 旧版 vLLM / DeepSeek / OpenRouter 等
+	//   reasoning         — 新版 vLLM(v0.27+) 官方口径
+	Reasoning        string `json:"reasoning"`
 	ReasoningContent string `json:"reasoning_content"`
 }
 
+// reasoningText 返回思考增量内容（兼容两种字段命名）。
+func (d deltaPayload) reasoningText() string {
+	if d.ReasoningContent != "" {
+		return d.ReasoningContent
+	}
+	return d.Reasoning
+}
+
 type chunkChoice struct {
-	Delta   deltaPayload `json:"delta"`
-	Message *deltaPayload `json:"message,omitempty"`
+	Delta        *deltaPayload `json:"delta,omitempty"`
+	Message      *deltaPayload `json:"message,omitempty"`
+	FinishReason string        `json:"finish_reason"`
 }
 
 type usageInfo struct {
@@ -101,6 +114,7 @@ type TurnMetrics struct {
 	CompletionTokens int `json:"completion_tokens"`
 	ReasoningTokens  int `json:"reasoning_tokens,omitempty"`
 	TotalTokens      int `json:"total_tokens"`
+	FinishReason     string `json:"finish_reason,omitempty"` // stop / length / ...（思考吃光预算时为 length 且无 content）
 
 	// 派生指标（Finalize 后填充），单位 ms；非流式时 TTFT/思考/ITL 为 0（N/A）
 	E2EMS   float64 `json:"e2e_ms"`                // 请求发出 -> 结束（两种模式都有）
@@ -113,6 +127,10 @@ type TurnMetrics struct {
 	ITLP50   float64  `json:"itl_p50_ms,omitempty"`
 	ITLP95   float64  `json:"itl_p95_ms,omitempty"`
 	TokensPerSec float64 `json:"tokens_per_sec"`
+
+	// 思考吃光输出预算标记：Thinking + 流式 + 全程无 content + finish_reason=length。
+	// 此时 ThinkMS/DecodeMS/ITL 均不可测，分析时应剔除或调大 max_tokens 重跑。
+	ThinkingNoContent bool `json:"thinking_no_content,omitempty"`
 
 	contentTimes []time.Time
 }
@@ -138,13 +156,12 @@ func (m *TurnMetrics) Finalize() {
 		if m.FirstReasoningAt != nil {
 			m.ThinkMS = ms(*m.FirstReasoningAt, *m.FirstContentAt)
 		}
-		start := *m.FirstContentAt
-		if m.FirstContentAt == nil && m.FirstChunkAt != nil {
-			start = *m.FirstChunkAt
-		}
-		m.DecodeMS = ms(start, m.EndAt)
+		m.DecodeMS = ms(*m.FirstContentAt, m.EndAt)
 	} else if m.FirstChunkAt != nil {
 		m.DecodeMS = ms(*m.FirstChunkAt, m.EndAt)
+	}
+	if m.Stream && m.Thinking && m.FirstContentAt == nil && m.FinishReason == "length" {
+		m.ThinkingNoContent = true
 	}
 
 	// ITL：相邻 content chunk 间隔（GenAI-Perf 口径，不含 TTFT）
@@ -293,25 +310,29 @@ func (c *Client) readStream(resp *http.Response, m *TurnMetrics) {
 		if len(ch.Choices) == 0 {
 			continue
 		}
-		d := ch.Choices[0].Delta
-		if d.ReasoningContent != "" {
-			m.ReasoningChunks++
-			m.ReasoningChars += len(d.ReasoningContent)
-			if m.FirstReasoningAt == nil {
-				t := now
-				m.FirstReasoningAt = &t
-			}
+		if fr := ch.Choices[0].FinishReason; fr != "" {
+			m.FinishReason = fr
 		}
-		if d.Content != "" {
-			m.ContentChunks++
-			m.ContentChars += len(d.Content)
-			if len(m.ReplyText) < 16*1024 {
-				m.ReplyText += d.Content
+		if d := ch.Choices[0].Delta; d != nil {
+			if rt := d.reasoningText(); rt != "" {
+				m.ReasoningChunks++
+				m.ReasoningChars += len(rt)
+				if m.FirstReasoningAt == nil {
+					t := now
+					m.FirstReasoningAt = &t
+				}
 			}
-			m.contentTimes = append(m.contentTimes, now)
-			if m.FirstContentAt == nil {
-				t := now
-				m.FirstContentAt = &t
+			if d.Content != "" {
+				m.ContentChunks++
+				m.ContentChars += len(d.Content)
+				if len(m.ReplyText) < 16*1024 {
+					m.ReplyText += d.Content
+				}
+				m.contentTimes = append(m.contentTimes, now)
+				if m.FirstContentAt == nil {
+					t := now
+					m.FirstContentAt = &t
+				}
 			}
 		}
 	}
@@ -334,14 +355,18 @@ func (c *Client) readWhole(resp *http.Response, m *TurnMetrics) {
 		return
 	}
 	c.applyUsage(m, out.Usage)
-	if len(out.Choices) > 0 && out.Choices[0].Message != nil {
-		msg := out.Choices[0].Message
-		if msg.Content != "" {
-			m.ContentChars = len(msg.Content)
-			m.ReplyText = msg.Content
+	if len(out.Choices) > 0 {
+		if fr := out.Choices[0].FinishReason; fr != "" {
+			m.FinishReason = fr
 		}
-		if msg.ReasoningContent != "" {
-			m.ReasoningChars = len(msg.ReasoningContent)
+		if msg := out.Choices[0].Message; msg != nil {
+			if msg.Content != "" {
+				m.ContentChars = len(msg.Content)
+				m.ReplyText = msg.Content
+			}
+			if rt := msg.reasoningText(); rt != "" {
+				m.ReasoningChars = len(rt)
+			}
 		}
 	}
 }

@@ -28,7 +28,7 @@ thinking:
     chat_template_kwargs: {enable_thinking: true}
   extra_body_off:
     chat_template_kwargs: {enable_thinking: false}
-  max_tokens_floor: 2048
+  max_tokens_floor: 8192   # Qwen3 思考普遍 1500-2500 token；实测 2048 会被吃光（finish=length 无 content），留足余量
 
 # 场景一：单发单轮（fixed_seed 复用同一 prompt，观察前缀缓存命中幅度）
 single:

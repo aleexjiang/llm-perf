@@ -32,8 +32,12 @@ func runOne(ctx context.Context, client *engine.Client, cfg *config.Config, mode
 		log.Printf("    失败: %v", err)
 		return m
 	}
+	if m.ThinkingNoContent {
+		log.Printf("    ⚠️ 思考吃光 max_tokens=%d，全程无 content（finish=length）——本次 ThinkMS/DecodeMS 不可测，建议调大 thinking.max_tokens_floor", maxTokens)
+	}
 	if cfg.StreamEnabled() {
-		log.Printf("    TTFT=%.0fms think=%.0fms decode=%.0fms tok/s=%.0f", m.TTFT, m.ThinkMS, m.DecodeMS, m.TokensPerSec)
+		log.Printf("    TTFT=%.0fms think=%.0fms decode=%.0fms tok/s=%.0f finish=%s",
+			m.TTFT, m.ThinkMS, m.DecodeMS, m.TokensPerSec, m.FinishReason)
 	} else {
 		log.Printf("    E2E=%.0fms tok/s=%.0f（非流式，TTFT/思考拆分 N/A）", m.E2EMS, m.TokensPerSec)
 	}
