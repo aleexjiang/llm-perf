@@ -133,92 +133,50 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 	if err != nil {
 		check("chat_nonstream", false, err.Error())
 	} else {
-		var out chunkChoiceList
-		jerr := json.Unmarshal(raw, &out)
-		content := ""
-		if jerr == nil && len(out.Choices) > 0 && out.Choices[0].Message != nil {
-			content = out.Choices[0].Message.Content
-		}
-		check("chat_nonstream", st == 200 && jerr == nil && content != "",
-			fmt.Sprintf("HTTP %d finish=%s content=%.30q", st, out.Choices[0].FinishReason, content))
+		pm := &TurnMetrics{}
+		pm.applyWholeBody(raw)
+		check("chat_nonstream", st == 200 && pm.Error == "" && pm.ReplyText != "",
+			fmt.Sprintf("HTTP %d finish=%s content=%.30q", st, pm.FinishReason, pm.ReplyText))
 		if st != 200 {
 			res.Verdicts = append(res.Verdicts, "非流式基础对话失败（HTTP "+fmt.Sprint(st)+"）——检查认证/模型名")
 		}
 	}
 
-	// ── 3. 流式基础对话：字段名清单 + usage + [DONE] ──
-	fields := map[string]bool{}
-	usageSeen, doneSeen, finish := false, false, ""
-	serr := func() error {
+	// ── 3. 流式基础对话：字段名清单 + usage + [DONE]（走共享解析器，与计时同一份代码）──
+	streamAnalyze := func(raw []byte) *TurnMetrics {
+		pm := &TurnMetrics{Stream: true}
+		_ = ingestSSEBody(pm, bytes.NewReader(raw), time.Now, o.IncludeUsage)
+		pm.closeOutWarnings(o.IncludeUsage)
+		return pm
+	}
+	pm, serr := func() (*TurnMetrics, error) {
 		st, raw, _, err := doChat(baseExtra, 16, true)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if st != 200 {
-			return fmt.Errorf("HTTP %d: %.200s", st, raw)
+			return nil, fmt.Errorf("HTTP %d: %.200s", st, raw)
 		}
-		for _, line := range strings.Split(string(raw), "\n") {
-			line = strings.TrimSpace(line)
-			if !strings.HasPrefix(line, "data:") {
-				continue
-			}
-			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-			if data == "[DONE]" {
-				doneSeen = true
-				continue
-			}
-			var ch chunkChoiceList
-			if json.Unmarshal([]byte(data), &ch) != nil {
-				continue
-			}
-			if ch.Usage != nil {
-				usageSeen = true
-			}
-			if len(ch.Choices) == 0 {
-				continue
-			}
-			if ch.Choices[0].FinishReason != "" {
-				finish = ch.Choices[0].FinishReason
-			}
-			if ch.Choices[0].Delta != nil {
-				var probeCh struct {
-					Choices []struct {
-						Delta map[string]any `json:"delta"`
-					} `json:"choices"`
-				}
-				_ = json.Unmarshal([]byte(data), &probeCh)
-				if len(probeCh.Choices) > 0 {
-					for k := range probeCh.Choices[0].Delta {
-						fields[k] = true
-					}
-				}
-			}
-		}
-		return nil
+		return streamAnalyze(raw), nil
 	}()
 	if serr != nil {
 		check("chat_stream", false, serr.Error())
 	} else {
-		keys := make([]string, 0, len(fields))
-		for k := range fields {
+		keys := make([]string, 0, len(pm.seenDeltaKeys))
+		for k := range pm.seenDeltaKeys {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
-		check("chat_stream", true, fmt.Sprintf("delta 字段: [%s] usage=%v done=%v finish=%s", strings.Join(keys, ","), usageSeen, doneSeen, finish))
-		if o.IncludeUsage && !usageSeen {
-			res.Verdicts = append(res.Verdicts, "⚠️ 流式响应不带 usage → token 数全 0，性能结论不可信；改配置 include_usage: false 并改用本地估算，或修服务端")
-		}
-		if !doneSeen {
-			res.Verdicts = append(res.Verdicts, "⚠️ 流没有 [DONE] 终止符——魔改迹象，记录到 issue")
-		}
-		unknown := []string{}
-		for k := range fields {
-			if !knownDeltaKeys[k] {
-				unknown = append(unknown, k)
+		check("chat_stream", true, fmt.Sprintf("delta 字段: [%s] usage=%v done=%v finish=%s",
+			strings.Join(keys, ","), pm.usageSeen, pm.doneSeen, pm.FinishReason))
+		for _, w := range pm.Warnings {
+			if w == "usage_missing" {
+				res.Verdicts = append(res.Verdicts, "⚠️ 流式响应不带 usage → token 数全 0，性能结论不可信；改配置 include_usage: false 并改用本地估算，或修服务端")
+			} else if w == "stream_ended_without_done" {
+				res.Verdicts = append(res.Verdicts, "⚠️ 流没有 [DONE] 终止符——魔改迹象，记录到 issue")
+			} else if strings.HasPrefix(w, "unknown_delta_fields:") {
+				res.Verdicts = append(res.Verdicts, "发现非标 delta 字段 "+strings.TrimPrefix(w, "unknown_delta_fields: ")+"——可能魔改，把 raw 转储发给工具维护者适配")
 			}
-		}
-		if len(unknown) > 0 {
-			res.Verdicts = append(res.Verdicts, "发现非标 delta 字段 "+strings.Join(unknown, ",")+"——可能魔改，把 raw 转储发给工具维护者适配")
 		}
 	}
 
@@ -229,25 +187,8 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 			check("thinking_"+label, false, fmt.Sprintf("HTTP %d err=%v", st, err))
 			return "none", 0
 		}
-		for _, line := range strings.Split(string(raw), "\n") {
-			line = strings.TrimSpace(line)
-			if !strings.HasPrefix(line, "data:") || strings.TrimSpace(strings.TrimPrefix(line, "data:")) == "[DONE]" {
-				continue
-			}
-			var ch chunkChoiceList
-			if json.Unmarshal([]byte(line[5:]), &ch) != nil || len(ch.Choices) == 0 || ch.Choices[0].Delta == nil {
-				continue
-			}
-			d := ch.Choices[0].Delta
-			if d.ReasoningContent != "" {
-				reasoningField = "reasoning_content"
-				reasoningLen += len(d.ReasoningContent)
-			} else if d.Reasoning != "" {
-				reasoningField = "reasoning"
-				reasoningLen += len(d.Reasoning)
-			}
-		}
-		return reasoningField, reasoningLen
+		pm := streamAnalyze(raw)
+		return pm.reasoningField, pm.ReasoningChars
 	}
 
 	if len(o.ThinkingOn) > 0 {

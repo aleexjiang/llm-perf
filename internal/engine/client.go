@@ -11,7 +11,6 @@
 package engine
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -53,46 +52,6 @@ func NewClient(baseURL, apiKey string, timeout time.Duration, includeUsage bool)
 	}
 }
 
-type deltaPayload struct {
-	Content string `json:"content"`
-	// 思考增量字段两代命名并存：
-	//   reasoning_content — 旧版 vLLM / DeepSeek / OpenRouter 等
-	//   reasoning         — 新版 vLLM(v0.27+) 官方口径
-	Reasoning        string `json:"reasoning"`
-	ReasoningContent string `json:"reasoning_content"`
-}
-
-// reasoningText 返回思考增量内容（兼容两种字段命名）。
-func (d deltaPayload) reasoningText() string {
-	if d.ReasoningContent != "" {
-		return d.ReasoningContent
-	}
-	return d.Reasoning
-}
-
-type chunkChoice struct {
-	Delta        *deltaPayload `json:"delta,omitempty"`
-	Message      *deltaPayload `json:"message,omitempty"`
-	FinishReason string        `json:"finish_reason"`
-}
-
-type usageInfo struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
-	CompletionTokensDetails *struct {
-		ReasoningTokens int `json:"reasoning_tokens"`
-	} `json:"completion_tokens_details"`
-}
-
-type chunkChoiceList struct {
-	Choices []chunkChoice `json:"choices"`
-	Usage   *usageInfo    `json:"usage"`
-	Error   *struct {
-		Message string `json:"message"`
-	} `json:"error"`
-}
-
 // TurnMetrics 记录一次请求的完整计时与 token 统计。时间字段为毫秒。
 type TurnMetrics struct {
 	Model    string `json:"model"`
@@ -121,6 +80,7 @@ type TurnMetrics struct {
 	ReasoningTokens  int `json:"reasoning_tokens,omitempty"`
 	TotalTokens      int `json:"total_tokens"`
 	FinishReason     string `json:"finish_reason,omitempty"` // stop / length / ...（思考吃光预算时为 length 且无 content）
+	ReasoningField   string `json:"reasoning_field,omitempty"` // 思考增量字段名：reasoning / reasoning_content（引擎口径证据）
 
 	// 派生指标（Finalize 后填充），单位 ms；非流式时 TTFT/思考/ITL 为 0（N/A）
 	E2EMS   float64 `json:"e2e_ms"`                // 请求发出 -> 结束（两种模式都有）
@@ -142,10 +102,13 @@ type TurnMetrics struct {
 	Warnings []string `json:"warnings,omitempty"`
 
 	contentTimes []time.Time
-	unknownKeys  map[string]bool // 流式 delta 中出现的非标字段名
-	usageSeen    bool
-	doneSeen     bool
-	rawResp      []byte // 原始响应头部片段（用于失败/调试转储）
+	// 解析状态（sse.go 的 ingest 逻辑使用；probe 也读它们做兼容性判定）
+	seenDeltaKeys  map[string]bool // 流中出现过的全部 delta 键名
+	unknownKeys    map[string]bool // 非标 delta 键名
+	usageSeen      bool
+	doneSeen       bool
+	reasoningField string
+	rawResp        []byte // 原始响应头部片段（用于失败/调试转储）
 }
 
 func (m *TurnMetrics) warn(format string, args ...any) {
@@ -289,122 +252,12 @@ func (c *Client) Chat(ctx context.Context, o ChatOptions) (*TurnMetrics, error) 
 	return m, nil
 }
 
-func (c *Client) applyUsage(m *TurnMetrics, u *usageInfo) {
-	if u == nil {
-		return
-	}
-	m.PromptTokens = u.PromptTokens
-	m.CompletionTokens = u.CompletionTokens
-	m.TotalTokens = u.TotalTokens
-	if u.CompletionTokensDetails != nil {
-		m.ReasoningTokens = u.CompletionTokensDetails.ReasoningTokens
-	}
-}
-
-// knownDeltaKeys 是流式 delta 的已知字段；出现其他字段说明引擎魔改或协议变体，记录进 warnings。
-var knownDeltaKeys = map[string]bool{
-	"role": true, "content": true, "reasoning": true, "reasoning_content": true,
-	"tool_calls": true, "function_call": true,
-}
-
-// readStream 逐行解析 SSE，记录逐 chunk 时间戳。
+// readStream 读 SSE 流：解析/告警逻辑在 sse.go（与 probe 共用），这里只接网络与真实时钟。
 func (c *Client) readStream(resp *http.Response, m *TurnMetrics) {
-	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		m.appendRaw(line + "\n")
-		if !strings.HasPrefix(line, "data:") {
-			continue // 非 SSE data 行（注释放宽、BOM 等魔改迹象也留存在 raw 转储里）
-		}
-		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if data == "[DONE]" {
-			m.doneSeen = true
-			break
-		}
-		var ch chunkChoiceList
-		if err := json.Unmarshal([]byte(data), &ch); err != nil {
-			m.warn("unparseable_stream_line: %.120s", data)
-			continue // 跳过无法解析的行
-		}
-		if ch.Error != nil {
-			m.Error = ch.Error.Message
-			continue
-		}
-		now := time.Now()
-		if m.FirstChunkAt == nil {
-			t := now
-			m.FirstChunkAt = &t
-		}
-		m.Chunks++
-		if ch.Usage != nil {
-			m.usageSeen = true
-		}
-		c.applyUsage(m, ch.Usage)
-		if len(ch.Choices) == 0 {
-			continue
-		}
-		if fr := ch.Choices[0].FinishReason; fr != "" {
-			m.FinishReason = fr
-		}
-		if d := ch.Choices[0].Delta; d != nil {
-			// 未知字段探测：二次解析 delta 取键名（在时间戳捕获之后做，不影响计时）
-			var probeCh struct {
-				Choices []struct {
-					Delta map[string]any `json:"delta"`
-				} `json:"choices"`
-			}
-			_ = json.Unmarshal([]byte(data), &probeCh)
-			if len(probeCh.Choices) > 0 {
-				for k := range probeCh.Choices[0].Delta {
-					if !knownDeltaKeys[k] {
-						if m.unknownKeys == nil {
-							m.unknownKeys = map[string]bool{}
-						}
-						m.unknownKeys[k] = true
-					}
-				}
-			}
-			if rt := d.reasoningText(); rt != "" {
-				m.ReasoningChunks++
-				m.ReasoningChars += len(rt)
-				if m.FirstReasoningAt == nil {
-					t := now
-					m.FirstReasoningAt = &t
-				}
-			}
-			if d.Content != "" {
-				m.ContentChunks++
-				m.ContentChars += len(d.Content)
-				if len(m.ReplyText) < 16*1024 {
-					m.ReplyText += d.Content
-				}
-				m.contentTimes = append(m.contentTimes, now)
-				if m.FirstContentAt == nil {
-					t := now
-					m.FirstContentAt = &t
-				}
-			}
-		}
+	if err := ingestSSEBody(m, resp.Body, time.Now, c.IncludeUsage); err != nil {
+		return // 读取错误已记入 warnings
 	}
-	if err := scanner.Err(); err != nil {
-		m.warn("stream_read_error: %v", err)
-	}
-	// 收尾告警：兼容性问题在这几条里暴露
-	if m.unknownKeys != nil {
-		keys := make([]string, 0, len(m.unknownKeys))
-		for k := range m.unknownKeys {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		m.warn("unknown_delta_fields: %s", strings.Join(keys, ","))
-	}
-	if m.Chunks > 0 && !m.doneSeen {
-		m.warn("stream_ended_without_done")
-	}
-	if c.IncludeUsage && !m.usageSeen {
-		m.warn("usage_missing") // 服务端未回 usage → token 数全 0，性能数据不可信
-	}
+	m.closeOutWarnings(c.IncludeUsage)
 }
 
 const maxRawKeep = 256 * 1024
@@ -479,7 +332,7 @@ func maskJSON(raw []byte) []byte {
 	return rj
 }
 
-// readWhole 解析非流式 JSON 响应。只有端到端延迟与 usage 可测。
+// readWhole 读非流式响应体：解析逻辑在 sse.go（applyWholeBody）。
 func (c *Client) readWhole(resp *http.Response, m *TurnMetrics) {
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
 	if err != nil {
@@ -487,30 +340,7 @@ func (c *Client) readWhole(resp *http.Response, m *TurnMetrics) {
 		return
 	}
 	m.appendRaw(string(data))
-	var out chunkChoiceList
-	if err := json.Unmarshal(data, &out); err != nil {
-		m.Error = "invalid json response: " + truncate(string(data), 200)
-		return
-	}
-	if out.Error != nil {
-		m.Error = out.Error.Message
-		return
-	}
-	c.applyUsage(m, out.Usage)
-	if len(out.Choices) > 0 {
-		if fr := out.Choices[0].FinishReason; fr != "" {
-			m.FinishReason = fr
-		}
-		if msg := out.Choices[0].Message; msg != nil {
-			if msg.Content != "" {
-				m.ContentChars = len(msg.Content)
-				m.ReplyText = msg.Content
-			}
-			if rt := msg.reasoningText(); rt != "" {
-				m.ReasoningChars = len(rt)
-			}
-		}
-	}
+	m.applyWholeBody(data)
 }
 
 func truncate(s string, n int) string {
