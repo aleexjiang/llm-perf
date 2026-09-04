@@ -35,6 +35,9 @@ func runOne(ctx context.Context, client *engine.Client, cfg *config.Config, mode
 	if m.ThinkingNoContent {
 		log.Printf("    ⚠️ 思考吃光 max_tokens=%d，全程无 content（finish=length）——本次 ThinkMS/DecodeMS 不可测，建议调大 thinking.max_tokens_floor", maxTokens)
 	}
+	for _, w := range m.Warnings {
+		log.Printf("    ⚠️ 兼容性告警: %s", w)
+	}
 	if cfg.StreamEnabled() {
 		log.Printf("    TTFT=%.0fms think=%.0fms decode=%.0fms tok/s=%.0f finish=%s",
 			m.TTFT, m.ThinkMS, m.DecodeMS, m.TokensPerSec, m.FinishReason)

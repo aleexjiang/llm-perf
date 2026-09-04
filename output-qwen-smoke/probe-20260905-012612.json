@@ -1,0 +1,39 @@
+{
+  "generated_at": "2026-09-05T01:26:10.729699+08:00",
+  "endpoint": "http://172.17.0.3:8849/v1",
+  "server_header": "uvicorn",
+  "engine_guess": "vllm",
+  "models": [
+    "qwen3.8-27b"
+  ],
+  "checks": [
+    {
+      "name": "models_list",
+      "ok": true,
+      "detail": "HTTP 200, 1 个模型"
+    },
+    {
+      "name": "chat_nonstream",
+      "ok": false,
+      "detail": "HTTP 200 finish=length content=\"\""
+    },
+    {
+      "name": "chat_stream",
+      "ok": true,
+      "detail": "delta 字段: [content,reasoning,role] usage=true done=true finish=length"
+    },
+    {
+      "name": "thinking_on",
+      "ok": true,
+      "detail": "思考增量字段=reasoning，130 字符"
+    },
+    {
+      "name": "thinking_off",
+      "ok": true,
+      "detail": "关闭后思考增量=0 字符（字段=）"
+    }
+  ],
+  "verdicts": [
+    "思考字段为新版 reasoning（vLLM v0.27+ 口径，引擎已兼容）"
+  ]
+}

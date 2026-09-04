@@ -44,6 +44,38 @@
 单发版关键对照：`fixed_seed: true` 时各 run 复用同一 prompt——Run2+ 的 TTFT 显著低于 Run1 即前缀缓存命中。
 多轮版关键判定：turn N 的 TTFT ≈ turn N−1 TTFT + 新增 token 的 prefill ⇒ 缓存命中；接近全量 prefill ⇒ 未命中。
 
+## 兼容性：多推理引擎支持
+
+核心协议是 OpenAI 兼容 `/v1/chat/completions`，vLLM / SGLang / TGI / MindIE（华为魔改 vLLM）/ llama.cpp 等均可用，
+但各引擎在**细节字段**上差异很大（`reasoning` vs `reasoning_content`、usage 是否回传、`stream_options` 支持、
+非标 delta 字段）。工具内置三层排查能力：
+
+**1. `bench probe` —— 换引擎先跑探针**
+
+```bash
+./bench probe -c example.yaml          # 对 /models 列表第一个模型探测
+./bench probe -c example.yaml <模型ID>  # 指定模型
+```
+
+输出：引擎猜测（Server 头 + 响应特征）、模型列表、逐项检查（非流式/流式/usage/[DONE]/思考开关有效性）、
+结论提示（哪些配置要改、哪些魔改需要适配），落盘 `probe-<时间戳>.json`。
+
+**2. 请求级兼容性告警（自动）**
+
+每个请求的 JSON 里带 `warnings` 字段，日志同步打印 `⚠️ 兼容性告警`：
+`usage_missing`（token 数不可信）/ `stream_ended_without_done` / `unknown_delta_fields: xxx`（魔改字段名）/
+`unparseable_stream_line` / `thinking_no_content`（思考吃光 max_tokens）。
+分析报告时先按 warnings 过滤脏数据。
+
+**3. `debug: true` —— 原始流量留存**
+
+```yaml
+debug: true   # 原始响应 → <output_dir>/raw/*.log；日志同步 → <output_dir>/run.log
+```
+
+每个请求一份转储：请求体摘要 + 状态码 + 原始 SSE 行（头部 256KB）。
+魔改引擎行为看一眼 raw 文件就清楚；**请求失败时即使不开 debug 也会自动转储**。
+
 ## 快速开始
 
 ```bash

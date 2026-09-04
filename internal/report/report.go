@@ -53,7 +53,12 @@ type Report struct {
 
 // SaveJSON 将报告写入单个 JSON 文件（自动创建父目录）。
 func (r *Report) SaveJSON(path string) error {
-	rj, err := json.MarshalIndent(r, "", "  ")
+	return SaveJSONAny(r, path)
+}
+
+// SaveJSONAny 任意结构落盘为 JSON（probe 等非 Report 结构用）。
+func SaveJSONAny(v any, path string) error {
+	rj, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return err
 	}

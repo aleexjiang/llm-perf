@@ -81,6 +81,7 @@ type Config struct {
 	IncludeUsage   *bool  `yaml:"include_usage"`
 	FillerLang     string `yaml:"filler_lang"`
 	Stream         *bool  `yaml:"stream"` // 默认 true；false 时 TTFT/ITL/思考拆分不可测（N/A）
+	Debug          bool   `yaml:"debug"`  // true: 每个请求的原始响应留存到 <output_dir>/raw/，日志同步写 run.log（排查魔改引擎用）
 	Models         []string `yaml:"models"`
 
 	Thinking Thinking `yaml:"thinking"`

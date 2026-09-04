@@ -18,8 +18,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -35,6 +38,9 @@ type Client struct {
 	APIKey       string       // 为空则不带 Authorization
 	IncludeUsage bool         // 请求 stream_options.include_usage
 	HTTP         *http.Client //
+	DebugDir     string       // 非空时留存每个请求的原始响应到该目录（排查魔改引擎）；请求失败时即使为空也会留存
+
+	seq atomic.Int64 // 原始流量转储文件序号
 }
 
 // NewClient 创建客户端。timeout 作用于整个请求（含流式读取）。
@@ -132,7 +138,18 @@ type TurnMetrics struct {
 	// 此时 ThinkMS/DecodeMS/ITL 均不可测，分析时应剔除或调大 max_tokens 重跑。
 	ThinkingNoContent bool `json:"thinking_no_content,omitempty"`
 
+	// 引擎兼容性告警（usage 缺失、未知增量字段、流未正常终止等）——排查魔改引擎的关键线索
+	Warnings []string `json:"warnings,omitempty"`
+
 	contentTimes []time.Time
+	unknownKeys  map[string]bool // 流式 delta 中出现的非标字段名
+	usageSeen    bool
+	doneSeen     bool
+	rawResp      []byte // 原始响应头部片段（用于失败/调试转储）
+}
+
+func (m *TurnMetrics) warn(format string, args ...any) {
+	m.Warnings = append(m.Warnings, fmt.Sprintf(format, args...))
 }
 
 // Finalize 根据 raw 时间戳计算派生指标。必须在请求结束后调用。
@@ -230,6 +247,7 @@ func (c *Client) Chat(ctx context.Context, o ChatOptions) (*TurnMetrics, error) 
 	}
 
 	m := &TurnMetrics{Model: o.Model, Stream: o.Stream, Thinking: o.Thinking}
+	m.appendRaw(string(payload) + "\n--- RESPONSE ---\n")
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/chat/completions", bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
@@ -245,6 +263,7 @@ func (c *Client) Chat(ctx context.Context, o ChatOptions) (*TurnMetrics, error) 
 		m.Error = err.Error()
 		m.EndAt = time.Now()
 		m.Finalize()
+		c.dumpIfNeeded(m, payload, 0, nil, o.Stream)
 		return m, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
@@ -254,6 +273,8 @@ func (c *Client) Chat(ctx context.Context, o ChatOptions) (*TurnMetrics, error) 
 		m.Error = fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(buf))
 		m.EndAt = time.Now()
 		m.Finalize()
+		m.appendRaw(fmt.Sprintf("HTTP %d\n", resp.StatusCode) + string(buf))
+		c.dumpIfNeeded(m, payload, resp.StatusCode, resp.Header, o.Stream)
 		return m, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(buf), 500))
 	}
 
@@ -264,6 +285,7 @@ func (c *Client) Chat(ctx context.Context, o ChatOptions) (*TurnMetrics, error) 
 	}
 	m.EndAt = time.Now()
 	m.Finalize()
+	c.dumpIfNeeded(m, payload, resp.StatusCode, resp.Header, o.Stream)
 	return m, nil
 }
 
@@ -279,21 +301,30 @@ func (c *Client) applyUsage(m *TurnMetrics, u *usageInfo) {
 	}
 }
 
+// knownDeltaKeys 是流式 delta 的已知字段；出现其他字段说明引擎魔改或协议变体，记录进 warnings。
+var knownDeltaKeys = map[string]bool{
+	"role": true, "content": true, "reasoning": true, "reasoning_content": true,
+	"tool_calls": true, "function_call": true,
+}
+
 // readStream 逐行解析 SSE，记录逐 chunk 时间戳。
 func (c *Client) readStream(resp *http.Response, m *TurnMetrics) {
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
+		m.appendRaw(line + "\n")
 		if !strings.HasPrefix(line, "data:") {
-			continue
+			continue // 非 SSE data 行（注释放宽、BOM 等魔改迹象也留存在 raw 转储里）
 		}
 		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if data == "[DONE]" {
+			m.doneSeen = true
 			break
 		}
 		var ch chunkChoiceList
 		if err := json.Unmarshal([]byte(data), &ch); err != nil {
+			m.warn("unparseable_stream_line: %.120s", data)
 			continue // 跳过无法解析的行
 		}
 		if ch.Error != nil {
@@ -306,6 +337,9 @@ func (c *Client) readStream(resp *http.Response, m *TurnMetrics) {
 			m.FirstChunkAt = &t
 		}
 		m.Chunks++
+		if ch.Usage != nil {
+			m.usageSeen = true
+		}
 		c.applyUsage(m, ch.Usage)
 		if len(ch.Choices) == 0 {
 			continue
@@ -314,6 +348,23 @@ func (c *Client) readStream(resp *http.Response, m *TurnMetrics) {
 			m.FinishReason = fr
 		}
 		if d := ch.Choices[0].Delta; d != nil {
+			// 未知字段探测：二次解析 delta 取键名（在时间戳捕获之后做，不影响计时）
+			var probeCh struct {
+				Choices []struct {
+					Delta map[string]any `json:"delta"`
+				} `json:"choices"`
+			}
+			_ = json.Unmarshal([]byte(data), &probeCh)
+			if len(probeCh.Choices) > 0 {
+				for k := range probeCh.Choices[0].Delta {
+					if !knownDeltaKeys[k] {
+						if m.unknownKeys == nil {
+							m.unknownKeys = map[string]bool{}
+						}
+						m.unknownKeys[k] = true
+					}
+				}
+			}
 			if rt := d.reasoningText(); rt != "" {
 				m.ReasoningChunks++
 				m.ReasoningChars += len(rt)
@@ -336,6 +387,96 @@ func (c *Client) readStream(resp *http.Response, m *TurnMetrics) {
 			}
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		m.warn("stream_read_error: %v", err)
+	}
+	// 收尾告警：兼容性问题在这几条里暴露
+	if m.unknownKeys != nil {
+		keys := make([]string, 0, len(m.unknownKeys))
+		for k := range m.unknownKeys {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		m.warn("unknown_delta_fields: %s", strings.Join(keys, ","))
+	}
+	if m.Chunks > 0 && !m.doneSeen {
+		m.warn("stream_ended_without_done")
+	}
+	if c.IncludeUsage && !m.usageSeen {
+		m.warn("usage_missing") // 服务端未回 usage → token 数全 0，性能数据不可信
+	}
+}
+
+const maxRawKeep = 256 * 1024
+
+// appendRaw 保留原始流片段（头尾各留一半），用于 debug 转储与失败排查。
+func (m *TurnMetrics) appendRaw(line string) {
+	if len(m.rawResp) >= maxRawKeep {
+		return
+	}
+	m.rawResp = append(m.rawResp, line...)
+}
+
+// dumpIfNeeded 把请求上下文 + 原始响应写进 DebugDir；请求失败时无条件留存。
+func (c *Client) dumpIfNeeded(m *TurnMetrics, reqBody []byte, status int, respHeader http.Header, stream bool) {
+	dumpOnError := m.Error != ""
+	if c.DebugDir == "" && !dumpOnError {
+		return
+	}
+	dir := c.DebugDir
+	if dir == "" {
+		dir = os.TempDir()
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
+	}
+	name := fmt.Sprintf("%s-%s-%d-%s.log", time.Now().Format("150405"), sanitize(m.Model), c.seq.Add(1), map[bool]string{true: "stream", false: "whole"}[stream])
+	var b bytes.Buffer
+	fmt.Fprintf(&b, "time=%s endpoint=%s model=%s stream=%v thinking=%v status=%d\n", time.Now().Format(time.RFC3339), c.BaseURL, m.Model, stream, m.Thinking, status)
+	fmt.Fprintf(&b, "request: %s\n", truncate(string(maskJSON(reqBody)), 4096))
+	if respHeader != nil {
+		fmt.Fprintf(&b, "response_headers: %s\n", truncate(respHeader.Get("Server")+" | "+respHeader.Get("Content-Type")+" | fingerprint header? "+respHeader.Get("X-Request-Id"), 300))
+	}
+	b.Write(m.rawResp)
+	_ = os.WriteFile(filepath.Join(dir, name), b.Bytes(), 0o644)
+}
+
+func sanitize(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '.' || r == '_' {
+			return r
+		}
+		return '-'
+	}, s)
+}
+
+// maskJSON 把请求体里的长消息内容截断（保留结构，方便人工查看）。
+func maskJSON(raw []byte) []byte {
+	var body struct {
+		Model    string `json:"model"`
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		return raw
+	}
+	out := map[string]any{"model": body.Model, "message_count": len(body.Messages), "messages_preview": []map[string]string{}}
+	prev := []map[string]string{}
+	for i, msg := range body.Messages {
+		if i >= 4 {
+			prev = append(prev, map[string]string{"role": "...", "content": fmt.Sprintf("（共 %d 条消息省略）", len(body.Messages)-4)})
+			break
+		}
+		prev = append(prev, map[string]string{"role": msg.Role, "content": truncate(msg.Content, 160)})
+	}
+	out["messages_preview"] = prev
+	rj, err := json.Marshal(out)
+	if err != nil {
+		return raw
+	}
+	return rj
 }
 
 // readWhole 解析非流式 JSON 响应。只有端到端延迟与 usage 可测。
@@ -345,6 +486,7 @@ func (c *Client) readWhole(resp *http.Response, m *TurnMetrics) {
 		m.Error = err.Error()
 		return
 	}
+	m.appendRaw(string(data))
 	var out chunkChoiceList
 	if err := json.Unmarshal(data, &out); err != nil {
 		m.Error = "invalid json response: " + truncate(string(data), 200)

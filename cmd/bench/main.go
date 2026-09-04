@@ -14,6 +14,8 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -31,6 +33,7 @@ func usage() {
 输入: YAML 配置    输出: JSON 原始数据（报告请用外部工具基于 JSON 生成）
 
 用法:
+  bench probe     -c configs/example.yaml            # 兼容性探针：先摸清引擎实现细节再压测
   bench <single|multiturn|concurrent|all> [-c 配置.yaml] [-o 输出路径] [-m 模名过滤]
 
 -o 说明:
@@ -38,7 +41,12 @@ func usage() {
   - 指定目录        → 在该目录下生成 <场景>-<时间戳>.json
   - 缺省            → 使用配置 output_dir
 
+排查模式:
+  配置里 debug: true 时，原始响应留存到 <output_dir>/raw/、日志同步写 <output_dir>/run.log；
+  任何请求失败时即使不开 debug 也会自动留存转储（写到系统临时目录）。
+
 示例:
+  bench probe -c configs/example.yaml
   bench all -c configs/example.yaml
   bench single -c configs/example.yaml -o result/deepseek-40k.json -m DeepSeek
 `)
@@ -67,7 +75,7 @@ func main() {
 	}
 	cmd := os.Args[1]
 	switch cmd {
-	case "single", "multiturn", "concurrent", "all":
+	case "probe", "single", "multiturn", "concurrent", "all":
 	default:
 		usage()
 	}
@@ -84,9 +92,61 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 排查模式：debug=true 时日志同步写 run.log，原始响应留 raw/
+	if cfg.Debug {
+		if err := os.MkdirAll(cfg.OutputDir, 0o755); err == nil {
+			if lf, err := os.Create(filepath.Join(cfg.OutputDir, "run.log")); err == nil {
+				log.SetOutput(io.MultiWriter(os.Stderr, lf))
+				defer lf.Close()
+			}
+		}
+	}
+
 	client := engine.NewClient(cfg.Endpoint, cfg.APIKey, cfg.Timeout(), *cfg.IncludeUsage)
+	if cfg.Debug {
+		client.DebugDir = filepath.Join(cfg.OutputDir, "raw")
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// ── probe：兼容性探测（不需要场景配置） ──
+	if cmd == "probe" {
+		model := ""
+		if fs.Arg(0) != "" {
+			model = fs.Arg(0)
+		} else if len(cfg.Models) > 0 {
+			model = cfg.Models[0]
+		}
+		res := engine.Probe(ctx, engine.ProbeOptions{
+			Endpoint:     cfg.Endpoint,
+			APIKey:       cfg.APIKey,
+			Model:        model,
+			ThinkingOn:   cfg.Thinking.ExtraBodyOn,
+			ThinkingOff:  cfg.Thinking.ExtraBodyOff,
+			IncludeUsage: *cfg.IncludeUsage,
+		})
+		outPath := resolveOutPath(*outFlag, cfg.OutputDir, "probe")
+		if err := report.SaveJSONAny(res, outPath); err != nil {
+			fmt.Fprintln(os.Stderr, "写出探针 JSON 失败:", err)
+			os.Exit(1)
+		}
+		fmt.Printf("引擎猜测: %s（Server 头: %s）\n", res.EngineGuess, res.Server)
+		for _, m := range res.Models {
+			fmt.Printf("  模型: %s\n", m)
+		}
+		for _, c := range res.Checks {
+			mark := "✅"
+			if !c.OK {
+				mark = "❌"
+			}
+			fmt.Printf("%s %s: %s\n", mark, c.Name, c.Detail)
+		}
+		for _, v := range res.Verdicts {
+			fmt.Printf("💡 %s\n", v)
+		}
+		fmt.Printf("探针完成，输出: %s\n", outPath)
+		return
+	}
 
 	run := func(name string, fn func() (*report.Report, error)) {
 		start := time.Now()
