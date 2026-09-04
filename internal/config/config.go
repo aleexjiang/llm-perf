@@ -31,6 +31,46 @@ type Concurrent struct {
 	RunsPerWorker int   `yaml:"runs_per_worker"`
 	PromptTokens  int   `yaml:"prompt_tokens"`
 	MaxTokens     int   `yaml:"max_tokens"`
+	Multiturn     bool  `yaml:"multiturn"` // true=每个虚拟用户各自跑完整多轮会话（会话重放）
+}
+
+// Thinking 思考模式配置。
+// 通用透传设计（对齐 vLLM --extra-body）：不硬编码参数名，on/off 两套 JSON 合并进请求体。
+type Thinking struct {
+	Mode           string         `yaml:"mode"`              // both（默认，A/B 对照）| on | off
+	ExtraBodyOn    map[string]any `yaml:"extra_body_on"`     // 思考开启时合并进请求体
+	ExtraBodyOff   map[string]any `yaml:"extra_body_off"`    // 思考关闭时合并进请求体
+	MaxTokensFloor int            `yaml:"max_tokens_floor"`  // 思考开启时 max_tokens 下限保护（防思考吃光输出预算）
+}
+
+// ThinkingVariant 是一个思考模式变体。
+type ThinkingVariant struct {
+	Name      string         // "off" / "on"
+	Enabled   bool
+	ExtraBody map[string]any
+}
+
+// Variants 按 mode 展开成变体列表（both 时先 off 后 on，便于报告对照）。
+func (t Thinking) Variants() []ThinkingVariant {
+	switch t.Mode {
+	case "on":
+		return []ThinkingVariant{{Name: "on", Enabled: true, ExtraBody: t.ExtraBodyOn}}
+	case "off":
+		return []ThinkingVariant{{Name: "off", Enabled: false, ExtraBody: t.ExtraBodyOff}}
+	default: // both
+		return []ThinkingVariant{
+			{Name: "off", Enabled: false, ExtraBody: t.ExtraBodyOff},
+			{Name: "on", Enabled: true, ExtraBody: t.ExtraBodyOn},
+		}
+	}
+}
+
+// MaxTokens 对思考开启的变体应用 max_tokens 下限保护。
+func (t Thinking) MaxTokens(maxTokens int, v ThinkingVariant) int {
+	if v.Enabled && t.MaxTokensFloor > 0 && maxTokens < t.MaxTokensFloor {
+		return t.MaxTokensFloor
+	}
+	return maxTokens
 }
 
 type Config struct {
@@ -40,7 +80,10 @@ type Config struct {
 	TimeoutSeconds int    `yaml:"timeout_seconds"`
 	IncludeUsage   *bool  `yaml:"include_usage"`
 	FillerLang     string `yaml:"filler_lang"`
+	Stream         *bool  `yaml:"stream"` // 默认 true；false 时 TTFT/ITL/思考拆分不可测（N/A）
 	Models         []string `yaml:"models"`
+
+	Thinking Thinking `yaml:"thinking"`
 
 	Single     Single     `yaml:"single"`
 	Multiturn  Multiturn  `yaml:"multiturn"`
@@ -88,6 +131,16 @@ func Load(path string) (*Config, error) {
 		t := true
 		cfg.IncludeUsage = &t
 	}
+	if cfg.Stream == nil {
+		t := true
+		cfg.Stream = &t
+	}
+	if cfg.Thinking.Mode == "" {
+		cfg.Thinking.Mode = "both"
+	}
+	if cfg.Thinking.MaxTokensFloor <= 0 {
+		cfg.Thinking.MaxTokensFloor = 2048
+	}
 	// 各场景默认值
 	if cfg.Single.Runs <= 0 {
 		cfg.Single.Runs = 3
@@ -130,3 +183,6 @@ func (c *Config) Timeout() time.Duration { return time.Duration(c.TimeoutSeconds
 
 // Fillers 返回填充文本语言设置。
 func (c *Config) Fillers() string { return c.FillerLang }
+
+// StreamEnabled 返回是否使用流式请求。
+func (c *Config) StreamEnabled() bool { return *c.Stream }

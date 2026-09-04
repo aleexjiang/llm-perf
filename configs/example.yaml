@@ -7,19 +7,32 @@ output_dir: "output"              # 输出 JSON 的默认目录（-o 可覆盖�
 timeout_seconds: 300
 include_usage: true               # 请求 stream_options.include_usage，从 usage 字段取精确 token 数
 filler_lang: "en"                 # 填充文本语言：en（约 1 word ≈ 0.75 token）/ zh（约 1 字 ≈ 1 token）
+stream: true                      # 流式开关。false 时只能测端到端延迟与 usage，TTFT/ITL/思考拆分 N/A
 
 models:
   - "/models/DeepSeek-V4-Flash-0731"
   - "/models/Qwen3.8-27B"
 
-# 场景一：单请求基线（同 prompt 重复 runs 次，用于观察前缀缓存命中）
+# 思考模式：both=每个场景自动跑 off/on 各一遍（A/B 对照）；on / off=只跑其一。
+# extra_body 通用透传（对齐 vLLM --extra-body），按实际网关写参数，不同服务示例：
+#   vLLM/Qwen:  {chat_template_kwargs: {enable_thinking: true}}
+#   其他网关:   {thinking: {type: enabled}} / {enable_thinking: true} 等
+thinking:
+  mode: "both"
+  extra_body_on:
+    chat_template_kwargs: {enable_thinking: true}
+  extra_body_off:
+    chat_template_kwargs: {enable_thinking: false}
+  max_tokens_floor: 2048          # 思考开启时 max_tokens 低于此值自动抬高（防思考吃光输出预算）
+
+# 场景一：单发单轮（同 prompt 重复 runs 次，用于观察前缀缓存命中）
 single:
   runs: 3
   prompt_tokens: [4000, 10000, 20000, 40000]
   max_tokens: 512
   fixed_seed: true                # true=各 run 用同一 prompt（测缓存）；false=每次换 prompt（测冷启动）
 
-# 场景二：多轮会话重放（模拟 agent：system + tool defs + 逐轮滚大的 history）
+# 场景二：单发多轮（模拟 agent：system + tool defs + 逐轮滚大的 history）
 multiturn:
   sessions: 2                     # 跑几个独立会话
   turns: 8                        # 每个会话几轮
@@ -29,9 +42,10 @@ multiturn:
   max_tokens: 256
   keep_assistant: true            # assistant 回复保留进 history（真实 agent 行为）
 
-# 场景三：阶梯并发
+# 场景三：并发（单轮或多轮由 multiturn 决定）
 concurrent:
+  multiturn: false                # false=每用户独立单轮请求；true=每用户各自跑完整多轮会话重放
   levels: [1, 2, 4, 8, 16]
-  runs_per_worker: 2              # 每个虚拟用户连续发几次
+  runs_per_worker: 2              # 单轮模式下每个虚拟用户连续发几次
   prompt_tokens: 10000
   max_tokens: 256

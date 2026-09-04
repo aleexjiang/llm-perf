@@ -12,25 +12,30 @@ import (
 	"github.com/aleexjiang/llm-perf/internal/engine"
 )
 
-// SingleRow：一个模型在一个 token 档位下的多次 run。
+// SingleRow：一个模型在一个 token 档位 × 思考模式下的多次 run。
 type SingleRow struct {
 	Model        string                `json:"model"`
+	Thinking     string                `json:"thinking"` // "on" / "off"
 	PromptTokens int                   `json:"prompt_tokens"`
 	Runs         []*engine.TurnMetrics `json:"runs"`
 }
 
-// MultiturnRun：一个模型的一次多轮会话。
+// MultiturnRun：一个模型的一次多轮会话（每 turn 均含思考时长）。
 type MultiturnRun struct {
-	Model   string                `json:"model"`
-	Session int                   `json:"session"`
-	Turns   []*engine.TurnMetrics `json:"turns"`
+	Model    string                `json:"model"`
+	Thinking string                `json:"thinking"` // "on" / "off"
+	Session  int                   `json:"session"`
+	Turns    []*engine.TurnMetrics `json:"turns"`
 }
 
-// ConcurrentLevel：一个模型在一个并发档位下的结果。
+// ConcurrentLevel：一个模型在一个并发档位 × 思考模式下的结果。
+// Multiturn=false 时 Requests 为各虚拟用户的单轮请求；true 时 Sessions 为各虚拟用户的完整会话重放。
 type ConcurrentLevel struct {
 	Model         string                `json:"model"`
+	Thinking      string                `json:"thinking"` // "on" / "off"
 	Level         int                   `json:"level"`
-	Requests      []*engine.TurnMetrics `json:"requests"`
+	Requests      []*engine.TurnMetrics `json:"requests,omitempty"`
+	Sessions      []MultiturnRun        `json:"sessions,omitempty"`
 	WallSeconds   float64               `json:"wall_seconds"`
 	ThroughputTPS float64               `json:"throughput_tps"` // 整体 completion tokens/s
 }
