@@ -30,12 +30,15 @@
 - **流式**（`stream: true/false`，默认 `true`）：非流式只能测端到端延迟与 usage，
   TTFT/ITL/思考拆分不可测（JSON 中相应字段缺省）；用于 E2E 对照与网关缓冲问题排查
 
+另有 `bench probe` 兼容性探针（换引擎先跑）与 `debug` 原始流量留存，见下文
+[兼容性：多推理引擎支持](#兼容性多推理引擎支持)。
+
 ## 指标口径
 
 每个流式请求逐 chunk 记录时间戳，拆分为：
 
 - **TTFT**：首个任意 chunk（含排队 + prefill）
-- **TTFT reasoning**：首个 `reasoning_content` chunk ≈ prefill 完成时刻（思考模型）
+- **TTFT reasoning**：首个思考增量 chunk（`reasoning` / `reasoning_content` 双字段兼容）≈ prefill 完成时刻
 - **TTFT content**：首个可见内容 chunk = prefill + 思考
 - **思考时长**（`think_ms`）= TTFT content − TTFT reasoning；**每次对话（含多轮每一 turn）都有**
 - **decode 时长 / ITL 分位数**（GenAI-Perf 口径，不含 TTFT）/ tokens per second
@@ -87,7 +90,9 @@ scp bin/bench-linux-amd64 configs/example.yaml 堡垒机:~/llm-perf/
 mv bench-linux-amd64 bench && chmod +x bench
 export LLM_PERF_ENDPOINT=http://10.0.201.1:30082/router/v1
 export LLM_PERF_API_KEY=...         # 如服务需要
-./bench all -c example.yaml
+./bench probe -c example.yaml       # ① 先探针：确认引擎兼容性与思考开关参数
+./bench single -c example.yaml      # ② 小档位验证解析正确性（改小 prompt_tokens/max_tokens）
+./bench all -c example.yaml         # ③ 正式跑完整矩阵
 ```
 
 ## 输出

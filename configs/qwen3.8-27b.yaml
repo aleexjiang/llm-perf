@@ -17,6 +17,7 @@ timeout_seconds: 600              # 长档位 + max-num-seqs=2 排队，放宽�
 include_usage: true
 filler_lang: "en"
 stream: true
+debug: false                      # 换引擎/网关时先改 true 抓原始流量，或直接跑 bench probe
 
 models:
   - "qwen3.8-27b"

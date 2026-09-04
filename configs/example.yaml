@@ -8,6 +8,8 @@ timeout_seconds: 300
 include_usage: true               # 请求 stream_options.include_usage，从 usage 字段取精确 token 数
 filler_lang: "en"                 # 填充文本语言：en（约 1 word ≈ 0.75 token）/ zh（约 1 字 ≈ 1 token）
 stream: true                      # 流式开关。false 时只能测端到端延迟与 usage，TTFT/ITL/思考拆分 N/A
+debug: false                      # true: 原始响应留存 <output_dir>/raw/*.log + 日志写 run.log（排查魔改引擎用；
+                                  # 请求失败时即使 false 也会自动转储）。新接引擎建议先跑 bench probe
 
 models:
   - "/models/DeepSeek-V4-Flash-0731"
