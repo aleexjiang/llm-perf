@@ -237,13 +237,14 @@ options:{plugins:{title:{display:true,text:'并发档位整体吞吐'}},scales:{
 </script>
 """
 
+    # 注意顺序：先注入图表代码骨架（内含数据占位符），再替换数据值
+    h = h.replace("__CHARTJS__", chartjs)
     for k, v in [("__TOKENS__", chart_tokens), ("__RUN1__", chart_run1), ("__RUN2__", chart_run2),
                  ("__THINK_SEC__", think_sec), ("__MT_LABELS__", mt_labels), ("__MT_TTFT__", mt_ttft),
                  ("__MT_CTX__", mt_ctx), ("__LEVELS__", levels), ("__THR_OFF__", thr_off), ("__THR_ON__", thr_on)]:
         h = h.replace(k, v)
     with open(VENDOR, encoding="utf-8") as f:
         h = h.replace("__CHARTJS_LIB__", f.read().replace("</script>", "<\\/script>"))
-    h = h.replace("__CHARTJS__", chartjs)
     h = h.replace("__TITLE__", html.escape(title)).replace("__ENDPOINT__", html.escape(str(meta.get("endpoint"))))
     h = h.replace("__KPI__", kpi_html).replace("__CACHE_VERDICT__", cache_verdict)
     h = h.replace("__MT_VERDICT__", mt_verdict).replace("__MT_TABLE__", mt_table)
