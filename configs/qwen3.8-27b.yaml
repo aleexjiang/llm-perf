@@ -19,7 +19,14 @@ filler_lang: "en"
 filler_corpus: "en"               # 真实文本语料填充（内置公版书），比合成词表更贴近真实 tokenization
 stream: true
 server_metrics: true              # vLLM 原生 /metrics 已确认可用：缓存命中率/排队/prefill-decode 分解/MTP 接受率
+warmup_requests: 2                # 每场景前暖连接（不计入统计）
 debug: false                      # 换引擎/网关时先改 true 抓原始流量，或直接跑 bench probe
+
+goodput:                          # SLO 约束：TTFT≤2s 且 TPOT≤200ms 才算有效请求
+  ttft_ms: 2000
+  tpot_ms: 200
+correctness:
+  samples: 4                      # 数字转写金丝雀，防"HTTP 200 但内容异常"
 
 models:
   - "qwen3.8-27b"
