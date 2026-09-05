@@ -1,0 +1,460 @@
+// Package smetrics 抓取推理服务端原生暴露的 Prometheus /metrics（vLLM 等默认开启），
+// 给客户端计时补上"服务端视角"：前缀缓存命中、排队深度、prefill/decode 分解、投机解码接受率。
+//
+// 采集模型（对标 NVIDIA AIPerf 的 server metrics 层）：
+//   - counter：请求/场景前后各抓一次，取差值（串行时精确归因到单个请求；并发窗口内为混合贡献）
+//   - gauge：后台轮询取峰值/均值（running/waiting 排队深度、KV 池占用）
+//   - histogram：场景窗口差值，从桶边界估算分位数（AIPerf 口径 p50/p99_estimate）
+//
+// 指标名做归一化：Prometheus counter 的 _total 后缀与 _created 时间线剔除，
+// 兼容 vLLM 各版本命名差异（如 prefix_cache_hits / prefix_cache_hits_total）。
+package smetrics
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"math"
+	"net/http"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+// Bucket 是 histogram 的一个桶（LE 为上边界，+Inf 用 math.Inf(1)）。
+type Bucket struct {
+	LE    float64
+	Count float64
+}
+
+// Hist 是一个 histogram family 的完整快照。
+type Hist struct {
+	Buckets []Bucket
+	Sum     float64
+	Count   float64
+}
+
+// Sample 是一次 /metrics 抓取的完整快照。
+type Sample struct {
+	Counters map[string]float64 // 归一化名（去 _total）→ 跨 label 系列求和
+	Gauges   map[string]float64
+	Hists    map[string]*Hist // family 名（无 _bucket/_sum/_count 后缀）
+}
+
+// Scraper 面向一个服务端 /metrics 端点。
+type Scraper struct {
+	URL    string // 如 http://host:port/metrics
+	Client *http.Client
+}
+
+// NewScraper 从 OpenAI 端点推导 /metrics 地址：http://host:port/v1 → http://host:port/metrics。
+func NewScraper(endpoint string) *Scraper {
+	base := strings.TrimRight(endpoint, "/")
+	base = strings.TrimSuffix(base, "/v1")
+	return &Scraper{
+		URL:    base + "/metrics",
+		Client: &http.Client{Timeout: 5 * time.Second},
+	}
+}
+
+// Available 探测 /metrics 是否可达且含 vLLM 系指标。
+func (s *Scraper) Available(ctx context.Context) (bool, string) {
+	sample, err := s.Scrape(ctx)
+	if err != nil {
+		return false, err.Error()
+	}
+	n := len(sample.Counters) + len(sample.Gauges) + len(sample.Hists)
+	if n == 0 {
+		return false, "端点可达但没有任何指标"
+	}
+	return true, fmt.Sprintf("可达，%d 项指标", n)
+}
+
+// Scrape 抓取并解析一次 /metrics。瞬时 connection refused（服务端 accept 队列被打满的
+// 场景起跑瞬间常见）自动重试 2 次。
+func (s *Scraper) Scrape(ctx context.Context) (*Sample, error) {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(300 * time.Millisecond):
+			}
+		}
+		sample, err := s.scrapeOnce(ctx)
+		if err == nil {
+			return sample, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+func (s *Scraper) scrapeOnce(ctx context.Context) (*Sample, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.URL, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := s.Client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 16*1024*1024))
+	if err != nil {
+		return nil, err
+	}
+	return Parse(string(body)), nil
+}
+
+// Parse 解析 Prometheus 文本暴露格式。解析失败的行静默跳过（第三方指标混杂是常态）。
+func Parse(text string) *Sample {
+	s := &Sample{
+		Counters: map[string]float64{},
+		Gauges:   map[string]float64{},
+		Hists:    map[string]*Hist{},
+	}
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		name, labels, rest := splitMetricLine(line)
+		val, err := strconv.ParseFloat(rest, 64)
+		if err != nil || name == "" {
+			continue
+		}
+		switch {
+		case strings.HasSuffix(name, "_bucket") && labels["le"] != "":
+			family := strings.TrimSuffix(name, "_bucket")
+			h := s.Hists[family]
+			if h == nil {
+				h = &Hist{}
+				s.Hists[family] = h
+			}
+			le := parseLE(labels["le"])
+			h.Buckets = append(h.Buckets, Bucket{LE: le, Count: val})
+		case strings.HasSuffix(name, "_sum"):
+			family := strings.TrimSuffix(name, "_sum")
+			h := s.Hists[family]
+			if h == nil {
+				h = &Hist{}
+				s.Hists[family] = h
+			}
+			h.Sum += val
+		case strings.HasSuffix(name, "_count"):
+			family := strings.TrimSuffix(name, "_count")
+			h := s.Hists[family]
+			if h == nil {
+				h = &Hist{}
+				s.Hists[family] = h
+			}
+			h.Count += val
+		case strings.HasSuffix(name, "_created"):
+			// Prometheus counter 伴生时间线，忽略
+		default:
+			// counter（_total 后缀）与 gauge 统一进 Counters/Gauges；
+			// 文本格式无法严格区分语义，按调用方需要取用
+			norm := strings.TrimSuffix(name, "_total")
+			s.Counters[norm] += val
+			s.Gauges[name] = val
+		}
+	}
+	for _, h := range s.Hists {
+		sort.Slice(h.Buckets, func(i, j int) bool { return h.Buckets[i].LE < h.Buckets[j].LE })
+	}
+	return s
+}
+
+// splitMetricLine 拆出指标名、label 映射与值部分。
+func splitMetricLine(line string) (name string, labels map[string]string, value string) {
+	labels = map[string]string{}
+	sp := strings.IndexAny(line, " \t")
+	if sp < 0 {
+		return line, labels, ""
+	}
+	value = strings.TrimSpace(line[sp+1:])
+	head := line[:sp]
+	if i := strings.Index(head, "{"); i >= 0 && strings.HasSuffix(head, "}") {
+		name = head[:i]
+		for _, kv := range splitLabels(head[i+1 : len(head)-1]) {
+			if eq := strings.Index(kv, "="); eq > 0 {
+				k := strings.TrimSpace(kv[:eq])
+				v := strings.Trim(strings.TrimSpace(kv[eq+1:]), `"`)
+				labels[k] = v
+			}
+		}
+	} else {
+		name = head
+	}
+	return name, labels, value
+}
+
+// splitLabels 按逗号切 label 串（不处理值内嵌逗号的罕见转义——够用于引擎指标）。
+func splitLabels(s string) []string {
+	if s == "" {
+		return nil
+	}
+	var out []string
+	depth := 0
+	start := 0
+	for i, r := range s {
+		switch r {
+		case '"':
+			depth = 1 - depth
+		case ',':
+			if depth == 0 {
+				out = append(out, s[start:i])
+				start = i + 1
+			}
+		}
+	}
+	out = append(out, s[start:])
+	return out
+}
+
+func parseLE(s string) float64 {
+	if s == "+Inf" {
+		return inf()
+	}
+	v, _ := strconv.ParseFloat(s, 64)
+	return v
+}
+
+// counterNames 是我们关心的 counter 的候选名（不同 vLLM 版本命名有差异，按序匹配）。
+var counterNames = map[string][]string{
+	"prefix_cache_hits":    {"vllm:prefix_cache_hits", "vllm:prefix_cache_hits_total"},
+	"prefix_cache_queries": {"vllm:prefix_cache_queries", "vllm:prefix_cache_queries_total"},
+	"preemptions":          {"vllm:num_preemptions", "vllm:num_preemptions_total"},
+	"spec_drafts":          {"vllm:spec_decode_num_drafts", "vllm:spec_decode_num_drafts_total"},
+	"spec_accepted":        {"vllm:spec_decode_num_accepted_tokens", "vllm:spec_decode_num_accepted_tokens_total"},
+	"prompt_tokens":        {"vllm:prompt_tokens", "vllm:prompt_tokens_total"},
+	"generation_tokens":    {"vllm:generation_tokens", "vllm:generation_tokens_total"},
+}
+
+var gaugeNames = map[string][]string{
+	"running":  {"vllm:num_requests_running"},
+	"waiting":  {"vllm:num_requests_waiting"},
+	"kv_usage": {"vllm:kv_cache_usage_perc", "vllm:gpu_cache_usage_perc"},
+}
+
+// histNames 是我们关心的延迟分解直方图（单位秒）。
+var HistNames = []string{
+	"vllm:request_queue_time_seconds",
+	"vllm:request_prefill_time_seconds",
+	"vllm:request_decode_time_seconds",
+	"vllm:time_to_first_token_seconds",
+	"vllm:inter_token_latency_seconds",
+	"vllm:e2e_request_latency_seconds",
+	"vllm:request_prefill_kv_computed_tokens",
+}
+
+// CounterDelta 是两次快照之间关心的 counter 增量（tokens / 次）。
+type CounterDelta struct {
+	PrefixCacheHitTokens   float64 `json:"cache_hit_tokens,omitempty"`
+	PrefixCacheQueryTokens float64 `json:"cache_query_tokens,omitempty"`
+	Preemptions            float64 `json:"preemptions,omitempty"`
+	SpecDrafts             float64 `json:"spec_drafts,omitempty"`
+	SpecAcceptedTokens     float64 `json:"spec_accepted_tokens,omitempty"`
+}
+
+// CacheHitRate 返回窗口内前缀缓存 token 命中率（无查询时返回 0）。
+func (d *CounterDelta) CacheHitRate() float64 {
+	if d == nil || d.PrefixCacheQueryTokens <= 0 {
+		return 0
+	}
+	return d.PrefixCacheHitTokens / d.PrefixCacheQueryTokens
+}
+
+// DiffCounters 计算 before→after 的 counter 增量。
+func DiffCounters(before, after *Sample) *CounterDelta {
+	get := func(s *Sample, key string) float64 {
+		if s == nil {
+			return 0
+		}
+		for _, n := range counterNames[key] {
+			if v, ok := s.Counters[n]; ok {
+				return v
+			}
+		}
+		return 0
+	}
+	d := &CounterDelta{}
+	for key, dst := range map[string]*float64{
+		"prefix_cache_hits":    &d.PrefixCacheHitTokens,
+		"prefix_cache_queries": &d.PrefixCacheQueryTokens,
+		"preemptions":          &d.Preemptions,
+		"spec_drafts":          &d.SpecDrafts,
+		"spec_accepted":        &d.SpecAcceptedTokens,
+	} {
+		*dst = get(after, key) - get(before, key)
+	}
+	return d
+}
+
+// HistDelta 是 histogram 窗口差值与分位估计。
+type HistDelta struct {
+	Count float64 `json:"count"`          // 窗口内落入的观测数
+	Sum   float64 `json:"sum"`            // 单位随原指标（延迟类为秒）
+	P50   float64 `json:"p50,omitempty"`  // 桶边界估算
+	P99   float64 `json:"p99,omitempty"`  // 桶边界估算
+	Mean  float64 `json:"mean,omitempty"` // Sum/Count
+}
+
+// HistDeltas 计算 HistNames 里各直方图的窗口差值分位估计。
+// 并发窗口内直方图混入其他流量的观测属已知近似（AIPerf 同口径）。
+func HistDeltas(before, after *Sample) map[string]HistDelta {
+	out := map[string]HistDelta{}
+	for _, name := range HistNames {
+		hb, ha := before.Hists[name], after.Hists[name]
+		if hb == nil && ha == nil {
+			continue
+		}
+		d := HistDelta{}
+		if ha != nil {
+			d.Count = ha.Count
+			d.Sum = ha.Sum
+		}
+		if hb != nil {
+			d.Count -= hb.Count
+			d.Sum -= hb.Sum
+		}
+		if d.Count <= 0 {
+			continue
+		}
+		d.Mean = d.Sum / d.Count
+		d.P50 = histQuantile(hb, ha, 0.50)
+		d.P99 = histQuantile(hb, ha, 0.99)
+		out[name] = d
+	}
+	return out
+}
+
+// histQuantile 从桶边界估算分位。Prometheus histogram 的桶为累计计数：
+// 总观测数取最后一个桶（+Inf）的计数差，累计到 p*total 时的桶上界即分位估计。
+func histQuantile(before, after *Hist, p float64) float64 {
+	if after == nil || len(after.Buckets) == 0 {
+		return 0
+	}
+	beforeByLE := map[float64]float64{}
+	if before != nil {
+		for _, b := range before.Buckets {
+			beforeByLE[b.LE] = b.Count
+		}
+	}
+	last := after.Buckets[len(after.Buckets)-1]
+	total := last.Count - beforeByLE[last.LE]
+	if total <= 0 {
+		return 0
+	}
+	target := p * total
+	for _, b := range after.Buckets {
+		if b.Count-beforeByLE[b.LE] >= target && !isInf(b.LE) {
+			return b.LE
+		}
+	}
+	return 0 // 只剩 +Inf 桶：无法估计
+}
+
+func isInf(f float64) bool { return math.IsInf(f, 1) }
+
+func inf() float64 { return math.Inf(1) }
+
+// GaugeSummary 是 gauge 轮询的聚合。
+type GaugeSummary struct {
+	Max     float64 `json:"max"`
+	Avg     float64 `json:"avg"`
+	Samples int     `json:"samples"`
+}
+
+// GaugePoller 周期抓取 gauge（排队深度、KV 占用），Stop 后可用 Summary 取聚合。
+type GaugePoller struct {
+	scraper  *Scraper
+	interval time.Duration
+	ctx      context.Context
+
+	mu       sync.Mutex
+	samples  map[string][]float64
+	stopOnce sync.Once
+	done     chan struct{} // Stop 关闭：通知 loop 退出
+	stopped  chan struct{} // loop 退出时关闭：外部可等待
+}
+
+// StartGaugePoller 启动后台轮询（首次立即抓一次）。url 为 /metrics 地址。
+func StartGaugePoller(ctx context.Context, endpoint string, interval time.Duration) *GaugePoller {
+	g := &GaugePoller{
+		scraper:  NewScraper(endpoint),
+		interval: interval,
+		ctx:      ctx,
+		samples:  map[string][]float64{},
+		done:     make(chan struct{}),
+		stopped:  make(chan struct{}),
+	}
+	go g.loop()
+	return g
+}
+
+func (g *GaugePoller) loop() {
+	defer close(g.stopped)
+	t := time.NewTicker(g.interval)
+	defer t.Stop()
+	g.once()
+	for {
+		select {
+		case <-g.ctx.Done():
+			return
+		case <-g.done:
+			return
+		case <-t.C:
+			g.once()
+		}
+	}
+}
+
+func (g *GaugePoller) once() {
+	sample, err := g.scraper.Scrape(g.ctx)
+	if err != nil {
+		return // 服务端瞬时不可达不致命
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for key, cands := range gaugeNames {
+		for _, n := range cands {
+			if v, ok := sample.Counters[n]; ok {
+				g.samples[key] = append(g.samples[key], v)
+				break
+			}
+		}
+	}
+}
+
+// Stop 停止轮询（幂等；不等待 loop 退出，Summary 会先 Stop 再读数据）。
+func (g *GaugePoller) Stop() { g.stopOnce.Do(func() { close(g.done) }) }
+
+// Summary 返回各 gauge 的峰值/均值。
+func (g *GaugePoller) Summary() map[string]GaugeSummary {
+	g.Stop()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	out := map[string]GaugeSummary{}
+	for k, xs := range g.samples {
+		if len(xs) == 0 {
+			continue
+		}
+		max, sum := xs[0], 0.0
+		for _, v := range xs {
+			if v > max {
+				max = v
+			}
+			sum += v
+		}
+		out[k] = GaugeSummary{Max: max, Avg: sum / float64(len(xs)), Samples: len(xs)}
+	}
+	return out
+}

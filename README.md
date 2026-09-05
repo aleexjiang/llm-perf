@@ -30,8 +30,23 @@
 - **流式**（`stream: true/false`，默认 `true`）：非流式只能测端到端延迟与 usage，
   TTFT/ITL/思考拆分不可测（JSON 中相应字段缺省）；用于 E2E 对照与网关缓冲问题排查
 
-另有 `bench probe` 兼容性探针（换引擎先跑）与 `debug` 原始流量留存，见下文
-[兼容性：多推理引擎支持](#兼容性多推理引擎支持)。
+并发场景支持两种负载模型（`concurrent` 段，互斥）：
+
+- **闭环并发**（默认，`levels: [1,2,4,...]`）：N 个虚拟用户同时发车，测容量上限下的衰减
+- **开环到达率**（`request_rate: 4` 或 `rate_sweep: [1,2,4,8]`）：请求按 Poisson 过程到达
+  （对齐 vLLM bench serve / inference-perf），测排队-延迟曲线；`rate_sweep` 多档扫描找饱和点，
+  `max_concurrency` 防止到达率超容量时无限堆积
+
+## 数据源：filler vs trace
+
+- **filler**（默认）：token 精确的合成/语料填充（`filler_lang` + `filler_corpus`），
+  用于前缀缓存对照、上下文深度阶梯等**变量控制实验**
+- **trace**（`dataset.mode: trace`）：真实会话回放，多轮长度来自真实分布（贴近客户实际流量）。
+  支持 ShareGPT 格式与自定义 `sessions` 格式（`[{"turns": ["...", ...]}]`，`.json`/`.json.gz`），
+  token 以服务端 usage 为准；trace 模式下 system_tokens/turn_tokens 不生效（会话形状由回放决定）
+
+另有 `bench probe` 兼容性探针（换引擎先跑）、`debug` 原始流量留存与 `/metrics` 服务端观测层，
+见下文[兼容性](#兼容性多推理引擎支持)与[服务端观测层](#服务端观测层metrics)。
 
 ## 指标口径
 
@@ -41,8 +56,12 @@
 - **TTFT reasoning**：首个思考增量 chunk（`reasoning` / `reasoning_content` 双字段兼容）≈ prefill 完成时刻
 - **TTFT content**：首个可见内容 chunk = prefill + 思考
 - **思考时长**（`think_ms`）= TTFT content − TTFT reasoning；**每次对话（含多轮每一 turn）都有**
-- **decode 时长 / ITL 分位数**（GenAI-Perf 口径，不含 TTFT）/ tokens per second
-- token 数取自响应 `usage` 字段（服务端精确值，非本地估算），含 `reasoning_tokens`
+- **decode 时长 / ITL 分位数**（GenAI-Perf 口径，不含 TTFT；P50/P90/P95/P99/max）/ tokens per second
+- **TPOT**：每 output token 时间 =（E2E−TTFT）/(completion−1)，含思考 token（GenAI-Perf 横评口径）
+- token 数取自响应 `usage` 字段（服务端精确值，非本地估算），含 `reasoning_tokens` 与
+  `cached_tokens`（部分引擎不回传，置信 /metrics 观测层）
+- **new_tokens**（多轮）：本轮相对上一轮新增的 prompt tokens；配合 TTFT 得**增量 prefill 速率**
+  （ms/千新 token），直接量化"上下文越滚越贵"
 
 单发版关键对照：`fixed_seed: true` 时各 run 复用同一 prompt——Run2+ 的 TTFT 显著低于 Run1 即前缀缓存命中。
 多轮版关键判定：turn N 的 TTFT ≈ turn N−1 TTFT + 新增 token 的 prefill ⇒ 缓存命中；接近全量 prefill ⇒ 未命中。
@@ -99,6 +118,43 @@ debug: true   # 原始响应 → <output_dir>/raw/*.log；日志同步 → <outp
 
 每个请求一份转储：请求体摘要 + 状态码 + 原始 SSE 行（头部 256KB）。
 魔改引擎行为看一眼 raw 文件就清楚；**请求失败时即使不开 debug 也会自动转储**。
+
+**4. 交叉验证建议（probe 自动输出）——工具结果存疑时用引擎原生工具复核**
+
+`bench probe` 识别出引擎后，输出对应的原生 perf 工具与按当前配置映射的等价命令：
+
+| 引擎 | 原生工具 |
+|---|---|
+| vLLM | `vllm bench serve`（CLI 内置，原 benchmark_serving.py） |
+| SGLang | `python3 -m sglang.bench_serving`（`--backend openai` 可打任意兼容端点） |
+| TGI | `text-generation-benchmark` |
+| TensorRT-LLM / Triton | `trtllm-bench` / GenAI-Perf（AIPerf） |
+| MindIE（华为） | MindIE-Service 自带 benchmark（版本间差异大） |
+
+注意：交叉验证是**对数量级与分位趋势**（数据集/计时口径不同），不是逐数对齐。
+结果对不上时的排查顺序：数据集差异 → 网络路径 → 客户端计时方法。
+
+## 服务端观测层（/metrics）
+
+```yaml
+server_metrics: true   # 抓推理服务原生 /metrics（vLLM 默认暴露）；不可达自动降级纯客户端计时
+```
+
+对标 NVIDIA AIPerf / inference-perf 的 server metrics 层，给客户端计时补上服务端视角：
+
+- **counter 请求前后差值**：前缀缓存命中 tokens（**逐 turn 命中率**）、preemptions（KV 淘汰重算）、
+  MTP 投机解码 draft/accepted（接受率）；串行时精确归因到单请求
+- **gauge 高频轮询**：running/waiting 排队深度、KV 池占用的峰值/均值
+- **histogram 场景窗口差值**：服务端口径的 queue/prefill/decode/TTFT/ITL 延迟分解（P50/P99 桶估算）
+- 结果进 JSON（`server_metrics` 汇总 + 逐请求 `server_counter_delta`）与报告「服务端观测」章节
+
+典型用法：TTFT 高时看命中率（低=缓存没生效）与 queue 时间（高=排队）、preemptions>0（KV 压力）。
+
+## 其他
+
+- **预热**：`warmup_requests: N` 每场景开始前发 N 条小请求暖连接（不计入统计，唯一内容不污染缓存对照）
+- **goodput**：`goodput: {ttft_ms: 2000, tpot_ms: 100}` 定义 SLO，concurrent 结果输出达标数与有效吞吐
+- **正确性抽查**：`correctness: {samples: 8}` 数字转写金丝雀，防"HTTP 200 但内容异常"的假成功
 
 ## 快速开始
 

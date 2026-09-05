@@ -15,6 +15,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/aleexjiang/llm-perf/internal/smetrics"
 )
 
 // ProbeCheck 一项探测结果。
@@ -22,6 +24,14 @@ type ProbeCheck struct {
 	Name   string `json:"name"`
 	OK     bool   `json:"ok"`
 	Detail string `json:"detail,omitempty"`
+}
+
+// CrossCheck 交叉验证建议：识别出引擎后给出对应的原生 perf 工具与等价命令。
+// 工具结果存疑时，用户可用引擎原生工具独立复核（对数量级与分位趋势，非逐数对齐）。
+type CrossCheck struct {
+	Tool    string `json:"tool"`               // 原生工具（含运行方式）
+	Command string `json:"command,omitempty"`  // 按当前配置映射的等价命令（能给出来的都给出）
+	Note    string `json:"note,omitempty"`
 }
 
 // ProbeResult 一次兼容性探测的完整报告（落盘为 probe-<时间戳>.json）。
@@ -34,6 +44,8 @@ type ProbeResult struct {
 	ModelMaxLen int          `json:"model_max_len,omitempty"` // 服务端报告的模型上下文上限（vLLM 等提供）
 	Checks      []ProbeCheck `json:"checks"`
 	Verdicts    []string     `json:"verdicts,omitempty"`
+	CrossChecks []CrossCheck `json:"cross_checks,omitempty"` // 交叉验证建议（引擎→原生 perf 工具）
+	ServerMetrics string     `json:"server_metrics,omitempty"` // /metrics 可用性（观测层前置条件）
 }
 
 // ProbeOptions 探测参数。
@@ -45,6 +57,10 @@ type ProbeOptions struct {
 	ThinkingOff  map[string]any // 思考关闭的 extra_body（可空）
 	IncludeUsage bool
 	MaxContext   int // 计划压测的最大上下文（config.LargestPromptTokens()），与服务端上限对比
+
+	// 交叉验证命令映射用的计划压测参数
+	XVPromptTokens int
+	XVMaxTokens    int
 }
 
 type probeModelsResp struct {
@@ -238,7 +254,86 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 		}
 	}
 
+	// ── 6. /metrics 可用性（服务端观测层的前置条件；vLLM 默认暴露） ──
+	s := smetrics.NewScraper(o.Endpoint)
+	if ok, detail := s.Available(ctx); ok {
+		res.ServerMetrics = "available: " + detail
+		check("server_metrics", true, "/metrics 可用（"+detail+"）→ 配置 server_metrics: true 可开启观测层（缓存命中率/排队/prefill-decode 分解）")
+	} else {
+		res.ServerMetrics = "unavailable: " + detail
+		check("server_metrics", false, "/metrics 不可达（"+detail+"）→ 观测层不可用，压测时自动降级为纯客户端计时")
+	}
+
+	// ── 7. 交叉验证建议：引擎 → 原生 perf 工具 ──
+	res.CrossChecks = crossChecks(o, res.EngineGuess, model)
+
 	return res
+}
+
+// nativeTools 引擎 → 原生 perf 工具对照（命令映射只对 OpenAI 兼容客户端型工具能给全；其余给指引）。
+// 这些工具同样走 OpenAI 兼容端点的可从本机直接跑；引擎内置离线基准需到服务端跑。
+var nativeTools = map[string]struct{ Tool, Note string }{
+	"vllm": {"vllm bench serve（vLLM CLI 内置，原 benchmark_serving.py）",
+		"可在本机跑（OpenAI 兼容客户端）；数据集/计时口径与本工具不同，用于交叉校验数量级与分位趋势"},
+	"sglang": {"python3 -m sglang.bench_serving（SGLang 内置）",
+		"--backend openai 可打任意 OpenAI 兼容端点，含 vLLM；本机可跑"},
+	"mindie(华为)": {"MindIE-Service 自带 benchmark 工具（版本间差异大，以部署版本文档为准）",
+		"通常需在服务端环境跑；本工具的 warnings 层对 MindIE 魔改字段已做兼容探测"},
+	"tensorrt-llm/triton": {"trtllm-bench --mode throughput|latency（TensorRT-LLM 自带）",
+		"以 TRT-LLM 版本文档为准；Triton 用 GenAI-Perf / AIPerf"},
+	"tgi": {"text-generation-benchmark（TGI 自带）",
+		"以 TGI 版本文档为准"},
+	"llama.cpp": {"llama-bench（离线引擎基准，非服务级）",
+		"服务级压测可直接用本工具 + llama-server 的 OpenAI 兼容端点"},
+	"ollama": {"无官方服务级 perf 工具",
+		"本工具即主要观测手段；注意 ollama 默认并发=1，需 OLLAMA_NUM_PARALLEL"},
+}
+
+// crossChecks 构建交叉验证建议列表。
+func crossChecks(o ProbeOptions, engineGuess, model string) []CrossCheck {
+	entry, ok := nativeTools[engineGuess]
+	if !ok {
+		return []CrossCheck{{
+			Tool: "无法识别引擎（Server 头: " + engineGuess + "）",
+			Note: "请查看服务端部署框架文档确认原生 perf 工具；或把 probe JSON 反馈给工具维护者补充对照表",
+		}}
+	}
+	cc := CrossCheck{Tool: entry.Tool, Note: entry.Note}
+	// vLLM / SGLang 的工具是 OpenAI 兼容客户端：能按当前配置直接映射等价命令
+	switch engineGuess {
+	case "vllm", "sglang":
+		if u := strings.TrimRight(o.Endpoint, "/"); strings.HasSuffix(u, "/v1") {
+			base := strings.TrimSuffix(u, "/v1")
+			host, port := splitHostPort(base)
+			pt := o.XVPromptTokens
+			if pt <= 0 {
+				pt = 1024
+			}
+			mt := o.XVMaxTokens
+			if mt <= 0 {
+				mt = 256
+			}
+			if engineGuess == "vllm" {
+				cc.Command = fmt.Sprintf("vllm bench serve --backend openai-chat --base-url %s --model %s "+
+					"--dataset-name random --random-input-len %d --random-output-len %d --num-prompts 64 --request-rate 4",
+					u, model, pt, mt)
+			} else {
+				cc.Command = fmt.Sprintf("python3 -m sglang.bench_serving --backend openai --host %s --port %s --model %s "+
+					"--dataset-name random --random-input-len %d --random-output-len %d --num-prompts 64 --request-rate 4",
+					host, port, model, pt, mt)
+			}
+		}
+	}
+	return []CrossCheck{cc}
+}
+
+// splitHostPort 从 http://host:port 拆出主机与端口（给 sglang bench 的 --host/--port）。
+func splitHostPort(base string) (host, port string) {
+	s := strings.TrimPrefix(strings.TrimPrefix(base, "http://"), "https://")
+	if i := strings.LastIndex(s, ":"); i >= 0 {
+		return s[:i], s[i+1:]
+	}
+	return s, "80"
 }
 
 // guessEngine 从 Server 头与响应体特征猜引擎类型。
@@ -255,6 +350,8 @@ func guessEngine(server string, modelsBody []byte) string {
 		return "tensorrt-llm/triton"
 	case strings.Contains(s, "llama.cpp") || strings.Contains(s, "llamacpp"):
 		return "llama.cpp"
+	case strings.Contains(s, "text-generation-inference") || strings.Contains(s, "tgi"):
+		return "tgi"
 	case strings.Contains(s, "ollama"):
 		return "ollama"
 	case server == "":

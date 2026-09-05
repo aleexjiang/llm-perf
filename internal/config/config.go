@@ -33,6 +33,35 @@ type Concurrent struct {
 	PromptTokens  int   `yaml:"prompt_tokens"`
 	MaxTokens     int   `yaml:"max_tokens"`
 	Multiturn     bool  `yaml:"multiturn"` // true=每个虚拟用户各自跑完整多轮会话（会话重放）
+
+	// 开环到达率模式（对齐 vLLM bench serve / inference-perf）：request_rate>0 或 rate_sweep
+	// 非空时替代 levels 闭环——请求按 Poisson 过程到达，能测出排队-延迟曲线
+	RequestRate   float64   `yaml:"request_rate"`   // 到达率（req/s），>0 启用开环模式
+	RateSweep     []float64 `yaml:"rate_sweep"`     // 多档到达率扫描（饱和点寻找），每档跑一轮开环
+	NumPrompts    int       `yaml:"num_prompts"`    // 开环模式总请求数（multiturn 时为总会话数）
+	MaxConcurrency int      `yaml:"max_concurrency"` // 开环模式并发上限（0=不限）
+}
+
+// DatasetCfg 数据源：filler（默认，token 精确的合成/语料填充，用于变量控制实验）
+// 或 trace（真实会话回放，贴近客户实际流量分布）。
+type DatasetCfg struct {
+	Mode        string `yaml:"mode"`         // filler | trace
+	Path        string `yaml:"path"`         // trace 文件路径（.json / .json.gz）
+	Format      string `yaml:"format"`       // sharegpt | sessions（空=自动识别）
+	MinTurns    int    `yaml:"min_turns"`    // 会话最少 user 轮数（sharegpt 过滤），默认 2
+	MaxSessions int    `yaml:"max_sessions"` // 最多加载多少会话，0=不限
+}
+
+// GoodputCfg SLO 约束（goodput 口径）：同时满足 TTFT 与 TPOT 上限的请求才算有效吞吐。
+type GoodputCfg struct {
+	TTFTMS float64 `yaml:"ttft_ms"` // 如 2000
+	TPOTMS float64 `yaml:"tpot_ms"` // 如 100
+}
+
+// CorrectnessCfg 正确性抽查（llmperf 式防"假成功"）：向服务发数字转写金丝雀请求，
+// 验证回复确实包含目标数字——结构上 200 但内容异常（缓存污染/截断/网关伪响应）能被揪出。
+type CorrectnessCfg struct {
+	Samples int `yaml:"samples"` // 每个模型抽查条数，0=关闭
 }
 
 // Thinking 思考模式配置。
@@ -90,6 +119,19 @@ type Config struct {
 	// single 档位超限截到该值并去重；多轮会话 ctx 到顶后停止加轮。0 = 不限制。
 	// CLI --max-ctx 可覆盖。建议同时参考 bench probe 报告的模型 max_model_len。
 	MaxPromptTokens int `yaml:"max_prompt_tokens"`
+
+	// ServerMetrics 服务端观测层：抓取推理服务原生 /metrics（vLLM 默认暴露），
+	// 补充前缀缓存命中率、排队深度、prefill/decode 分解、MTP 接受率（不可达时自动降级并告警）
+	ServerMetrics   bool `yaml:"server_metrics"`
+	MetricsIntervalMS int `yaml:"metrics_interval_ms"` // gauge 轮询间隔，默认 500
+
+	// WarmupRequests 每场景开始前的预热请求数（不计入统计）：
+	// 暖连接池/首包路径；用唯一内容避免污染被测前缀的缓存对照
+	WarmupRequests int `yaml:"warmup_requests"`
+
+	Dataset     DatasetCfg    `yaml:"dataset"`
+	Goodput     *GoodputCfg   `yaml:"goodput"`
+	Correctness *CorrectnessCfg `yaml:"correctness"`
 
 	Thinking Thinking `yaml:"thinking"`
 
@@ -191,6 +233,23 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Concurrent.MaxTokens <= 0 {
 		cfg.Concurrent.MaxTokens = 256
+	}
+	// 新增能力默认值与校验
+	if cfg.MetricsIntervalMS <= 0 {
+		cfg.MetricsIntervalMS = 500
+	}
+	switch cfg.Dataset.Mode {
+	case "":
+		cfg.Dataset.Mode = "filler"
+	case "filler", "trace":
+	default:
+		return nil, fmt.Errorf("dataset.mode 无效值 %q（可选 filler/trace）", cfg.Dataset.Mode)
+	}
+	if cfg.Dataset.Mode == "trace" && cfg.Dataset.Path == "" {
+		return nil, fmt.Errorf("dataset.mode=trace 需要 dataset.path（trace 文件路径）")
+	}
+	if cfg.Concurrent.RequestRate < 0 {
+		return nil, fmt.Errorf("concurrent.request_rate 不能为负")
 	}
 	return cfg, nil
 }

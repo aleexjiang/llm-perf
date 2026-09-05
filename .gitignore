@@ -3,3 +3,4 @@ output/
 output-*/
 .env
 *.test
+.DS_Store

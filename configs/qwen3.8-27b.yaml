@@ -18,6 +18,7 @@ include_usage: true
 filler_lang: "en"
 filler_corpus: "en"               # 真实文本语料填充（内置公版书），比合成词表更贴近真实 tokenization
 stream: true
+server_metrics: true              # vLLM 原生 /metrics 已确认可用：缓存命中率/排队/prefill-decode 分解/MTP 接受率
 debug: false                      # 换引擎/网关时先改 true 抓原始流量，或直接跑 bench probe
 
 models:

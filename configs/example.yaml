@@ -14,6 +14,28 @@ max_prompt_tokens: 0              # 上下文截止（tokens）：>0 时所有�
 stream: true                      # 流式开关。false 时只能测端到端延迟与 usage，TTFT/ITL/思考拆分 N/A
 debug: false                      # true: 原始响应留存 <output_dir>/raw/*.log + 日志写 run.log（排查魔改引擎用；
                                   # 请求失败时即使 false 也会自动转储）。新接引擎建议先跑 bench probe
+server_metrics: true              # 服务端观测层：抓推理服务原生 /metrics（vLLM 默认暴露）——前缀缓存命中率、
+                                  # 排队深度、prefill/decode 分解、MTP 接受率；不可达时自动降级纯客户端计时
+warmup_requests: 0                # 每场景开始前的预热请求数（不计入统计，唯一内容不污染缓存对照）
+
+# 数据源：filler（默认）= token 精确填充，用于缓存对照/上下文深度等变量控制实验；
+#         trace = 真实会话回放（ShareGPT/自定义），贴近实际流量分布，token 以服务端 usage 为准
+dataset:
+  mode: "filler"
+  # mode: "trace"
+  # path: "ShareGPT_V3_unfiltered_cleaned_split.json"   # .json / .json.gz
+  # format: "sharegpt"       # sharegpt | sessions（自定义 [{"turns":[...]}]；留空自动识别）
+  # min_turns: 2             # 会话最少 user 轮数
+  # max_sessions: 64         # 最多加载多少会话（0=不限）
+
+# goodput（SLO 约束吞吐）：同时满足以下两条的请求才算有效（concurrent 结果里出 goodput 列）
+# goodput:
+#   ttft_ms: 2000
+#   tpot_ms: 100
+
+# 正确性抽查（防"HTTP 200 但内容异常"的假成功）：数字转写金丝雀，结果进 JSON 与报告数据质量节
+# correctness:
+#   samples: 8
 
 models:
   - "/models/DeepSeek-V4-Flash-0731"
@@ -48,10 +70,16 @@ multiturn:
   max_tokens: 256
   keep_assistant: true            # assistant 回复保留进 history（真实 agent 行为）
 
-# 场景三：并发（单轮或多轮由 multiturn 决定）
+# 场景三：并发（单轮或多轮由 multiturn 决定；闭环 levels 与开环到达率二选一）
 concurrent:
   multiturn: false                # false=每用户独立单轮请求；true=每用户各自跑完整多轮会话重放
-  levels: [1, 2, 4, 8, 16]
+  levels: [1, 2, 4, 8, 16]        # 闭环并发档位（request_rate/rate_sweep 未配置时生效）
   runs_per_worker: 2              # 单轮模式下每个虚拟用户连续发几次
   prompt_tokens: 10000
   max_tokens: 256
+  # 开环到达率模式（对齐 vLLM bench serve / inference-perf）：请求按 Poisson 过程到达，
+  # 能测出排队-延迟曲线与饱和点；与 levels 互斥，两者都配时 rate_sweep 优先
+  # request_rate: 4                # 到达率 req/s
+  # rate_sweep: [1, 2, 4, 8, 16]  # 多档扫描（饱和点寻找）
+  # num_prompts: 64               # 总请求数（multiturn 时为总会话数），默认 32
+  # max_concurrency: 8            # 并发上限（0=不限），防到达率超容量时请求无限堆积

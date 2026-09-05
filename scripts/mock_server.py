@@ -15,6 +15,37 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    # 模拟 vLLM /metrics：让观测层（counter 差值 / gauge 轮询 / histogram 窗口）有真路径可测。
+    # 计数器随请求数累加（全局可变状态），gauge/gauge 直方图为静态样例。
+    requests_served = 0
+
+    def do_GET(self):
+        if self.path.endswith("/metrics"):
+            H.requests_served += 1
+            n = H.requests_served
+            body = (
+                f'vllm:prefix_cache_queries_total{{engine="0"}} {n * 1000}\n'
+                f'vllm:prefix_cache_hits_total{{engine="0"}} {n * 800}\n'
+                f'vllm:num_preemptions_total{{engine="0"}} 0\n'
+                f'vllm:spec_decode_num_drafts_total{{engine="0"}} {n * 10}\n'
+                f'vllm:spec_decode_num_accepted_tokens_total{{engine="0"}} {n * 16}\n'
+                f'vllm:num_requests_running{{engine="0"}} 1\n'
+                f'vllm:num_requests_waiting{{engine="0"}} 0\n'
+                f'vllm:gpu_cache_usage_perc{{engine="0"}} 0.31\n'
+                f'vllm:request_queue_time_seconds_bucket{{le="0.01"}} {n}\n'
+                f'vllm:request_queue_time_seconds_bucket{{le="+Inf"}} {n}\n'
+                f'vllm:request_queue_time_seconds_sum {n * 0.005}\n'
+                f'vllm:request_queue_time_seconds_count {n}\n'
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_response(404)
+        self.end_headers()
+
     def do_POST(self):
         raw = self.rfile.read(int(self.headers["Content-Length"]))
         body = json.loads(raw)

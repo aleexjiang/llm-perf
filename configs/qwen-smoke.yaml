@@ -8,6 +8,13 @@ timeout_seconds: 300
 include_usage: true
 filler_lang: "en"
 stream: true
+server_metrics: true       # 观测层真机验证
+warmup_requests: 2
+correctness:
+  samples: 2
+goodput:
+  ttft_ms: 2000
+  tpot_ms: 500
 
 models: ["qwen3.8-27b"]
 

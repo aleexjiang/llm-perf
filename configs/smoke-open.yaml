@@ -1,0 +1,21 @@
+# 开环到达率冒烟：Poisson 到达 + 并发上限
+endpoint: "http://127.0.0.1:18099/router/v1"
+output_dir: "output-smoke-open"
+timeout_seconds: 30
+filler_lang: "en"
+stream: true
+server_metrics: true
+
+models: ["mock-model-a"]
+
+thinking:
+  mode: off
+  max_tokens_floor: 512
+
+concurrent:
+  multiturn: false
+  request_rate: 5
+  num_prompts: 6
+  max_concurrency: 2
+  prompt_tokens: 300
+  max_tokens: 32

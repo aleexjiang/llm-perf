@@ -23,6 +23,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/aleexjiang/llm-perf/internal/smetrics"
 )
 
 // Message 是一条对话消息。
@@ -91,8 +93,13 @@ type TurnMetrics struct {
 	CompletionTokens int `json:"completion_tokens"`
 	ReasoningTokens  int `json:"reasoning_tokens,omitempty"`
 	TotalTokens      int `json:"total_tokens"`
+	CachedTokens     int `json:"cached_tokens,omitempty"` // usage.prompt_tokens_details.cached_tokens（引擎不回传时缺省）
 	FinishReason     string `json:"finish_reason,omitempty"` // stop / length / ...（思考吃光预算时为 length 且无 content）
 	ReasoningField   string `json:"reasoning_field,omitempty"` // 思考增量字段名：reasoning / reasoning_content（引擎口径证据）
+
+	// NewTokens 多轮场景专用：本轮相对上一轮新增的 prompt tokens（scenario 层在响应返回后填）。
+	// 与增量 prefill 速率（TTFT/新增 tokens）配合，量化"上下文越滚越贵"。
+	NewTokens int `json:"new_tokens,omitempty"`
 
 	// 派生指标（Finalize 后填充），单位 ms；非流式时 TTFT/思考/ITL 为 0（N/A）
 	E2EMS   float64 `json:"e2e_ms"`                // 请求发出 -> 结束（两种模式都有）
@@ -103,8 +110,18 @@ type TurnMetrics struct {
 	DecodeMS float64  `json:"decode_ms,omitempty"` // content 首包 -> 结束
 	ITLAvg   float64  `json:"itl_avg_ms,omitempty"`
 	ITLP50   float64  `json:"itl_p50_ms,omitempty"`
+	ITLP90   float64  `json:"itl_p90_ms,omitempty"`
 	ITLP95   float64  `json:"itl_p95_ms,omitempty"`
+	ITLP99   float64  `json:"itl_p99_ms,omitempty"`
+	ITLMax   float64  `json:"itl_max_ms,omitempty"`
+	// TPOT 每 output token 时间（GenAI-Perf 口径：(E2E−TTFT)/(completion−1)，含思考 token），
+	// 横评常用；与 ITL（仅 content chunk 间隔）互补
+	TPOTMS      float64 `json:"tpot_ms,omitempty"`
 	TokensPerSec float64 `json:"tokens_per_sec"`
+
+	// SrvDelta 服务端 /metrics counter 增量（前缀缓存命中、preemptions、MTP 接受率）；
+	// server_metrics 开启时由 scenario 层在请求前后抓取差值填入
+	SrvDelta *smetrics.CounterDelta `json:"server_counter_delta,omitempty"`
 
 	// 思考吃光输出预算标记：Thinking + 流式 + 全程无 content + finish_reason=length。
 	// 此时 ThinkMS/DecodeMS/ITL 均不可测，分析时应剔除或调大 max_tokens 重跑。
@@ -162,9 +179,18 @@ func (m *TurnMetrics) Finalize() {
 		itl = append(itl, ms(m.contentTimes[i-1], m.contentTimes[i]))
 	}
 	if len(itl) > 0 {
+		sort.Float64s(itl) // 先排序，Max 取末位
 		m.ITLAvg = avg(itl)
 		m.ITLP50 = percentile(itl, 50)
+		m.ITLP90 = percentile(itl, 90)
 		m.ITLP95 = percentile(itl, 95)
+		m.ITLP99 = percentile(itl, 99)
+		m.ITLMax = itl[len(itl)-1]
+	}
+
+	// TPOT（GenAI-Perf 口径）：含思考 token 在内的每个 output token 平均耗时
+	if m.CompletionTokens > 1 && m.TTFT > 0 {
+		m.TPOTMS = (m.E2EMS - m.TTFT) / float64(m.CompletionTokens-1)
 	}
 
 	if m.CompletionTokens > 0 && m.DecodeMS > 0 {

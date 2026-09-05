@@ -79,6 +79,9 @@ type usageInfo struct {
 	CompletionTokensDetails *struct {
 		ReasoningTokens int `json:"reasoning_tokens"`
 	} `json:"completion_tokens_details"`
+	PromptTokensDetails *struct {
+		CachedTokens int `json:"cached_tokens"` // 前缀缓存命中 token 数（OpenAI 口径；部分引擎不填，置信 /metrics 观测层）
+	} `json:"prompt_tokens_details"`
 }
 
 type chunkChoiceList struct {
@@ -127,6 +130,9 @@ func (m *TurnMetrics) applyUsage(u *usageInfo) {
 	m.TotalTokens = u.TotalTokens
 	if u.CompletionTokensDetails != nil {
 		m.ReasoningTokens = u.CompletionTokensDetails.ReasoningTokens
+	}
+	if u.PromptTokensDetails != nil {
+		m.CachedTokens = u.PromptTokensDetails.CachedTokens
 	}
 }
 

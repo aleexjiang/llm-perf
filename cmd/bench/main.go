@@ -150,6 +150,8 @@ func main() {
 			ThinkingOff:  cfg.Thinking.ExtraBodyOff,
 			IncludeUsage: *cfg.IncludeUsage,
 			MaxContext:   cfg.LargestPromptTokens(),
+			XVPromptTokens: cfg.Concurrent.PromptTokens,
+			XVMaxTokens:    cfg.Concurrent.MaxTokens,
 		})
 		outPath := resolveOutPath(*outFlag, cfg.OutputDir, "probe")
 		if err := report.SaveJSONAny(res, outPath); err != nil {
@@ -169,6 +171,15 @@ func main() {
 		}
 		for _, v := range res.Verdicts {
 			fmt.Printf("💡 %s\n", v)
+		}
+		for _, x := range res.CrossChecks {
+			fmt.Printf("🔎 交叉验证建议（工具结果存疑时复核用）: %s\n", x.Tool)
+			if x.Command != "" {
+				fmt.Printf("   等价命令: %s\n", x.Command)
+			}
+			if x.Note != "" {
+				fmt.Printf("   说明: %s\n", x.Note)
+			}
 		}
 		fmt.Printf("探针完成，输出: %s\n", outPath)
 		return
