@@ -43,7 +43,7 @@ thinking:
 # 场景一：单发单轮（fixed_seed 复用同一 prompt，观察前缀缓存命中幅度）
 single:
   runs: 3
-  prompt_tokens: [4096, 10240, 20480, 40960, 102400]
+  prompt_tokens: [4096, 10240, 20480, 40960, 102400, 204800]   # 204800 档：204.8K+8192思考+512输出≈213.5K < 262144 上限
   max_tokens: 512
   fixed_seed: true
 
