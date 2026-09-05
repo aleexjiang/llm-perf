@@ -1,0 +1,31 @@
+# Agent 场景专项：单发多轮 + 并发多轮（真实 Qwen3.8-27B @ 172.17.0.3:8849）
+endpoint: "http://172.17.0.3:8849/v1"
+output_dir: "output-agent"
+timeout_seconds: 600
+include_usage: true
+filler_lang: "en"
+stream: true
+
+models: ["qwen3.8-27b"]
+
+thinking:
+  mode: both
+  extra_body_on:  {chat_template_kwargs: {enable_thinking: true}}
+  extra_body_off: {chat_template_kwargs: {enable_thinking: false}}
+  max_tokens_floor: 8192   # Qwen3 对填充文本思考很长，4096 会被吃光
+
+multiturn:
+  sessions: 1
+  turns: 4
+  system_tokens: 800       # agent system prompt
+  tool_defs_tokens: 800    # tool definitions 持续开销
+  turn_tokens: 500         # 每轮 user 消息（含 history 滚动）
+  max_tokens: 256
+  keep_assistant: true
+
+concurrent:
+  multiturn: true          # 并发多轮：每虚拟用户独立跑完整会话重放
+  levels: [1, 2]           # max-num-seqs=2，level2 已是真实并行上限
+  runs_per_worker: 1
+  prompt_tokens: 1024
+  max_tokens: 256
