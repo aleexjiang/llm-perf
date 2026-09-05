@@ -7,15 +7,16 @@
 #   --kv-cache-dtype fp8 + MTP 3token 投机解码 → decode 段会明显偏快，属预期
 #   --max-model-len 262144           支持到 200k 档
 #
-# 端点说明：172.17.0.3 是 docker 网桥内网 IP，仅宿主机可达；
-#   宿主机上跑 bench → 127.0.0.1:8849；其他机器跑 → <宿主机内网IP>:8849
+# 端点说明：云上实例，docker-compose 见 deploy/docker-compose.qwen3.8-27b.yml；
+#   宿主机上跑 bench → 127.0.0.1:8849；其他机器跑 → 172.17.0.3:8849
 
-endpoint: "http://127.0.0.1:8849/v1"
+endpoint: "http://172.17.0.3:8849/v1"
 api_key_env: ""                   # 该实例未启用 API key 校验，留空即不带认证头
 output_dir: "output"
 timeout_seconds: 600              # 长档位 + max-num-seqs=2 排队，放宽超时
 include_usage: true
 filler_lang: "en"
+filler_corpus: "en"               # 真实文本语料填充（内置公版书），比合成词表更贴近真实 tokenization
 stream: true
 debug: false                      # 换引擎/网关时先改 true 抓原始流量，或直接跑 bench probe
 

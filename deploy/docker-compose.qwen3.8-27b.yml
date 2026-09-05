@@ -1,0 +1,52 @@
+# Qwen3.8-27B vLLM 推理服务（云上实例，配套 bench 配置见 configs/qwen3.8-27b.yaml）
+#
+# 与 bench 配置对齐的要点：
+#   --enable-prefix-caching          前缀缓存 → single fixed_seed 的 Run1 vs Run2 对照有效
+#   --max-num-seqs 2                 并发档位 >2 实测的是排队压力
+#   --reasoning-parser qwen3         流式带 reasoning_content → 思考三段拆分可用
+#   --kv-cache-dtype fp8 + MTP 3token 投机解码 → decode 段明显偏快，属预期
+#   --max-model-len 262144           支持到 200k 档
+#   端口 8849:8000 → 宿主机 http://172.17.0.3:8849/v1（无 API key 校验）
+#
+# GPU：device_ids 2、3，tensor-parallel-size 2
+
+services:
+  qwen3.8:
+    image: vllm/vllm-openai:v0.27.1
+    container_name: qwen3.8-27b
+    restart: unless-stopped
+    # gpus: all  （原注释：改用下方 deploy.resources 精确指定 GPU）
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["2", "3"]
+              capabilities: [gpu]
+    ipc: host
+    ports:
+      - "8849:8000"
+    volumes:
+      - /data/aleexjiang/models:/models
+    environment:
+      - HF_HOME=/models/.cache
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
+    command: >
+      --model /models/Qwen3.8-27B
+      --served-model-name qwen3.8-27b
+      --tensor-parallel-size 2
+      --dtype bfloat16
+      --gpu-memory-utilization 0.9
+      --max-model-len 262144
+      --max-num-seqs 2
+      --kv-cache-dtype fp8
+      --enable-prefix-caching
+      --enable-chunked-prefill
+      --reasoning-parser qwen3
+      --tool-call-parser qwen3_xml
+      --enable-auto-tool-choice
+      --speculative-config '{"method":"mtp","num_speculative_tokens":3}'
