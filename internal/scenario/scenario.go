@@ -266,10 +266,13 @@ func Single(ctx context.Context, cfg *config.Config, client *engine.Client, mode
 				row := report.SingleRow{Model: model, Thinking: v.Name, PromptTokens: tokens}
 				for run := 0; run < cfg.Single.Runs; run++ {
 					var seed int64
+					// fixed_seed：每档一个独立种子（档位内各 run 复用同一 prompt 测缓存对照）。
+					// 不要让不同档位共享种子——语料窗口同起点会使档位间 prompt 互为嵌套前缀，
+					// 上一档的缓存会"预热"下一档的 run1，冷启动测量就不干净了。
 					if cfg.Single.FixedSeed {
-						seed = 1000
+						seed = int64(1000 + tokens + cfg.SeedSalt)
 					} else {
-						seed = int64(tokens*100 + run)
+						seed = int64(tokens*100 + run + cfg.SeedSalt)
 					}
 					msgs := []engine.Message{engine.UserMsg(tokens, seed, cfg.Fillers())}
 					log.Printf("[single] %s thinking=%s %dtk run%d", model, v.Name, tokens, run+1)
@@ -321,7 +324,7 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 			for s := 0; s < mt.Sessions; s++ {
 				run := report.MultiturnRun{Model: model, Thinking: v.Name, Session: s + 1}
 				log.Printf("[multiturn] %s thinking=%s session%d", model, v.Name, s+1)
-				baseSeed := int64(5000 + s*10000)
+				baseSeed := int64(5000 + s*10000 + cfg.SeedSalt)
 				msgs := []engine.Message{}
 				if e.trace == nil {
 					if sys := engine.SystemMsg(mt.SystemTokens, mt.ToolDefsTokens, baseSeed, cfg.Fillers()); sys.Content != "" {
@@ -392,7 +395,7 @@ func collectSessionTurns(ctx context.Context, e *env, cfg *config.Config,
 
 	mt := cfg.Multiturn
 	maxTok := cfg.Thinking.MaxTokens(mt.MaxTokens, v)
-	baseSeed := int64(5000 + sessionIdx*10000)
+	baseSeed := int64(5000 + sessionIdx*10000 + cfg.SeedSalt)
 	msgs := []engine.Message{}
 	userTurns := e.sessionUserTurns(sessionIdx)
 	if e.trace == nil {
@@ -532,7 +535,7 @@ func runClosedRound(ctx context.Context, e *env, cfg *config.Config,
 			maxTok := cfg.Thinking.MaxTokens(cc.MaxTokens, v)
 			promptTokens := cfg.ClampOne(cc.PromptTokens)
 			for r := 0; r < cc.RunsPerWorker; r++ {
-				seed := int64(90000 + workerID*100 + r) // 每用户不同 prompt
+				seed := int64(90000 + workerID*100 + r + cfg.SeedSalt) // 每用户不同 prompt
 				msgs := []engine.Message{engine.UserMsg(promptTokens, seed, cfg.Fillers())}
 				m := runOne(ctx, e, model, msgs, maxTok, v)
 				mu.Lock()
@@ -583,7 +586,7 @@ func runOpenRound(ctx context.Context, e *env, cfg *config.Config,
 				mu.Unlock()
 				return
 			}
-			seed := int64(90000 + i)
+			seed := int64(90000 + i + cfg.SeedSalt)
 			msgs := []engine.Message{engine.UserMsg(cfg.ClampOne(cc.PromptTokens), seed, cfg.Fillers())}
 			m := runOne(ctx, e, model, msgs, maxTok, v)
 			mu.Lock()

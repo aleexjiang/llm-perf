@@ -129,6 +129,11 @@ type Config struct {
 	// 暖连接池/首包路径；用唯一内容避免污染被测前缀的缓存对照
 	WarmupRequests int `yaml:"warmup_requests"`
 
+	// SeedSalt 种子盐值：所有场景的 prompt 种子都叠加该值。服务端 prefix cache 是内存态、
+	// 跨请求存活——同一配置重跑时 prompt 与上次完全相同，"冷缓存"测量会被上次战役污染。
+	// 每次测试战役（改代码/改配置后的重测）递增盐值即可隔离；不改服务端也能拿到干净的冷缓存。
+	SeedSalt int `yaml:"seed_salt"`
+
 	Dataset     DatasetCfg    `yaml:"dataset"`
 	Goodput     *GoodputCfg   `yaml:"goodput"`
 	Correctness *CorrectnessCfg `yaml:"correctness"`

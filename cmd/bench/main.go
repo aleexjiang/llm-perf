@@ -86,6 +86,7 @@ func main() {
 	outFlag := fs.String("o", "", "输出路径：.json 文件或目录（默认用配置 output_dir）")
 	corpusFlag := fs.String("corpus", "", "填充语料：en/zh（内置公版书）或自定义文件路径（.txt/.txt.gz）；覆盖配置 filler_corpus")
 	maxCtxFlag := fs.Int("max-ctx", 0, "上下文截止（tokens）：>0 时所有请求 prompt 不超过该值；覆盖配置 max_prompt_tokens")
+	saltFlag := fs.Int("seed-salt", 0, "种子盐值：隔离测试战役（服务端 prefix cache 未清空时重测用）；覆盖配置 seed_salt")
 	fs.Parse(os.Args[2:])
 
 	cfg, err := config.Load(*cfgPath)
@@ -98,6 +99,9 @@ func main() {
 	}
 	if *maxCtxFlag > 0 {
 		cfg.MaxPromptTokens = *maxCtxFlag
+	}
+	if *saltFlag > 0 {
+		cfg.SeedSalt = *saltFlag
 	}
 
 	// 语料模式：真实公版文本填充，比随机词表更贴近真实负载的 tokenization 分布
