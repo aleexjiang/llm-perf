@@ -2,7 +2,7 @@
 #
 # 与 bench 配置对齐的要点：
 #   --enable-prefix-caching          前缀缓存 → single fixed_seed 的 Run1 vs Run2 对照有效
-#   --max-num-seqs 2                 并发档位 >2 实测的是排队压力
+#   --max-num-seqs 4                 并发档位 >2 实测的是排队压力
 #   --reasoning-parser qwen3         流式带 reasoning_content → 思考三段拆分可用
 #   --kv-cache-dtype fp8 + MTP 3token 投机解码 → decode 段明显偏快，属预期
 #   --max-model-len 262144           支持到 200k 档
@@ -42,7 +42,7 @@ services:
       --dtype bfloat16
       --gpu-memory-utilization 0.9
       --max-model-len 262144
-      --max-num-seqs 2
+      --max-num-seqs 4
       --kv-cache-dtype fp8
       --enable-prefix-caching
       --enable-chunked-prefill
