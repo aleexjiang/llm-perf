@@ -7,6 +7,8 @@
 """
 import json, glob, sys, os, html
 
+VENDOR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor", "chart.umd.min.js")
+
 def load(d):
     out = {}
     for k in ("single", "multiturn", "concurrent"):
@@ -168,7 +170,7 @@ def main():
 
     h = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
 <title>__TITLE__</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>__CHARTJS_LIB__</script>
 <style>
 body{font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;max-width:1080px;margin:24px auto;padding:0 16px;color:#1a1a2e;background:#fafafa}
 h1{font-size:26px} h2{margin-top:36px;border-bottom:2px solid #e8e8ef;padding-bottom:6px}
@@ -239,6 +241,8 @@ options:{plugins:{title:{display:true,text:'并发档位整体吞吐'}},scales:{
                  ("__THINK_SEC__", think_sec), ("__MT_LABELS__", mt_labels), ("__MT_TTFT__", mt_ttft),
                  ("__MT_CTX__", mt_ctx), ("__LEVELS__", levels), ("__THR_OFF__", thr_off), ("__THR_ON__", thr_on)]:
         h = h.replace(k, v)
+    with open(VENDOR, encoding="utf-8") as f:
+        h = h.replace("__CHARTJS_LIB__", f.read().replace("</script>", "<\\/script>"))
     h = h.replace("__CHARTJS__", chartjs)
     h = h.replace("__TITLE__", html.escape(title)).replace("__ENDPOINT__", html.escape(str(meta.get("endpoint"))))
     h = h.replace("__KPI__", kpi_html).replace("__CACHE_VERDICT__", cache_verdict)
