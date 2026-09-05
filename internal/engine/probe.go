@@ -31,6 +31,7 @@ type ProbeResult struct {
 	Server      string       `json:"server_header,omitempty"`
 	EngineGuess string       `json:"engine_guess,omitempty"`
 	Models      []string     `json:"models,omitempty"`
+	ModelMaxLen int          `json:"model_max_len,omitempty"` // 服务端报告的模型上下文上限（vLLM 等提供）
 	Checks      []ProbeCheck `json:"checks"`
 	Verdicts    []string     `json:"verdicts,omitempty"`
 }
@@ -39,10 +40,11 @@ type ProbeResult struct {
 type ProbeOptions struct {
 	Endpoint     string
 	APIKey       string
-	Model        string        // 为空则取 /models 列表第一个
+	Model        string         // 为空则取 /models 列表第一个
 	ThinkingOn   map[string]any // 思考开启的 extra_body（可空）
 	ThinkingOff  map[string]any // 思考关闭的 extra_body（可空）
 	IncludeUsage bool
+	MaxContext   int // 计划压测的最大上下文（config.LargestPromptTokens()），与服务端上限对比
 }
 
 type probeModelsResp struct {
@@ -93,6 +95,29 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 			return res
 		}
 		model = res.Models[0]
+	}
+	// 服务端上下文上限：取目标模型（找不到精确匹配就取列表最大值）
+	for _, m := range ml.Data {
+		if m.ID == model && m.MaxModelLen > 0 {
+			res.ModelMaxLen = m.MaxModelLen
+		}
+	}
+	if res.ModelMaxLen == 0 {
+		for _, m := range ml.Data {
+			if m.MaxModelLen > res.ModelMaxLen {
+				res.ModelMaxLen = m.MaxModelLen
+			}
+		}
+	}
+	if res.ModelMaxLen > 0 {
+		check("context_limit", true, fmt.Sprintf("模型 %s max_model_len=%d", model, res.ModelMaxLen))
+		if o.MaxContext > res.ModelMaxLen {
+			res.Verdicts = append(res.Verdicts, fmt.Sprintf("⚠️ 计划压测的最大上下文 %dtk 超过模型上限 %dtk——超限请求会被服务端拒绝，请用 --max-ctx 或 max_prompt_tokens 截止到 %d 以内", o.MaxContext, res.ModelMaxLen, res.ModelMaxLen))
+		} else if o.MaxContext > 0 {
+			res.Verdicts = append(res.Verdicts, fmt.Sprintf("上下文规划 OK：计划最大 %dtk ≤ 模型上限 %dtk（注意预留 max_tokens 输出空间）", o.MaxContext, res.ModelMaxLen))
+		}
+	} else {
+		check("context_limit", false, "服务端未报告 max_model_len（网关可能剥离）——长上下文压测前先用小档位试探")
 	}
 	res.EngineGuess = guessEngine(res.Server, body)
 

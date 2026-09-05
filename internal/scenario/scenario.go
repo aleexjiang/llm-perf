@@ -60,7 +60,11 @@ func Single(ctx context.Context, cfg *config.Config, client *engine.Client, mode
 	for _, model := range filterModels(cfg.Models, modelFilter) {
 		for _, v := range cfg.Thinking.Variants() {
 			maxTok := cfg.Thinking.MaxTokens(cfg.Single.MaxTokens, v)
-			for _, tokens := range cfg.Single.PromptTokens {
+			ladder, clamped := cfg.ClampLadder(cfg.Single.PromptTokens)
+			if clamped {
+				log.Printf("[single] 档位已按 max_prompt_tokens=%d 截断: %v", cfg.MaxPromptTokens, ladder)
+			}
+			for _, tokens := range ladder {
 				row := report.SingleRow{Model: model, Thinking: v.Name, PromptTokens: tokens}
 				for run := 0; run < cfg.Single.Runs; run++ {
 					var seed int64
@@ -102,9 +106,16 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 					msgs = append(msgs, sys)
 				}
 				maxTok := cfg.Thinking.MaxTokens(mt.MaxTokens, v)
+				lastPrompt := 0 // 上一轮服务端实测 prompt_tokens（截止计算用）
 				for turn := 0; turn < mt.Turns; turn++ {
-					msgs = append(msgs, engine.UserMsg(mt.TurnTokens, baseSeed+int64(turn), cfg.Fillers()))
+					tt := nextTurnTokens(cfg, mt.TurnTokens, lastPrompt)
+					if tt <= 0 {
+						log.Printf("    已达 max_prompt_tokens=%d 截止，提前结束会话（%d/%d 轮）", cfg.MaxPromptTokens, turn, mt.Turns)
+						break
+					}
+					msgs = append(msgs, engine.UserMsg(tt, baseSeed+int64(turn), cfg.Fillers()))
 					m := runOne(ctx, client, cfg, model, msgs, maxTok, v)
+					lastPrompt = m.PromptTokens
 					log.Printf("    turn%d (ctx≈%dtk)", turn+1, m.PromptTokens)
 					if mt.KeepAssistant && m.ReplyText != "" {
 						reply := m.ReplyText
@@ -161,9 +172,10 @@ func Concurrent(ctx context.Context, cfg *config.Config, client *engine.Client, 
 							return
 						}
 						maxTok := cfg.Thinking.MaxTokens(cc.MaxTokens, v)
+						promptTokens := cfg.ClampOne(cc.PromptTokens)
 						for r := 0; r < cc.RunsPerWorker; r++ {
 							seed := int64(90000 + workerID*100 + r) // 每用户不同 prompt
-							msgs := []engine.Message{engine.UserMsg(cc.PromptTokens, seed, cfg.Fillers())}
+							msgs := []engine.Message{engine.UserMsg(promptTokens, seed, cfg.Fillers())}
 							m := runOne(ctx, client, cfg, model, msgs, maxTok, v)
 							mu.Lock()
 							lv.Requests = append(lv.Requests, m)
@@ -213,9 +225,16 @@ func collectSessionTurns(ctx context.Context, client *engine.Client, cfg *config
 		turns = mt.Turns
 	}
 	var out []*engine.TurnMetrics
+	lastPrompt := 0
 	for turn := 0; turn < turns; turn++ {
-		msgs = append(msgs, engine.UserMsg(mt.TurnTokens, baseSeed+int64(turn), cfg.Fillers()))
+		tt := nextTurnTokens(cfg, mt.TurnTokens, lastPrompt)
+		if tt <= 0 {
+			log.Printf("    worker 会话已达 max_prompt_tokens=%d 截止，提前结束（%d/%d 轮）", cfg.MaxPromptTokens, turn, turns)
+			break
+		}
+		msgs = append(msgs, engine.UserMsg(tt, baseSeed+int64(turn), cfg.Fillers()))
 		m := runOne(ctx, client, cfg, model, msgs, maxTok, v)
+		lastPrompt = m.PromptTokens
 		out = append(out, m)
 		if mt.KeepAssistant && m.ReplyText != "" {
 			reply := m.ReplyText
@@ -226,6 +245,23 @@ func collectSessionTurns(ctx context.Context, client *engine.Client, cfg *config
 		}
 	}
 	return out
+}
+
+// nextTurnTokens 根据上下文截止计算本轮 user 消息的 token 规模。
+// lastPrompt 为上一轮服务端实测 prompt_tokens（首轮传 0）；返回 0 表示已达上限应停轮。
+// 未配置截止（MaxPromptTokens<=0）时原样返回 turnTokens。
+func nextTurnTokens(cfg *config.Config, turnTokens, lastPrompt int) int {
+	if cfg.MaxPromptTokens <= 0 {
+		return turnTokens
+	}
+	remaining := cfg.MaxPromptTokens - lastPrompt
+	if remaining < 200 { // 剩余空间不足一个最小 turn，停止加轮
+		return 0
+	}
+	if turnTokens > remaining {
+		return remaining
+	}
+	return turnTokens
 }
 
 func filterModels(models []string, filter string) []string {

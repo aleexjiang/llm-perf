@@ -81,9 +81,15 @@ type Config struct {
 	TimeoutSeconds int    `yaml:"timeout_seconds"`
 	IncludeUsage   *bool  `yaml:"include_usage"`
 	FillerLang     string `yaml:"filler_lang"`
-	Stream         *bool  `yaml:"stream"` // 默认 true；false 时 TTFT/ITL/思考拆分不可测（N/A）
-	Debug          bool   `yaml:"debug"`  // true: 每个请求的原始响应留存到 <output_dir>/raw/，日志同步写 run.log（排查魔改引擎用）
+	FillerCorpus   string `yaml:"filler_corpus"` // "":合成词表 | "en"/"zh":内置公版书语料 | 文件路径(.txt/.txt.gz):自定义语料
+	Stream         *bool  `yaml:"stream"`        // 默认 true；false 时 TTFT/ITL/思考拆分不可测（N/A）
+	Debug          bool   `yaml:"debug"`         // true: 每个请求的原始响应留存到 <output_dir>/raw/，日志同步写 run.log（排查魔改引擎用）
 	Models         []string `yaml:"models"`
+
+	// MaxPromptTokens 上下文截止（tokens）：>0 时所有请求的 prompt 规模都不超过该值。
+	// single 档位超限截到该值并去重；多轮会话 ctx 到顶后停止加轮。0 = 不限制。
+	// CLI --max-ctx 可覆盖。建议同时参考 bench probe 报告的模型 max_model_len。
+	MaxPromptTokens int `yaml:"max_prompt_tokens"`
 
 	Thinking Thinking `yaml:"thinking"`
 
@@ -197,3 +203,50 @@ func (c *Config) Fillers() string { return c.FillerLang }
 
 // StreamEnabled 返回是否使用流式请求。
 func (c *Config) StreamEnabled() bool { return *c.Stream }
+
+// ClampLadder 将 token 档位截到 MaxPromptTokens（>0 时生效）：超限档位收敛到上限，去重保序。
+// 返回 (截断后档位, 是否发生了截断)。
+func (c *Config) ClampLadder(tokens []int) ([]int, bool) {
+	if c.MaxPromptTokens <= 0 {
+		return tokens, false
+	}
+	clamped := false
+	seen := map[int]bool{}
+	out := make([]int, 0, len(tokens))
+	for _, t := range tokens {
+		if t > c.MaxPromptTokens {
+			t = c.MaxPromptTokens
+			clamped = true
+		}
+		if !seen[t] {
+			seen[t] = true
+			out = append(out, t)
+		}
+	}
+	return out, clamped
+}
+
+// ClampOne 将单个 token 规模截到 MaxPromptTokens（>0 时生效）。
+func (c *Config) ClampOne(tokens int) int {
+	if c.MaxPromptTokens > 0 && tokens > c.MaxPromptTokens {
+		return c.MaxPromptTokens
+	}
+	return tokens
+}
+
+// LargestPromptTokens 返回配置中最大的单请求 prompt 规模（三场景取最大，用于超时提示与 probe 对比）。
+func (c *Config) LargestPromptTokens() int {
+	mx := 0
+	for _, t := range c.Single.PromptTokens {
+		if t > mx {
+			mx = t
+		}
+	}
+	if est := c.Multiturn.SystemTokens + c.Multiturn.ToolDefsTokens + c.Multiturn.Turns*c.Multiturn.TurnTokens; est > mx {
+		mx = est
+	}
+	if c.Concurrent.PromptTokens > mx {
+		mx = c.Concurrent.PromptTokens
+	}
+	return c.ClampOne(mx)
+}

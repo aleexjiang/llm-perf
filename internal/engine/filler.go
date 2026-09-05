@@ -25,7 +25,12 @@ var zhSentences = []string{
 // Filler 生成近似 targetTokens 的确定性填充文本。
 // lang: "en" 按词生成（约 1.33 word/token），"zh" 按字生成（约 1 char/token）。
 // seed 相同则文本相同（用于前缀缓存测试）；seed 不同则文本不同（避免伪缓存命中）。
+// 若该语言注册了语料（LoadCorpus），优先使用真实文本窗口——
+// 自然文本的 tokenization 与语义分布都比随机词表更贴近真实负载。
 func Filler(targetTokens int, seed int64, lang string) string {
+	if w := corpusWindow(targetTokens, seed, lang); w != "" {
+		return w
+	}
 	rng := rand.New(rand.NewSource(seed))
 	switch lang {
 	case "zh":

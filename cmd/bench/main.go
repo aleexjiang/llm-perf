@@ -84,12 +84,33 @@ func main() {
 	cfgPath := fs.String("c", "configs/example.yaml", "YAML 配置文件路径")
 	modelFilter := fs.String("m", "", "只测包含该子串的模型")
 	outFlag := fs.String("o", "", "输出路径：.json 文件或目录（默认用配置 output_dir）")
+	corpusFlag := fs.String("corpus", "", "填充语料：en/zh（内置公版书）或自定义文件路径（.txt/.txt.gz）；覆盖配置 filler_corpus")
+	maxCtxFlag := fs.Int("max-ctx", 0, "上下文截止（tokens）：>0 时所有请求 prompt 不超过该值；覆盖配置 max_prompt_tokens")
 	fs.Parse(os.Args[2:])
 
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "配置错误:", err)
 		os.Exit(1)
+	}
+	if *corpusFlag != "" {
+		cfg.FillerCorpus = *corpusFlag
+	}
+	if *maxCtxFlag > 0 {
+		cfg.MaxPromptTokens = *maxCtxFlag
+	}
+
+	// 语料模式：真实公版文本填充，比随机词表更贴近真实负载的 tokenization 分布
+	if cfg.FillerCorpus != "" {
+		if err := engine.LoadCorpus(cfg.FillerCorpus, cfg.FillerLang); err != nil {
+			fmt.Fprintln(os.Stderr, "语料加载失败:", err)
+			os.Exit(1)
+		}
+		log.Printf("填充语料: %s（lang=%s）", engine.CorpusInfo(cfg.FillerLang), cfg.FillerLang)
+	}
+	// 大上下文提示：1M 级 prefill 可能远超默认超时
+	if maxLadder := cfg.LargestPromptTokens(); maxLadder >= 100_000 && cfg.TimeoutSeconds < 600 {
+		log.Printf("⚠️ 最大档位 %dtk ≥ 100k 而 timeout_seconds=%d 偏小，超长上下文 prefill 可能超时，建议 ≥ 900", maxLadder, cfg.TimeoutSeconds)
 	}
 
 	// 排查基础能力：run.log 始终写（现场排查时日志永远拿得到）；raw 转储由 debug 控制
@@ -128,6 +149,7 @@ func main() {
 			ThinkingOn:   cfg.Thinking.ExtraBodyOn,
 			ThinkingOff:  cfg.Thinking.ExtraBodyOff,
 			IncludeUsage: *cfg.IncludeUsage,
+			MaxContext:   cfg.LargestPromptTokens(),
 		})
 		outPath := resolveOutPath(*outFlag, cfg.OutputDir, "probe")
 		if err := report.SaveJSONAny(res, outPath); err != nil {

@@ -5,6 +5,11 @@ import (
 	"testing"
 )
 
+func init() { // 保证合成词表测试不被语料注册表污染（Go 测试同包共享状态）
+	UnloadCorpus("en")
+	UnloadCorpus("zh")
+}
+
 // 固定 seed 必须产出完全相同的文本——前缀缓存实验（fixed_seed: true）依赖这一点
 func TestFiller_Deterministic(t *testing.T) {
 	a := Filler(5000, 42, "en")
@@ -20,7 +25,7 @@ func TestFiller_Deterministic(t *testing.T) {
 	}
 }
 
-// 生成量与目标 token 数的近似度（宽度上限内，防大档位内存/时长意外）
+// 生成量与目标 token 数的近似度（合成词表路径）
 func TestFiller_TokenApproximation(t *testing.T) {
 	// en: 1 word ≈ 0.75 token → target*1.33 词
 	en := Filler(10000, 7, "en")

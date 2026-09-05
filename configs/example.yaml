@@ -7,6 +7,10 @@ output_dir: "output"              # 输出 JSON 的默认目录（-o 可覆盖�
 timeout_seconds: 300
 include_usage: true               # 请求 stream_options.include_usage，从 usage 字段取精确 token 数
 filler_lang: "en"                 # 填充文本语言：en（约 1 word ≈ 0.75 token）/ zh（约 1 字 ≈ 1 token）
+filler_corpus: "en"               # 真实文本语料填充："en"=战争与和平+白鲸记(内置,≈99万token) / "zh"=红楼梦(内置,≈62万token) /
+                                  # 文件路径(.txt/.txt.gz)=自定义语料；留空=合成词表。语料比词表更贴近真实 tokenization
+max_prompt_tokens: 0              # 上下文截止（tokens）：>0 时所有请求 prompt 不超过该值——single 档位超限截到该值并去重，
+                                  # 多轮会话 ctx 到顶后停止加轮；0=不限制。CLI --max-ctx 可覆盖。上限参考 bench probe 的 context_limit
 stream: true                      # 流式开关。false 时只能测端到端延迟与 usage，TTFT/ITL/思考拆分 N/A
 debug: false                      # true: 原始响应留存 <output_dir>/raw/*.log + 日志写 run.log（排查魔改引擎用；
                                   # 请求失败时即使 false 也会自动转储）。新接引擎建议先跑 bench probe

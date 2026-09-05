@@ -47,6 +47,27 @@
 单发版关键对照：`fixed_seed: true` 时各 run 复用同一 prompt——Run2+ 的 TTFT 显著低于 Run1 即前缀缓存命中。
 多轮版关键判定：turn N 的 TTFT ≈ turn N−1 TTFT + 新增 token 的 prefill ⇒ 缓存命中；接近全量 prefill ⇒ 未命中。
 
+## 填充语料：真实文本，支持到 1M 上下文
+
+默认合成词表低信息量、可复现，但 tokenization 与语义分布和真实负载有差距。配置 `filler_corpus` 后
+改用**内置公版书语料**（go:embed 打进二进制，堡垒机无需额外文件）：
+
+| 配置值 | 语料 | 规模 |
+|---|---|---|
+| `filler_corpus: "en"` | 战争与和平 + 白鲸记（Gutenberg #2600/#2700） | ≈ 99 万 token |
+| `filler_corpus: "zh"` | 红楼梦（120 回全文） | ≈ 62 万 token（超出部分循环填充） |
+| `filler_corpus: "path/to/x.txt(.gz)"` | 自定义语料（UTF-8） | 不限 |
+
+字符/token 换算比已在真实 Qwen 服务上校准（en 4.0 chars/token 实测偏差 <2%，zh 1.4 实测偏差 ≈3%）；
+`filler_lang` 决定语料语言与换算比；同 seed 仍产出相同文本（`fixed_seed` 缓存实验不受影响）。
+
+**上下文截止**：`max_prompt_tokens`（或 CLI `--max-ctx`）设定压测的上下文上限——
+
+- single 档位超限自动截到该值并去重（如 `[50k, 300k, 1M] --max-ctx 262000` → `[50k, 262000]`）
+- 多轮会话逐轮逼近上限，最后不足一轮的空间压缩填充、到顶即停（日志注明提前结束）
+- `bench probe` 会读取服务端 `max_model_len` 并对比计划压测的最大档位，超限直接告警
+- 大上下文注意 `timeout_seconds`（1M 级 prefill 可能需要 5 分钟以上，工具在 ≥100k 档位时自动提示）
+
 ## 兼容性：多推理引擎支持
 
 核心协议是 OpenAI 兼容 `/v1/chat/completions`，vLLM / SGLang / TGI / MindIE（华为魔改 vLLM）/ llama.cpp 等均可用，
