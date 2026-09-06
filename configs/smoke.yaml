@@ -1,3 +1,15 @@
+# 基础冒烟：mock 流式 + 单发/多轮/闭环并发（配 scripts/mock_server.py 用）
+# 环境变量覆盖：LLM_PERF_ENDPOINT、LLM_PERF_API_KEY（.env 或 shell 均可）
+#
+# 变体跑法（原独立配置已并入本文件，按需开关）：
+#   非流式路径: 把 stream 改 false、thinking.mode 改 on（原 smoke-nostream.yaml）
+#   开环到达率: 把 concurrent 段换成——
+#     multiturn: false
+#     request_rate: 5
+#     num_prompts: 6
+#     max_concurrency: 2
+#   （原 smoke-open.yaml；全能力回归另见 smoke-all.yaml）
+
 endpoint: "http://127.0.0.1:18099/router/v1"
 api_key_env: ""
 output_dir: "output-smoke"
