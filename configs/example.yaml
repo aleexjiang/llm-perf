@@ -1,5 +1,5 @@
 # llm-perf 配置示例
-# 环境变量覆盖（仅 shell export，工具不读 .env 文件）：LLM_PERF_ENDPOINT、LLM_PERF_API_KEY
+# 端点与认证直接写在本文件（endpoint + api_key）；环境变量 LLM_PERF_ENDPOINT、LLM_PERF_API_KEY 优先级更高（应急用；工具不读 .env 文件）
 
 endpoint: "http://<客户路由IP>:30082/router/v1"
 api_key: ""                      # 字面量 key，直接写这里（仅用于不入库的本地配置）；也可改用 api_key_env 从环境变量读
@@ -68,7 +68,7 @@ thinking:
   #   - {name: off,  enabled: false, extra_body: {reasoning_effort: "low"}}   # enabled:false = 思考关闭态
   #   - {name: low,  enabled: true,  extra_body: {reasoning_effort: "low"}}
   #   - {name: high, enabled: true,  extra_body: {reasoning_effort: "high"}}
-  # CLI 只跑单档：bench single -c xxx.yaml --thinking low
+  # CLI 只跑单档：bench -c xxx.yaml --turns single --concurrency 1 --thinking low
 
 # 按模型覆盖思考配置（可选）：不同模型/引擎的思考参数与档位词汇不同时用。
 # 键=模型名（必须在 models 列表内，否则配置报错）；只写要改的字段，其余继承全局 thinking。
