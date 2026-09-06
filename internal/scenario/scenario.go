@@ -92,14 +92,21 @@ func newEnv(ctx context.Context, cfg *config.Config, client *engine.Client) (*en
 	e := &env{cfg: cfg, client: client}
 	if cfg.ServerMetrics {
 		s := smetrics.NewScraper(cfg.Endpoint)
-		sample, err := s.Scrape(ctx)
-		if err != nil {
-			log.Printf("⚠️ server_metrics=true 但 /metrics 不可达（%v）——降级为纯客户端计时", err)
+		// 判定口径与 probe 一致：HTTP 200 但 0 项 vLLM 指标（网关占位响应）也算不可用，
+		// 否则观测层会带着空指标集白跑，报告里出现假"可用"
+		ok, detail := s.Available(ctx)
+		if !ok {
+			log.Printf("⚠️ server_metrics=true 但 /metrics 不可用（%v）——降级为纯客户端计时", detail)
 		} else {
-			e.srv = s
-			e.provider = smetrics.DetectProvider(sample)
-			n := len(sample.Counters) + len(sample.Gauges) + len(sample.Hists)
-			log.Printf("服务端观测层: /metrics 可用（%d 项指标，%s 命名）", n, e.provider.Name())
+			sample, err := s.Scrape(ctx)
+			if err != nil {
+				log.Printf("⚠️ server_metrics=true 但 /metrics 抓取失败（%v）——降级为纯客户端计时", err)
+			} else {
+				e.srv = s
+				e.provider = smetrics.DetectProvider(sample)
+				n := len(sample.Counters) + len(sample.Gauges) + len(sample.Hists)
+				log.Printf("服务端观测层: /metrics 可用（%d 项指标，%s 命名）", n, e.provider.Name())
+			}
 		}
 	}
 	if cfg.Dataset.Mode == "trace" {
