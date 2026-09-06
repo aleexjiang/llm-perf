@@ -37,6 +37,10 @@ dataset:
 # correctness:
 #   samples: 8
 
+# 战役盐值：服务端 prefix cache 是内存态且不会被挤出——同一配置重跑时"冷缓存"测量会被
+# 上次战役污染。每次测试战役递增盐值（或重启服务端清缓存）。CLI --seed-salt 可覆盖。
+# seed_salt: 1
+
 # 连接层重试（默认关闭——压测语义下重试会掩盖服务端不稳定）：只重试瞬时失败
 # （TCP/流被 reset、HTTP 5xx/429），4xx 不重试。重试会计入 warnings/retry_count 留痕
 # retry:

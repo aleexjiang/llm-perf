@@ -2,8 +2,9 @@
 
 客户自部署 LLM 推理服务性能评测工具（Go，单二进制，无运行时依赖）。
 
-**契约：输入 YAML 配置，输出 JSON 原始数据。** 工具不做任何报告渲染——把 JSON 拿回来
-用 WorkBuddy 等工具二次加工出报告。
+**契约：输入 YAML 配置，输出 JSON 原始数据。** Go 工具本身不做报告渲染——JSON 拿回来
+用 `scripts/gen_html_report.py`（仓库自带，离线自包含 HTML，见[报告](#输出)）或 WorkBuddy
+等工具二次加工。
 
 面向堡垒机/内网交付场景：本机交叉编译出 linux/amd64 二进制，连同配置三件套
 （`bench` + `config.yaml` + `.env`）拷贝到客户环境执行，跑完把 JSON 拉回来分析。
@@ -140,6 +141,10 @@ debug: true   # 原始响应 → <output_dir>/raw/*.log；日志同步 → <outp
 server_metrics: true   # 抓推理服务原生 /metrics（vLLM 默认暴露）；不可达自动降级纯客户端计时
 ```
 
+指标命名经 `MetricsProvider` 抽象，**按抓取样本的指标名前缀自动识别引擎**（`vllm:` → vLLM、
+`sglang:` → SGLang，无法识别回落 vLLM）；SGLang 的缓存 counter 命名待真机校准（TODO.md #1）。
+gauge 轮询自带健康度：从未成功或连续失败 ≥5 时 JSON 标记 `observation_degraded`，报告出红色警示。
+
 对标 NVIDIA AIPerf / inference-perf 的 server metrics 层，给客户端计时补上服务端视角：
 
 - **counter 请求前后差值**：前缀缓存命中 tokens（**逐 turn 命中率**）、preemptions（KV 淘汰重算）、
@@ -152,6 +157,9 @@ server_metrics: true   # 抓推理服务原生 /metrics（vLLM 默认暴露）�
 
 ## 其他
 
+- **战役盐值**：`seed_salt: N`（CLI `--seed-salt`）给所有 prompt 种子叠加盐值——服务端 prefix cache
+  是内存态且不会被挤出，同一配置重跑时"冷缓存"测量会被上次战役污染；**每次测试战役递增盐值**，
+  或重启服务端清缓存（二选一）
 - **预热**：`warmup_requests: N` 每场景开始前发 N 条小请求暖连接（不计入统计，唯一内容不污染缓存对照）
 - **连接层重试**：`retry: {max_attempts: 2, backoff_ms: 300}` 对瞬时失败（reset/5xx/429）重试，默认关闭；重试留痕 warnings/retry_count
 - **goodput**：`goodput: {ttft_ms: 2000, tpot_ms: 100}` 定义 SLO，concurrent 结果输出达标数与有效吞吐
@@ -184,7 +192,15 @@ export LLM_PERF_API_KEY=...         # 如服务需要
 ```
 
 JSON 结构见 `internal/report/report.go`：`single` / `multiturn` / `concurrent` 三个数组，
-元素分别为档位 / 会话 / 并发档位，每条请求是 `engine.TurnMetrics`。
+元素分别为档位 / 会话 / 并发档位，每条请求是 `engine.TurnMetrics`；观测层开启时附
+`server_metrics` 汇总（缓存命中率/排队/prefill-decode 分解）与逐请求 `server_counter_delta`。
+
+JSON → HTML 报告（自包含、Chart.js 内嵌离线可用，支持按场景出单独报告）：
+
+```bash
+python3 scripts/gen_html_report.py output/ [标题] [multiturn|concurrent|single|all]
+node scripts/validate_report.js <报告.html>   # JS 端校验（占位符/图表可执行）
+```
 
 ## 配置
 
@@ -194,7 +210,11 @@ JSON 结构见 `internal/report/report.go`：`single` / `multiturn` / `concurren
 ## 开发
 
 ```bash
-make build          # 本机二进制
+make build          # 本机二进制（-ldflags 注入 git describe 版本号到 JSON 的 tool 字段）
 make test
-scripts/mock_server.py  # 本地 mock OpenAI 兼容流式服务（configs/smoke.yaml 配套冒烟）
+scripts/mock_server.py   # 本地 mock OpenAI 兼容流式服务 + /metrics（smoke.yaml 配套冒烟）
+scripts/gen_html_report.py  # JSON → 自包含 HTML 报告
+scripts/validate_report.js  # 报告 JS 校验（占位符/图表可执行）
+deploy/             # 模型服务 docker-compose 存档（与 bench 配置对齐说明）
+TODO.md             # 代码改进待办（含验收标准）
 ```
