@@ -499,11 +499,11 @@ def gen_conclusions(A):
             l0, l1 = P["off"]["ladder"][0], P["off"]["ladder"][-1]
             sl = P["off"]["slope"]
             if sl < CACHE_EFFECTIVE_MS_PER_TOKEN:
-                cs.append("<b>{}</b>：TTFT 几乎不随档位变化（{}k→{}k 仅 {}s→{}s，≈{:.3f} ms/token）——"
+                cs.append("<b>{}</b>（单发·单轮）：TTFT 几乎不随档位变化（{}k→{}k 仅 {}s→{}s，≈{:.3f} ms/token）——"
                           "prefill 成本被前缀缓存掩盖。".format(
                     esc(short(m)), l0["size"] // 1000, l1["size"] // 1000, l0["ttft"][0], l1["ttft"][0], sl))
             else:
-                cs.append("<b>{}</b>：TTFT 随档位线性增长，{}k={}s → {}k={}s（≈{:.2f} ms/token）。".format(
+                cs.append("<b>{}</b>（单发·单轮）：TTFT 随档位线性增长，{}k={}s → {}k={}s（≈{:.2f} ms/token）。".format(
                     esc(short(m)), l0["size"] // 1000, l0["ttft"][0], l1["size"] // 1000, l1["ttft"][0], sl))
     # 2 缓存判定
     for m, P in A["per_model"].items():
@@ -512,46 +512,46 @@ def gen_conclusions(A):
             continue
         r = P.get("cache_ratio")
         if label == "生效":
-            cs.append("<b>{}</b>：多轮 TTFT 逐轮几乎不涨（斜率 ≈ {:.3f} ms/token{}）⇒ 前缀缓存生效，"
+            cs.append("<b>{}</b>（多轮对话）：TTFT 逐轮几乎不涨（斜率 ≈ {:.3f} ms/token{}）⇒ 前缀缓存生效，"
                       "历史前缀跨轮复用。".format(
                 esc(short(m)),
                 P.get("off", P.get("on", {})).get("slope_multi") or 0,
                 "，为单发斜率的 {:.0%}".format(r) if r is not None and r < 1 else ""))
         elif label == "未命中":
-            cs.append("<b>{}</b>：多轮斜率与单发一致（比值 {:.0%}）⇒ 未命中前缀缓存，每轮全量重算历史。".format(
+            cs.append("<b>{}</b>（多轮对话）：TTFT 斜率与单发一致（比值 {:.0%}）⇒ 未命中前缀缓存，每轮全量重算历史。".format(
                 esc(short(m)), r))
         else:
-            cs.append("<b>{}</b>：多轮斜率为单发的 {:.0%} ⇒ 前缀缓存部分命中。".format(esc(short(m)), r))
+            cs.append("<b>{}</b>（多轮对话）：TTFT 斜率为单发的 {:.0%} ⇒ 前缀缓存部分命中。".format(esc(short(m)), r))
         # 冷/热形态佐证
         cw = P.get("off", {}).get("cold_warm_ratio")
         if cw and cw > 3:
-            cs.append("{} 同档位 run1 TTFT 约为 run2/3 的 {:.0f} 倍，符合缓存冷 miss 形态。".format(esc(short(m)), cw))
+            cs.append("{}（单发）同档位 run1 TTFT 约为 run2/3 的 {:.0f} 倍，符合缓存冷 miss 形态。".format(esc(short(m)), cw))
     # 3 decode
     decs = [(m, P.get("decode_tps")) for m, P in A["per_model"].items() if P.get("decode_tps")]
     if len(decs) >= 2:
         decs_sorted = sorted(decs, key=lambda x: -x[1][0])
         hi, lo = decs_sorted[0], decs_sorted[-1]
-        cs.append("<b>Decode 吞吐</b>：{} ≈ {:.0f} tok/s，{} ≈ {:.0f} tok/s（{} 约为 {} 的 {:.0f}%）。".format(
+        cs.append("<b>Decode 吞吐（单发·thinking=off）</b>：{} ≈ {:.0f} tok/s，{} ≈ {:.0f} tok/s（{} 约为 {} 的 {:.0f}%）。".format(
             esc(short(hi[0])), hi[1][0], esc(short(lo[0])), lo[1][0],
             esc(short(lo[0])), esc(short(hi[0])), lo[1][0] / hi[1][0] * 100))
     elif decs:
-        cs.append("<b>Decode 吞吐</b>：{} ≈ {:.0f} tok/s。".format(esc(short(decs[0][0])), decs[0][1][0]))
+        cs.append("<b>Decode 吞吐（单发·thinking=off）</b>：{} ≈ {:.0f} tok/s。".format(esc(short(decs[0][0])), decs[0][1][0]))
     # 4 思考行为
     for m, P in A["per_model"].items():
         beh = P.get("thinking_behavior")
         if beh == "no_reasoning":
-            cs.append("<b>{}</b>：thinking=on 时 <code>reasoning_content</code> 恒为空，TTFT 与 off 一致 ⇒ "
+            cs.append("<b>{}</b>（单发·thinking=on）：<code>reasoning_content</code> 恒为空，TTFT 与 off 一致 ⇒ "
                       "思考开关在该模型上未产生独立思考输出，需核对网关参数透传。".format(esc(short(m))))
         elif beh == "budget_exhausted":
             n = len(P["on"].get("no_content_runs", []))
-            cs.append("<b>{}</b>：thinking=on 出现 {} 次「思考独占输出预算」（正文 0 token，finish=length）；"
+            cs.append("<b>{}</b>（单发·thinking=on）：出现 {} 次「思考独占输出预算」（正文 0 token，finish=length）；"
                       "思考输出 {:,}–{:,} 字符/次，E2E {}–{}s。".format(
                 esc(short(m)), n, min(P["on"]["rc_all"]), max(P["on"]["rc_all"]),
                 "{:.0f}".format(min(P["on"]["e2e_all"])), "{:.0f}".format(max(P["on"]["e2e_all"]))))
         elif beh == "normal":
             rc = P["on"]["rc_all"]; e2 = P["on"]["e2e_all"]
             n_exh = len(P["on"].get("no_content_runs", []))
-            cs.append("<b>{}</b>：thinking=on 思考输出 {:,}–{:,} 字符/次，E2E {}–{}s（中位 {:.0f}s），"
+            cs.append("<b>{}</b>（单发·thinking=on）：思考输出 {:,}–{:,} 字符/次，E2E {}–{}s（中位 {:.0f}s），"
                       "长草稿显著放大单次时延{}。".format(
                 esc(short(m)), min(rc), max(rc), "{:.0f}".format(min(e2)), "{:.0f}".format(max(e2)), st.median(e2),
                 "；其中 {} 次思考独占输出预算（正文 0 token）".format(n_exh) if n_exh else ""))
@@ -561,7 +561,7 @@ def gen_conclusions(A):
             top = P["off"]["ladder"][-1]
             if top["size"] >= 20000 and top["ttft"]:
                 cs.append("<b>agent 场景推算（{}）</b>：单次响应 5–7 次模型调用、每次携带全量上下文，"
-                          "按 {}k TTFT {:.1f}s 计，仅首字等待累计即 {}–{}s。".format(
+                          "按单发 {}k TTFT {:.1f}s 计，仅首字等待累计即 {}–{}s。".format(
                     esc(short(m)), top["size"] // 1000, top["ttft"][0],
                     round(top["ttft"][0] * 5), round(top["ttft"][0] * 7)))
     return cs
@@ -725,12 +725,12 @@ def main():
     for m, P in A["per_model"].items():
         if "off" in P and P["off"]["ladder"]:
             l0, l1 = P["off"]["ladder"][0], P["off"]["ladder"][-1]
-            kpis.append(("TTFT @{}k ({})".format(l1["size"] // 1000, short(m)),
+            kpis.append(("单发 TTFT @{}k ({})".format(l1["size"] // 1000, short(m)),
                          "{:.2f} s".format(l1["ttft"][0]) if l1["ttft"] else "—"))
         if P.get("decode_tps"):
-            kpis.append(("Decode ({})".format(short(m)), "{:.0f} tok/s".format(P["decode_tps"][0])))
+            kpis.append(("Decode 单发 ({})".format(short(m)), "{:.0f} tok/s".format(P["decode_tps"][0])))
         if "on" in P and P["on"].get("e2e_all"):
-            kpis.append(("思考 E2E 中位 ({})".format(short(m)),
+            kpis.append(("思考 E2E 中位·单发 ({})".format(short(m)),
                          "{:.0f} s".format(st.median(P["on"]["e2e_all"]))))
     kpi_html = "".join('<div class="kpi"><div class="kpi-v">{}</div><div class="kpi-l">{}</div></div>'.format(
         esc(v), esc(l)) for l, v in kpis)
