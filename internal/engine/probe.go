@@ -46,6 +46,10 @@ type ProbeResult struct {
 	Verdicts      []string     `json:"verdicts,omitempty"`
 	CrossChecks   []CrossCheck `json:"cross_checks,omitempty"`   // 交叉验证建议（引擎→原生 perf 工具）
 	ServerMetrics string       `json:"server_metrics,omitempty"` // /metrics 可用性（观测层前置条件）
+
+	// ThinkingLevel 探测到的思考等级控制参数（空 = 未探测到可控参数）
+	ThinkingLevelParam string `json:"thinking_level_param,omitempty"`
+	ThinkingLevelNote  string `json:"thinking_level_note,omitempty"`
 }
 
 // ProbeOptions 探测参数。
@@ -260,6 +264,62 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 		check("thinking_off", nOff == 0, fmt.Sprintf("关闭后思考增量=%d 字符（字段=%s）", nOff, fOff))
 		if nOff > 0 {
 			res.Verdicts = append(res.Verdicts, "⚠️ 思考关闭参数未生效：off 变体仍在思考，A/B 对照会失真")
+		}
+	}
+
+	// ── 5.5 思考等级（effort/budget）控制探测 ──
+	// 基线 = 思考开启状态下的默认思考长度；候选参数逐个试"压低"方向，
+	// 显著低于基线（<50%）判为可控制；命中后试对应"拉高"方向确认双向可控。
+	// 不同框架参数名不同，全走 extra_body 顶层合并（网关对 chat_template_kwargs 的处理也能顺带验证）。
+	if len(o.ThinkingOn) > 0 {
+		_, nBase := testThinking(o.ThinkingOn, "levels_base")
+		working := ""
+		if nBase == 0 {
+			check("thinking_levels", false, "思考开启参数下思考增量=0，等级探测无意义（先解决思考开启）")
+		} else {
+			type levelCand struct {
+				name string
+				low  map[string]any
+				high map[string]any
+			}
+			cands := []levelCand{
+				{"reasoning_effort(顶层,OpenAI口径)",
+					map[string]any{"reasoning_effort": "low"},
+					map[string]any{"reasoning_effort": "high"}},
+				{"reasoning_effort(chat_template_kwargs)",
+					map[string]any{"chat_template_kwargs": map[string]any{"reasoning_effort": "low"}},
+					map[string]any{"chat_template_kwargs": map[string]any{"reasoning_effort": "high"}}},
+				{"thinking_budget(chat_template_kwargs,Qwen系)",
+					map[string]any{"chat_template_kwargs": map[string]any{"thinking_budget": 16}},
+					map[string]any{"chat_template_kwargs": map[string]any{"thinking_budget": budget}}},
+				{"thinking_budget(顶层)",
+					map[string]any{"thinking_budget": 16},
+					map[string]any{"thinking_budget": budget}},
+				{"thinking.type+budget(GLM系)",
+					map[string]any{"thinking": map[string]any{"type": "disabled"}},
+					map[string]any{"thinking": map[string]any{"type": "enabled", "budget_tokens": budget}}},
+			}
+			for _, c := range cands {
+				_, nLow := testThinking(c.low, "levels_low")
+				if nLow == 0 || nLow*2 >= nBase {
+					continue // 压低不显著，参数不可控
+				}
+				_, nHigh := testThinking(c.high, "levels_high")
+				working = c.name
+				check("thinking_levels", true,
+					fmt.Sprintf("参数[%s]可控：low=%d字（基线=%d字），high=%d字", c.name, nLow, nBase, nHigh))
+				break
+			}
+			if working == "" {
+				check("thinking_levels", false,
+					fmt.Sprintf("5 组候选等级参数均未能显著压低思考量（基线=%d字）——按开/关两态压测，或查部署框架文档补充参数", nBase))
+			}
+		}
+		res.ThinkingLevelParam = working
+		res.ThinkingLevelNote = fmt.Sprintf("基线思考 %d 字（探测预算 %dtk）", nBase, budget)
+		if working != "" {
+			res.Verdicts = append(res.Verdicts,
+				"思考等级可控（参数="+working+"）——可在配置 thinking.levels 定义多档变体（name/extra_body），报告按档位名分组对比")
 		}
 	}
 

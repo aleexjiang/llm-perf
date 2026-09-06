@@ -96,7 +96,10 @@ type TurnMetrics struct {
 	ReasoningChars  int    `json:"reasoning_chars"`
 	ContentChars    int    `json:"content_chars"`
 	ReplyText       string `json:"reply_text,omitempty"`
-	Error           string `json:"error,omitempty"`
+	// 预览字段（Finalize 填充）：长文本掐头 120 + 掐尾 120，报告与排错用，全量不入 JSON
+	ContentPreview   string `json:"content_preview,omitempty"`
+	ReasoningPreview string `json:"reasoning_preview,omitempty"`
+	Error            string `json:"error,omitempty"`
 
 	// usage（服务端精确值）
 	PromptTokens     int    `json:"prompt_tokens"`
@@ -155,6 +158,21 @@ type TurnMetrics struct {
 	doneSeen       bool
 	reasoningField string
 	rawResp        []byte // 原始响应头部片段（用于失败/调试转储）
+
+	reasoningBuf string // 思考增量累积（日志预览用；json:"-" 不入库，上限 64KB）
+}
+
+// ReasoningText 返回思考增量的累积文本（日志预览用；流式与非流式都填）。
+func (m *TurnMetrics) ReasoningText() string { return m.reasoningBuf }
+
+// PreviewHeadTail 长文本掐头 120 + 掐尾 120（按 rune 计，中文友好）。
+// ≤280 rune 原样返回；否则首 120 + 中略提示 + 尾 120。
+func PreviewHeadTail(s string) string {
+	r := []rune(s)
+	if len(r) <= 280 {
+		return s
+	}
+	return string(r[:120]) + fmt.Sprintf("……[中略 %d 字]……", len(r)-240) + string(r[len(r)-120:])
 }
 
 func (m *TurnMetrics) warn(format string, args ...any) {
@@ -163,6 +181,8 @@ func (m *TurnMetrics) warn(format string, args ...any) {
 
 // Finalize 根据 raw 时间戳计算派生指标。必须在请求结束后调用。
 func (m *TurnMetrics) Finalize() {
+	m.ContentPreview = PreviewHeadTail(m.ReplyText)
+	m.ReasoningPreview = PreviewHeadTail(m.reasoningBuf)
 	m.E2EMS = ms(m.SentAt, m.EndAt)
 	if !m.Stream {
 		// 非流式：只有端到端延迟可测

@@ -62,6 +62,13 @@ thinking:
   extra_body_off:
     chat_template_kwargs: {enable_thinking: false}
   max_tokens_floor: 8192          # 思考普遍 1500-2500+ token，云上实测 2048 会被吃光（finish=length 无内容）
+  # 思考等级（可选）：probe 探测到可控参数后启用；配置 levels 后上面的 mode/extra_body_on/off 失效。
+  # 报告与日志按 name 分组，参数名随框架不同（OpenAI reasoning_effort / Qwen thinking_budget / GLM thinking.type）：
+  # levels:
+  #   - {name: off,  enabled: false, extra_body: {reasoning_effort: "low"}}   # enabled:false = 思考关闭态
+  #   - {name: low,  enabled: true,  extra_body: {reasoning_effort: "low"}}
+  #   - {name: high, enabled: true,  extra_body: {reasoning_effort: "high"}}
+  # CLI 只跑单档：bench single -c xxx.yaml --thinking low
 
 # 场景一：单发单轮（同 prompt 重复 runs 次，用于观察前缀缓存命中）
 single:

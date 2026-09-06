@@ -176,6 +176,9 @@ func (m *TurnMetrics) ingestEvent(ev *SSEEvent, now time.Time) {
 	if rt := d.reasoningText(); rt != "" {
 		m.ReasoningChunks++
 		m.ReasoningChars += len(rt)
+		if len(m.reasoningBuf) < 64*1024 {
+			m.reasoningBuf += rt
+		}
 		if m.reasoningField == "" {
 			m.reasoningField = d.reasoningFieldName()
 		}
@@ -187,7 +190,7 @@ func (m *TurnMetrics) ingestEvent(ev *SSEEvent, now time.Time) {
 	if d.Content != "" {
 		m.ContentChunks++
 		m.ContentChars += len(d.Content)
-		if len(m.ReplyText) < 16*1024 {
+		if len(m.ReplyText) < 64*1024 {
 			m.ReplyText += d.Content
 		}
 		m.contentTimes = append(m.contentTimes, now)
@@ -293,6 +296,7 @@ func (m *TurnMetrics) applyWholeBody(data []byte) {
 		}
 		if rt := msg.reasoningText(); rt != "" {
 			m.ReasoningChars = len(rt)
+			m.reasoningBuf = rt
 			m.reasoningField = msg.reasoningFieldName()
 		}
 	}

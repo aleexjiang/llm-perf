@@ -166,6 +166,18 @@ func runOne(ctx context.Context, e *env, model string,
 	if err != nil {
 		log.Printf("    失败: %v", err)
 	} else {
+		// 输入/输出全量打印（用户要求）：长内容掐头 120 + 掐尾 120，逐请求留痕便于现场排错
+		if n := len(msgs); n > 0 {
+			last := msgs[n-1]
+			log.Printf("    输入[%d条消息,末条 %s %d字]: %s",
+				n, last.Role, len([]rune(last.Content)), engine.PreviewHeadTail(last.Content))
+		}
+		if m.ReasoningChars > 0 {
+			log.Printf("    思考[%d字]: %s", m.ReasoningChars, engine.PreviewHeadTail(m.ReasoningText()))
+		}
+		if m.ContentChars > 0 {
+			log.Printf("    输出[content %d字]: %s", m.ContentChars, engine.PreviewHeadTail(m.ReplyText))
+		}
 		if m.ThinkingNoContent {
 			log.Printf("    ⚠️ 思考吃光 max_tokens=%d，全程无 content（finish=length）——本次 ThinkMS/DecodeMS 不可测，建议调大 thinking.max_tokens_floor", maxTokens)
 		}

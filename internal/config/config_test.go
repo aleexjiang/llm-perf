@@ -91,3 +91,34 @@ func TestShippedConfigsParse(t *testing.T) {
 		}
 	}
 }
+
+// thinking.levels 自定义变体：取代 mode 展开 + CLI 按档位名过滤
+func TestThinkingLevelsVariants(t *testing.T) {
+	th := Thinking{
+		Levels: []LevelVariant{
+			{Name: "off", Enabled: false},
+			{Name: "low", Enabled: true, ExtraBody: map[string]any{"reasoning_effort": "low"}},
+			{Name: "HIGH", Enabled: true, ExtraBody: map[string]any{"reasoning_effort": "high"}},
+		},
+	}
+	all := th.Variants()
+	if len(all) != 3 || all[0].Name != "off" || all[2].Name != "HIGH" {
+		t.Fatalf("levels 应按声明顺序全量展开: %+v", all)
+	}
+	// 过滤大小写不敏感
+	th.SetFilter("high")
+	got := th.Variants()
+	if len(got) != 1 || got[0].Name != "HIGH" || got[0].Enabled != true {
+		t.Fatalf("filter=high 应命中 HIGH 变体: %+v", got)
+	}
+	// 过滤不命中 → 空
+	th.SetFilter("ultra")
+	if got := th.Variants(); len(got) != 0 {
+		t.Fatalf("filter=ultra 不应命中任何变体: %+v", got)
+	}
+	// 未配 levels 时 mode 展开不受影响
+	m := Thinking{Mode: "both"}
+	if got := m.Variants(); len(got) != 2 || got[0].Name != "off" || got[1].Name != "on" {
+		t.Fatalf("mode=both 应展开 off+on: %+v", got)
+	}
+}

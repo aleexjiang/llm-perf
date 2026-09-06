@@ -105,12 +105,31 @@ func main() {
 		cfg.SeedSalt = *saltFlag
 	}
 	if *thinkingFlag != "" {
-		if *thinkingFlag != "on" && *thinkingFlag != "off" {
-			fmt.Fprintln(os.Stderr, "--thinking 只接受 on 或 off（跑两轮就都能覆盖，无需 both）")
-			os.Exit(1)
+		switch {
+		case *thinkingFlag == "on" || *thinkingFlag == "off" || *thinkingFlag == "both":
+			if len(cfg.Thinking.Levels) > 0 {
+				fmt.Fprintln(os.Stderr, "配置已使用 thinking.levels 自定义变体，--thinking on/off/both 不适用——请用档位名过滤（如 --thinking low）")
+				os.Exit(1)
+			}
+			cfg.Thinking.Mode = *thinkingFlag
+			log.Printf("思考模式（CLI 覆盖）: %s", *thinkingFlag)
+		default:
+			var names []string
+			match := false
+			for _, v := range cfg.Thinking.Variants() {
+				names = append(names, v.Name)
+				if strings.EqualFold(v.Name, *thinkingFlag) {
+					match = true
+				}
+			}
+			if !match {
+				fmt.Fprintf(os.Stderr, "--thinking %s 不匹配任何变体（可用档位: %s；基础配置可用 on/off/both）\n",
+					*thinkingFlag, strings.Join(names, "/"))
+				os.Exit(1)
+			}
+			cfg.Thinking.SetFilter(*thinkingFlag)
+			log.Printf("思考变体过滤（CLI）: 只跑 %s", *thinkingFlag)
 		}
-		cfg.Thinking.Mode = *thinkingFlag
-		log.Printf("思考模式（CLI 覆盖）: %s", *thinkingFlag)
 	}
 
 	// 语料模式：真实公版文本填充，比随机词表更贴近真实负载的 tokenization 分布

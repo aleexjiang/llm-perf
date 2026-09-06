@@ -148,3 +148,19 @@ func hasWarningPrefix(ws []string, prefix string) bool {
 	}
 	return false
 }
+
+func TestPreviewHeadTail(t *testing.T) {
+	if got := PreviewHeadTail("短文本"); got != "短文本" {
+		t.Fatalf("短文本应原样: %q", got)
+	}
+	long := strings.Repeat("甲", 120) + strings.Repeat("乙", 100) + strings.Repeat("丙", 120)
+	got := PreviewHeadTail(long)
+	wantHead := strings.Repeat("甲", 120)
+	wantTail := strings.Repeat("丙", 120)
+	if !strings.HasPrefix(got, wantHead) || !strings.HasSuffix(got, wantTail) {
+		t.Fatalf("长文本应掐头120掐尾120: head=%v tail=%v", strings.HasPrefix(got, wantHead), strings.HasSuffix(got, wantTail))
+	}
+	if !strings.Contains(got, "中略 100 字") {
+		t.Fatalf("应含省略提示: %q", got)
+	}
+}

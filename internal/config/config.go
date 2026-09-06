@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -78,28 +79,63 @@ type Thinking struct {
 	ExtraBodyOn    map[string]any `yaml:"extra_body_on"`    // 思考开启时合并进请求体
 	ExtraBodyOff   map[string]any `yaml:"extra_body_off"`   // 思考关闭时合并进请求体
 	MaxTokensFloor int            `yaml:"max_tokens_floor"` // 思考开启时 max_tokens 下限保护（防思考吃光输出预算）
+
+	// Levels 自定义思考变体（低/中/高/极高等任意档位）：配置后取代 mode 展开。
+	// 不同推理框架参数名不同（OpenAI reasoning_effort / Qwen chat_template_kwargs.thinking_budget /
+	// GLM thinking.type 等），统一用 extra_body 透传；probe 会自动探测哪个参数可控并给出建议。
+	Levels []LevelVariant `yaml:"levels"`
+
+	filter string // CLI --thinking 变体名过滤（非序列化字段）
 }
+
+// LevelVariant 一个自定义思考档位。
+type LevelVariant struct {
+	Name      string         `yaml:"name"`       // 档位名（进日志与报告分组，如 low/medium/high/ultra）
+	Enabled   bool           `yaml:"enabled"`    // 是否处于思考开启状态（true 时享受 max_tokens_floor 保护）
+	ExtraBody map[string]any `yaml:"extra_body"` // 合并进请求体的参数
+}
+
+// SetFilter CLI 指定变体名过滤（大小写不敏感；不匹配任何变体时 Variants 返回空）。
+func (t *Thinking) SetFilter(name string) { t.filter = name }
 
 // ThinkingVariant 是一个思考模式变体。
 type ThinkingVariant struct {
-	Name      string // "off" / "on"
+	Name      string // "off" / "on" / 自定义档位名
 	Enabled   bool
 	ExtraBody map[string]any
 }
 
-// Variants 按 mode 展开成变体列表（both 时先 off 后 on，便于报告对照）。
+// Variants 展开成变体列表：配了 levels 用 levels（保持声明顺序），否则按 mode 展开
+// （both 时先 off 后 on，便于报告对照）；CLI filter 非空时只留名字匹配的变体。
 func (t Thinking) Variants() []ThinkingVariant {
-	switch t.Mode {
-	case "on":
-		return []ThinkingVariant{{Name: "on", Enabled: true, ExtraBody: t.ExtraBodyOn}}
-	case "off":
-		return []ThinkingVariant{{Name: "off", Enabled: false, ExtraBody: t.ExtraBodyOff}}
-	default: // both
-		return []ThinkingVariant{
-			{Name: "off", Enabled: false, ExtraBody: t.ExtraBodyOff},
-			{Name: "on", Enabled: true, ExtraBody: t.ExtraBodyOn},
+	var vs []ThinkingVariant
+	if len(t.Levels) > 0 {
+		for _, lv := range t.Levels {
+			vs = append(vs, ThinkingVariant{Name: lv.Name, Enabled: lv.Enabled, ExtraBody: lv.ExtraBody})
+		}
+	} else {
+		switch t.Mode {
+		case "on":
+			vs = []ThinkingVariant{{Name: "on", Enabled: true, ExtraBody: t.ExtraBodyOn}}
+		case "off":
+			vs = []ThinkingVariant{{Name: "off", Enabled: false, ExtraBody: t.ExtraBodyOff}}
+		default: // both
+			vs = []ThinkingVariant{
+				{Name: "off", Enabled: false, ExtraBody: t.ExtraBodyOff},
+				{Name: "on", Enabled: true, ExtraBody: t.ExtraBodyOn},
+			}
 		}
 	}
+	if t.filter != "" {
+		var out []ThinkingVariant
+		for _, v := range vs {
+			if strings.EqualFold(v.Name, t.filter) {
+				out = append(out, v)
+			}
+		}
+		vs = out
+	}
+	return vs
 }
 
 // MaxTokens 对思考开启的变体应用 max_tokens 下限保护。
