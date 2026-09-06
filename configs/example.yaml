@@ -61,12 +61,12 @@ thinking:
     chat_template_kwargs: {enable_thinking: true}
   extra_body_off:
     chat_template_kwargs: {enable_thinking: false}
-  max_tokens_floor: 2048          # 思考开启时 max_tokens 低于此值自动抬高（防思考吃光输出预算）
+  max_tokens_floor: 8192          # 思考普遍 1500-2500+ token，云上实测 2048 会被吃光（finish=length 无内容）
 
 # 场景一：单发单轮（同 prompt 重复 runs 次，用于观察前缀缓存命中）
 single:
   runs: 3
-  prompt_tokens: [4000, 10000, 20000, 40000]
+  prompt_tokens: [4000, 10000, 20000, 40000, 100000, 200000]  # 爬到 200k；网关剥离 max_model_len，若超模型上限该档 400 报错自带上限数字，不影响其他档位
   max_tokens: 512
   fixed_seed: true                # true=各 run 用同一 prompt（测缓存）；false=每次换 prompt（测冷启动）
 
@@ -76,7 +76,7 @@ multiturn:
   turns: 8                        # 每个会话几轮
   system_tokens: 1000
   tool_defs_tokens: 2000          # 模拟 agent 的 tool definitions 持续开销
-  turn_tokens: 5000               # 每轮新增 user 消息：8 轮滚到 ~43k，对齐 WorkBuddy"多轮积累到 40k"真实形态
+  turn_tokens: 24000              # 每轮新增 user 消息：8 轮滚到 ~195k（base 3k + 8×24k）
                                   #（注意与 single 40k 档的区别：单条塞 40k ≠ 多轮滚到 40k，两者推理行为不同）
   max_tokens: 256
   keep_assistant: true            # assistant 回复保留进 history（真实 agent 行为）
