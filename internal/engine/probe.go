@@ -61,6 +61,11 @@ type ProbeOptions struct {
 	// 交叉验证命令映射用的计划压测参数
 	XVPromptTokens int
 	XVMaxTokens    int
+
+	// ThinkingBudget 思考探测的 max_tokens 上限（≤0 或 >1024 时取 1024）：
+	// 探测 prompt 极短，但思考长的模型（如 Qwen3 对填充文本思考 1500+ token）
+	// 在 512 预算下会吃光预算导致误报"开关未生效"
+	ThinkingBudget int
 }
 
 type probeModelsResp struct {
@@ -222,8 +227,12 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 	}
 
 	// ── 4/5. 思考开关有效性 ──
+	budget := o.ThinkingBudget
+	if budget <= 0 || budget > 1024 {
+		budget = 1024
+	}
 	testThinking := func(extra map[string]any, label string) (reasoningField string, reasoningLen int) {
-		st, raw, _, err := doChat(extra, 512, true)
+		st, raw, _, err := doChat(extra, budget, true)
 		if err != nil || st != 200 {
 			check("thinking_"+label, false, fmt.Sprintf("HTTP %d err=%v", st, err))
 			return "none", 0
@@ -235,7 +244,7 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 	if len(o.ThinkingOn) > 0 {
 		fOn, nOn := testThinking(o.ThinkingOn, "on")
 		if nOn > 0 {
-			check("thinking_on", true, fmt.Sprintf("思考增量字段=%s，%d 字符", fOn, nOn))
+			check("thinking_on", true, fmt.Sprintf("思考增量字段=%s，%d 字符（探测预算 %dtk）", fOn, nOn, budget))
 			if fOn == "reasoning_content" {
 				res.Verdicts = append(res.Verdicts, "思考字段为旧版 reasoning_content（引擎已兼容）")
 			} else {

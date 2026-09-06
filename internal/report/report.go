@@ -92,7 +92,8 @@ type ServerMetricsSummary struct {
 type GaugeSummary = smetrics.GaugeSummary
 
 // Version 是工具版本，随每个 JSON 输出落盘（报告追溯用）。
-const Version = "llm-perf/0.3"
+// 默认 dev；Makefile 构建时用 -ldflags 注入 git describe 版本号。
+var Version = "llm-perf/dev"
 
 // Report 是一次场景执行的完整数据，整体落盘为单个 JSON 文件。
 type Report struct {

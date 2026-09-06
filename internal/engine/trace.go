@@ -32,6 +32,9 @@ type TraceSet struct {
 	Format   string // 实际识别的格式
 }
 
+// maxTraceFileBytes 单文件内存上限：工具全量载入 trace（非流式），超限直接给出可行动的错误。
+const maxTraceFileBytes = 512 << 20
+
 // LoadTrace 读取 trace 文件（.json / .json.gz），按 format 解析（""=自动识别）。
 // minTurns 过滤掉 user 轮数不足的会话（多轮场景至少 2），maxSessions 限制总量（0=不限）。
 func LoadTrace(path, format string, minTurns, maxSessions int) (*TraceSet, error) {
@@ -40,6 +43,13 @@ func LoadTrace(path, format string, minTurns, maxSessions int) (*TraceSet, error
 	}
 	if minTurns <= 0 {
 		minTurns = 2
+	}
+	// 非压缩文件先查大小：超限时给出可行动的错误，而不是截断后报晦涩的 JSON 解析失败
+	if !strings.HasSuffix(path, ".gz") {
+		if fi, statErr := os.Stat(path); statErr == nil && fi.Size() > maxTraceFileBytes {
+			return nil, fmt.Errorf("trace 文件 %s 有 %.0fMB，超过 %dMB 内存上限（工具全量载入）——请预先切分或调低 dataset.max_sessions",
+				path, float64(fi.Size())/(1<<20), maxTraceFileBytes/(1<<20))
+		}
 	}
 	data, err := readFile(path)
 	if err != nil {
@@ -102,7 +112,7 @@ func parseTrace(data []byte, format string) ([]TraceSession, string, error) {
 	// format == "" 自动识别落到 sessions；或显式 sessions
 	s, err := parseSessions(data)
 	if err != nil {
-		return nil, "", fmt.Errorf("无法识别 trace 格式（尝试 sharegpt 与 sessions 均失败）: %w", err)
+		return nil, "", fmt.Errorf("无法识别 trace 格式（尝试 sharegpt 与 sessions 均失败）: %w（若文件接近 512MB 内存上限，可能已被截断——请切分）", err)
 	}
 	return s, "sessions", nil
 }

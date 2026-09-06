@@ -16,6 +16,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"math/rand"
 	"strconv"
 	"strings"
@@ -110,6 +111,14 @@ func newEnv(ctx context.Context, cfg *config.Config, client *engine.Client) (*en
 		log.Printf("trace 回放: %s（%s 格式，%d 个会话）", ts.Source, ts.Format, len(ts.Sessions))
 	}
 	return e, nil
+}
+
+// warnTraceTraceWrap trace 会话数不足所需时提示回绕复用（覆盖多样性受限）。
+func (e *env) warnTraceWrap(need int) {
+	if e.trace != nil && need > len(e.trace.Sessions) {
+		log.Printf("⚠️ trace 会话数 %d 少于需要的 %d——将按序回绕复用，会话多样性受限",
+			len(e.trace.Sessions), need)
+	}
 }
 
 // runOne 发起一次请求（流式/非流式、思考变体由 opts 决定），并做 /metrics counter 前后差值。
@@ -372,6 +381,7 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 
 	for _, model := range filterModels(cfg.Models, modelFilter) {
 		warmup(ctx, e, model)
+		e.warnTraceWrap(mt.Sessions)
 		for _, v := range cfg.Thinking.Variants() {
 			for s := 0; s < mt.Sessions; s++ {
 				run := report.MultiturnRun{Model: model, Thinking: v.Name, Session: s + 1}
@@ -569,6 +579,9 @@ func runClosedRound(ctx context.Context, e *env, cfg *config.Config,
 	model string, v config.ThinkingVariant, level int) report.ConcurrentLevel {
 
 	cc := cfg.Concurrent
+	if cc.Multiturn {
+		e.warnTraceWrap(level)
+	}
 	lv := &report.ConcurrentLevel{Model: model, Thinking: v.Name, Level: level}
 	start := time.Now()
 	var mu sync.Mutex
@@ -615,6 +628,13 @@ func runOpenRound(ctx context.Context, e *env, cfg *config.Config,
 	if n <= 0 {
 		n = 32
 	}
+	if cc.Multiturn {
+		n := cc.NumPrompts
+		if n <= 0 {
+			n = 32
+		}
+		e.warnTraceWrap(n)
+	}
 	start := time.Now()
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -622,8 +642,9 @@ func runOpenRound(ctx context.Context, e *env, cfg *config.Config,
 	if cc.MaxConcurrency > 0 {
 		sem = make(chan struct{}, cc.MaxConcurrency)
 	}
-	// 固定种子：同一 rate 重复跑到达序列一致（可复现）
-	rng := rand.New(rand.NewSource(int64(rate * 1000)))
+	// 固定种子：同一 rate 重复跑到达序列一致（可复现）。
+	// 用 Float64bits 而非 rate*1000——浮点截断会让 0.5001/0.5002 这类相邻档位碰撞出同一种子
+	rng := rand.New(rand.NewSource(int64(math.Float64bits(rate))))
 	maxTok := cfg.Thinking.MaxTokens(cc.MaxTokens, v)
 	launch := func(i int) {
 		wg.Add(1)

@@ -163,6 +163,7 @@ func main() {
 			MaxContext:     cfg.LargestPromptTokens(),
 			XVPromptTokens: cfg.Concurrent.PromptTokens,
 			XVMaxTokens:    cfg.Concurrent.MaxTokens,
+			ThinkingBudget: cfg.Thinking.MaxTokensFloor,
 		})
 		outPath := resolveOutPath(*outFlag, cfg.OutputDir, "probe")
 		if err := report.SaveJSONAny(res, outPath); err != nil {

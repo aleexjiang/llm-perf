@@ -53,58 +53,44 @@ P0 项（gofmt、scenario 测试、lastPrompt 修复、重试策略）已完成�
 
 ## P2（择机，均为小改动）
 
-### 5. appendRaw 常开内存churn
+### 5. ⏸ appendRaw 常开内存churn（性能项，按 2026-09-06 决定暂缓）
 - **问题**：`internal/engine/sse.go:225` 每个流式请求把所有行追加进 256KB 环形缓冲（`maxRawKeep`），
   即便不开 debug。长流下多数追加是空转（达到上限后仍在做 len 检查与切片拼接）。
 - **建议**：`DebugDir == ""` 时只保留头部 64KB（够失败排查用），或 appendRaw 加快路径判断。
 - **验收**：基准 `BenchmarkIngestSSEBody`（新增）在 debug=false 时分配字节数下降。
 
-### 6. percentile 重复排序
+### 6. ⏸ percentile 重复排序（性能项，按 2026-09-06 决定暂缓）
 - **问题**：`internal/engine/client.go Finalize` 对同一 ITL 序列调用 6 次 `percentile`，
   每次内部 copy + sort（O(n log n) × 6）。
 - **建议**：Finalize 里排序一次，百分位改索引取样（p50/p90/p95/p99/max 共用有序切片）。
 - **验收**：现有 sse/client 测试不变通过；新增一个 Finalize 的 ITL 分位单测。
 
-### 7. trace 大文件流式解析
-- **问题**：`internal/engine/trace.go:88` 全量读入（512MB LimitReader 截断），ShareGPT 全量 ~600MB
-  会被截断后 JSON 解析失败，报错信息有误导性。
-- **建议**：短期——截断时报错改为"文件超过 512MB 上限，请预先切分或调低 max_sessions"；
-  长期——`json.Decoder` token 流逐会话解析，边读边过滤 min_turns/max_sessions。
-- **验收**：构造 600MB 文件时错误信息可指导用户行动；常规文件行为不变。
+### 7. ✅ trace 超限报错（短期修复完成；流式解析仍开放）
+- 已实现（2026-09-06）：非压缩文件先用 os.Stat 检查大小，超 512MB 给出可行动错误
+  （"请预先切分或调低 dataset.max_sessions"）；解析失败的报错附截断提示。
+- 仍开放（低优先）：`json.Decoder` 流式逐会话解析——除非真的要跑 600MB 级 ShareGPT 全量，否则不值得做。
 
-### 8. probe 思考探测的 max_tokens 上限
-- **问题**：`internal/engine/probe.go:226` 思考探测硬编码 `max_tokens=512`，思考长的模型
-  （如 Qwen3 对长 prompt 思考 1500+ token）会吃满预算导致误报"思考开关未生效"。
-- **建议**：抬到 1024，或复用 config 的 `thinking.max_tokens_floor`（取 min(1024, floor)），
-  探测结果 detail 里注明预算值。
-- **验收**：对 Qwen3.8-27B probe，thinking_on 检查在长 prompt 下不再误报。
+### 8. ✅ probe 思考探测的 max_tokens 上限
+- 已实现（2026-09-06）：`ProbeOptions.ThinkingBudget`（main 传 thinking.max_tokens_floor，
+  probe 端 clamp 到 ≤1024），探测结果注明预算值。真机验证：
+  `thinking_on: ... 125 字符（探测预算 1024tk）`。
 
-### 9. 开环模式随机种子浮点截断碰撞
-- **问题**：`internal/scenario/scenario.go:571` `rand.NewSource(int64(rate * 1000))`——
-  rate=0.5001 与 0.5002 截断后同种子，到达序列相同。
-- **建议**：`int64(math.Float64bits(rate))`（稳定且无碰撞），或乘 1e6。
-- **验收**：rate 0.5001/0.5002 生成的到达序列首个间隔不同。
+### 9. ✅ 开环模式随机种子浮点截断碰撞
+- 已实现（2026-09-06）：改用 `math.Float64bits(rate)`——任意相邻 rate 档位种子必不相同，
+  且同一 rate 仍可复现。
 
-### 10. report.Version 用 ldflags 注入
-- **问题**：`internal/report/report.go` 的 `Version = "llm-perf/0.3"` 手工维护，
-  发版容易忘升（JSON 里的 tool 字段用于追溯）。
-- **建议**：`var Version = "dev"`，Makefile build 时 `-ldflags "-X .../report.Version=llm-perf/$(VERSION)"`，
-  VERSION 取 git describe。
-- **验收**：make build 产物运行时 JSON 的 tool 字段带 git 版本号。
+### 10. ✅ report.Version 用 ldflags 注入
+- 已实现（2026-09-06）：`var Version = "llm-perf/dev"` + Makefile `-ldflags` 注入
+  `git describe --tags --always --dirty`。已验证产物内含 `llm-perf/86886e7-dirty`；
+  未走 Makefile 的构建（go test / go build）显示 dev。
 
-### 11. TraceSet.Pick 回绕静默
-- **问题**：`internal/engine/trace.go:111` 会话数不足时静默取模复用，日志无提示——
-  测试覆盖的会话多样性比配置预期低时不易察觉。
-- **建议**：Multiturn/Concurrent 启动时若 `sessions > len(trace.Sessions)` 打一行
-  log 提示"会话将回绕复用 N 次"。
-- **验收**：sessions=4 + trace 2 会话时日志出现回绕提示。
+### 11. ✅ TraceSet.Pick 回绕静默
+- 已实现（2026-09-06）：`env.warnTraceWrap(need)` 在 Multiturn / 闭环并发（multiturn）/ 开环
+  （multiturn）启动时检查，会话数不足打 ⚠️ 日志。
 
-### 12. report / cmd 包测试空白
-- **问题**：`internal/report`（130 行）与 `cmd/bench`（219 行）0% 覆盖。report 是纯结构 + SaveJSONAny；
-  cmd 的 `resolveOutPath` 有分支逻辑值得测。
-- **建议**：report 测 SaveJSONAny 的目录创建/JSON 可回读；cmd 测 resolveOutPath 三种输入形态
-  （空/`.json` 后缀/目录）与 usage 分支。
-- **验收**：report 与 cmd 覆盖率 > 60%。
+### 12. ✅ report / cmd 包测试空白
+- 已实现（2026-09-06）：report 测 SaveJSONAny 往返/嵌套目录/DefaultName 格式（66.7%）；
+  cmd 测 resolveOutPath 三形态。cmd 整体覆盖率仍低（main/usage 未测），resolveOutPath 已覆盖。
 
 ## 方向性备忘（review 结论，不设时限）
 
