@@ -207,6 +207,9 @@ func thinkingNoteSuffix(cfg *config.Config) string {
 	return "；部分模型的思考配置由 model_thinking 按模型覆盖"
 }
 
+// interrupted 中断检查：SIGINT 取消 ctx 后返回 true，外层循环据此停止并保留已完成数据。
+func interrupted(ctx context.Context) bool { return ctx.Err() != nil }
+
 // warmup 场景开始前的预热：暖连接池/首包路径；唯一内容（时间戳 seed）避免污染被测前缀的缓存对照。
 func warmup(ctx context.Context, e *env, model string) {
 	n := e.cfg.WarmupRequests
@@ -368,9 +371,17 @@ func Single(ctx context.Context, cfg *config.Config, client *engine.Client, mode
 					log.Printf("[single] %s thinking=%s trace#%d (~%dtk)", model, v.Name, i+1, row.PromptTokens)
 					for run := 0; run < cfg.Single.Runs; run++ {
 						msgs := []engine.Message{{Role: "user", Content: content}}
-						row.Runs = append(row.Runs, runOne(ctx, e, model, msgs, maxTok, v))
+						log.Printf("[single] %s thinking=%s trace#%d (~%dtk) run%d", model, v.Name, i+1, row.PromptTokens, run+1)
+						m := runOne(ctx, e, model, msgs, maxTok, v)
+						row.Runs = append(row.Runs, m)
+						if interrupted(ctx) {
+							break
+						}
 					}
 					rep.Single = append(rep.Single, row)
+					if interrupted(ctx) {
+						return rep, nil
+					}
 				}
 				continue
 			}
@@ -390,8 +401,15 @@ func Single(ctx context.Context, cfg *config.Config, client *engine.Client, mode
 						log.Printf("    🛑 触发模型上下文上限（limit=%stk）——跳过 %dtk 剩余 run 及更大档位（重试必然同样超限）", limit, tokens)
 						break
 					}
+					if interrupted(ctx) {
+						break
+					}
 				}
 				rep.Single = append(rep.Single, row)
+				if interrupted(ctx) {
+					log.Printf("🛑 收到中断信号——停止新请求，已完成数据全部保留")
+					return rep, nil
+				}
 				if len(row.Runs) > 0 && ctxLimitHit(row.Runs[len(row.Runs)-1]) != "" {
 					break // 更大档位必然同样超限，跳过该模型该变体的剩余档位
 				}
@@ -488,6 +506,10 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 						msgs = append(msgs, engine.Message{Role: "assistant", Content: reply})
 					}
 					run.Turns = append(run.Turns, m)
+					if interrupted(ctx) {
+						log.Printf("    🛑 收到中断信号——提前结束会话（已完成 %d/%d 轮保留）", len(run.Turns), mt.Turns)
+						break
+					}
 					if limit := ctxLimitHit(m); limit != "" {
 						// 会话 history 已超限，继续加轮必然失败——结束该会话并跳过剩余会话
 						log.Printf("    🛑 触发模型上下文上限（limit=%stk，ctx≈%dtk）——提前结束会话，跳过剩余会话", limit, m.PromptTokens)
@@ -496,6 +518,10 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 					}
 				}
 				rep.Multiturn = append(rep.Multiturn, run)
+				if interrupted(ctx) {
+					log.Printf("🛑 收到中断信号——停止新请求，已完成会话全部保留")
+					return rep, nil
+				}
 				if ctxAborted {
 					break
 				}
@@ -611,6 +637,10 @@ func Concurrent(ctx context.Context, cfg *config.Config, client *engine.Client, 
 					lv := runOpenRound(ctx, e, cfg, model, v, rate)
 					logConcurrent(&lv)
 					rep.Concurrent = append(rep.Concurrent, lv)
+					if interrupted(ctx) {
+						log.Printf("🛑 收到中断信号——停止新请求，已完成档位全部保留")
+						return rep, nil
+					}
 				}
 				continue
 			}
@@ -618,6 +648,10 @@ func Concurrent(ctx context.Context, cfg *config.Config, client *engine.Client, 
 				lv := runClosedRound(ctx, e, cfg, model, v, level)
 				logConcurrent(&lv)
 				rep.Concurrent = append(rep.Concurrent, lv)
+				if interrupted(ctx) {
+					log.Printf("🛑 收到中断信号——停止新请求，已完成档位全部保留")
+					return rep, nil
+				}
 			}
 		}
 		rep.Correctness = append(rep.Correctness, runCorrectness(ctx, e, model)...)

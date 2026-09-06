@@ -17,8 +17,10 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/aleexjiang/llm-perf/internal/config"
@@ -182,6 +184,18 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Ctrl+C 优雅中断：第一次停止新请求并保存已完成数据；再按一次强制退出
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigs
+		log.Printf("🛑 收到中断信号——停止发新请求，在飞请求将被取消，已完成数据照常保存（再按一次 Ctrl+C 强制退出）")
+		cancel()
+		<-sigs
+		fmt.Fprintln(os.Stderr, "强制退出，未保存的数据可能丢失")
+		os.Exit(130)
+	}()
+
 	// bench all 的 -o 只接受目录：三个场景各自落一个文件，给 .json 会互相覆盖
 	if cmd == "all" && strings.HasSuffix(*outFlag, ".json") {
 		fmt.Fprintln(os.Stderr, "bench all 的 -o 请给目录（三场景各落一个 JSON），不要指定单个 .json 文件")
@@ -253,6 +267,11 @@ func main() {
 			fmt.Fprintf(os.Stderr, "[%s] 写出 JSON 失败: %v\n", name, err)
 			os.Exit(1)
 		}
+		if ctx.Err() != nil {
+			fmt.Printf("[%s] ⚠️ 中断——已完成的 %d 组数据已保存: %s\n",
+				name, len(rep.Single)+len(rep.Multiturn)+len(rep.Concurrent), outPath)
+			return
+		}
 		fmt.Printf("[%s] 完成，用时 %s，输出: %s\n", name, time.Since(start).Round(time.Second), outPath)
 	}
 
@@ -260,6 +279,9 @@ func main() {
 		for _, sc := range scenario.All() {
 			sc := sc
 			run(sc.Name(), func() (*report.Report, error) { return sc.Run(ctx, cfg, client, *modelFilter) })
+			if ctx.Err() != nil {
+				return // 中断后不再启动后续场景
+			}
 		}
 		return
 	}
