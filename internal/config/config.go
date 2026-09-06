@@ -98,6 +98,18 @@ type LevelVariant struct {
 // SetFilter CLI 指定变体名过滤（大小写不敏感；不匹配任何变体时 Variants 返回空）。
 func (t *Thinking) SetFilter(name string) { t.filter = name }
 
+// VariantNames 返回全部变体名（忽略 CLI 过滤）——CLI --thinking 校验用。
+func (t Thinking) VariantNames() []string {
+	saved := t.filter
+	t.filter = ""
+	var names []string
+	for _, v := range t.Variants() {
+		names = append(names, v.Name)
+	}
+	t.filter = saved
+	return names
+}
+
 // ThinkingVariant 是一个思考模式变体。
 type ThinkingVariant struct {
 	Name      string // "off" / "on" / 自定义档位名
@@ -146,6 +158,31 @@ func (t Thinking) MaxTokens(maxTokens int, v ThinkingVariant) int {
 	return maxTokens
 }
 
+// ThinkingFor 返回某模型生效的思考配置：全局 thinking 为底，model_thinking[model] 的
+// 非零字段覆盖（零值 = 未写 = 继承全局）；CLI --thinking 的变体过滤始终继承。
+func (c *Config) ThinkingFor(model string) *Thinking {
+	t := c.Thinking // 值拷贝（map/slice 共享底层数组但只读，安全）
+	if ov := c.ModelThinking[model]; ov != nil {
+		if ov.Mode != "" {
+			t.Mode = ov.Mode
+		}
+		if ov.ExtraBodyOn != nil {
+			t.ExtraBodyOn = ov.ExtraBodyOn
+		}
+		if ov.ExtraBodyOff != nil {
+			t.ExtraBodyOff = ov.ExtraBodyOff
+		}
+		if ov.MaxTokensFloor > 0 {
+			t.MaxTokensFloor = ov.MaxTokensFloor
+		}
+		if len(ov.Levels) > 0 {
+			t.Levels = ov.Levels
+		}
+	}
+	t.filter = c.Thinking.filter
+	return &t
+}
+
 type Config struct {
 	Endpoint       string   `yaml:"endpoint"`
 	APIKeyLiteral  string   `yaml:"api_key"`     // 字面量 key，直接写配置文件（该配置文件应避免入库）；环境变量 LLM_PERF_API_KEY 优先级更高
@@ -184,6 +221,12 @@ type Config struct {
 	Correctness *CorrectnessCfg `yaml:"correctness"`
 
 	Thinking Thinking `yaml:"thinking"`
+
+	// ModelThinking 按模型覆盖思考配置（键=模型名，必须在 models 列表内）。
+	// 覆盖语义：只写要改的字段，未写的字段继承全局 thinking（零值 = 未写）。
+	// 不同模型/引擎的思考参数与档位词汇不同（Qwen thinking_budget / OpenAI reasoning_effort / GLM thinking.type），
+	// probe 会探测哪个参数可控；每个模型配各自己的 levels/extra_body。
+	ModelThinking map[string]*Thinking `yaml:"model_thinking"`
 
 	Single     Single     `yaml:"single"`
 	Multiturn  Multiturn  `yaml:"multiturn"`
@@ -253,6 +296,24 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Thinking.MaxTokensFloor <= 0 {
 		cfg.Thinking.MaxTokensFloor = 2048
+	}
+	// model_thinking 覆盖校验：模型必须在 models 列表内；mode 值合法
+	inModels := make(map[string]bool, len(cfg.Models))
+	for _, m := range cfg.Models {
+		inModels[m] = true
+	}
+	for name, ov := range cfg.ModelThinking {
+		if ov == nil {
+			continue
+		}
+		if !inModels[name] {
+			return nil, fmt.Errorf("model_thinking 键 %q 不在 models 列表中（models: %v）", name, cfg.Models)
+		}
+		switch ov.Mode {
+		case "", "both", "on", "off":
+		default:
+			return nil, fmt.Errorf("model_thinking[%s].mode 无效值 %q（可选 both/on/off；留空继承全局）", name, ov.Mode)
+		}
 	}
 	// 各场景默认值
 	if cfg.Single.Runs <= 0 {

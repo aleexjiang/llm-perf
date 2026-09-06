@@ -199,13 +199,21 @@ func runOne(ctx context.Context, e *env, model string,
 	return m
 }
 
+// thinkingNoteSuffix model_thinking 有按模型覆盖时，报告备注追加标记（Note 只描述全局基线）
+func thinkingNoteSuffix(cfg *config.Config) string {
+	if len(cfg.ModelThinking) == 0 {
+		return ""
+	}
+	return "；部分模型的思考配置由 model_thinking 按模型覆盖"
+}
+
 // warmup 场景开始前的预热：暖连接池/首包路径；唯一内容（时间戳 seed）避免污染被测前缀的缓存对照。
 func warmup(ctx context.Context, e *env, model string) {
 	n := e.cfg.WarmupRequests
 	if n <= 0 {
 		return
 	}
-	vOff := config.ThinkingVariant{Name: "off", Enabled: false, ExtraBody: e.cfg.Thinking.ExtraBodyOff}
+	vOff := config.ThinkingVariant{Name: "off", Enabled: false, ExtraBody: e.cfg.ThinkingFor(model).ExtraBodyOff}
 	now := time.Now().UnixNano()
 	for i := 0; i < n; i++ {
 		msgs := []engine.Message{engine.UserMsg(128, now+int64(i), e.cfg.Fillers())}
@@ -292,7 +300,7 @@ func runCorrectness(ctx context.Context, e *env, model string) []report.Correctn
 	if n <= 0 {
 		return nil
 	}
-	vOff := config.ThinkingVariant{Name: "off", Enabled: false, ExtraBody: e.cfg.Thinking.ExtraBodyOff}
+	vOff := config.ThinkingVariant{Name: "off", Enabled: false, ExtraBody: e.cfg.ThinkingFor(model).ExtraBodyOff}
 	rng := rand.New(rand.NewSource(4242)) // 固定种子：金丝雀可复现
 	rows := []report.CorrectnessRow{}
 	for i := 0; i < n; i++ {
@@ -336,8 +344,8 @@ func Single(ctx context.Context, cfg *config.Config, client *engine.Client, mode
 		Scenario:    "single",
 		GeneratedAt: time.Now(),
 		Endpoint:    cfg.Endpoint,
-		Note: fmt.Sprintf("单发单轮 runs=%d fixed_seed=%v stream=%v thinking=%s；思考开启时 max_tokens 下限 %d；数据源=%s",
-			cfg.Single.Runs, cfg.Single.FixedSeed, cfg.StreamEnabled(), cfg.Thinking.Mode, cfg.Thinking.MaxTokensFloor, cfg.Dataset.Mode),
+		Note: fmt.Sprintf("单发单轮 runs=%d fixed_seed=%v stream=%v thinking=%s；思考开启时 max_tokens 下限 %d；数据源=%s%s",
+			cfg.Single.Runs, cfg.Single.FixedSeed, cfg.StreamEnabled(), cfg.Thinking.Mode, cfg.Thinking.MaxTokensFloor, cfg.Dataset.Mode, thinkingNoteSuffix(cfg)),
 	}
 	applySLO(e, rep)
 	before, poller := startWindow(ctx, e)
@@ -345,8 +353,9 @@ func Single(ctx context.Context, cfg *config.Config, client *engine.Client, mode
 
 	for _, model := range filterModels(cfg.Models, modelFilter) {
 		warmup(ctx, e, model)
-		for _, v := range cfg.Thinking.Variants() {
-			maxTok := cfg.Thinking.MaxTokens(cfg.Single.MaxTokens, v)
+		th := cfg.ThinkingFor(model)
+		for _, v := range th.Variants() {
+			maxTok := th.MaxTokens(cfg.Single.MaxTokens, v)
 			if e.trace != nil {
 				// trace 模式：用回放会话的首轮 user 消息做档位（prompt_tokens 粗估，服务端 usage 为准）
 				n := len(e.trace.Sessions)
@@ -418,8 +427,8 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 		Scenario:    "multiturn",
 		GeneratedAt: time.Now(),
 		Endpoint:    cfg.Endpoint,
-		Note: fmt.Sprintf("单发多轮 sessions=%d turns=%d stream=%v thinking=%s 数据源=%s（trace 模式下轮次来自回放会话，system/turn_tokens 不生效）",
-			mt.Sessions, mt.Turns, cfg.StreamEnabled(), cfg.Thinking.Mode, dataSrc),
+		Note: fmt.Sprintf("单发多轮 sessions=%d turns=%d stream=%v thinking=%s 数据源=%s（trace 模式下轮次来自回放会话，system/turn_tokens 不生效）%s",
+			mt.Sessions, mt.Turns, cfg.StreamEnabled(), cfg.Thinking.Mode, dataSrc, thinkingNoteSuffix(cfg)),
 	}
 	applySLO(e, rep)
 	before, poller := startWindow(ctx, e)
@@ -428,7 +437,8 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 	for _, model := range filterModels(cfg.Models, modelFilter) {
 		warmup(ctx, e, model)
 		e.warnTraceWrap(mt.Sessions)
-		for _, v := range cfg.Thinking.Variants() {
+		th := cfg.ThinkingFor(model)
+		for _, v := range th.Variants() {
 			ctxAborted := false // 触发模型上下文上限：剩余会话必然同样超限，全部跳过
 			for s := 0; s < mt.Sessions; s++ {
 				run := report.MultiturnRun{Model: model, Thinking: v.Name, Session: s + 1}
@@ -441,7 +451,7 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 					}
 				}
 				userTurns := e.sessionUserTurns(s)
-				maxTok := cfg.Thinking.MaxTokens(mt.MaxTokens, v)
+				maxTok := th.MaxTokens(mt.MaxTokens, v)
 				lastPrompt := 0 // 上一轮服务端实测 prompt_tokens（截止计算与新增 tokens 计算）
 				for turn := 0; turn < mt.Turns; turn++ {
 					if e.trace != nil {
@@ -514,7 +524,7 @@ func collectSessionTurns(ctx context.Context, e *env, cfg *config.Config,
 	model string, v config.ThinkingVariant, sessionIdx int, turnLimit int) []*engine.TurnMetrics {
 
 	mt := cfg.Multiturn
-	maxTok := cfg.Thinking.MaxTokens(mt.MaxTokens, v)
+	maxTok := cfg.ThinkingFor(model).MaxTokens(mt.MaxTokens, v)
 	baseSeed := sessionSeed(sessionIdx, cfg.SeedSalt)
 	msgs := []engine.Message{}
 	userTurns := e.sessionUserTurns(sessionIdx)
@@ -585,8 +595,8 @@ func Concurrent(ctx context.Context, cfg *config.Config, client *engine.Client, 
 		Scenario:    "concurrent",
 		GeneratedAt: time.Now(),
 		Endpoint:    cfg.Endpoint,
-		Note: fmt.Sprintf("并发%s %s prompt≈%dtk stream=%v thinking=%s；每用户独立 prompt/会话（不同 seed）",
-			mode, loadModel, cc.PromptTokens, cfg.StreamEnabled(), cfg.Thinking.Mode),
+		Note: fmt.Sprintf("并发%s %s prompt≈%dtk stream=%v thinking=%s；每用户独立 prompt/会话（不同 seed）%s",
+			mode, loadModel, cc.PromptTokens, cfg.StreamEnabled(), cfg.Thinking.Mode, thinkingNoteSuffix(cfg)),
 	}
 	applySLO(e, rep)
 	before, poller := startWindow(ctx, e)
@@ -594,7 +604,8 @@ func Concurrent(ctx context.Context, cfg *config.Config, client *engine.Client, 
 
 	for _, model := range filterModels(cfg.Models, modelFilter) {
 		warmup(ctx, e, model)
-		for _, v := range cfg.Thinking.Variants() {
+		th := cfg.ThinkingFor(model)
+		for _, v := range th.Variants() {
 			if rates != nil {
 				for _, rate := range rates {
 					lv := runOpenRound(ctx, e, cfg, model, v, rate)
@@ -656,7 +667,7 @@ func runClosedRound(ctx context.Context, e *env, cfg *config.Config,
 				mu.Unlock()
 				return
 			}
-			maxTok := cfg.Thinking.MaxTokens(cc.MaxTokens, v)
+			maxTok := cfg.ThinkingFor(model).MaxTokens(cc.MaxTokens, v)
 			promptTokens := cfg.ClampOne(cc.PromptTokens)
 			for r := 0; r < cc.RunsPerWorker; r++ {
 				seed := workerSeed(workerID, r, cfg.SeedSalt) // 每用户不同 prompt
@@ -701,7 +712,7 @@ func runOpenRound(ctx context.Context, e *env, cfg *config.Config,
 	// 固定种子：同一 rate 重复跑到达序列一致（可复现）。
 	// 用 Float64bits 而非 rate*1000——浮点截断会让 0.5001/0.5002 这类相邻档位碰撞出同一种子
 	rng := rand.New(rand.NewSource(int64(math.Float64bits(rate))))
-	maxTok := cfg.Thinking.MaxTokens(cc.MaxTokens, v)
+	maxTok := cfg.ThinkingFor(model).MaxTokens(cc.MaxTokens, v)
 	launch := func(i int) {
 		wg.Add(1)
 		go func(i int) {

@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -120,5 +121,49 @@ func TestThinkingLevelsVariants(t *testing.T) {
 	m := Thinking{Mode: "both"}
 	if got := m.Variants(); len(got) != 2 || got[0].Name != "off" || got[1].Name != "on" {
 		t.Fatalf("mode=both 应展开 off+on: %+v", got)
+	}
+}
+
+// model_thinking 按模型覆盖：只写要改的字段，其余继承全局；CLI filter 始终继承
+func TestThinkingForModelOverride(t *testing.T) {
+	c := &Config{
+		Thinking: Thinking{
+			Mode:           "both",
+			MaxTokensFloor: 8192,
+			ExtraBodyOn:    map[string]any{"chat_template_kwargs": map[string]any{"enable_thinking": true}},
+		},
+		ModelThinking: map[string]*Thinking{
+			"/models/Qwen3.8-27B": {
+				Levels: []LevelVariant{{Name: "low", Enabled: true, ExtraBody: map[string]any{"reasoning_effort": "low"}}},
+			},
+			"/models/DeepSeek": {MaxTokensFloor: 16384},
+		},
+	}
+	q := c.ThinkingFor("/models/Qwen3.8-27B")
+	if len(q.Levels) != 1 || q.Mode != "both" || q.MaxTokensFloor != 8192 {
+		t.Fatalf("Qwen: levels 覆盖，mode/floor 应继承全局: %+v", q)
+	}
+	d := c.ThinkingFor("/models/DeepSeek")
+	if d.MaxTokensFloor != 16384 || len(d.Levels) != 0 || d.Mode != "both" {
+		t.Fatalf("DeepSeek: 只覆盖 floor，其余继承: %+v", d)
+	}
+	g := c.ThinkingFor("/models/未配置的模型")
+	if g.Mode != "both" || g.MaxTokensFloor != 8192 || len(g.Levels) != 0 {
+		t.Fatalf("未覆盖模型应返回全局: %+v", g)
+	}
+	// CLI filter 继承到每个模型的生效配置
+	c.Thinking.SetFilter("low")
+	if got := c.ThinkingFor("/models/Qwen3.8-27B").Variants(); len(got) != 1 || got[0].Name != "low" {
+		t.Fatalf("filter 应继承进 ThinkingFor: %+v", got)
+	}
+}
+
+// model_thinking 键不在 models 列表 → 配置报错
+func TestModelThinkingUnknownModelError(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "c.yaml")
+	os.WriteFile(p, []byte("endpoint: \"http://x/v1\"\nmodels: [\"m1\"]\nmodel_thinking:\n  \"m2\":\n    mode: \"on\"\n"), 0644)
+	if _, err := Load(p); err == nil || !strings.Contains(err.Error(), "m2") {
+		t.Fatalf("未知模型键应报错且提到 m2: %v", err)
 	}
 }

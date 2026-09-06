@@ -105,24 +105,39 @@ func main() {
 		cfg.SeedSalt = *saltFlag
 	}
 	if *thinkingFlag != "" {
+		anyLevels := len(cfg.Thinking.Levels) > 0
+		for _, ov := range cfg.ModelThinking {
+			if ov != nil && len(ov.Levels) > 0 {
+				anyLevels = true
+			}
+		}
 		switch {
 		case *thinkingFlag == "on" || *thinkingFlag == "off" || *thinkingFlag == "both":
-			if len(cfg.Thinking.Levels) > 0 {
-				fmt.Fprintln(os.Stderr, "配置已使用 thinking.levels 自定义变体，--thinking on/off/both 不适用——请用档位名过滤（如 --thinking low）")
+			if anyLevels {
+				fmt.Fprintln(os.Stderr, "配置已使用 thinking.levels（含 model_thinking 覆盖），--thinking on/off/both 不适用——请用档位名过滤（如 --thinking low）")
 				os.Exit(1)
 			}
 			cfg.Thinking.Mode = *thinkingFlag
 			log.Printf("思考模式（CLI 覆盖）: %s", *thinkingFlag)
 		default:
+			nameSet := map[string]bool{}
 			var names []string
-			match := false
-			for _, v := range cfg.Thinking.Variants() {
-				names = append(names, v.Name)
-				if strings.EqualFold(v.Name, *thinkingFlag) {
-					match = true
+			addVariantNames := func(t config.Thinking) {
+				for _, n := range t.VariantNames() {
+					key := strings.ToLower(n)
+					if !nameSet[key] {
+						nameSet[key] = true
+						names = append(names, n)
+					}
 				}
 			}
-			if !match {
+			addVariantNames(cfg.Thinking)
+			for _, ov := range cfg.ModelThinking {
+				if ov != nil {
+					addVariantNames(*ov)
+				}
+			}
+			if !nameSet[strings.ToLower(*thinkingFlag)] {
 				fmt.Fprintf(os.Stderr, "--thinking %s 不匹配任何变体（可用档位: %s；基础配置可用 on/off/both）\n",
 					*thinkingFlag, strings.Join(names, "/"))
 				os.Exit(1)
@@ -181,17 +196,18 @@ func main() {
 		} else if len(cfg.Models) > 0 {
 			model = cfg.Models[0]
 		}
+		th := cfg.ThinkingFor(model) // probe 也按模型解析思考配置（model_thinking 覆盖生效）
 		res := engine.Probe(ctx, engine.ProbeOptions{
 			Endpoint:       cfg.Endpoint,
 			APIKey:         cfg.APIKey,
 			Model:          model,
-			ThinkingOn:     cfg.Thinking.ExtraBodyOn,
-			ThinkingOff:    cfg.Thinking.ExtraBodyOff,
+			ThinkingOn:     th.ExtraBodyOn,
+			ThinkingOff:    th.ExtraBodyOff,
 			IncludeUsage:   *cfg.IncludeUsage,
 			MaxContext:     cfg.LargestPromptTokens(),
 			XVPromptTokens: cfg.Concurrent.PromptTokens,
 			XVMaxTokens:    cfg.Concurrent.MaxTokens,
-			ThinkingBudget: cfg.Thinking.MaxTokensFloor,
+			ThinkingBudget: th.MaxTokensFloor,
 		})
 		outPath := resolveOutPath(*outFlag, cfg.OutputDir, "probe")
 		if err := report.SaveJSONAny(res, outPath); err != nil {
