@@ -6,7 +6,7 @@
 #   --reasoning-parser qwen3         流式带 reasoning_content → 思考三段拆分可用
 #   --kv-cache-dtype fp8 + MTP 3token 投机解码 → decode 段明显偏快，属预期
 #   --max-model-len 262144           支持到 200k 档
-#   端口 8849:8000 → 宿主机 http://172.17.0.3:8849/v1（无 API key 校验）
+#   端口 8849:8000 → 宿主机 http://<实例IP>:8849/v1（无 API key 校验）
 #
 # GPU：device_ids 2、3，tensor-parallel-size 2
 

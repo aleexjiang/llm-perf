@@ -8,9 +8,9 @@
 #   --max-model-len 262144           支持到 200k 档
 #
 # 端点说明：云上实例，docker-compose 见 deploy/docker-compose.qwen3.8-27b.yml；
-#   宿主机上跑 bench → 127.0.0.1:8849；其他机器跑 → 172.17.0.3:8849
+#   宿主机上跑 bench → 127.0.0.1:8849；其他机器跑 → <实例IP>:8849
 
-endpoint: "http://172.17.0.3:8849/v1"
+endpoint: "http://<实例IP>:8849/v1"
 api_key_env: ""                   # 该实例未启用 API key 校验，留空即不带认证头
 output_dir: "output"
 timeout_seconds: 600              # 长档位 + max-num-seqs=2 排队，放宽超时

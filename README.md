@@ -174,7 +174,7 @@ scp bin/bench-linux-amd64 configs/example.yaml 堡垒机:~/llm-perf/
 
 # 堡垒机
 mv bench-linux-amd64 bench && chmod +x bench
-export LLM_PERF_ENDPOINT=http://10.0.201.1:30082/router/v1
+export LLM_PERF_ENDPOINT=http://<客户路由IP>:30082/router/v1
 export LLM_PERF_API_KEY=...         # 如服务需要
 ./bench probe -c example.yaml       # ① 先探针：确认引擎兼容性与思考开关参数
 ./bench single -c example.yaml      # ② 小档位验证解析正确性（改小 prompt_tokens/max_tokens）

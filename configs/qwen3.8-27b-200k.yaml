@@ -1,4 +1,4 @@
-# 200K 上下文专项：单发多轮 + 并发多轮（Qwen3.8-27B @ 172.17.0.3:8849）
+# 200K 上下文专项：单发多轮 + 并发多轮（Qwen3.8-27B @ <实例IP>:8849）
 #
 # 会话形状：base≈3k(system 1k + tool_defs 2k) + 9轮×25k ≈ 滚到 ~223k（以服务端实测 prompt_tokens 为准）
 # 预算核对：~223k prompt + 8192 思考 + 256 content ≈ 232k < max_model_len 262144，余量充足
@@ -7,7 +7,7 @@
 #   levels [1,2] 对应服务端 --max-num-seqs 2：level1 基线，level2 即真实并行上限，
 #   更高档位在 200k 会话下只剩排队放大，不再单测
 
-endpoint: "http://172.17.0.3:8849/v1"
+endpoint: "http://<实例IP>:8849/v1"
 output_dir: "output-200k"
 timeout_seconds: 900              # 200k 档 + level2 KV 压力，放宽超时
 include_usage: true

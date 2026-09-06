@@ -39,7 +39,7 @@ func hasWarning(m *TurnMetrics, prefix string) bool {
 	return false
 }
 
-// vLLM v0.27.1 真实流样例（172.17.0.3:8849 现场抓取，思考字段为 reasoning）
+// vLLM v0.27.1 真实流样例（<实例IP>:8849 现场抓取，思考字段为 reasoning）
 const sseVLLM027 = `data: {"id":"c1","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
 
 data: {"id":"c1","choices":[{"index":0,"delta":{"reasoning":"User"},"finish_reason":null}]}

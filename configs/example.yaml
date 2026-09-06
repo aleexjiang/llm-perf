@@ -1,7 +1,7 @@
 # llm-perf 配置示例
 # 环境变量覆盖：LLM_PERF_ENDPOINT、LLM_PERF_API_KEY（.env 或 shell 均可）
 
-endpoint: "http://10.0.201.1:30082/router/v1"
+endpoint: "http://<客户路由IP>:30082/router/v1"
 api_key_env: "LLM_PERF_API_KEY"   # 从哪个环境变量读 key；留空则不带认证头
 output_dir: "output"              # 输出 JSON 的默认目录（-o 可覆盖）
 timeout_seconds: 300

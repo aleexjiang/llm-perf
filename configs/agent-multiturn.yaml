@@ -1,5 +1,5 @@
-# Agent 场景专项：单发多轮 + 并发多轮（真实 Qwen3.8-27B @ 172.17.0.3:8849）
-endpoint: "http://172.17.0.3:8849/v1"
+# Agent 场景专项：单发多轮 + 并发多轮（真实 Qwen3.8-27B @ <实例IP>:8849）
+endpoint: "http://<实例IP>:8849/v1"
 output_dir: "output-agent"
 timeout_seconds: 600
 include_usage: true
