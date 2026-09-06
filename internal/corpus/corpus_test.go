@@ -50,7 +50,7 @@ func TestWindowWrapAround(t *testing.T) {
 	}
 	c := Loaded("zh")
 	// 超过语料长度 → 循环填充
-	big := c.Window(c.Len()*2 + 100, 7)
+	big := c.Window(c.Len()*2+100, 7)
 	if len([]rune(big)) != c.Len()*2+100 {
 		t.Fatalf("循环填充长度不符: %d", len([]rune(big)))
 	}

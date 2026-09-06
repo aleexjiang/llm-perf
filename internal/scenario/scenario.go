@@ -1,6 +1,7 @@
 // Package scenario 实现评测场景矩阵：
-//   执行方式（单发/并发/开环到达率） × 轮次（单轮/多轮） × 思考模式（off/on，由 config.Thinking 展开），
-//   stream 为请求级开关（config.stream）。
+//
+//	执行方式（单发/并发/开环到达率） × 轮次（单轮/多轮） × 思考模式（off/on，由 config.Thinking 展开），
+//	stream 为请求级开关（config.stream）。
 //
 // 横切能力（所有场景共用）：
 //   - warmup：场景开始前的预热请求（不计入统计，唯一内容避免污染被测前缀）
@@ -265,15 +266,7 @@ func Single(ctx context.Context, cfg *config.Config, client *engine.Client, mode
 			for _, tokens := range ladder {
 				row := report.SingleRow{Model: model, Thinking: v.Name, PromptTokens: tokens}
 				for run := 0; run < cfg.Single.Runs; run++ {
-					var seed int64
-					// fixed_seed：每档一个独立种子（档位内各 run 复用同一 prompt 测缓存对照）。
-					// 不要让不同档位共享种子——语料窗口同起点会使档位间 prompt 互为嵌套前缀，
-					// 上一档的缓存会"预热"下一档的 run1，冷启动测量就不干净了。
-					if cfg.Single.FixedSeed {
-						seed = int64(1000 + tokens + cfg.SeedSalt)
-					} else {
-						seed = int64(tokens*100 + run + cfg.SeedSalt)
-					}
+					seed := singleSeed(cfg.Single.FixedSeed, tokens, run, cfg.SeedSalt)
 					msgs := []engine.Message{engine.UserMsg(tokens, seed, cfg.Fillers())}
 					log.Printf("[single] %s thinking=%s %dtk run%d", model, v.Name, tokens, run+1)
 					row.Runs = append(row.Runs, runOne(ctx, e, model, msgs, maxTok, v))
@@ -324,7 +317,7 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 			for s := 0; s < mt.Sessions; s++ {
 				run := report.MultiturnRun{Model: model, Thinking: v.Name, Session: s + 1}
 				log.Printf("[multiturn] %s thinking=%s session%d", model, v.Name, s+1)
-				baseSeed := int64(5000 + s*10000 + cfg.SeedSalt)
+				baseSeed := sessionSeed(s, cfg.SeedSalt)
 				msgs := []engine.Message{}
 				if e.trace == nil {
 					if sys := engine.SystemMsg(mt.SystemTokens, mt.ToolDefsTokens, baseSeed, cfg.Fillers()); sys.Content != "" {
@@ -356,8 +349,10 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 						} else {
 							m.NewTokens = m.PromptTokens
 						}
+						// 只有成功的轮次才推进基准：失败的轮次（ctx=0）不能把 lastPrompt 清零，
+						// 否则下一轮会把整条 history 都算成"新增"，增量 prefill 指标错乱
+						lastPrompt = m.PromptTokens
 					}
-					lastPrompt = m.PromptTokens
 					log.Printf("    turn%d (ctx≈%dtk +%dtk)", turn+1, m.PromptTokens, m.NewTokens)
 					if mt.KeepAssistant && m.ReplyText != "" {
 						reply := m.ReplyText
@@ -395,7 +390,7 @@ func collectSessionTurns(ctx context.Context, e *env, cfg *config.Config,
 
 	mt := cfg.Multiturn
 	maxTok := cfg.Thinking.MaxTokens(mt.MaxTokens, v)
-	baseSeed := int64(5000 + sessionIdx*10000 + cfg.SeedSalt)
+	baseSeed := sessionSeed(sessionIdx, cfg.SeedSalt)
 	msgs := []engine.Message{}
 	userTurns := e.sessionUserTurns(sessionIdx)
 	if e.trace == nil {
@@ -430,8 +425,9 @@ func collectSessionTurns(ctx context.Context, e *env, cfg *config.Config,
 			} else {
 				m.NewTokens = m.PromptTokens
 			}
+			// 与 Multiturn 同语义：失败轮不推进基准
+			lastPrompt = m.PromptTokens
 		}
-		lastPrompt = m.PromptTokens
 		out = append(out, m)
 		if mt.KeepAssistant && m.ReplyText != "" {
 			reply := m.ReplyText
@@ -535,7 +531,7 @@ func runClosedRound(ctx context.Context, e *env, cfg *config.Config,
 			maxTok := cfg.Thinking.MaxTokens(cc.MaxTokens, v)
 			promptTokens := cfg.ClampOne(cc.PromptTokens)
 			for r := 0; r < cc.RunsPerWorker; r++ {
-				seed := int64(90000 + workerID*100 + r + cfg.SeedSalt) // 每用户不同 prompt
+				seed := workerSeed(workerID, r, cfg.SeedSalt) // 每用户不同 prompt
 				msgs := []engine.Message{engine.UserMsg(promptTokens, seed, cfg.Fillers())}
 				m := runOne(ctx, e, model, msgs, maxTok, v)
 				mu.Lock()
@@ -586,7 +582,7 @@ func runOpenRound(ctx context.Context, e *env, cfg *config.Config,
 				mu.Unlock()
 				return
 			}
-			seed := int64(90000 + i + cfg.SeedSalt)
+			seed := openWorkerSeed(i, cfg.SeedSalt)
 			msgs := []engine.Message{engine.UserMsg(cfg.ClampOne(cc.PromptTokens), seed, cfg.Fillers())}
 			m := runOne(ctx, e, model, msgs, maxTok, v)
 			mu.Lock()
@@ -643,6 +639,27 @@ func finalizeLevel(e *env, lv *report.ConcurrentLevel, wall float64) {
 	}
 	lv.SLOMeet = meet
 }
+
+// ── 种子派生（表驱动测试锁定语义：盐值隔离战役、fixed_seed 档内复用/档间独立、worker 间互异） ──
+
+// singleSeed 单发场景：fixed_seed 时每档独立种子（档位内各 run 复用同一 prompt 测缓存对照）。
+// 不要让不同档位共享种子——语料窗口同起点会使档位间 prompt 互为嵌套前缀，
+// 上一档的缓存会"预热"下一档的 run1，冷启动测量就不干净了。
+func singleSeed(fixed bool, tokens, run, salt int) int64 {
+	if fixed {
+		return int64(1000 + tokens + salt)
+	}
+	return int64(tokens*100 + run + salt)
+}
+
+// sessionSeed 多轮会话：不同会话（含并发多轮的不同虚拟用户）内容互异。
+func sessionSeed(sessionIdx, salt int) int64 { return int64(5000 + sessionIdx*10000 + salt) }
+
+// workerSeed 闭环并发单轮：不同 worker / 不同 run 内容互异。
+func workerSeed(workerIdx, run, salt int) int64 { return int64(90000 + workerIdx*100 + run + salt) }
+
+// openWorkerSeed 开环并发单轮。
+func openWorkerSeed(i, salt int) int64 { return int64(90000 + i + salt) }
 
 // nextTurnTokens 根据上下文截止计算本轮 user 消息的 token 规模。
 // lastPrompt 为上一轮服务端实测 prompt_tokens（首轮传 0）；返回 0 表示已达上限应停轮。

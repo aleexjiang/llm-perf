@@ -14,6 +14,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -33,6 +34,14 @@ type Message struct {
 	Content string `json:"content"`
 }
 
+// RetryPolicy 可选的连接层重试策略。压测语义下默认关闭（重试会掩盖服务端的不稳定），
+// 开启后只对瞬时失败重试：TCP/流被 reset、HTTP 5xx/429。重试本身会记入 warnings
+// （retried ×N）与 RetryCount——测量的计时窗口是干净的，但服务端的不稳定不会从数据里消失。
+type RetryPolicy struct {
+	MaxAttempts int           // 总尝试次数（1 = 不重试）
+	Backoff     time.Duration // 退避基数（默认 300ms，指数退避，封顶 5s）
+}
+
 // Client 是 OpenAI 兼容客户端（流式/非流式）。
 type Client struct {
 	BaseURL      string       // 如 http://host:30082/router/v1
@@ -40,6 +49,7 @@ type Client struct {
 	IncludeUsage bool         // 请求 stream_options.include_usage
 	HTTP         *http.Client //
 	DebugDir     string       // 非空时留存每个请求的原始响应到该目录（排查魔改引擎）；请求失败时即使为空也会留存
+	Retry        *RetryPolicy // nil = 不重试（压测默认）
 
 	seq atomic.Int64 // 原始流量转储文件序号
 }
@@ -89,12 +99,12 @@ type TurnMetrics struct {
 	Error           string `json:"error,omitempty"`
 
 	// usage（服务端精确值）
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	ReasoningTokens  int `json:"reasoning_tokens,omitempty"`
-	TotalTokens      int `json:"total_tokens"`
-	CachedTokens     int `json:"cached_tokens,omitempty"` // usage.prompt_tokens_details.cached_tokens（引擎不回传时缺省）
-	FinishReason     string `json:"finish_reason,omitempty"` // stop / length / ...（思考吃光预算时为 length 且无 content）
+	PromptTokens     int    `json:"prompt_tokens"`
+	CompletionTokens int    `json:"completion_tokens"`
+	ReasoningTokens  int    `json:"reasoning_tokens,omitempty"`
+	TotalTokens      int    `json:"total_tokens"`
+	CachedTokens     int    `json:"cached_tokens,omitempty"`   // usage.prompt_tokens_details.cached_tokens（引擎不回传时缺省）
+	FinishReason     string `json:"finish_reason,omitempty"`   // stop / length / ...（思考吃光预算时为 length 且无 content）
 	ReasoningField   string `json:"reasoning_field,omitempty"` // 思考增量字段名：reasoning / reasoning_content（引擎口径证据）
 
 	// NewTokens 多轮场景专用：本轮相对上一轮新增的 prompt tokens（scenario 层在响应返回后填）。
@@ -102,21 +112,21 @@ type TurnMetrics struct {
 	NewTokens int `json:"new_tokens,omitempty"`
 
 	// 派生指标（Finalize 后填充），单位 ms；非流式时 TTFT/思考/ITL 为 0（N/A）
-	E2EMS   float64 `json:"e2e_ms"`                // 请求发出 -> 结束（两种模式都有）
-	TTFT    float64 `json:"ttft_ms,omitempty"`     // 首个任意 chunk（含排队 + prefill）
+	E2EMS         float64 `json:"e2e_ms"`                      // 请求发出 -> 结束（两种模式都有）
+	TTFT          float64 `json:"ttft_ms,omitempty"`           // 首个任意 chunk（含排队 + prefill）
 	TTFTReasoning float64 `json:"ttft_reasoning_ms,omitempty"` // 首个 reasoning chunk ≈ prefill 完成
 	TTFTContent   float64 `json:"ttft_content_ms,omitempty"`   // 首个 content chunk = prefill + 思考
-	ThinkMS  float64  `json:"think_ms,omitempty"`  // reasoning 首包 -> content 首包
-	DecodeMS float64  `json:"decode_ms,omitempty"` // content 首包 -> 结束
-	ITLAvg   float64  `json:"itl_avg_ms,omitempty"`
-	ITLP50   float64  `json:"itl_p50_ms,omitempty"`
-	ITLP90   float64  `json:"itl_p90_ms,omitempty"`
-	ITLP95   float64  `json:"itl_p95_ms,omitempty"`
-	ITLP99   float64  `json:"itl_p99_ms,omitempty"`
-	ITLMax   float64  `json:"itl_max_ms,omitempty"`
+	ThinkMS       float64 `json:"think_ms,omitempty"`          // reasoning 首包 -> content 首包
+	DecodeMS      float64 `json:"decode_ms,omitempty"`         // content 首包 -> 结束
+	ITLAvg        float64 `json:"itl_avg_ms,omitempty"`
+	ITLP50        float64 `json:"itl_p50_ms,omitempty"`
+	ITLP90        float64 `json:"itl_p90_ms,omitempty"`
+	ITLP95        float64 `json:"itl_p95_ms,omitempty"`
+	ITLP99        float64 `json:"itl_p99_ms,omitempty"`
+	ITLMax        float64 `json:"itl_max_ms,omitempty"`
 	// TPOT 每 output token 时间（GenAI-Perf 口径：(E2E−TTFT)/(completion−1)，含思考 token），
 	// 横评常用；与 ITL（仅 content chunk 间隔）互补
-	TPOTMS      float64 `json:"tpot_ms,omitempty"`
+	TPOTMS       float64 `json:"tpot_ms,omitempty"`
 	TokensPerSec float64 `json:"tokens_per_sec"`
 
 	// SrvDelta 服务端 /metrics counter 增量（前缀缓存命中、preemptions、MTP 接受率）；
@@ -126,6 +136,13 @@ type TurnMetrics struct {
 	// 思考吃光输出预算标记：Thinking + 流式 + 全程无 content + finish_reason=length。
 	// 此时 ThinkMS/DecodeMS/ITL 均不可测，分析时应剔除或调大 max_tokens 重跑。
 	ThinkingNoContent bool `json:"thinking_no_content,omitempty"`
+
+	// StreamBroken 流式读取中断（连接 reset/EOF 等）：响应不完整，TTFT/usage 可能部分可用
+	// 但整体不可信。重试策略（RetryPolicy）以此判定可重试。
+	StreamBroken bool `json:"stream_broken,omitempty"`
+
+	// RetryCount 经历过几次重试（RetryPolicy 开启时；计时只含最后一次成功尝试）
+	RetryCount int `json:"retry_count,omitempty"`
 
 	// 引擎兼容性告警（usage 缺失、未知增量字段、流未正常终止等）——排查魔改引擎的关键线索
 	Warnings []string `json:"warnings,omitempty"`
@@ -221,12 +238,63 @@ type ChatOptions struct {
 	Messages  []Message
 	MaxTokens int
 	Stream    bool
-	Thinking  bool            // 仅记录进指标，标记本请求是否思考开启
-	ExtraBody map[string]any  // 合并进请求体（思考开关等透传；不可覆盖 model/messages）
+	Thinking  bool           // 仅记录进指标，标记本请求是否思考开启
+	ExtraBody map[string]any // 合并进请求体（思考开关等透传；不可覆盖 model/messages）
 }
 
 // Chat 发起一次 chat completion（流式或非流式），返回计时指标。
+// 配置了 RetryPolicy 时对"连接层瞬时失败"重试（见 RetryPolicy），计时只记最终成功的那次尝试。
 func (c *Client) Chat(ctx context.Context, o ChatOptions) (*TurnMetrics, error) {
+	attempts := 1
+	if c.Retry != nil && c.Retry.MaxAttempts > 1 {
+		attempts = c.Retry.MaxAttempts
+	}
+	var last *TurnMetrics
+	var lastErr error
+	retried := 0
+	firstErr := ""
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			backoff := c.Retry.Backoff
+			if backoff <= 0 {
+				backoff = 300 * time.Millisecond
+			}
+			if d := backoff << (i - 1); d < 5*time.Second {
+				backoff = d // 指数退避，封顶 5s
+			} else {
+				backoff = 5 * time.Second
+			}
+			select {
+			case <-ctx.Done():
+				return last, lastErr
+			case <-time.After(backoff):
+			}
+		}
+		m, err, retryable := c.attempt(ctx, o)
+		last, lastErr = m, err
+		if !retryable || i == attempts-1 {
+			if retried > 0 && m != nil {
+				m.RetryCount = retried
+				m.warn("retried ×%d: %s", retried, firstErr)
+			}
+			return m, err
+		}
+		retried++
+		if firstErr == "" {
+			if err != nil {
+				firstErr = err.Error()
+			} else if m != nil {
+				firstErr = m.Error
+			}
+		}
+	}
+	return last, lastErr // 不可达（循环内已返回）
+}
+
+// attempt 执行一次完整请求尝试。retryable 表示该失败属于"连接层瞬时失败"，
+// 值得重试：传输错误（非 ctx 取消/超时）、HTTP 5xx/429、流式读取中断。
+// HTTP 4xx 是服务端确定性行为（记录进数据），不重试。
+func (c *Client) attempt(ctx context.Context, o ChatOptions) (m *TurnMetrics, err error, retryable bool) {
 	body := map[string]any{
 		"model":      o.Model,
 		"messages":   o.Messages,
@@ -244,14 +312,14 @@ func (c *Client) Chat(ctx context.Context, o ChatOptions) (*TurnMetrics, error) 
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {
-		return nil, err
+		return nil, err, false
 	}
 
-	m := &TurnMetrics{Model: o.Model, Stream: o.Stream, Thinking: o.Thinking}
+	m = &TurnMetrics{Model: o.Model, Stream: o.Stream, Thinking: o.Thinking}
 	m.appendRaw(string(payload) + "\n--- RESPONSE ---\n")
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/chat/completions", bytes.NewReader(payload))
 	if err != nil {
-		return nil, err
+		return nil, err, false
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if c.APIKey != "" {
@@ -265,7 +333,9 @@ func (c *Client) Chat(ctx context.Context, o ChatOptions) (*TurnMetrics, error) 
 		m.EndAt = time.Now()
 		m.Finalize()
 		c.dumpIfNeeded(m, payload, 0, nil, o.Stream)
-		return m, fmt.Errorf("request failed: %w", err)
+		// ctx 取消/超时是调用方或整请求超时的确定性行为，重试只会重复等待
+		transient := !(errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded))
+		return m, fmt.Errorf("request failed: %w", err), transient
 	}
 	defer resp.Body.Close()
 
@@ -276,7 +346,8 @@ func (c *Client) Chat(ctx context.Context, o ChatOptions) (*TurnMetrics, error) 
 		m.Finalize()
 		m.appendRaw(fmt.Sprintf("HTTP %d\n", resp.StatusCode) + string(buf))
 		c.dumpIfNeeded(m, payload, resp.StatusCode, resp.Header, o.Stream)
-		return m, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(buf), 500))
+		retryable = resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests
+		return m, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(buf), 500)), retryable
 	}
 
 	if o.Stream {
@@ -287,13 +358,14 @@ func (c *Client) Chat(ctx context.Context, o ChatOptions) (*TurnMetrics, error) 
 	m.EndAt = time.Now()
 	m.Finalize()
 	c.dumpIfNeeded(m, payload, resp.StatusCode, resp.Header, o.Stream)
-	return m, nil
+	return m, nil, m.StreamBroken
 }
 
 // readStream 读 SSE 流：解析/告警逻辑在 sse.go（与 probe 共用），这里只接网络与真实时钟。
 func (c *Client) readStream(resp *http.Response, m *TurnMetrics) {
 	if err := ingestSSEBody(m, resp.Body, time.Now, c.IncludeUsage); err != nil {
-		return // 读取错误已记入 warnings
+		m.StreamBroken = true // 读取中断：连接层瞬时失败，可重试
+		return
 	}
 	m.closeOutWarnings(c.IncludeUsage)
 }

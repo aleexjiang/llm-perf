@@ -126,6 +126,11 @@ func main() {
 	}
 
 	client := engine.NewClient(cfg.Endpoint, cfg.APIKey, cfg.Timeout(), *cfg.IncludeUsage)
+	if cfg.Retry != nil && cfg.Retry.MaxAttempts > 1 {
+		backoff := time.Duration(cfg.Retry.BackoffMS) * time.Millisecond
+		client.Retry = &engine.RetryPolicy{MaxAttempts: cfg.Retry.MaxAttempts, Backoff: backoff}
+		log.Printf("重试策略: 连接层瞬时失败最多尝试 %d 次", cfg.Retry.MaxAttempts)
+	}
 	if cfg.Debug {
 		client.DebugDir = filepath.Join(cfg.OutputDir, "raw")
 	}
@@ -147,13 +152,13 @@ func main() {
 			model = cfg.Models[0]
 		}
 		res := engine.Probe(ctx, engine.ProbeOptions{
-			Endpoint:     cfg.Endpoint,
-			APIKey:       cfg.APIKey,
-			Model:        model,
-			ThinkingOn:   cfg.Thinking.ExtraBodyOn,
-			ThinkingOff:  cfg.Thinking.ExtraBodyOff,
-			IncludeUsage: *cfg.IncludeUsage,
-			MaxContext:   cfg.LargestPromptTokens(),
+			Endpoint:       cfg.Endpoint,
+			APIKey:         cfg.APIKey,
+			Model:          model,
+			ThinkingOn:     cfg.Thinking.ExtraBodyOn,
+			ThinkingOff:    cfg.Thinking.ExtraBodyOff,
+			IncludeUsage:   *cfg.IncludeUsage,
+			MaxContext:     cfg.LargestPromptTokens(),
 			XVPromptTokens: cfg.Concurrent.PromptTokens,
 			XVMaxTokens:    cfg.Concurrent.MaxTokens,
 		})

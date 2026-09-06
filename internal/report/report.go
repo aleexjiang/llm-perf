@@ -43,8 +43,8 @@ type ConcurrentLevel struct {
 	ThroughputTPS float64               `json:"throughput_tps"` // 整体 completion tokens/s
 
 	// goodput（SLO 约束吞吐，配置了 goodput 时填充）：SLOMeet/SLOTotal 为达标/总请求数（多轮按 turn 计）
-	SLOMeet  int     `json:"slo_meet,omitempty"`
-	SLOTotal int     `json:"slo_total,omitempty"`
+	SLOMeet    int     `json:"slo_meet,omitempty"`
+	SLOTotal   int     `json:"slo_total,omitempty"`
 	GoodputRPS float64 `json:"goodput_rps,omitempty"` // 达标请求 / 墙钟
 	GoodputTPS float64 `json:"goodput_tps,omitempty"` // 达标请求的 completion tokens / 墙钟
 }
@@ -57,11 +57,11 @@ type SLO struct {
 
 // CorrectnessRow 一条正确性金丝雀请求的结果。
 type CorrectnessRow struct {
-	Number   string  `json:"number"` // 要求转写的目标数字
-	Reply    string  `json:"reply"`
-	Match    bool    `json:"match"`
-	E2EMS    float64 `json:"e2e_ms"`
-	Error    string  `json:"error,omitempty"`
+	Number string  `json:"number"` // 要求转写的目标数字
+	Reply  string  `json:"reply"`
+	Match  bool    `json:"match"`
+	E2EMS  float64 `json:"e2e_ms"`
+	Error  string  `json:"error,omitempty"`
 }
 
 // GaugeSummary / HistSummary / ServerMetricsSummary：服务端 /metrics 观测汇总。
@@ -71,10 +71,10 @@ type ServerMetricsSummary struct {
 	Note      string `json:"note,omitempty"`
 
 	// counter 窗口差值（并发窗口内为混合贡献；命中率 = hit/query）
-	CacheHitTokens   float64 `json:"cache_hit_tokens,omitempty"`
-	CacheQueryTokens float64 `json:"cache_query_tokens,omitempty"`
-	Preemptions      float64 `json:"preemptions,omitempty"`
-	SpecDrafts       float64 `json:"spec_drafts,omitempty"`
+	CacheHitTokens     float64 `json:"cache_hit_tokens,omitempty"`
+	CacheQueryTokens   float64 `json:"cache_query_tokens,omitempty"`
+	Preemptions        float64 `json:"preemptions,omitempty"`
+	SpecDrafts         float64 `json:"spec_drafts,omitempty"`
 	SpecAcceptedTokens float64 `json:"spec_accepted_tokens,omitempty"`
 
 	// gauge 轮询聚合（running/waiting 排队深度、kv_usage KV 池占用率）
@@ -92,16 +92,16 @@ const Version = "llm-perf/0.3"
 
 // Report 是一次场景执行的完整数据，整体落盘为单个 JSON 文件。
 type Report struct {
-	Tool        string            `json:"tool"`
-	Scenario    string            `json:"scenario"`
-	GeneratedAt time.Time         `json:"generated_at"`
-	Endpoint    string            `json:"endpoint"`
-	Note        string            `json:"note,omitempty"`
-	SLO         *SLO              `json:"slo,omitempty"`
-	Single      []SingleRow       `json:"single,omitempty"`
-	Multiturn   []MultiturnRun    `json:"multiturn,omitempty"`
-	Concurrent  []ConcurrentLevel `json:"concurrent,omitempty"`
-	Correctness []CorrectnessRow  `json:"correctness,omitempty"`
+	Tool        string                `json:"tool"`
+	Scenario    string                `json:"scenario"`
+	GeneratedAt time.Time             `json:"generated_at"`
+	Endpoint    string                `json:"endpoint"`
+	Note        string                `json:"note,omitempty"`
+	SLO         *SLO                  `json:"slo,omitempty"`
+	Single      []SingleRow           `json:"single,omitempty"`
+	Multiturn   []MultiturnRun        `json:"multiturn,omitempty"`
+	Concurrent  []ConcurrentLevel     `json:"concurrent,omitempty"`
+	Correctness []CorrectnessRow      `json:"correctness,omitempty"`
 	Server      *ServerMetricsSummary `json:"server_metrics,omitempty"`
 }
 

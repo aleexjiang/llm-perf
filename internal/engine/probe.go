@@ -29,23 +29,23 @@ type ProbeCheck struct {
 // CrossCheck 交叉验证建议：识别出引擎后给出对应的原生 perf 工具与等价命令。
 // 工具结果存疑时，用户可用引擎原生工具独立复核（对数量级与分位趋势，非逐数对齐）。
 type CrossCheck struct {
-	Tool    string `json:"tool"`               // 原生工具（含运行方式）
-	Command string `json:"command,omitempty"`  // 按当前配置映射的等价命令（能给出来的都给出）
+	Tool    string `json:"tool"`              // 原生工具（含运行方式）
+	Command string `json:"command,omitempty"` // 按当前配置映射的等价命令（能给出来的都给出）
 	Note    string `json:"note,omitempty"`
 }
 
 // ProbeResult 一次兼容性探测的完整报告（落盘为 probe-<时间戳>.json）。
 type ProbeResult struct {
-	GeneratedAt time.Time    `json:"generated_at"`
-	Endpoint    string       `json:"endpoint"`
-	Server      string       `json:"server_header,omitempty"`
-	EngineGuess string       `json:"engine_guess,omitempty"`
-	Models      []string     `json:"models,omitempty"`
-	ModelMaxLen int          `json:"model_max_len,omitempty"` // 服务端报告的模型上下文上限（vLLM 等提供）
-	Checks      []ProbeCheck `json:"checks"`
-	Verdicts    []string     `json:"verdicts,omitempty"`
-	CrossChecks []CrossCheck `json:"cross_checks,omitempty"` // 交叉验证建议（引擎→原生 perf 工具）
-	ServerMetrics string     `json:"server_metrics,omitempty"` // /metrics 可用性（观测层前置条件）
+	GeneratedAt   time.Time    `json:"generated_at"`
+	Endpoint      string       `json:"endpoint"`
+	Server        string       `json:"server_header,omitempty"`
+	EngineGuess   string       `json:"engine_guess,omitempty"`
+	Models        []string     `json:"models,omitempty"`
+	ModelMaxLen   int          `json:"model_max_len,omitempty"` // 服务端报告的模型上下文上限（vLLM 等提供）
+	Checks        []ProbeCheck `json:"checks"`
+	Verdicts      []string     `json:"verdicts,omitempty"`
+	CrossChecks   []CrossCheck `json:"cross_checks,omitempty"`   // 交叉验证建议（引擎→原生 perf 工具）
+	ServerMetrics string       `json:"server_metrics,omitempty"` // /metrics 可用性（观测层前置条件）
 }
 
 // ProbeOptions 探测参数。

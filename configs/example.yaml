@@ -37,6 +37,12 @@ dataset:
 # correctness:
 #   samples: 8
 
+# 连接层重试（默认关闭——压测语义下重试会掩盖服务端不稳定）：只重试瞬时失败
+# （TCP/流被 reset、HTTP 5xx/429），4xx 不重试。重试会计入 warnings/retry_count 留痕
+# retry:
+#   max_attempts: 2     # 总尝试次数
+#   backoff_ms: 300     # 退避基数（指数退避，封顶 5s）
+
 models:
   - "/models/DeepSeek-V4-Flash-0731"
   - "/models/Qwen3.8-27B"

@@ -153,6 +153,7 @@ server_metrics: true   # 抓推理服务原生 /metrics（vLLM 默认暴露）�
 ## 其他
 
 - **预热**：`warmup_requests: N` 每场景开始前发 N 条小请求暖连接（不计入统计，唯一内容不污染缓存对照）
+- **连接层重试**：`retry: {max_attempts: 2, backoff_ms: 300}` 对瞬时失败（reset/5xx/429）重试，默认关闭；重试留痕 warnings/retry_count
 - **goodput**：`goodput: {ttft_ms: 2000, tpot_ms: 100}` 定义 SLO，concurrent 结果输出达标数与有效吞吐
 - **正确性抽查**：`correctness: {samples: 8}` 数字转写金丝雀，防"HTTP 200 但内容异常"的假成功
 

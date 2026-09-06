@@ -36,10 +36,10 @@ type Concurrent struct {
 
 	// 开环到达率模式（对齐 vLLM bench serve / inference-perf）：request_rate>0 或 rate_sweep
 	// 非空时替代 levels 闭环——请求按 Poisson 过程到达，能测出排队-延迟曲线
-	RequestRate   float64   `yaml:"request_rate"`   // 到达率（req/s），>0 启用开环模式
-	RateSweep     []float64 `yaml:"rate_sweep"`     // 多档到达率扫描（饱和点寻找），每档跑一轮开环
-	NumPrompts    int       `yaml:"num_prompts"`    // 开环模式总请求数（multiturn 时为总会话数）
-	MaxConcurrency int      `yaml:"max_concurrency"` // 开环模式并发上限（0=不限）
+	RequestRate    float64   `yaml:"request_rate"`    // 到达率（req/s），>0 启用开环模式
+	RateSweep      []float64 `yaml:"rate_sweep"`      // 多档到达率扫描（饱和点寻找），每档跑一轮开环
+	NumPrompts     int       `yaml:"num_prompts"`     // 开环模式总请求数（multiturn 时为总会话数）
+	MaxConcurrency int       `yaml:"max_concurrency"` // 开环模式并发上限（0=不限）
 }
 
 // DatasetCfg 数据源：filler（默认，token 精确的合成/语料填充，用于变量控制实验）
@@ -58,6 +58,13 @@ type GoodputCfg struct {
 	TPOTMS float64 `yaml:"tpot_ms"` // 如 100
 }
 
+// RetryCfg 连接层重试策略（默认关闭）：只重试瞬时失败（TCP/流被 reset、HTTP 5xx/429），
+// 4xx 不重试。重试会记入 warnings 与 retry_count——计时窗口干净，但服务端不稳定仍可见。
+type RetryCfg struct {
+	MaxAttempts int `yaml:"max_attempts"` // 总尝试次数；0/1 = 不重试
+	BackoffMS   int `yaml:"backoff_ms"`   // 退避基数，默认 300ms，指数退避封顶 5s
+}
+
 // CorrectnessCfg 正确性抽查（llmperf 式防"假成功"）：向服务发数字转写金丝雀请求，
 // 验证回复确实包含目标数字——结构上 200 但内容异常（缓存污染/截断/网关伪响应）能被揪出。
 type CorrectnessCfg struct {
@@ -67,15 +74,15 @@ type CorrectnessCfg struct {
 // Thinking 思考模式配置。
 // 通用透传设计（对齐 vLLM --extra-body）：不硬编码参数名，on/off 两套 JSON 合并进请求体。
 type Thinking struct {
-	Mode           string         `yaml:"mode"`              // both（默认，A/B 对照）| on | off
-	ExtraBodyOn    map[string]any `yaml:"extra_body_on"`     // 思考开启时合并进请求体
-	ExtraBodyOff   map[string]any `yaml:"extra_body_off"`    // 思考关闭时合并进请求体
-	MaxTokensFloor int            `yaml:"max_tokens_floor"`  // 思考开启时 max_tokens 下限保护（防思考吃光输出预算）
+	Mode           string         `yaml:"mode"`             // both（默认，A/B 对照）| on | off
+	ExtraBodyOn    map[string]any `yaml:"extra_body_on"`    // 思考开启时合并进请求体
+	ExtraBodyOff   map[string]any `yaml:"extra_body_off"`   // 思考关闭时合并进请求体
+	MaxTokensFloor int            `yaml:"max_tokens_floor"` // 思考开启时 max_tokens 下限保护（防思考吃光输出预算）
 }
 
 // ThinkingVariant 是一个思考模式变体。
 type ThinkingVariant struct {
-	Name      string         // "off" / "on"
+	Name      string // "off" / "on"
 	Enabled   bool
 	ExtraBody map[string]any
 }
@@ -104,15 +111,15 @@ func (t Thinking) MaxTokens(maxTokens int, v ThinkingVariant) int {
 }
 
 type Config struct {
-	Endpoint       string `yaml:"endpoint"`
-	APIKeyEnv      string `yaml:"api_key_env"`
-	OutputDir      string `yaml:"output_dir"`
-	TimeoutSeconds int    `yaml:"timeout_seconds"`
-	IncludeUsage   *bool  `yaml:"include_usage"`
-	FillerLang     string `yaml:"filler_lang"`
-	FillerCorpus   string `yaml:"filler_corpus"` // "":合成词表 | "en"/"zh":内置公版书语料 | 文件路径(.txt/.txt.gz):自定义语料
-	Stream         *bool  `yaml:"stream"`        // 默认 true；false 时 TTFT/ITL/思考拆分不可测（N/A）
-	Debug          bool   `yaml:"debug"`         // true: 每个请求的原始响应留存到 <output_dir>/raw/，日志同步写 run.log（排查魔改引擎用）
+	Endpoint       string   `yaml:"endpoint"`
+	APIKeyEnv      string   `yaml:"api_key_env"`
+	OutputDir      string   `yaml:"output_dir"`
+	TimeoutSeconds int      `yaml:"timeout_seconds"`
+	IncludeUsage   *bool    `yaml:"include_usage"`
+	FillerLang     string   `yaml:"filler_lang"`
+	FillerCorpus   string   `yaml:"filler_corpus"` // "":合成词表 | "en"/"zh":内置公版书语料 | 文件路径(.txt/.txt.gz):自定义语料
+	Stream         *bool    `yaml:"stream"`        // 默认 true；false 时 TTFT/ITL/思考拆分不可测（N/A）
+	Debug          bool     `yaml:"debug"`         // true: 每个请求的原始响应留存到 <output_dir>/raw/，日志同步写 run.log（排查魔改引擎用）
 	Models         []string `yaml:"models"`
 
 	// MaxPromptTokens 上下文截止（tokens）：>0 时所有请求的 prompt 规模都不超过该值。
@@ -122,8 +129,8 @@ type Config struct {
 
 	// ServerMetrics 服务端观测层：抓取推理服务原生 /metrics（vLLM 默认暴露），
 	// 补充前缀缓存命中率、排队深度、prefill/decode 分解、MTP 接受率（不可达时自动降级并告警）
-	ServerMetrics   bool `yaml:"server_metrics"`
-	MetricsIntervalMS int `yaml:"metrics_interval_ms"` // gauge 轮询间隔，默认 500
+	ServerMetrics     bool `yaml:"server_metrics"`
+	MetricsIntervalMS int  `yaml:"metrics_interval_ms"` // gauge 轮询间隔，默认 500
 
 	// WarmupRequests 每场景开始前的预热请求数（不计入统计）：
 	// 暖连接池/首包路径；用唯一内容避免污染被测前缀的缓存对照
@@ -134,8 +141,9 @@ type Config struct {
 	// 每次测试战役（改代码/改配置后的重测）递增盐值即可隔离；不改服务端也能拿到干净的冷缓存。
 	SeedSalt int `yaml:"seed_salt"`
 
-	Dataset     DatasetCfg    `yaml:"dataset"`
-	Goodput     *GoodputCfg   `yaml:"goodput"`
+	Dataset     DatasetCfg      `yaml:"dataset"`
+	Goodput     *GoodputCfg     `yaml:"goodput"`
+	Retry       *RetryCfg       `yaml:"retry"`
 	Correctness *CorrectnessCfg `yaml:"correctness"`
 
 	Thinking Thinking `yaml:"thinking"`
