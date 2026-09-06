@@ -87,6 +87,7 @@ func main() {
 	corpusFlag := fs.String("corpus", "", "填充语料：en/zh（内置公版书）或自定义文件路径（.txt/.txt.gz）；覆盖配置 filler_corpus")
 	maxCtxFlag := fs.Int("max-ctx", 0, "上下文截止（tokens）：>0 时所有请求 prompt 不超过该值；覆盖配置 max_prompt_tokens")
 	saltFlag := fs.Int("seed-salt", 0, "种子盐值：隔离测试战役（服务端 prefix cache 未清空时重测用）；覆盖配置 seed_salt")
+	thinkingFlag := fs.String("thinking", "", "只跑某个思考变体：on/off（开思考费 token，建议 off/on 分开两轮跑，互不连坐）；覆盖配置 thinking.mode")
 	fs.Parse(os.Args[2:])
 
 	cfg, err := config.Load(*cfgPath)
@@ -102,6 +103,14 @@ func main() {
 	}
 	if *saltFlag > 0 {
 		cfg.SeedSalt = *saltFlag
+	}
+	if *thinkingFlag != "" {
+		if *thinkingFlag != "on" && *thinkingFlag != "off" {
+			fmt.Fprintln(os.Stderr, "--thinking 只接受 on 或 off（跑两轮就都能覆盖，无需 both）")
+			os.Exit(1)
+		}
+		cfg.Thinking.Mode = *thinkingFlag
+		log.Printf("思考模式（CLI 覆盖）: %s", *thinkingFlag)
 	}
 
 	// 语料模式：真实公版文本填充，比随机词表更贴近真实负载的 tokenization 分布

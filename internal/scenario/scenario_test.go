@@ -359,3 +359,23 @@ func TestScenarioRegistry(t *testing.T) {
 		t.Fatalf("All 应按注册顺序返回: %v", all)
 	}
 }
+
+func TestCtxLimitHit(t *testing.T) {
+	cases := []struct {
+		name string
+		err  string
+		want string
+	}{
+		{"vLLM 超限", `HTTP 400: {"error":"This model's maximum context length is 131072 tokens. However, you requested 200000 tokens."}`, "131072"},
+		{"400 但与上下文无关", `HTTP 400: {"error":"invalid parameter"}`, ""},
+		{"非 400", `HTTP 500: internal error`, ""},
+		{"400 提到上下文但无数字", `HTTP 400: context length exceeded`, "未知"},
+		{"无错误", "", ""},
+	}
+	for _, c := range cases {
+		m := &engine.TurnMetrics{Error: c.err}
+		if got := ctxLimitHit(m); got != c.want {
+			t.Errorf("%s: ctxLimitHit=%q want %q", c.name, got, c.want)
+		}
+	}
+}

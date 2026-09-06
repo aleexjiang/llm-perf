@@ -18,6 +18,7 @@ import (
 	"log"
 	"math"
 	"math/rand"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -129,6 +130,24 @@ func (e *env) warnTraceWrap(need int) {
 }
 
 // runOne 发起一次请求（流式/非流式、思考变体由 opts 决定），并做 /metrics counter 前后差值。
+// ctxLimitHit 识别"请求超过模型上下文上限"类失败（vLLM 对超限返回 400 且错误信息带
+// "maximum context length is N tokens"），返回解析出的上限数字；非该类错误返回 ""。
+// 现场语义：这类错误是确定性的（同档位重试必然再失败，更大档位更超），应立即止损。
+var ctxLimitRe = regexp.MustCompile(`(?i)context length is (\d+)`)
+
+func ctxLimitHit(m *engine.TurnMetrics) string {
+	if m == nil || m.Error == "" || !strings.Contains(m.Error, "HTTP 400") {
+		return ""
+	}
+	if !strings.Contains(strings.ToLower(m.Error), "context length") {
+		return ""
+	}
+	if mm := ctxLimitRe.FindStringSubmatch(m.Error); mm != nil {
+		return mm[1]
+	}
+	return "未知"
+}
+
 func runOne(ctx context.Context, e *env, model string,
 	msgs []engine.Message, maxTokens int, v config.ThinkingVariant) *engine.TurnMetrics {
 
@@ -344,9 +363,17 @@ func Single(ctx context.Context, cfg *config.Config, client *engine.Client, mode
 					seed := singleSeed(cfg.Single.FixedSeed, tokens, run, cfg.SeedSalt)
 					msgs := []engine.Message{engine.UserMsg(tokens, seed, cfg.Fillers())}
 					log.Printf("[single] %s thinking=%s %dtk run%d", model, v.Name, tokens, run+1)
-					row.Runs = append(row.Runs, runOne(ctx, e, model, msgs, maxTok, v))
+					m := runOne(ctx, e, model, msgs, maxTok, v)
+					row.Runs = append(row.Runs, m)
+					if limit := ctxLimitHit(m); limit != "" {
+						log.Printf("    🛑 触发模型上下文上限（limit=%stk）——跳过 %dtk 剩余 run 及更大档位（重试必然同样超限）", limit, tokens)
+						break
+					}
 				}
 				rep.Single = append(rep.Single, row)
+				if len(row.Runs) > 0 && ctxLimitHit(row.Runs[len(row.Runs)-1]) != "" {
+					break // 更大档位必然同样超限，跳过该模型该变体的剩余档位
+				}
 			}
 		}
 		rep.Correctness = append(rep.Correctness, runCorrectness(ctx, e, model)...)
@@ -390,6 +417,7 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 		warmup(ctx, e, model)
 		e.warnTraceWrap(mt.Sessions)
 		for _, v := range cfg.Thinking.Variants() {
+			ctxAborted := false // 触发模型上下文上限：剩余会话必然同样超限，全部跳过
 			for s := 0; s < mt.Sessions; s++ {
 				run := report.MultiturnRun{Model: model, Thinking: v.Name, Session: s + 1}
 				log.Printf("[multiturn] %s thinking=%s session%d", model, v.Name, s+1)
@@ -438,8 +466,17 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 						msgs = append(msgs, engine.Message{Role: "assistant", Content: reply})
 					}
 					run.Turns = append(run.Turns, m)
+					if limit := ctxLimitHit(m); limit != "" {
+						// 会话 history 已超限，继续加轮必然失败——结束该会话并跳过剩余会话
+						log.Printf("    🛑 触发模型上下文上限（limit=%stk，ctx≈%dtk）——提前结束会话，跳过剩余会话", limit, m.PromptTokens)
+						ctxAborted = true
+						break
+					}
 				}
 				rep.Multiturn = append(rep.Multiturn, run)
+				if ctxAborted {
+					break
+				}
 			}
 		}
 		rep.Correctness = append(rep.Correctness, runCorrectness(ctx, e, model)...)
