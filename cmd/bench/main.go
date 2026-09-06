@@ -145,6 +145,9 @@ func main() {
 		fmt.Fprintln(os.Stderr, "配置错误:", err)
 		os.Exit(1)
 	}
+	for _, w := range cfg.Warnings {
+		log.Printf("配置提示: %s", w)
+	}
 	// 别名翻译：仅当用户没显式给 --turns/--concurrency 时生效
 	if aliasTurns != "" || aliasConc != "" {
 		if aliasName == "concurrent" && !userSetTurns {

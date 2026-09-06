@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -119,6 +120,21 @@ type ThinkingVariant struct {
 
 // Variants 展开成变体列表：配了 levels 用 levels（保持声明顺序），否则按 mode 展开
 // （both 时先 off 后 on，便于报告对照）；CLI filter 非空时只留名字匹配的变体。
+// validateThinkingLevels 校验 levels 变体名非空且唯一（报告与日志按 name 分组，重名会串数据）。
+func validateThinkingLevels(th Thinking, where string) error {
+	seen := map[string]bool{}
+	for _, lv := range th.Levels {
+		if lv.Name == "" {
+			return fmt.Errorf("%s thinking.levels 变体缺少 name（报告与日志按 name 分组，必须显式命名）", where)
+		}
+		if seen[lv.Name] {
+			return fmt.Errorf("%s thinking.levels 变体名 %q 重复——档位名必须唯一", where, lv.Name)
+		}
+		seen[lv.Name] = true
+	}
+	return nil
+}
+
 func (t Thinking) Variants() []ThinkingVariant {
 	var vs []ThinkingVariant
 	if len(t.Levels) > 0 {
@@ -214,6 +230,10 @@ type Config struct {
 	// 跨请求存活——同一配置重跑时 prompt 与上次完全相同，"冷缓存"测量会被上次战役污染。
 	// 每次测试战役（改代码/改配置后的重测）递增盐值即可隔离；不改服务端也能拿到干净的冷缓存。
 	SeedSalt int `yaml:"seed_salt"`
+
+	// Warnings 配置诊断提示（Load 时生成，非序列化字段）：不阻止运行，
+	// 但启动时打印——数量级不合理、轮次不足、覆盖关系等"合法但值得知道"的事
+	Warnings []string `yaml:"-"`
 
 	Dataset     DatasetCfg      `yaml:"dataset"`
 	Goodput     *GoodputCfg     `yaml:"goodput"`
@@ -366,6 +386,81 @@ func Load(path string) (*Config, error) {
 	if cfg.Concurrent.RequestRate < 0 {
 		return nil, fmt.Errorf("concurrent.request_rate 不能为负")
 	}
+
+	// ── 输入合理性校验：错误在开跑前暴露，而不是跑完才发现 ──
+
+	// 单发档位：拒绝非正值；排序去重（被修正时提示）；相邻增量 <10% 拒绝
+	if len(cfg.Single.PromptTokens) > 0 {
+		for _, t := range cfg.Single.PromptTokens {
+			if t <= 0 {
+				return nil, fmt.Errorf("single.prompt_tokens 含非正值 %d——档位必须是正整数 token 数", t)
+			}
+		}
+		orig := append([]int(nil), cfg.Single.PromptTokens...)
+		sort.Ints(cfg.Single.PromptTokens)
+		ded := cfg.Single.PromptTokens[:0]
+		for i, t := range cfg.Single.PromptTokens {
+			if i == 0 || t != ded[len(ded)-1] {
+				ded = append(ded, t)
+			}
+		}
+		cfg.Single.PromptTokens = ded
+		changed := len(orig) != len(ded)
+		for i := 0; !changed && i < len(orig); i++ {
+			changed = orig[i] != ded[i]
+		}
+		if changed {
+			cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
+				"single.prompt_tokens 已排序去重 → %v（原顺序/重复档位不影响结果，但图表与日志按修正后顺序展示）", ded))
+		}
+		for i := 1; i < len(ded); i++ {
+			prev, cur := ded[i-1], ded[i]
+			if cur-prev < prev/10 {
+				return nil, fmt.Errorf(
+					"single.prompt_tokens 档位 %d 与前一档 %d 增量仅 %.1f%%（<10%%）——同量级档位的 TTFT 差异会淹没在请求间抖动里，测了也测不出结论；请拉开差距或删除多余档位（如 40000 之后想探更深，用 60000/80000 而不是 41000）",
+					cur, prev, float64(cur-prev)/float64(prev)*100)
+			}
+		}
+	}
+
+	// 多轮可行性：单轮消息过大直接拒绝；轮次不足与可达深度用提示
+	if cfg.Multiturn.TurnTokens > 200000 {
+		return nil, fmt.Errorf(
+			"multiturn.turn_tokens=%d 过大：单条 user 消息大概率超过模型上下文上限，该会话形状无法成立。多轮深度应通过增加轮次实现（如 turns: 16 + turn_tokens: 12300 → 末轮 ~200k），而不是增大单轮",
+			cfg.Multiturn.TurnTokens)
+	}
+	if cfg.Multiturn.Turns < 4 {
+		cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
+			"multiturn.turns=%d 偏少：TTFT 逐轮斜率与前缀缓存判定至少需要 4 轮才可靠（建议 8–16 轮）", cfg.Multiturn.Turns))
+	}
+	if cfg.Multiturn.TurnTokens > 0 {
+		base := cfg.Multiturn.SystemTokens + cfg.Multiturn.ToolDefsTokens
+		reach := base + cfg.Multiturn.Turns*cfg.Multiturn.TurnTokens
+		w := fmt.Sprintf("多轮可达深度：base %d + %d 轮 × %d ≈ 末轮 %d token",
+			base, cfg.Multiturn.Turns, cfg.Multiturn.TurnTokens, reach)
+		if cfg.MaxPromptTokens > 0 && reach > cfg.MaxPromptTokens {
+			w += fmt.Sprintf("（超过 max_prompt_tokens=%d，到顶后提前停轮）", cfg.MaxPromptTokens)
+		}
+		cfg.Warnings = append(cfg.Warnings, w)
+	}
+
+	// thinking levels：变体名唯一；levels 生效时提示 mode/extra_body 被覆盖
+	if err := validateThinkingLevels(cfg.Thinking, "全局"); err != nil {
+		return nil, err
+	}
+	if len(cfg.Thinking.Levels) > 0 {
+		cfg.Warnings = append(cfg.Warnings,
+			"thinking.levels 已配置：mode 与 extra_body_on/off 不再参与思考展开（以 levels 为准）")
+	}
+	for name, ov := range cfg.ModelThinking {
+		if ov == nil {
+			continue
+		}
+		if err := validateThinkingLevels(*ov, "model_thinking["+name+"]"); err != nil {
+			return nil, err
+		}
+	}
+
 	return cfg, nil
 }
 
