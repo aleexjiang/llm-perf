@@ -112,7 +112,8 @@ func (t Thinking) MaxTokens(maxTokens int, v ThinkingVariant) int {
 
 type Config struct {
 	Endpoint       string   `yaml:"endpoint"`
-	APIKeyEnv      string   `yaml:"api_key_env"`
+	APIKeyLiteral  string   `yaml:"api_key"`     // 字面量 key，直接写配置文件（该配置文件应避免入库）；环境变量 LLM_PERF_API_KEY 优先级更高
+	APIKeyEnv      string   `yaml:"api_key_env"` // 从哪个环境变量读 key（留空则跳过）；字面量 api_key 与环境变量都未提供时不带认证头
 	OutputDir      string   `yaml:"output_dir"`
 	TimeoutSeconds int      `yaml:"timeout_seconds"`
 	IncludeUsage   *bool    `yaml:"include_usage"`
@@ -185,8 +186,12 @@ func Load(path string) (*Config, error) {
 	if cfg.Endpoint == "" {
 		return nil, fmt.Errorf("endpoint 未配置（yaml endpoint 或 LLM_PERF_ENDPOINT）")
 	}
+	// 认证 key 解析优先级：环境变量 LLM_PERF_API_KEY > 配置字面量 api_key > api_key_env 指向的变量
 	if cfg.APIKeyEnv != "" {
 		cfg.APIKey = os.Getenv(cfg.APIKeyEnv)
+	}
+	if cfg.APIKeyLiteral != "" {
+		cfg.APIKey = cfg.APIKeyLiteral
 	}
 	if v := os.Getenv("LLM_PERF_API_KEY"); v != "" {
 		cfg.APIKey = v

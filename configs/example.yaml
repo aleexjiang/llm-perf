@@ -2,7 +2,7 @@
 # 环境变量覆盖（仅 shell export，工具不读 .env 文件）：LLM_PERF_ENDPOINT、LLM_PERF_API_KEY
 
 endpoint: "http://<客户路由IP>:30082/router/v1"
-api_key_env: "LLM_PERF_API_KEY"   # 从哪个环境变量读 key；留空则不带认证头
+api_key: ""                      # 字面量 key，直接写这里（仅用于不入库的本地配置）；也可改用 api_key_env 从环境变量读
 output_dir: "output"              # 输出 JSON 的默认目录（-o 可覆盖）
 timeout_seconds: 600              # 客户环境慢 + 并发高档位排队，放宽（300s 可能不够）
 include_usage: true               # 请求 stream_options.include_usage，从 usage 字段取精确 token 数

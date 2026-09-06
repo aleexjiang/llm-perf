@@ -57,9 +57,34 @@ thinking: {mode: "maybe"}
 	}
 }
 
+// 认证 key 解析优先级：环境变量 > 字面量 api_key > api_key_env
+func TestAPIKeyResolution(t *testing.T) {
+	p := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+api_key: "literal-key"
+api_key_env: "SOME_MISSING_VAR"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.APIKey != "literal-key" {
+		t.Fatalf("api_key literal should be used when env unset: %q", cfg.APIKey)
+	}
+	t.Setenv("LLM_PERF_API_KEY", "env-key")
+	cfg2, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg2.APIKey != "env-key" {
+		t.Fatalf("LLM_PERF_API_KEY should have highest priority: %q", cfg2.APIKey)
+	}
+}
+
 // 随仓库的每份配置都必须能通过严格解析（防止加字段后忘了同步模板）
 func TestShippedConfigsParse(t *testing.T) {
-	for _, name := range []string{"example.yaml", "smoke.yaml", "smoke-nostream.yaml", "qwen-smoke.yaml", "qwen3.8-27b.yaml"} {
+	for _, name := range []string{"example.yaml", "smoke.yaml", "smoke-all.yaml", "qwen3.8-27b.yaml"} {
 		p := filepath.Join("..", "..", "configs", name)
 		if _, err := Load(p); err != nil {
 			t.Errorf("%s: %v", name, err)
