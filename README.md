@@ -6,8 +6,8 @@
 用 `scripts/gen_html_report.py`（仓库自带，离线自包含 HTML，见[报告](#输出)）或 WorkBuddy
 等工具二次加工。
 
-面向堡垒机/内网交付场景：本机交叉编译出 linux/amd64 二进制，连同配置三件套
-（`bench` + `config.yaml` + `.env`）拷贝到客户环境执行，跑完把 JSON 拉回来分析。
+面向堡垒机/内网交付场景：本机交叉编译出 linux/amd64 二进制，连同配置文件
+（`bench` + `config.yaml`，端点与认证直接写进配置）拷贝到客户环境执行，跑完把 JSON 拉回来分析。
 
 ## 场景矩阵
 
@@ -212,8 +212,8 @@ node scripts/validate_report.js <报告.html>   # JS 端校验（占位符/图�
 
 ## 配置
 
-见 `configs/example.yaml`，含详细注释。环境变量优先级最高：
-`LLM_PERF_ENDPOINT`、`LLM_PERF_API_KEY`（`api_key_env` 指定从哪个变量读 key）。
+见 `configs/example.yaml`，含详细注释。端点与认证优先写配置文件（`endpoint` + `api_key` 字面量）；
+环境变量 `LLM_PERF_ENDPOINT`、`LLM_PERF_API_KEY` 优先级最高（应急通道；另有 `api_key_env` 指定从哪个变量读 key）。
 
 ## 开发
 
