@@ -151,7 +151,7 @@ server_metrics: true   # 抓推理服务原生 /metrics（vLLM 默认暴露）�
 ```
 
 指标命名经 `MetricsProvider` 抽象，**按抓取样本的指标名前缀自动识别引擎**（`vllm:` → vLLM、
-`sglang:` → SGLang，无法识别回落 vLLM）；SGLang 的缓存 counter 命名待真机校准（TODO.md #1）。
+`sglang:` → SGLang，无法识别回落 vLLM）；SGLang 的缓存 counter 命名待真机校准（待真机校准）。
 gauge 轮询自带健康度：从未成功或连续失败 ≥5 时 JSON 标记 `observation_degraded`，报告出红色警示。
 
 对标 NVIDIA AIPerf / inference-perf 的 server metrics 层，给客户端计时补上服务端视角：
@@ -203,10 +203,14 @@ JSON 结构见 `internal/report/report.go`：`single` / `multiturn` / `concurren
 元素分别为档位 / 会话 / 并发档位，每条请求是 `engine.TurnMetrics`；观测层开启时附
 `server_metrics` 汇总（缓存命中率/排队/prefill-decode 分解）与逐请求 `server_counter_delta`。
 
-JSON → HTML 报告（自包含、Chart.js 内嵌离线可用，支持按场景出单独报告）：
+JSON → HTML 分析报告（自包含、Chart.js 内嵌离线可用）。自动合并多份 JSON（含 thinking off/on 分离的战役）、
+数据驱动生成结论与建议（prefill 斜率、前缀缓存判定、decode 吞吐、思考行为分类），报告末尾内嵌
+`perf-summary` JSON 数据块——把整份 HTML 交给 AI 即可让它追加通俗解读备注：
 
 ```bash
-python3 scripts/gen_html_report.py output/ [标题] [multiturn|concurrent|single|all]
+python3 scripts/gen_html_report.py output/                    # 目录模式：递归合并目录下全部场景 JSON
+python3 scripts/gen_html_report.py a.json b.json [标题]        # 文件模式：显式指定一份或多份报告
+python3 scripts/gen_html_report.py output/ 标题 multiturn      # 旧用法兼容（第三参数=场景过滤）
 node scripts/validate_report.js <报告.html>   # JS 端校验（占位符/图表可执行）
 ```
 
@@ -221,8 +225,7 @@ node scripts/validate_report.js <报告.html>   # JS 端校验（占位符/图�
 make build          # 本机二进制（-ldflags 注入 git describe 版本号到 JSON 的 tool 字段）
 make test
 scripts/mock_server.py   # 本地 mock OpenAI 兼容流式服务 + /metrics（smoke.yaml 配套冒烟）
-scripts/gen_html_report.py  # JSON → 自包含 HTML 报告
+scripts/gen_html_report.py  # JSON → 自包含 HTML 分析报告（多文件合并 + 自动结论 + 内嵌 AI 摘要）
 scripts/validate_report.js  # 报告 JS 校验（占位符/图表可执行）
 deploy/             # 模型服务 docker-compose 存档（与 bench 配置对齐说明）
-TODO.md             # 代码改进待办（含验收标准）
 ```
