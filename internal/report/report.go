@@ -80,8 +80,12 @@ type ServerMetricsSummary struct {
 	// gauge 轮询聚合（running/waiting 排队深度、kv_usage KV 池占用率）
 	Gauges map[string]GaugeSummary `json:"gauges,omitempty"`
 
-	// histogram 窗口差值分位估计（服务端口径的延迟分解；key 为 vllm: 指标名）
+	// histogram 窗口差值分位估计（服务端口径的延迟分解；key 为引擎指标名）
 	Hists map[string]smetrics.HistDelta `json:"histograms,omitempty"`
+
+	// 观测健康度：gauge 轮询从未成功或连续失败达到阈值时置位（报告应醒目标注）
+	ObservationDegraded bool   `json:"observation_degraded,omitempty"`
+	ObservationNote     string `json:"observation_note,omitempty"`
 }
 
 // GaugeSummary 复用 smetrics 的轮询聚合类型。

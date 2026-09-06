@@ -332,7 +332,10 @@ def prep_server(all_data):
                            "{:,.1f} ms".format(h.get("mean", 0) * 1000) if "mean" in h else "—"])
         for gname, g in sorted((s.get("gauges") or {}).items()):
             gauge_rows.append([name, gname, "{:.2f}".format(g["max"]), "{:.2f}".format(g["avg"]), str(g["samples"])])
-    tbl = table(["场景", "直方图（服务端口径）", "观测数", "P50", "P99", "均值"], h_rows) + \
+    degraded = "".join('<div class="bad">⚠️ 观测降级：{}</div>'.format(html.escape(s.get("observation_note") or "gauge 轮询无有效样本"))
+                       for _, s in reps if s.get("observation_degraded"))
+    tbl = degraded + \
+          table(["场景", "直方图（服务端口径）", "观测数", "P50", "P99", "均值"], h_rows) + \
           '<div style="height:10px"></div>' + \
           table(["场景", "gauge", "峰值", "均值", "采样数"], gauge_rows)
 

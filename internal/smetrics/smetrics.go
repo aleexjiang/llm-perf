@@ -45,8 +45,9 @@ type Sample struct {
 
 // Scraper 面向一个服务端 /metrics 端点。
 type Scraper struct {
-	URL    string // 如 http://host:port/metrics
-	Client *http.Client
+	URL        string // 如 http://host:port/metrics
+	Client     *http.Client
+	MaxRetries int // Scrape 失败后的额外重试次数（默认 2；轮询场景置 0——下一个 tick 天然是重试）
 }
 
 // NewScraper 从 OpenAI 端点推导 /metrics 地址：http://host:port/v1 → http://host:port/metrics。
@@ -54,8 +55,9 @@ func NewScraper(endpoint string) *Scraper {
 	base := strings.TrimRight(endpoint, "/")
 	base = strings.TrimSuffix(base, "/v1")
 	return &Scraper{
-		URL:    base + "/metrics",
-		Client: &http.Client{Timeout: 5 * time.Second},
+		URL:        base + "/metrics",
+		Client:     &http.Client{Timeout: 5 * time.Second},
+		MaxRetries: 2,
 	}
 }
 
@@ -73,10 +75,10 @@ func (s *Scraper) Available(ctx context.Context) (bool, string) {
 }
 
 // Scrape 抓取并解析一次 /metrics。瞬时 connection refused（服务端 accept 队列被打满的
-// 场景起跑瞬间常见）自动重试 2 次。
+// 场景起跑瞬间常见）自动重试 MaxRetries 次（默认 2）。
 func (s *Scraper) Scrape(ctx context.Context) (*Sample, error) {
 	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := 0; attempt <= s.MaxRetries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -227,32 +229,103 @@ func parseLE(s string) float64 {
 	return v
 }
 
-// counterNames 是我们关心的 counter 的候选名（不同 vLLM 版本命名有差异，按序匹配）。
-var counterNames = map[string][]string{
-	"prefix_cache_hits":    {"vllm:prefix_cache_hits", "vllm:prefix_cache_hits_total"},
-	"prefix_cache_queries": {"vllm:prefix_cache_queries", "vllm:prefix_cache_queries_total"},
-	"preemptions":          {"vllm:num_preemptions", "vllm:num_preemptions_total"},
-	"spec_drafts":          {"vllm:spec_decode_num_drafts", "vllm:spec_decode_num_drafts_total"},
-	"spec_accepted":        {"vllm:spec_decode_num_accepted_tokens", "vllm:spec_decode_num_accepted_tokens_total"},
-	"prompt_tokens":        {"vllm:prompt_tokens", "vllm:prompt_tokens_total"},
-	"generation_tokens":    {"vllm:generation_tokens", "vllm:generation_tokens_total"},
+// MetricsProvider 抽象不同推理引擎的 /metrics 指标命名。
+// 语义键固定（prefix_cache_hits / preemptions / running / waiting / kv_usage 等），
+// 每个引擎提供候选名列表（按序匹配，兼容同引擎多版本）。probe 识别引擎或
+// DetectProvider 按指标名前缀自动选择；无法识别回落 vLLM。
+type MetricsProvider interface {
+	Name() string
+	CounterNames() map[string][]string // 语义键 → 候选指标名（counter 的 _total 后缀已由 Parse 剥离）
+	GaugeNames() map[string][]string   // 语义键 → 候选 gauge 名
+	HistNames() []string               // 关心的延迟分解直方图 family 名（单位秒）
 }
 
-var gaugeNames = map[string][]string{
-	"running":  {"vllm:num_requests_running"},
-	"waiting":  {"vllm:num_requests_waiting"},
-	"kv_usage": {"vllm:kv_cache_usage_perc", "vllm:gpu_cache_usage_perc"},
+// ── vLLM 原生命名（默认） ──
+
+type vllmProvider struct{}
+
+func (vllmProvider) Name() string { return "vllm" }
+
+func (vllmProvider) CounterNames() map[string][]string {
+	return map[string][]string{
+		"prefix_cache_hits":    {"vllm:prefix_cache_hits", "vllm:prefix_cache_hits_total"},
+		"prefix_cache_queries": {"vllm:prefix_cache_queries", "vllm:prefix_cache_queries_total"},
+		"preemptions":          {"vllm:num_preemptions", "vllm:num_preemptions_total"},
+		"spec_drafts":          {"vllm:spec_decode_num_drafts", "vllm:spec_decode_num_drafts_total"},
+		"spec_accepted":        {"vllm:spec_decode_num_accepted_tokens", "vllm:spec_decode_num_accepted_tokens_total"},
+	}
 }
 
-// histNames 是我们关心的延迟分解直方图（单位秒）。
-var HistNames = []string{
-	"vllm:request_queue_time_seconds",
-	"vllm:request_prefill_time_seconds",
-	"vllm:request_decode_time_seconds",
-	"vllm:time_to_first_token_seconds",
-	"vllm:inter_token_latency_seconds",
-	"vllm:e2e_request_latency_seconds",
-	"vllm:request_prefill_kv_computed_tokens",
+func (vllmProvider) GaugeNames() map[string][]string {
+	return map[string][]string{
+		"running":  {"vllm:num_requests_running"},
+		"waiting":  {"vllm:num_requests_waiting"},
+		"kv_usage": {"vllm:kv_cache_usage_perc", "vllm:gpu_cache_usage_perc"},
+	}
+}
+
+func (vllmProvider) HistNames() []string {
+	return []string{
+		"vllm:request_queue_time_seconds",
+		"vllm:request_prefill_time_seconds",
+		"vllm:request_decode_time_seconds",
+		"vllm:time_to_first_token_seconds",
+		"vllm:inter_token_latency_seconds",
+		"vllm:e2e_request_latency_seconds",
+		"vllm:request_prefill_kv_computed_tokens",
+	}
+}
+
+func VLLM() MetricsProvider { return vllmProvider{} }
+
+// ── SGLang 命名（草案：排队 gauge 已按公开文档实现；缓存 counter 暂缺——
+// 接真机时按其 /metrics 校准补充，缺失键即不出数不影响其余指标） ──
+
+type sglangProvider struct{}
+
+func (sglangProvider) Name() string { return "sglang" }
+
+func (sglangProvider) CounterNames() map[string][]string { return map[string][]string{} }
+
+func (sglangProvider) GaugeNames() map[string][]string {
+	return map[string][]string{
+		"running":  {"sglang:num_running_reqs"},
+		"waiting":  {"sglang:num_queue_reqs"},
+		"kv_usage": {"sglang:token_usage"},
+	}
+}
+
+func (sglangProvider) HistNames() []string { return nil }
+
+func SGLang() MetricsProvider { return sglangProvider{} }
+
+// DetectProvider 按抓取样本里的指标名前缀识别引擎命名；无法识别回落 vLLM。
+func DetectProvider(sample *Sample) MetricsProvider {
+	if sample == nil {
+		return VLLM()
+	}
+	has := func(prefix string) bool {
+		for k := range sample.Counters {
+			if strings.HasPrefix(k, prefix) {
+				return true
+			}
+		}
+		for k := range sample.Gauges {
+			if strings.HasPrefix(k, prefix) {
+				return true
+			}
+		}
+		for k := range sample.Hists {
+			if strings.HasPrefix(k, prefix) {
+				return true
+			}
+		}
+		return false
+	}
+	if has("sglang:") && !has("vllm:") {
+		return SGLang()
+	}
+	return VLLM()
 }
 
 // CounterDelta 是两次快照之间关心的 counter 增量（tokens / 次）。
@@ -272,13 +345,17 @@ func (d *CounterDelta) CacheHitRate() float64 {
 	return d.PrefixCacheHitTokens / d.PrefixCacheQueryTokens
 }
 
-// DiffCounters 计算 before→after 的 counter 增量。
-func DiffCounters(before, after *Sample) *CounterDelta {
+// DiffCounters 计算 before→after 的 counter 增量（p 为 nil 时回落 vLLM 命名）。
+func DiffCounters(before, after *Sample, p MetricsProvider) *CounterDelta {
+	if p == nil {
+		p = VLLM()
+	}
+	names := p.CounterNames()
 	get := func(s *Sample, key string) float64 {
 		if s == nil {
 			return 0
 		}
-		for _, n := range counterNames[key] {
+		for _, n := range names[key] {
 			if v, ok := s.Counters[n]; ok {
 				return v
 			}
@@ -309,9 +386,13 @@ type HistDelta struct {
 
 // HistDeltas 计算 HistNames 里各直方图的窗口差值分位估计。
 // 并发窗口内直方图混入其他流量的观测属已知近似（AIPerf 同口径）。
-func HistDeltas(before, after *Sample) map[string]HistDelta {
+// p 为 nil 时回落 vLLM 命名。
+func HistDeltas(before, after *Sample, p MetricsProvider) map[string]HistDelta {
+	if p == nil {
+		p = VLLM()
+	}
 	out := map[string]HistDelta{}
-	for _, name := range HistNames {
+	for _, name := range p.HistNames() {
 		hb, ha := before.Hists[name], after.Hists[name]
 		if hb == nil && ha == nil {
 			continue
@@ -374,24 +455,50 @@ type GaugeSummary struct {
 }
 
 // GaugePoller 周期抓取 gauge（排队深度、KV 占用），Stop 后可用 Summary 取聚合。
+// Health 暴露观测健康度：连续失败达到阈值时上层应在报告里标注"观测降级"。
 type GaugePoller struct {
 	scraper  *Scraper
 	interval time.Duration
 	ctx      context.Context
+	provider MetricsProvider
 
-	mu       sync.Mutex
-	samples  map[string][]float64
-	stopOnce sync.Once
-	done     chan struct{} // Stop 关闭：通知 loop 退出
-	stopped  chan struct{} // loop 退出时关闭：外部可等待
+	mu          sync.Mutex
+	samples     map[string][]float64
+	okSamples   int    // 成功抓取次数
+	totalFails  int    // 累计失败次数
+	consecFails int    // 连续失败次数
+	lastErr     string // 最后一次失败原因
+	stopOnce    sync.Once
+	done        chan struct{} // Stop 关闭：通知 loop 退出
+	stopped     chan struct{} // loop 退出时关闭：外部可等待
 }
 
-// StartGaugePoller 启动后台轮询（首次立即抓一次）。url 为 /metrics 地址。
-func StartGaugePoller(ctx context.Context, endpoint string, interval time.Duration) *GaugePoller {
+// GaugeHealth 是轮询健康度汇总。
+type GaugeHealth struct {
+	Samples             int    `json:"samples"` // 成功抓取次数
+	TotalFailures       int    `json:"total_failures"`
+	ConsecutiveFailures int    `json:"consecutive_failures"`
+	LastError           string `json:"last_error,omitempty"`
+}
+
+// Degraded 判定观测是否降级：从未成功，或连续失败达到阈值（窗口内基本无有效数据）。
+func (h GaugeHealth) Degraded() bool {
+	return h.Samples == 0 || h.ConsecutiveFailures >= 5
+}
+
+// StartGaugePoller 启动后台轮询（首次立即抓一次）。endpoint 为 OpenAI 端点（自动推导
+// /metrics 地址），p 为指标命名提供者（nil 回落 vLLM）。
+func StartGaugePoller(ctx context.Context, endpoint string, interval time.Duration, p MetricsProvider) *GaugePoller {
+	if p == nil {
+		p = VLLM()
+	}
+	sc := NewScraper(endpoint)
+	sc.MaxRetries = 0 // 轮询快速失败：失败计数即降级信号，下一 tick 天然是重试
 	g := &GaugePoller{
-		scraper:  NewScraper(endpoint),
+		scraper:  sc,
 		interval: interval,
 		ctx:      ctx,
+		provider: p,
 		samples:  map[string][]float64{},
 		done:     make(chan struct{}),
 		stopped:  make(chan struct{}),
@@ -419,18 +526,37 @@ func (g *GaugePoller) loop() {
 
 func (g *GaugePoller) once() {
 	sample, err := g.scraper.Scrape(g.ctx)
-	if err != nil {
-		return // 服务端瞬时不可达不致命
-	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	for key, cands := range gaugeNames {
+	if err != nil {
+		// 服务端瞬时不可达不致命，但必须留痕——观测降级要在报告里可见
+		g.totalFails++
+		g.consecFails++
+		g.lastErr = err.Error()
+		return
+	}
+	g.okSamples++
+	g.consecFails = 0
+	names := g.provider.GaugeNames()
+	for key, cands := range names {
 		for _, n := range cands {
 			if v, ok := sample.Counters[n]; ok {
 				g.samples[key] = append(g.samples[key], v)
 				break
 			}
 		}
+	}
+}
+
+// Health 返回轮询健康度（调用后轮询继续，可随时读取）。
+func (g *GaugePoller) Health() GaugeHealth {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return GaugeHealth{
+		Samples:             g.okSamples,
+		TotalFailures:       g.totalFails,
+		ConsecutiveFailures: g.consecFails,
+		LastError:           g.lastErr,
 	}
 }
 

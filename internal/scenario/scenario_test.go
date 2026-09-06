@@ -342,3 +342,20 @@ func TestSingleCacheSemantics(t *testing.T) {
 		t.Fatal("内容读取失败")
 	}
 }
+
+// ── Scenario 注册表：新增场景实现接口 + Register 即可，main 零改动 ──
+
+func TestScenarioRegistry(t *testing.T) {
+	for _, name := range []string{"single", "multiturn", "concurrent"} {
+		if _, ok := Lookup(name); !ok {
+			t.Fatalf("场景 %s 应已注册", name)
+		}
+	}
+	if _, ok := Lookup("nope"); ok {
+		t.Fatal("未注册场景不应查到")
+	}
+	all := All()
+	if len(all) != 3 || all[0].Name() != "single" || all[2].Name() != "concurrent" {
+		t.Fatalf("All 应按注册顺序返回: %v", all)
+	}
+}

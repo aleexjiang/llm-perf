@@ -28,23 +28,77 @@ import (
 	"github.com/aleexjiang/llm-perf/internal/smetrics"
 )
 
+// Scenario 是评测场景的统一抽象：注册表分发——新增场景实现该接口并 Register 即可，
+// main 无需改动，bench all 按注册顺序执行。
+type Scenario interface {
+	Name() string
+	Run(ctx context.Context, cfg *config.Config, client *engine.Client, modelFilter string) (*report.Report, error)
+}
+
+type funcScenario struct {
+	name string
+	fn   func(context.Context, *config.Config, *engine.Client, string) (*report.Report, error)
+}
+
+func (s funcScenario) Name() string { return s.name }
+
+func (s funcScenario) Run(ctx context.Context, cfg *config.Config, c *engine.Client, filter string) (*report.Report, error) {
+	return s.fn(ctx, cfg, c, filter)
+}
+
+var (
+	scenarioRegistry = map[string]Scenario{}
+	scenarioOrder    []string
+)
+
+// Register 注册场景（init 期调用，无并发）。
+func Register(s Scenario) {
+	scenarioRegistry[s.Name()] = s
+	scenarioOrder = append(scenarioOrder, s.Name())
+}
+
+// Lookup 按名字查场景。
+func Lookup(name string) (Scenario, bool) {
+	s, ok := scenarioRegistry[name]
+	return s, ok
+}
+
+// All 返回注册顺序的场景列表（bench all 的执行顺序）。
+func All() []Scenario {
+	out := make([]Scenario, 0, len(scenarioOrder))
+	for _, n := range scenarioOrder {
+		out = append(out, scenarioRegistry[n])
+	}
+	return out
+}
+
+func init() {
+	Register(funcScenario{"single", Single})
+	Register(funcScenario{"multiturn", Multiturn})
+	Register(funcScenario{"concurrent", Concurrent})
+}
+
 // env 承载一次场景执行的共享资源与横切能力。
 type env struct {
-	cfg    *config.Config
-	client *engine.Client
-	srv    *smetrics.Scraper // nil = 观测层关闭/不可用
-	trace  *engine.TraceSet  // nil = filler 模式
+	cfg      *config.Config
+	client   *engine.Client
+	srv      *smetrics.Scraper        // nil = 观测层关闭/不可用
+	provider smetrics.MetricsProvider // 观测层指标命名（按服务端指标前缀自动识别）
+	trace    *engine.TraceSet         // nil = filler 模式
 }
 
 func newEnv(ctx context.Context, cfg *config.Config, client *engine.Client) (*env, error) {
 	e := &env{cfg: cfg, client: client}
 	if cfg.ServerMetrics {
 		s := smetrics.NewScraper(cfg.Endpoint)
-		if ok, detail := s.Available(ctx); ok {
-			e.srv = s
-			log.Printf("服务端观测层: /metrics 可用（%s）", detail)
+		sample, err := s.Scrape(ctx)
+		if err != nil {
+			log.Printf("⚠️ server_metrics=true 但 /metrics 不可达（%v）——降级为纯客户端计时", err)
 		} else {
-			log.Printf("⚠️ server_metrics=true 但 /metrics 不可达（%s）——降级为纯客户端计时", detail)
+			e.srv = s
+			e.provider = smetrics.DetectProvider(sample)
+			n := len(sample.Counters) + len(sample.Gauges) + len(sample.Hists)
+			log.Printf("服务端观测层: /metrics 可用（%d 项指标，%s 命名）", n, e.provider.Name())
 		}
 	}
 	if cfg.Dataset.Mode == "trace" {
@@ -92,7 +146,7 @@ func runOne(ctx context.Context, e *env, model string,
 	}
 	if e.srv != nil && before != nil {
 		if after, err := e.srv.Scrape(ctx); err == nil {
-			m.SrvDelta = smetrics.DiffCounters(before, after)
+			m.SrvDelta = smetrics.DiffCounters(before, after, e.provider)
 		}
 	}
 	return m
@@ -126,7 +180,7 @@ func startWindow(ctx context.Context, e *env) (*smetrics.Sample, *smetrics.Gauge
 		log.Printf("⚠️ /metrics 起始快照失败（%v）——本场景无服务端观测", err)
 		return nil, nil
 	}
-	poller := smetrics.StartGaugePoller(ctx, e.cfg.Endpoint, time.Duration(e.cfg.MetricsIntervalMS)*time.Millisecond)
+	poller := smetrics.StartGaugePoller(ctx, e.cfg.Endpoint, time.Duration(e.cfg.MetricsIntervalMS)*time.Millisecond, e.provider)
 	return before, poller
 }
 
@@ -140,19 +194,24 @@ func finishWindow(ctx context.Context, e *env, before *smetrics.Sample, poller *
 	summary := &report.ServerMetricsSummary{Available: true}
 	if poller != nil {
 		summary.Gauges = poller.Summary() // Summary 内部会 Stop
+		if h := poller.Health(); h.Degraded() {
+			summary.ObservationDegraded = true
+			summary.ObservationNote = fmt.Sprintf("gauge 轮询降级：成功 %d 次，连续失败 %d 次，最后错误 %s",
+				h.Samples, h.ConsecutiveFailures, h.LastError)
+		}
 	}
 	after, err := e.srv.Scrape(ctx)
 	if err != nil {
 		summary.Note = "结束快照抓取失败: " + err.Error()
 		return summary
 	}
-	d := smetrics.DiffCounters(before, after)
+	d := smetrics.DiffCounters(before, after, e.provider)
 	summary.CacheHitTokens = d.PrefixCacheHitTokens
 	summary.CacheQueryTokens = d.PrefixCacheQueryTokens
 	summary.Preemptions = d.Preemptions
 	summary.SpecDrafts = d.SpecDrafts
 	summary.SpecAcceptedTokens = d.SpecAcceptedTokens
-	summary.Hists = smetrics.HistDeltas(before, after)
+	summary.Hists = smetrics.HistDeltas(before, after, e.provider)
 	return summary
 }
 

@@ -118,8 +118,10 @@ func main() {
 	}
 
 	// 排查基础能力：run.log 始终写（现场排查时日志永远拿得到）；raw 转储由 debug 控制
+	// run.log 追加而非覆盖：同目录多轮测试的日志都要留得住（两轮对照时踩过覆盖坑）
 	if err := os.MkdirAll(cfg.OutputDir, 0o755); err == nil {
-		if lf, err := os.Create(filepath.Join(cfg.OutputDir, "run.log")); err == nil {
+		if lf, err := os.OpenFile(filepath.Join(cfg.OutputDir, "run.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+			fmt.Fprintf(lf, "\n===== campaign %s（tool %s）=====\n", time.Now().Format(time.RFC3339), report.Version)
 			log.SetOutput(io.MultiWriter(os.Stderr, lf))
 			defer lf.Close()
 		}
@@ -209,16 +211,16 @@ func main() {
 		fmt.Printf("[%s] 完成，用时 %s，输出: %s\n", name, time.Since(start).Round(time.Second), outPath)
 	}
 
-	switch cmd {
-	case "single":
-		run("single", func() (*report.Report, error) { return scenario.Single(ctx, cfg, client, *modelFilter) })
-	case "multiturn":
-		run("multiturn", func() (*report.Report, error) { return scenario.Multiturn(ctx, cfg, client, *modelFilter) })
-	case "concurrent":
-		run("concurrent", func() (*report.Report, error) { return scenario.Concurrent(ctx, cfg, client, *modelFilter) })
-	case "all":
-		run("single", func() (*report.Report, error) { return scenario.Single(ctx, cfg, client, *modelFilter) })
-		run("multiturn", func() (*report.Report, error) { return scenario.Multiturn(ctx, cfg, client, *modelFilter) })
-		run("concurrent", func() (*report.Report, error) { return scenario.Concurrent(ctx, cfg, client, *modelFilter) })
+	if cmd == "all" {
+		for _, sc := range scenario.All() {
+			sc := sc
+			run(sc.Name(), func() (*report.Report, error) { return sc.Run(ctx, cfg, client, *modelFilter) })
+		}
+		return
 	}
+	sc, ok := scenario.Lookup(cmd)
+	if !ok {
+		usage()
+	}
+	run(sc.Name(), func() (*report.Report, error) { return sc.Run(ctx, cfg, client, *modelFilter) })
 }

@@ -4,9 +4,13 @@
 P0 项（gofmt、scenario 测试、lastPrompt 修复、重试策略）已完成于 `6291c69`，此处只记录剩余项。
 每项含：问题、位置、建议方案、验收标准。做完请勾选并在提交信息里注明本文件章节号。
 
-## P1（下一次接新引擎 / 跑长战役前完成）
+## P1（✅ 2026-09-06 全部完成，提交见 git log "P1"）
 
-### 1. MetricsProvider 接口——观测层多引擎化
+### 1. ✅ MetricsProvider 接口——观测层多引擎化
+- 已实现：`MetricsProvider` 接口 + `VLLMProvider`（原命名表）+ `SGLangProvider`（草案：排队 gauge
+  `num_running_reqs/num_queue_reqs/token_usage`，缓存 counter 留空待真机校准）+ `DetectProvider`
+  （按指标名前缀自动识别，未知回落 vLLM）。`DiffCounters/HistDeltas/StartGaugePoller` 均带 provider；
+  newEnv 抓一次样本自动识别并在日志注明命名。待办遗留：SGLang 缓存 counter 名接真机时补。
 - **问题**：`internal/smetrics/smetrics.go` 的 `counterNames / gaugeNames / HistNames`（~L180-210）硬编码 vLLM 指标名
   （`vllm:prefix_cache_hits` 等）。接 SGLang / MindIE 时观测层要么测不到数据要么改代码。
 - **建议**：抽 `MetricsProvider` 接口：`CounterNames() map[string][]string`（语义键→候选名列表）、
@@ -16,14 +20,18 @@ P0 项（gofmt、scenario 测试、lastPrompt 修复、重试策略）已完成�
 - **验收**：SGLang 实例（或 mock）上 probe 报告"观测层可用（sglang 命名）"，bench 产出命中计数；
   现有 smetrics 测试不改语义仍通过。
 
-### 2. Scenario 接口 + 注册表——场景矩阵的扩展点
+### 2. ✅ Scenario 接口 + 注册表——场景矩阵的扩展点
+- 已实现：`Scenario` 接口 + `Register/Lookup/All`（保注册顺序），main.go 改查表分发，switch 消除。
+  测试锁定 Lookup/All 语义。
 - **问题**：`cmd/bench/main.go` 的 switch 硬编码场景分发；新增场景要同时改 main / scenario / report / gen_html_report.py 四处，
   且 `scenario.go` 的 `Single/Multiturn/Concurrent` 签名虽一致却没有形式化约束。
 - **建议**：定义 `type Scenario interface { Name() string; Run(ctx, *config.Config, *engine.Client, string) (*report.Report, error) }`
   + `registry = map[string]Scenario`；main 变为查表执行；`bench all` 按注册顺序遍历。
 - **验收**：新增一个空场景（如 `bench observe`）只需新增一个文件 + 一行注册，main 的 switch 消失。
 
-### 3. run.log 追加化——战役日志被覆盖（真实踩过）
+### 3. ✅ run.log 追加化——战役日志被覆盖（真实踩过）
+- 已实现：O_APPEND + 每次启动写 `===== campaign <RFC3339>（tool <版本>）=====` 分隔标记。
+  冒烟验证：同目录连跑两轮，日志含 2 个战役标记。
 - **问题**：`cmd/bench/main.go:122` 用 `os.Create` 打开 run.log，同目录第二轮测试会覆盖第一轮日志。
   2026-09-05 两轮对照测试时第一轮日志已实际丢失。
 - **建议**：改为 `os.OpenFile(..., os.O_APPEND|os.O_CREATE)`，每次进程启动写一行分隔标记
@@ -31,7 +39,11 @@ P0 项（gofmt、scenario 测试、lastPrompt 修复、重试策略）已完成�
   `run-<ts>.log` + `run.log` 符号链接（后者报告读取更简单，二选一）。
 - **验收**：同一 output 目录连续跑两轮，两轮日志均可读，分隔标记含时间戳与 seed_salt。
 
-### 4. GaugePoller 降级标注——观测失败要可见
+### 4. ✅ GaugePoller 降级标注——观测失败要可见
+- 已实现：Poller 记录成功/失败/连续失败/最后错误（`Health()`，`Degraded()` 判定：
+  从未成功或连续失败 ≥5）；`ServerMetricsSummary.ObservationDegraded/ObservationNote`
+  进 JSON 与报告（红色警示条）。顺带修复：轮询场景的 Scraper 重试置 0（快速失败，
+  下一 tick 天然是重试——原来内嵌 3 次重试会让一次轮询阻塞 600ms+，降级延迟数秒才可见）。
 - **问题**：`internal/smetrics/smetrics.go` GaugePoller 抓取失败完全静默（`once()` 里 err 直接 return）。
   观测层挂掉时报告里的 gauge 只是"样本少"，无法区分"服务空闲"与"观测失效"。
 - **建议**：Poller 记录连续失败次数与首次失败原因；`Summary()` 增加返回
