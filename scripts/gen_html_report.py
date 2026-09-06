@@ -208,6 +208,8 @@ def analyze(data, meta):
                     "size": size,
                     "ttft": mmm([r.get("ttft_ms", 0) / 1000 for r in rs], 2),
                     "ttft_content": mmm([r.get("ttft_content_ms", 0) / 1000 for r in rs], 2),
+                    "ttft_rea": mmm([r.get("ttft_reasoning_ms", 0) / 1000 for r in rs], 2),
+                    "think": mmm([(r.get("think_ms") or 0) / 1000 for r in rs], 1),
                     "e2e": mmm([r.get("e2e_ms", 0) / 1000 for r in rs], 1),
                     "decode": mmm([r.get("decode_ms", 0) / 1000 for r in rs], 1),
                     "itl_p50": mmm([r.get("itl_p50_ms") for r in rs], 1),
@@ -225,6 +227,8 @@ def analyze(data, meta):
             P[th]["finish_length"] = sum(1 for l in ladder if "length" in l["finish"])
             P[th]["e2e_all"] = [r.get("e2e_ms", 0) / 1000 for l in ladder
                                 for r in s_by[(m, th)][l["size"]]["runs"]]
+            P[th]["think_all"] = [(r.get("think_ms") or 0) / 1000 for l in ladder
+                                  for r in s_by[(m, th)][l["size"]]["runs"]]
             P[th]["rc_all"] = [r.get("reasoning_chars", 0) for l in ladder
                                for r in s_by[(m, th)][l["size"]]["runs"]]
             P[th]["no_content_runs"] = [r for l in ladder
@@ -254,6 +258,7 @@ def analyze(data, meta):
                                max(t.get("prompt_tokens", 0) for t in ts)),
                     "new": st.median([t.get("new_tokens", 0) for t in ts]),
                     "ttft": mmm([t.get("ttft_ms", 0) / 1000 for t in ts], 2),
+                    "think": mmm([(t.get("think_ms") or 0) / 1000 for t in ts], 1),
                     "e2e": mmm([t.get("e2e_ms", 0) / 1000 for t in ts], 1),
                     "sess_ttft": [t.get("ttft_ms", 0) / 1000 for t in ts],
                     "sess_e2e": [t.get("e2e_ms", 0) / 1000 for t in ts],
@@ -380,16 +385,18 @@ def build_charts(data, A):
             vals = P["on"]["e2e_all"]
             on_e2e.append((m, min(vals), st.median(vals), max(vals)))
     if on_e2e:
-        labels, dmin, dmed, dmax = [], [], [], []
+        labels, dmin, dmed, dmax, dthink = [], [], [], [], []
         for m, lo, md, hi in on_e2e:
             labels.append(short(m))
             dmin.append(round(lo, 1)); dmed.append(round(md, 1)); dmax.append(round(hi, 1))
+            th_all = A["per_model"][m]["on"].get("think_all") or []
+            dthink.append(round(st.median(th_all), 1) if th_all else None)
         ds = [line_ds("最快", dmin, "#93c5fd"), line_ds("中位", dmed, "#1652f0"),
-              line_ds("最慢", dmax, "#e5484d")]
-        scales = {"x": spread(), "y": spread({"title": {"display": True, "text": "E2E 秒"}})}
+              line_ds("最慢", dmax, "#e5484d"), line_ds("思考时长中位", dthink, "#f59e0b")]
+        scales = {"x": spread(), "y": spread({"title": {"display": True, "text": "秒"}})}
         stmts.append(chart_js("c_on_e2e", "bar", labels, ds,
-                              "thinking=on 单次请求总耗时（全部 run 汇总）", scales))
-        add("c_on_e2e", "thinking=on E2E 分布")
+                              "thinking=on 单次请求耗时与思考时长（全部 run 汇总）", scales))
+        add("c_on_e2e", "thinking=on E2E 与思考时长分布")
 
     return canvases, stmts
 
@@ -407,15 +414,22 @@ def single_table(A, th):
             continue
         for l in P[th]["ladder"]:
             has_itl = l["itl_p50"] is not None
-            rows.append([esc(short(m)), "{:,}".format(l["size"]), str(l["n"]),
-                         f3(l["ttft"]), f3(l["ttft_content"]), f1(l["e2e"]), f1(l["decode"]),
-                         f1(l["itl_p50"], "ms") if has_itl else "—",
-                         f1(l["itl_p99"], "ms") if has_itl else "—",
-                         f0(l["tokps"]), f0(l["comp"]),
-                         f0(l["rc"]) if th == "on" else "—",
-                         " / ".join(l["finish"])])
-    head = ["模型", "档位 tk", "runs", "TTFT s", "首内容 s", "E2E s", "decode s",
-            "ITL p50 ms", "ITL p99 ms", "tok/s", "输出 tok"] + \
+            row = [esc(short(m)), "{:,}".format(l["size"]), str(l["n"]),
+                   f3(l["ttft"]), f3(l["ttft_content"])]
+            if th == "on":
+                # 思考占比 = 思考总时长 / E2E（思考与正文输出交错，占比为口径近似）
+                pct = "{:.0%}".format(l["think"][0] / l["e2e"][0]) if l["e2e"][0] else "—"
+                row += [f1(l["think"]), pct]
+            row += [f1(l["e2e"]), f1(l["decode"]),
+                    f1(l["itl_p50"], "ms") if has_itl else "—",
+                    f1(l["itl_p99"], "ms") if has_itl else "—",
+                    f0(l["tokps"]), f0(l["comp"]),
+                    f0(l["rc"]) if th == "on" else "—",
+                    " / ".join(l["finish"])]
+            rows.append(row)
+    head = ["模型", "档位 tk", "runs", "TTFT s", "首内容 s"] + \
+           (["思考 s", "思考占比"] if th == "on" else []) + \
+           ["E2E s", "decode s", "ITL p50 ms", "ITL p99 ms", "tok/s", "输出 tok"] + \
            (["思考字符"] if th == "on" else []) + ["finish"]
     return table(head, rows) if rows else "<p>无数据</p>"
 
@@ -426,7 +440,9 @@ def multiturn_table(A, th):
     for m, P in A["per_model"].items():
         if th in P and "turns" in P[th]:
             per_model_cols.append(m)
-            head += ["{} TTFT s".format(short(m)), "{} E2E s".format(short(m))]
+            head += ["{} TTFT s".format(short(m))]
+            head += ["{} 思考 s".format(short(m))] if th == "on" else []
+            head += ["{} E2E s".format(short(m))]
     if not per_model_cols:
         return "<p>无数据</p>"
     nturn = max(len(P[th]["turns"]) for m in per_model_cols for P in [A["per_model"][m]])
@@ -443,9 +459,11 @@ def multiturn_table(A, th):
                     row[1] = "{:,}–{:,}".format(*t["prompt"])
                     row[2] = "{:,.0f}".format(t["new"])
                     first = False
-                row += [f3(t["ttft"]), f1(t["e2e"])]
+                row += [f3(t["ttft"])]
+                row += [f1(t["think"])] if th == "on" else []
+                row += [f1(t["e2e"])]
             else:
-                row += ["—", "—"]
+                row += ["—"] + (["—"] if th == "on" else []) + ["—"]
         rows.append(row)
     return table(head, rows)
 
@@ -756,6 +774,8 @@ def main():
         ["指标", "定义"],
         [["TTFT", "请求发出 → 首个流式 chunk（空首包不计）；本报告单位秒"],
          ["首内容", "请求发出 → 首个 content chunk（TTFT_content）"],
+         ["思考时长", "模型思考输出的总时长（think_ms）；TTFT 在 thinking=on 时即思考首包"],
+         ["思考占比", "思考时长 ÷ E2E（思考与正文输出可能交错，口径近似）"],
          ["E2E", "请求发出 → 流结束（含思考全程）"],
          ["decode", "首 chunk → 流结束"],
          ["ITL p50/p99", "chunk 间间隔分位（不含 TTFT）"],
