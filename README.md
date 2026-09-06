@@ -11,17 +11,26 @@
 
 ## 场景矩阵
 
+模式 = `--turns` × `--concurrency` 两个参数的组合（**并发=1 即单发串行**）：
+
 ```
-                单发（串行）              并发（多虚拟用户）
-单轮            bench single             bench concurrent
-多轮            bench multiturn          bench concurrent (multiturn: true)
+                --concurrency 1（单发）          --concurrency 2,4,...（并发）
+--turns single  档位矩阵 ladder × runs          闭环并发（固定 prompt）
+--turns multi   多轮会话逐轮滚动                 闭环并发（每用户独立会话）
+```
+
+```bash
+./bench -c example.yaml --turns single --concurrency 1    # 单发单轮
+./bench -c example.yaml --turns multi  --concurrency 1    # 单发多轮
+./bench -c example.yaml --turns single --concurrency 1,2,4 # 并发爬坡（列表含 1 时先跑单发再跑 >1 档）
+./bench -c example.yaml                                    # 默认 turns=both concurrency=1
 ```
 
 | 场景 | 回答的问题 |
 |---|---|
-| `single` | 单请求 TTFT / decode 速度随上下文长度如何增长？前缀缓存有没有命中？ |
-| `multiturn` | 多轮对话**滚**到 40k 时每轮 TTFT 如何？（模拟 agent：system + tool defs + 逐轮增长 history） |
-| `concurrent` | 并发 1→2→4→8→16 时 TTFT 衰减多少？整体吞吐峰值在哪？（`multiturn: true` 时每个虚拟用户各自跑完整会话重放） |
+| `single`（conc=1, turns=single） | 单请求 TTFT / decode 速度随上下文长度如何增长？前缀缓存有没有命中？ |
+| `multiturn`（conc=1, turns=multi） | 多轮对话**滚**到 40k 时每轮 TTFT 如何？（模拟 agent：system + tool defs + 逐轮增长 history） |
+| `concurrent`（conc>1） | 并发 1→2→4→8→16 时 TTFT 衰减多少？整体吞吐峰值在哪？（turns=multi 时每个虚拟用户各自跑完整会话重放） |
 
 两个正交开关贯穿全部场景：
 
@@ -174,21 +183,20 @@ scp bin/bench-linux-amd64 configs/example.yaml 堡垒机:~/llm-perf/
 
 # 堡垒机
 mv bench-linux-amd64 bench && chmod +x bench
-export LLM_PERF_ENDPOINT=http://<客户路由IP>:30082/router/v1
-export LLM_PERF_API_KEY=...         # 如服务需要
+# 端点/key 直接写在配置文件里（endpoint + api_key 字面量；该配置勿入库）
 ./bench probe -c example.yaml       # ① 先探针：确认引擎兼容性与思考开关参数
-./bench single -c example.yaml      # ② 小档位验证解析正确性（改小 prompt_tokens/max_tokens）
-./bench all -c example.yaml         # ③ 正式跑完整矩阵
+./bench -c example.yaml --turns single --concurrency 1   # ② 小档位验证解析正确性（改小 prompt_tokens/max_tokens）
+./bench -c example.yaml                                  # ③ 默认 turns=both concurrency=1（单发全矩阵）
 ```
 
 ## 输出
 
-每场景落一个 JSON 文件（含全部原始数据：逐 run 计时、逐 chunk 派生指标、usage token）：
+每个场景落一个 JSON 文件（含全部原始数据：逐 run 计时、逐 chunk 派生指标、usage token）：
 
 ```bash
-./bench all -c example.yaml                 # → output/single-<ts>.json 等 3 个文件
-./bench single -c example.yaml -o r1.json   # → 指定输出文件名
-./bench all -c example.yaml -o results/     # → 指定输出目录
+./bench -c example.yaml                                  # → output/single-<ts>.json multiturn-<ts>.json
+./bench -c example.yaml --turns single --concurrency 1 -o r1.json   # → 指定输出文件名
+./bench -c example.yaml --turns both --concurrency 1,2,4 -o results/  # → 指定输出目录
 ```
 
 JSON 结构见 `internal/report/report.go`：`single` / `multiturn` / `concurrent` 三个数组，

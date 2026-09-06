@@ -2,12 +2,14 @@
 //
 // 契约：输入 YAML 配置，输出 JSON 原始数据；报告呈现由外部工具基于 JSON 二次加工。
 //
-// 用法：
+// 用法（模式 = --turns × --concurrency 组合，无场景子命令）：
 //
-//	bench single    -c configs/example.yaml [-o out.json] [-m 模型过滤]
-//	bench multiturn -c configs/example.yaml [-o out.json] [-m 模型过滤]
-//	bench concurrent -c configs/example.yaml [-o out.json] [-m 模型过滤]
-//	bench all       -c configs/example.yaml [-o 输出目录]
+//	bench -c configs/example.yaml                                  # 默认 turns=both concurrency=1（单发单轮+多轮，零并发压力）
+//	bench -c ... --turns single --concurrency 1                    # 单发单轮
+//	bench -c ... --turns multi  --concurrency 1                    # 单发多轮
+//	bench -c ... --turns single --concurrency 1,2,4                # 闭环并发爬坡（单轮）
+//	bench -c ... --turns multi  --concurrency 2,4                  # 闭环并发爬坡（每用户独立多轮会话）
+//	bench probe -c configs/example.yaml [模型名]                    # 兼容性探针
 package main
 
 import (
@@ -19,6 +21,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -34,23 +37,36 @@ func usage() {
 
 输入: YAML 配置    输出: JSON 原始数据（报告请用外部工具基于 JSON 生成）
 
-用法:
-  bench probe     -c configs/example.yaml            # 兼容性探针：先摸清引擎实现细节再压测
-  bench <single|multiturn|concurrent|all> [-c 配置.yaml] [-o 输出路径] [-m 模名过滤]
+用法（模式 = --turns × --concurrency 组合，无场景子命令）:
+  bench [-c 配置.yaml] [选项]
+  bench probe [-c 配置.yaml] [模型名]
 
--o 说明:
-  - 指定 .json 路径  → 直接作为输出文件（单场景时）
-  - 指定目录        → 在该目录下生成 <场景>-<时间戳>.json
-  - 缺省            → 使用配置 output_dir
+核心选项:
+  --turns single|multi|both    单轮 / 多轮会话 / 两者都跑（默认 both）
+  --concurrency 1|1,2,4|cfg    并发=1 表示单发（串行）；逗号列表逐档爬坡；
+                               cfg 用配置里 concurrent.levels（默认 1）
+  --thinking 变体名             只跑某个思考变体：on/off 或自定义档位名（如 low）
+  --seed-salt N                战役隔离：重跑/换变体必须换盐，否则命中服务端前缀缓存
+  -o 路径                       输出 .json 或目录（默认配置 output_dir）
+  -m 模型子串                   只测包含该子串的模型
+  --corpus en|zh|路径           填充语料；--max-ctx N 上下文截止
+
+组合语义:
+  --concurrency 1 --turns single            单发单轮档位矩阵（ladder × runs，缓存对照）
+  --concurrency 1 --turns multi             单发多轮会话（逐轮 history 滚动）
+  --concurrency 2,4 --turns single          闭环并发（固定 prompt，level 爬坡）
+  --concurrency 2,4 --turns multi           闭环并发（每虚拟用户独立多轮会话）
+  列表含 1 和更大值                          先跑单发场景再跑并发档位（仅 >1 的档位）
 
 排查模式:
   配置里 debug: true 时，原始响应留存到 <output_dir>/raw/、日志同步写 <output_dir>/run.log；
   任何请求失败时即使不开 debug 也会自动留存转储（写到系统临时目录）。
+  Ctrl+C 优雅中断：已完成数据照常落盘；再按一次强制退出。
 
 示例:
-  bench probe -c configs/example.yaml
-  bench all -c configs/example.yaml
-  bench single -c configs/example.yaml -o result/deepseek-40k.json -m DeepSeek
+  bench probe -c configs/customer.yaml
+  bench -c configs/customer.yaml --turns single --concurrency 1 --thinking off -o out-single-off --seed-salt 1
+  bench -c configs/customer.yaml --turns both --concurrency 1,2,4 -o output/
 `)
 	os.Exit(2)
 }
@@ -72,30 +88,79 @@ func resolveOutPath(o, outputDir, scenarioName string) string {
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		usage()
+	if len(os.Args) == 1 {
+		usage() // 裸调用不给参数：展示用法而不是拿默认配置开跑
 	}
-	cmd := os.Args[1]
-	switch cmd {
-	case "probe", "single", "multiturn", "concurrent", "all":
-	default:
-		usage()
+	args := os.Args[1:]
+	// 旧场景子命令 → 新语法自动翻译（兼容旧文档与肌肉记忆，翻译时打印提示）
+	var aliasTurns, aliasConc, aliasName string
+	mode := "bench"
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		aliasName = args[0]
+		switch args[0] {
+		case "probe":
+			mode = "probe"
+			args = args[1:]
+		case "single":
+			aliasTurns, aliasConc = "single", "1"
+			args = args[1:]
+		case "multiturn":
+			aliasTurns, aliasConc = "multi", "1"
+			args = args[1:]
+		case "concurrent":
+			aliasConc = "cfg" // turns 由配置 concurrent.multiturn 决定
+			args = args[1:]
+		case "all":
+			aliasTurns, aliasConc = "both", "1,cfg"
+			args = args[1:]
+		default:
+			fmt.Fprintf(os.Stderr, "未知参数 %q——压测模式没有场景子命令，用 --turns × --concurrency 组合（见下）\n\n", args[0])
+			usage()
+		}
 	}
 
-	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
+	fs := flag.NewFlagSet("bench", flag.ExitOnError)
 	cfgPath := fs.String("c", "configs/example.yaml", "YAML 配置文件路径")
+	turnsFlag := fs.String("turns", "both", "turns=single|multi|both：单轮 / 多轮会话 / 两者都跑")
+	concFlag := fs.String("concurrency", "1", "并发=1 表示单发（串行）；逗号列表如 1,2,4 逐档爬坡；cfg 用配置 concurrent.levels")
 	modelFilter := fs.String("m", "", "只测包含该子串的模型")
 	outFlag := fs.String("o", "", "输出路径：.json 文件或目录（默认用配置 output_dir）")
 	corpusFlag := fs.String("corpus", "", "填充语料：en/zh（内置公版书）或自定义文件路径（.txt/.txt.gz）；覆盖配置 filler_corpus")
 	maxCtxFlag := fs.Int("max-ctx", 0, "上下文截止（tokens）：>0 时所有请求 prompt 不超过该值；覆盖配置 max_prompt_tokens")
 	saltFlag := fs.Int("seed-salt", 0, "种子盐值：隔离测试战役（服务端 prefix cache 未清空时重测用）；覆盖配置 seed_salt")
 	thinkingFlag := fs.String("thinking", "", "只跑某个思考变体：on/off（开思考费 token，建议 off/on 分开两轮跑，互不连坐）；覆盖配置 thinking.mode")
-	fs.Parse(os.Args[2:])
+	fs.Parse(args)
+	userSetTurns, userSetConc := false, false
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "turns":
+			userSetTurns = true
+		case "concurrency":
+			userSetConc = true
+		}
+	})
 
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "配置错误:", err)
 		os.Exit(1)
+	}
+	// 别名翻译：仅当用户没显式给 --turns/--concurrency 时生效
+	if aliasTurns != "" || aliasConc != "" {
+		if aliasName == "concurrent" && !userSetTurns {
+			if cfg.Concurrent.Multiturn {
+				aliasTurns = "multi"
+			} else {
+				aliasTurns = "single"
+			}
+		}
+		if aliasTurns != "" && !userSetTurns {
+			*turnsFlag = aliasTurns
+		}
+		if aliasConc != "" && !userSetConc {
+			*concFlag = aliasConc
+		}
+		log.Printf("兼容模式: 旧子命令 %q 等价于 --turns %s --concurrency %s（下次可直接用新语法）", aliasName, *turnsFlag, *concFlag)
 	}
 	if *corpusFlag != "" {
 		cfg.FillerCorpus = *corpusFlag
@@ -196,14 +261,8 @@ func main() {
 		os.Exit(130)
 	}()
 
-	// bench all 的 -o 只接受目录：三个场景各自落一个文件，给 .json 会互相覆盖
-	if cmd == "all" && strings.HasSuffix(*outFlag, ".json") {
-		fmt.Fprintln(os.Stderr, "bench all 的 -o 请给目录（三场景各落一个 JSON），不要指定单个 .json 文件")
-		os.Exit(1)
-	}
-
 	// ── probe：兼容性探测（不需要场景配置） ──
-	if cmd == "probe" {
+	if mode == "probe" {
 		model := ""
 		if fs.Arg(0) != "" {
 			model = fs.Arg(0)
@@ -255,6 +314,93 @@ func main() {
 		return
 	}
 
+	// ── 组合模式解析：--turns × --concurrency → 场景执行计划 ──
+	var concVals []int
+	for _, p := range strings.Split(*concFlag, ",") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if p == "cfg" {
+			concVals = append(concVals, cfg.Concurrent.Levels...)
+			continue
+		}
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 1 {
+			fmt.Fprintf(os.Stderr, "--concurrency %q 无效：用 1、逗号列表（1,2,4）或 cfg\n", p)
+			os.Exit(1)
+		}
+		concVals = append(concVals, n)
+	}
+	if len(concVals) == 0 {
+		fmt.Fprintln(os.Stderr, "--concurrency 解析结果为空")
+		os.Exit(1)
+	}
+	seen := map[int]bool{}
+	var vals []int
+	for _, n := range concVals {
+		if !seen[n] {
+			seen[n] = true
+			vals = append(vals, n)
+		}
+	}
+	var turns []string
+	switch *turnsFlag {
+	case "single":
+		turns = []string{"single"}
+	case "multi":
+		turns = []string{"multi"}
+	case "both":
+		turns = []string{"single", "multi"}
+	default:
+		fmt.Fprintf(os.Stderr, "--turns %q 无效：用 single|multi|both\n", *turnsFlag)
+		os.Exit(1)
+	}
+
+	type runItem struct {
+		name  string
+		sc    scenario.Scenario
+		highs []int // >1 的并发档位（交给 concurrent 场景）；空 = 纯单发场景
+		mt    bool  // concurrent 场景是否跑多轮会话
+	}
+	var items []runItem
+	for _, tm := range turns {
+		var ones, highs []int
+		for _, n := range vals {
+			if n == 1 {
+				ones = append(ones, n)
+			} else {
+				highs = append(highs, n)
+			}
+		}
+		if len(ones) > 0 {
+			name := "single"
+			if tm == "multi" {
+				name = "multiturn"
+			}
+			sc, _ := scenario.Lookup(name)
+			items = append(items, runItem{name: name, sc: sc})
+		}
+		if len(highs) > 0 {
+			name := "concurrent"
+			if tm == "multi" {
+				name = "concurrent-multi"
+			}
+			sc, _ := scenario.Lookup("concurrent")
+			items = append(items, runItem{name: name, sc: sc, highs: highs, mt: tm == "multi"})
+		}
+	}
+	var names []string
+	for _, it := range items {
+		names = append(names, it.name)
+	}
+	log.Printf("执行计划: turns=%s concurrency=%v → %s（并发=1 即单发串行）", *turnsFlag, vals, strings.Join(names, " → "))
+
+	if len(items) > 1 && strings.HasSuffix(*outFlag, ".json") {
+		fmt.Fprintln(os.Stderr, "本次组合会跑多个场景（各落一个 JSON），-o 请给目录而不是单个 .json 文件")
+		os.Exit(1)
+	}
+
 	run := func(name string, fn func() (*report.Report, error)) {
 		start := time.Now()
 		rep, err := fn()
@@ -275,19 +421,16 @@ func main() {
 		fmt.Printf("[%s] 完成，用时 %s，输出: %s\n", name, time.Since(start).Round(time.Second), outPath)
 	}
 
-	if cmd == "all" {
-		for _, sc := range scenario.All() {
-			sc := sc
-			run(sc.Name(), func() (*report.Report, error) { return sc.Run(ctx, cfg, client, *modelFilter) })
-			if ctx.Err() != nil {
-				return // 中断后不再启动后续场景
-			}
+	for _, it := range items {
+		it := it
+		cc := *cfg // 场景间互不影响：并发档位/多轮开关按本项覆盖
+		if len(it.highs) > 0 {
+			cc.Concurrent.Levels = it.highs
+			cc.Concurrent.Multiturn = it.mt
 		}
-		return
+		run(it.name, func() (*report.Report, error) { return it.sc.Run(ctx, &cc, client, *modelFilter) })
+		if ctx.Err() != nil {
+			return // 中断后不再启动后续场景
+		}
 	}
-	sc, ok := scenario.Lookup(cmd)
-	if !ok {
-		usage()
-	}
-	run(sc.Name(), func() (*report.Report, error) { return sc.Run(ctx, cfg, client, *modelFilter) })
 }
