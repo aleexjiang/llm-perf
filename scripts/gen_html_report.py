@@ -34,14 +34,63 @@ GRID_JS = "const grid={ticks:{color:'#999'},grid:{color:'#f0f0f5'}};"
 
 # ────────────────────────── 输入加载 ──────────────────────────
 
+# 四象限场景：single=单发·单轮 multiturn=单发·多轮 conc-single=多发·单轮 conc-multi=多发·多轮
+QUADS = {"single": "单发单轮", "multiturn": "单发多轮", "conc-single": "多发单轮", "conc-multi": "多发多轮"}
+SCEN_ALIASES = {"单发单轮": "single", "单发多轮": "multiturn", "多发单轮": "conc-single",
+                "多发多轮": "conc-multi", "全部": "all", "合并": "all", "all": "all"}
+
+
+def parse_scenarios(spec):
+    """--scenarios 取值：逗号分隔的象限名（支持中文别名）；all/缺省 = 四象限合并。"""
+    toks = [t.strip() for t in (spec or "all").replace("，", ",").replace("+", ",").split(",") if t.strip()]
+    out = set()
+    for t in toks:
+        t = SCEN_ALIASES.get(t, t)
+        if t == "all":
+            return set(QUADS)
+        if t not in QUADS:
+            sys.exit("--scenarios 无效值 {!r}（可选：single=单发单轮 multiturn=单发多轮 "
+                     "conc-single=多发单轮 conc-multi=多发多轮 all=合并；支持中文别名）".format(t))
+        out.add(t)
+    return out or set(QUADS)
+
+
+def lv_quad(lv):
+    """并发等级条目属于哪个象限：有 sessions=多轮会话重放；有 requests=单轮。"""
+    if lv.get("multiturn") or (lv.get("sessions") and "requests" not in lv):
+        return "conc-multi"
+    return "conc-single"
+
+
+def filter_scenarios(data, sel):
+    out = {k: [] for k in SCENARIOS}
+    if "single" in sel:
+        out["single"] = data["single"]
+    if "multiturn" in sel:
+        out["multiturn"] = data["multiturn"]
+    for lv in data["concurrent"]:
+        if lv_quad(lv) in sel:
+            out["concurrent"].append(lv)
+    return out
+
+
 def load_inputs(argv):
-    """返回 (reports, title, scenario, out_dir)。reports: [(路径, dict)]"""
+    """返回 (reports, title, scenario, out_dir, scenarios)。reports: [(路径, dict)]"""
     paths, title, scenario = [], None, "all"
     out_dir = None
+    sel_spec = None
     rest = list(argv)
     i = 0
     while i < len(rest):
         a = rest[i]
+        if a == "--scenarios":
+            sel_spec = rest[i + 1]
+            i += 2
+            continue
+        if a.startswith("--scenarios="):
+            sel_spec = a.split("=", 1)[1]
+            i += 1
+            continue
         if a == "--scenario":
             scenario = rest[i + 1]
             i += 2
@@ -61,7 +110,7 @@ def load_inputs(argv):
     if not paths:
         sys.exit("没有输入：请给 output 目录或 .json 文件路径")
     reports = [(p, json.load(open(p, encoding="utf-8"))) for p in paths]
-    return reports, title, scenario, out_dir
+    return reports, title, scenario, out_dir, parse_scenarios(sel_spec)
 
 
 def merge(reports, scenario_filter):
@@ -163,6 +212,9 @@ def organize(data):
     for (m, _) in list(s_by) + list(m_by):
         if m not in models:
             models.append(m)
+    for lv in c_lvls:
+        if lv["model"] not in models:
+            models.append(lv["model"])
     return s_by, m_by, c_lvls, models
 
 
@@ -192,7 +244,37 @@ def analyze(data, meta):
         "has_single": bool(data["single"]),
         "has_multiturn": bool(data["multiturn"]),
         "has_concurrent": bool(c_lvls),
+        "has_conc_single": any(not lv.get("multiturn") and not lv.get("sessions") for lv in c_lvls),
+        "has_conc_multi": any(lv.get("multiturn") or lv.get("sessions") for lv in c_lvls),
     }
+
+    # 并发四象限聚合：每个 model×thinking×level 一行
+    for quad in ("conc_single", "conc_multi"):
+        A[quad] = []
+    for lv in c_lvls:
+        quad = "conc_multi" if (lv.get("multiturn") or lv.get("sessions")) else "conc_single"
+        if lv.get("multiturn") or lv.get("sessions"):
+            turns = [t for sess in lv.get("sessions", []) for t in sess.get("turns", [])]
+            n_units = len(lv.get("sessions", []))
+        else:
+            turns = lv.get("requests", [])
+            n_units = len(turns)
+        if not turns:
+            continue
+        A[quad].append({
+            "model": lv["model"],
+            "thinking": lv.get("thinking", "off"),
+            "level": lv.get("level", 0),
+            "n_units": n_units,
+            "n_turns": len(turns),
+            "wall": lv.get("wall_seconds"),
+            "tps": lv.get("throughput_tps"),
+            "ttft": mmm([t.get("ttft_ms", 0) / 1000 for t in turns], 2),
+            "e2e": mmm([t.get("e2e_ms", 0) / 1000 for t in turns], 1),
+            "think": mmm([(t.get("think_ms") or 0) / 1000 for t in turns], 1),
+            "tokps": mmm([t.get("tokens_per_sec") for t in turns], 0),
+            "finish": sorted({t.get("finish_reason", "?") for t in turns}),
+        })
 
     for m in models:
         P = {}
@@ -398,6 +480,46 @@ def build_charts(data, A):
                               "thinking=on 单次请求耗时与思考时长（全部 run 汇总）", scales))
         add("c_on_e2e", "thinking=on E2E 与思考时长分布")
 
+    # 并发四象限：吞吐 & TTFT vs 并发（每象限一张图，每模型×thinking 一条线）
+    for quad, cid_tps, cid_ttft, qname in (
+            ("conc_single", "c_cs_tps", "c_cs_ttft", "多发·单轮"),
+            ("conc_multi", "c_cm_tps", "c_cm_ttft", "多发·多轮")):
+        items = A.get(quad) or []
+        if not items:
+            continue
+        levels = sorted({e["level"] for e in items if e["level"]})
+        if not levels:
+            continue
+        groups = sorted({(e["model"], e["thinking"]) for e in items})
+        ds_tps, ds_ttft = [], []
+        for m, th in groups:
+            ys_tps, ys_ttft = [], []
+            for lv in levels:
+                es = [e for e in items if e["model"] == m and e["thinking"] == th and e["level"] == lv]
+                if es:
+                    ys_tps.append(round(sum(x["tps"] or 0 for x in es) / len(es), 1))
+                    med = st.median([x["ttft"][0] for x in es if x["ttft"]] or [None])
+                    ys_ttft.append(round(med, 2) if med is not None else None)
+                else:
+                    ys_tps.append(None)
+                    ys_ttft.append(None)
+            if any(v is not None for v in ys_tps):
+                lbl = "{} (thinking={})".format(short(m), th)
+                ds_tps.append(line_ds(lbl, ys_tps, color_of(models, m)))
+                ds_ttft.append(line_ds(lbl, ys_ttft, color_of(models, m)))
+        if ds_tps:
+            scales = {"x": spread({"title": {"display": True, "text": "并发数"}}),
+                      "y": spread({"title": {"display": True, "text": "吞吐 tok/s"}})}
+            stmts.append(chart_js(cid_tps, "line", [str(l) for l in levels], ds_tps,
+                                  "{}：吞吐 vs 并发（陡升转平=饱和点）".format(qname), scales))
+            add(cid_tps, "{} 吞吐 vs 并发".format(qname))
+        if ds_ttft:
+            scales = {"x": spread({"title": {"display": True, "text": "并发数"}}),
+                      "y": spread({"title": {"display": True, "text": "TTFT 秒"}})}
+            stmts.append(chart_js(cid_ttft, "line", [str(l) for l in levels], ds_ttft,
+                                  "{}：TTFT vs 并发（上翘=开始排队）".format(qname), scales))
+            add(cid_ttft, "{} TTFT vs 并发".format(qname))
+
     return canvases, stmts
 
 
@@ -432,6 +554,28 @@ def single_table(A, th):
            ["E2E s", "decode s", "ITL p50 ms", "ITL p99 ms", "tok/s", "输出 tok"] + \
            (["思考字符"] if th == "on" else []) + ["finish"]
     return table(head, rows) if rows else "<p>无数据</p>"
+
+
+def concurrent_table(A, quad):
+    qname = "多发·多轮" if quad == "conc_multi" else "多发·单轮"
+    has_think = any(e["thinking"] != "off" or (e["think"] and e["think"][0] > 0) for e in A[quad])
+    head = ["模型", "thinking", "并发", "单元数", "请求总数", "墙钟 s", "吞吐 tok/s",
+            "TTFT s", "E2E s"] + (["思考 s"] if quad == "conc_multi" else []) + \
+           ["单请求 tok/s", "finish"]
+    rows = []
+    for e in sorted(A[quad], key=lambda x: (x["model"], x["thinking"], x["level"])):
+        row = [esc(short(e["model"])), e["thinking"], str(e["level"]),
+               "{:,}".format(e["n_units"]), "{:,}".format(e["n_turns"]),
+               "{:.1f}".format(e["wall"]) if e["wall"] else "—",
+               "{:.0f}".format(e["tps"]) if e["tps"] else "—",
+               f3(e["ttft"]), f1(e["e2e"])]
+        if quad == "conc_multi":
+            row.append(f1(e["think"]))
+        row += [f0(e["tokps"]), " / ".join(e["finish"])]
+        rows.append(row)
+    note = '<div class="note">单元数：{}。TTFT/E2E 为该并发等级下全部请求的中位数（min–max）。</div>'.format(
+        "独立多轮会话（每用户各自重放完整会话）" if quad == "conc_multi" else "独立单轮请求")
+    return table(head, rows) + note if rows else "<p>无数据</p>"
 
 
 def multiturn_table(A, th):
@@ -536,10 +680,19 @@ def gen_conclusions(A):
                 P.get("off", P.get("on", {})).get("slope_multi") or 0,
                 "，为单发斜率的 {:.0%}".format(r) if r is not None and r < 1 else ""))
         elif label == "未命中":
-            cs.append("<b>{}</b>（多轮对话）：TTFT 斜率与单发一致（比值 {:.0%}）⇒ 未命中前缀缓存，每轮全量重算历史。".format(
-                esc(short(m)), r))
+            if r is not None:
+                cs.append("<b>{}</b>（多轮对话）：TTFT 斜率与单发一致（比值 {:.0%}）⇒ 未命中前缀缓存，每轮全量重算历史。".format(
+                    esc(short(m)), r))
+            else:
+                sm = (P.get("off") or P.get("on") or {}).get("slope_multi")
+                cs.append("<b>{}</b>（多轮对话）：多轮 TTFT 斜率 {:.3f} ms/token 超过绝对判据（{:.2f}）⇒ "
+                          "未命中前缀缓存，每轮全量重算历史。".format(
+                    esc(short(m)), sm if sm is not None else 0.0, CACHE_EFFECTIVE_MS_PER_TOKEN))
         else:
-            cs.append("<b>{}</b>（多轮对话）：TTFT 斜率为单发的 {:.0%} ⇒ 前缀缓存部分命中。".format(esc(short(m)), r))
+            if r is not None:
+                cs.append("<b>{}</b>（多轮对话）：TTFT 斜率为单发的 {:.0%} ⇒ 前缀缓存部分命中。".format(esc(short(m)), r))
+            else:
+                cs.append("<b>{}</b>（多轮对话）：前缀缓存部分命中（比值数据不足，按斜率判定）。".format(esc(short(m))))
         # 冷/热形态佐证
         cw = P.get("off", {}).get("cold_warm_ratio")
         if cw and cw > 3:
@@ -573,9 +726,31 @@ def gen_conclusions(A):
                       "长草稿显著放大单次时延{}。".format(
                 esc(short(m)), min(rc), max(rc), "{:.0f}".format(min(e2)), "{:.0f}".format(max(e2)), st.median(e2),
                 "；其中 {} 次思考独占输出预算（正文 0 token）".format(n_exh) if n_exh else ""))
-    # 5 agent 时延推算
+    # 5 并发扩展性（四象限中的两个"多发"）
+    for quad, qname in (("conc_single", "多发·单轮"), ("conc_multi", "多发·多轮")):
+        bymt = defaultdict(list)
+        for e in A.get(quad, []):
+            bymt[(e["model"], e["thinking"])].append(e)
+        for (m, th), es in sorted(bymt.items()):
+            es.sort(key=lambda x: x["level"])
+            if len(es) < 2 or not es[0]["tps"] or not es[-1]["tps"] or es[0]["level"] == es[-1]["level"]:
+                continue
+            scale = es[-1]["tps"] / es[0]["tps"]
+            lv_ratio = es[-1]["level"] / es[0]["level"]
+            ttft_infl = es[-1]["ttft"][0] / max(es[0]["ttft"][0], 1e-9)
+            if scale / lv_ratio < 0.7:
+                cs.append("<b>{}（{}·thinking={}）</b>：并发 {}→{} 吞吐仅 {:.1f}×（并发比 {:.0f}×）⇒ "
+                          "扩展性受限（排队/抢占），TTFT 中位 {:.2f}s→{:.2f}s（{:.1f}×）。".format(
+                    esc(short(m)), qname, th, es[0]["level"], es[-1]["level"], scale, lv_ratio,
+                    es[0]["ttft"][0], es[-1]["ttft"][0], ttft_infl))
+            else:
+                cs.append("<b>{}（{}·thinking={}）</b>：并发 {}→{} 吞吐 {:.1f}×（并发比 {:.0f}×）近似线性，"
+                          "TTFT 中位 {:.2f}s→{:.2f}s。".format(
+                    esc(short(m)), qname, th, es[0]["level"], es[-1]["level"], scale, lv_ratio,
+                    es[0]["ttft"][0], es[-1]["ttft"][0]))
+    # 6 agent 时延推算
     for m, P in A["per_model"].items():
-        if "off" in P and P["off"]["ladder"]:
+        if "off" in P and P["off"].get("ladder"):
             top = P["off"]["ladder"][-1]
             if top["size"] >= 20000 and top["ttft"]:
                 cs.append("<b>agent 场景推算（{}）</b>：单次响应 5–7 次模型调用、每次携带全量上下文，"
@@ -721,10 +896,11 @@ def summary_json(data, A, meta, conclusions, recommendations, limits):
 # ────────────────────────── 主流程 ──────────────────────────
 
 def main():
-    reports, title, scenario, out_dir = load_inputs(sys.argv[1:])
+    reports, title, scenario, out_dir, scenarios = load_inputs(sys.argv[1:])
     data, meta = merge(reports, scenario)
+    data = filter_scenarios(data, scenarios)
     if not any(data[k] for k in SCENARIOS):
-        sys.exit("输入中没有可用场景数据（single/multiturn/concurrent）")
+        sys.exit("输入中没有可用场景数据（过滤条件 --scenarios={}）".format("+".join(sorted(scenarios))))
     A = analyze(data, meta)
     conclusions = gen_conclusions(A)
     recommendations = gen_recommendations(A)
@@ -741,7 +917,7 @@ def main():
     # KPI
     kpis = []
     for m, P in A["per_model"].items():
-        if "off" in P and P["off"]["ladder"]:
+        if "off" in P and P["off"].get("ladder"):
             l0, l1 = P["off"]["ladder"][0], P["off"]["ladder"][-1]
             kpis.append(("单发 TTFT @{}k ({})".format(l1["size"] // 1000, short(m)),
                          "{:.2f} s".format(l1["ttft"][0]) if l1["ttft"] else "—"))
@@ -750,6 +926,15 @@ def main():
         if "on" in P and P["on"].get("e2e_all"):
             kpis.append(("思考 E2E 中位·单发 ({})".format(short(m)),
                          "{:.0f} s".format(st.median(P["on"]["e2e_all"]))))
+    for quad, qname in (("conc_single", "多发单轮"), ("conc_multi", "多发多轮")):
+        bym = defaultdict(list)
+        for e in A.get(quad, []):
+            bym[(e["model"], e["thinking"])].append(e)
+        for (m, th), es in sorted(bym.items()):
+            top = max(es, key=lambda x: x["level"])
+            if top["tps"]:
+                kpis.append(("吞吐@L{}·{} ({})".format(top["level"], qname, short(m)),
+                             "{:.0f} tok/s".format(top["tps"])))
     kpi_html = "".join('<div class="kpi"><div class="kpi-v">{}</div><div class="kpi-l">{}</div></div>'.format(
         esc(v), esc(l)) for l, v in kpis)
 
@@ -759,11 +944,13 @@ def main():
         "".join("<li>{}</li>".format(c) for c in conclusions))))
     cov = []
     if A["coverage"]["has_single"]:
-        cov.append("单发（档位矩阵 × runs）")
+        cov.append("单发·单轮（档位矩阵 × runs）")
     if A["coverage"]["has_multiturn"]:
-        cov.append("多轮（逐轮 history 滚动）")
-    if A["coverage"]["has_concurrent"]:
-        cov.append("并发")
+        cov.append("单发·多轮（history 逐轮滚动）")
+    if A["coverage"]["has_conc_single"]:
+        cov.append("多发·单轮（并发 × 独立单轮请求）")
+    if A["coverage"]["has_conc_multi"]:
+        cov.append("多发·多轮（并发 × 每用户独立会话重放）")
     notes_html = "".join("<p><b>{}</b>：{}</p>".format(esc(f), esc(n)) for f, n in meta["notes"][-4:])
     sec.append(("<h2>2 · 测试配置与方法</h2>",
                 table_kv([("端点", meta["endpoint"]), ("工具版本", meta["tool"]),
@@ -791,7 +978,7 @@ def main():
                 chart_html = ('<div class="chart"><canvas id="{}" height="110"></canvas></div>'.format(cid)
                               if any(c == cid for c, _ in canvases) else "")
                 body += "<h3>{}</h3>{}{}".format(label, chart_html, single_table(A, th))
-        sec.append(("<h2>4 · 单发结果</h2>", body))
+        sec.append(("<h2>4 · 单发·单轮结果</h2>", body))
     # 多轮
     if A["coverage"]["has_multiturn"]:
         body = ""
@@ -803,7 +990,21 @@ def main():
                 body += "<h3>{}</h3>{}{}".format(label, chart_html, multiturn_table(A, th))
         if any(c == "c_on_e2e" for c, _ in canvases):
             body += '<div class="chart"><canvas id="c_on_e2e" height="110"></canvas></div>'
-        sec.append(("<h2>5 · 多轮结果</h2>", body))
+        sec.append(("<h2>5 · 单发·多轮结果</h2>", body))
+    # 并发（多发·单轮 / 多发·多轮）
+    if A["coverage"]["has_concurrent"]:
+        body = ""
+        for quad, qname, cids in (("conc_single", "6.1 多发·单轮（并发 × 独立单轮请求）", ("c_cs_tps", "c_cs_ttft")),
+                                  ("conc_multi", "6.2 多发·多轮（并发 × 每用户独立会话重放）", ("c_cm_tps", "c_cm_ttft"))):
+            if not A.get(quad):
+                continue
+            body += "<h3>{}</h3>".format(qname)
+            for cid in cids:
+                if any(c == cid for c, _ in canvases):
+                    body += '<div class="chart"><canvas id="{}" height="110"></canvas></div>'.format(cid)
+            body += concurrent_table(A, quad)
+        if body:
+            sec.append(("<h2>6 · 并发结果</h2>", body))
     # 分析
     ana_rows = []
     for m, P in A["per_model"].items():
@@ -817,7 +1018,7 @@ def main():
                          "{:.0f}".format(P["decode_tps"][0]) if P.get("decode_tps") else "—",
                          {"no_reasoning": "思考无输出", "budget_exhausted": "思考独占预算",
                           "normal": "正常长草稿"}.get(P.get("thinking_behavior"), "—")])
-    sec.append(("<h2>6 · 分析：缓存 / 吞吐 / 思考</h2>", table(
+    sec.append(("<h2>7 · 分析：缓存 / 吞吐 / 思考</h2>", table(
         ["模型", "单发斜率 ms/tk", "多轮斜率 ms/tk", "多轮/单发", "缓存判定", "decode tok/s", "思考行为"],
         ana_rows) +
         '<div class="note">缓存判定规则：多轮 TTFT 斜率 &lt;{:.2f} ms/token（绝对判据）或 多轮/单发斜率比 &lt;20% ⇒ 生效；'
@@ -826,16 +1027,21 @@ def main():
         "normal=有思考草稿且正文正常。</div>".format(CACHE_EFFECTIVE_MS_PER_TOKEN)))
     # 结论建议
     rec_html = "".join('<p><b>【{}】</b>{}</p>'.format(esc(p), t) for p, t in recommendations)
-    sec.append(("<h2>7 · 结论与建议</h2>", '<div class="good">{}</div>'.format(rec_html)))
-    sec.append(("<h2>8 · 局限与备注</h2>", "<ul class='tight'>{}</ul>".format(
+    sec.append(("<h2>8 · 结论与建议</h2>", '<div class="good">{}</div>'.format(rec_html)))
+    sec.append(("<h2>9 · 局限与备注</h2>", "<ul class='tight'>{}</ul>".format(
         "".join("<li>{}</li>".format(esc(l)) for l in limits))))
-    sec.append(("<h2>9 · 数据质量</h2>", quality_block(data)))
+    sec.append(("<h2>10 · 数据质量</h2>", quality_block(data)))
     sec.append(("<h2>附录 A · 单发逐 run 明细</h2>",
                 "<details><summary>展开</summary>{}</details>".format(appendix_single(data))
                 if data["single"] else ""))
     sec.append(("<h2>附录 B · 多轮逐会话明细</h2>",
                 "<details><summary>展开</summary>{}</details>".format(appendix_multiturn(data))
                 if data["multiturn"] else ""))
+    if A["coverage"]["has_concurrent"]:
+        sec.append(("<h2>附录 C · 并发逐等级明细</h2>",
+                    "<details><summary>展开</summary>{}{}</details>".format(
+                        ("<h3>多发·单轮</h3>" + concurrent_table(A, "conc_single")) if A.get("conc_single") else "",
+                        ("<h3>多发·多轮</h3>" + concurrent_table(A, "conc_multi")) if A.get("conc_multi") else "")))
 
     body = "".join(h + '\n' + b + "\n" for h, b in sec)
     chart_block = ("<script>\n" + GRID_JS + "\n" + "\n".join(stmts) + "\n</script>") if stmts else ""
@@ -890,7 +1096,10 @@ __CHARTS__
                 .replace("__BODY__", body)
                 .replace("__SUMMARY__", summary_block)
                 .replace("__CHARTS__", chart_block))
-    out = os.path.join(out_dir, "llm-perf-报告.html")
+    suffix = ""
+    if scenarios != set(QUADS):
+        suffix = "-" + "+".join(QUADS[q] for q in sorted(scenarios, key=list(QUADS).index))
+    out = os.path.join(out_dir, "llm-perf-报告{}.html".format(suffix))
     open(out, "w", encoding="utf-8").write(page)
     print("报告:", out)
 

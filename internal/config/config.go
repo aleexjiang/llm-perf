@@ -461,7 +461,195 @@ func Load(path string) (*Config, error) {
 		}
 	}
 
+	// ── 联动与全局合理性校验 ──
+
+	// endpoint 形状：必须带协议头；指向具体接口路径是常见误填
+	if !strings.HasPrefix(cfg.Endpoint, "http://") && !strings.HasPrefix(cfg.Endpoint, "https://") {
+		return nil, fmt.Errorf("endpoint %q 缺少 http:// 或 https:// 前缀", cfg.Endpoint)
+	}
+	if strings.HasSuffix(strings.TrimRight(cfg.Endpoint, "/"), "/chat/completions") {
+		cfg.Warnings = append(cfg.Warnings,
+			"endpoint 指向 /chat/completions——工具会自动拼接接口路径，endpoint 应填到 /v1 为止")
+	}
+	for _, m := range cfg.Models {
+		if strings.TrimSpace(m) == "" {
+			return nil, fmt.Errorf("models 含空模型名")
+		}
+	}
+
+	// 数据源与语言联动
+	switch cfg.FillerLang {
+	case "", "en", "zh":
+	default:
+		return nil, fmt.Errorf("filler_lang 无效值 %q（可选 en/zh）", cfg.FillerLang)
+	}
+	if cfg.Dataset.Mode == "trace" {
+		if cfg.FillerCorpus != "" {
+			cfg.Warnings = append(cfg.Warnings,
+				"dataset.mode=trace：filler_corpus 不生效（语料只用于 filler 模式的 token 填充）")
+		}
+		if _, err := os.Stat(cfg.Dataset.Path); err != nil {
+			return nil, fmt.Errorf("dataset.path 文件不可读: %w", err)
+		}
+	} else if cfg.FillerCorpus == "en" && cfg.FillerLang == "zh" || cfg.FillerCorpus == "zh" && cfg.FillerLang == "en" {
+		cfg.Warnings = append(cfg.Warnings,
+			fmt.Sprintf("filler_lang=%s 与 filler_corpus=%s 语言不一致：token 计数口径会偏差，建议两者一致（en 语料配 en，zh 语料配 zh，或语料直接给文件路径）",
+				cfg.FillerLang, cfg.FillerCorpus))
+	}
+
+	// 超时：缺省/非法兜底；深上下文 + 思考时给足量提示
+	if cfg.TimeoutSeconds <= 0 {
+		cfg.Warnings = append(cfg.Warnings, "timeout_seconds 未配置或非正，回退 300s")
+		cfg.TimeoutSeconds = 300
+	}
+	thinkMayOn := cfg.Thinking.Mode == "on" || cfg.Thinking.Mode == "both" ||
+		(len(cfg.Thinking.Levels) > 0 && anyLevelEnabled(cfg.Thinking))
+	deepCtx := false
+	if n := len(cfg.Single.PromptTokens); n > 0 && cfg.Single.PromptTokens[n-1] >= 100000 {
+		deepCtx = true
+	}
+	if cfg.Multiturn.TurnTokens > 0 {
+		if reach := cfg.Multiturn.SystemTokens + cfg.Multiturn.ToolDefsTokens + cfg.Multiturn.Turns*cfg.Multiturn.TurnTokens; reach >= 100000 {
+			deepCtx = true
+		}
+	}
+	if cfg.TimeoutSeconds > 3600 {
+		cfg.Warnings = append(cfg.Warnings, fmt.Sprintf("timeout_seconds=%d 超过 1 小时：确认不是把毫秒当秒填了", cfg.TimeoutSeconds))
+	}
+	if thinkMayOn && deepCtx && cfg.TimeoutSeconds < 300 {
+		cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
+			"timeout_seconds=%d 偏小：思考开启 + 100k 级上下文时单请求可达 3–8 分钟，会被误判超时", cfg.TimeoutSeconds))
+	}
+
+	// runs/sessions 统计充分性
+	if cfg.Single.Runs < 2 {
+		cfg.Warnings = append(cfg.Warnings,
+			"single.runs=1 无法做缓存冷/热对照（run1 vs run2+ 至少要 2 次，建议 3 次）")
+	}
+	if cfg.Single.Runs >= 2 && !cfg.Single.FixedSeed {
+		cfg.Warnings = append(cfg.Warnings,
+			"single.fixed_seed=false：每个 run 换 prompt，测的是冷启动分布而非前缀缓存对照（确认是本意）")
+	}
+	if cfg.Multiturn.Sessions < 2 {
+		cfg.Warnings = append(cfg.Warnings,
+			"multiturn.sessions=1 无法评估会话间方差，缓存判定建议 ≥2 个会话取中位")
+	}
+
+	// 思考 floor 联动：on 时 max_tokens 会被抬高，off/on 的 E2E 口径不同
+	if thinkMayOn && cfg.Thinking.MaxTokensFloor > 0 {
+		if cfg.Single.MaxTokens > 0 && cfg.Single.MaxTokens < cfg.Thinking.MaxTokensFloor {
+			cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
+				"single.max_tokens=%d < max_tokens_floor=%d：thinking=on 的请求会被抬高到 floor，off/on 的 E2E 不可直接横向比（off 受 512 钳制、on 受 floor 抬高）",
+				cfg.Single.MaxTokens, cfg.Thinking.MaxTokensFloor))
+		}
+		if cfg.Multiturn.MaxTokens > 0 && cfg.Multiturn.MaxTokens < cfg.Thinking.MaxTokensFloor {
+			cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
+				"multiturn.max_tokens=%d < max_tokens_floor=%d：thinking=on 的请求会被抬高到 floor",
+				cfg.Multiturn.MaxTokens, cfg.Thinking.MaxTokensFloor))
+		}
+	}
+
+	// 多轮深度与单发档位的衔接
+	if cfg.Multiturn.TurnTokens > 0 && len(cfg.Single.PromptTokens) > 0 {
+		reach := cfg.Multiturn.SystemTokens + cfg.Multiturn.ToolDefsTokens + cfg.Multiturn.Turns*cfg.Multiturn.TurnTokens
+		if top := cfg.Single.PromptTokens[len(cfg.Single.PromptTokens)-1]; reach < top {
+			cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
+				"多轮可达深度（~%d）低于单发最大档位（%d）：多轮曲线无法覆盖单发最深处，两场景在最深处的形态差异测不到", reach, top))
+		}
+	}
+
+	// 并发：levels 非法值 / 重复；闭环与开环互斥提示；参数作用域提示
+	openLoop := cfg.Concurrent.RequestRate > 0 || len(cfg.Concurrent.RateSweep) > 0
+	seenLevel := map[int]bool{}
+	deduped := cfg.Concurrent.Levels[:0]
+	for _, lv := range cfg.Concurrent.Levels {
+		if lv <= 0 {
+			return nil, fmt.Errorf("concurrent.levels 含非正值 %d——并发度必须是正整数", lv)
+		}
+		if seenLevel[lv] {
+			cfg.Warnings = append(cfg.Warnings, fmt.Sprintf("concurrent.levels 重复档位 %d 已去重", lv))
+			continue
+		}
+		seenLevel[lv] = true
+		deduped = append(deduped, lv)
+	}
+	cfg.Concurrent.Levels = deduped
+	if openLoop {
+		if len(cfg.Concurrent.Levels) > 0 {
+			cfg.Warnings = append(cfg.Warnings,
+				"request_rate/rate_sweep 已配置：开环到达率模式生效，levels 被忽略")
+		}
+		if cfg.Concurrent.RequestRate > 0 && len(cfg.Concurrent.RateSweep) > 0 {
+			cfg.Warnings = append(cfg.Warnings,
+				"request_rate 与 rate_sweep 同时配置：rate_sweep 多档扫描优先")
+		}
+		if cfg.Concurrent.NumPrompts <= 0 {
+			cfg.Warnings = append(cfg.Warnings,
+				"开环模式未配 num_prompts，将使用默认 32（multiturn 时为总会话数）")
+		}
+	} else if cfg.Concurrent.MaxConcurrency > 0 {
+		cfg.Warnings = append(cfg.Warnings,
+			"max_concurrency 仅在开环模式（request_rate/rate_sweep）下生效，闭环 levels 模式会忽略")
+	}
+	if !cfg.Concurrent.Multiturn && cfg.Concurrent.PromptTokens > 200000 {
+		return nil, fmt.Errorf(
+			"concurrent.prompt_tokens=%d 过大：单条消息大概率超过模型上下文上限（阈值 200k，与 single 档位同一约束）",
+			cfg.Concurrent.PromptTokens)
+	}
+
+	// goodput / retry / correctness / warmup / salt
+	if cfg.Goodput != nil {
+		if cfg.Goodput.TTFTMS < 0 || cfg.Goodput.TPOTMS < 0 {
+			return nil, fmt.Errorf("goodput 阈值不能为负（ttft_ms=%v tpot_ms=%v）", cfg.Goodput.TTFTMS, cfg.Goodput.TPOTMS)
+		}
+		if cfg.Goodput.TTFTMS == 0 && cfg.Goodput.TPOTMS == 0 {
+			return nil, fmt.Errorf("goodput 已启用但 ttft_ms/tpot_ms 均为 0——至少配置一项才有判定意义（不打算用请整段注释掉）")
+		}
+	}
+	if cfg.Retry != nil {
+		if cfg.Retry.MaxAttempts < 0 || cfg.Retry.BackoffMS < 0 {
+			return nil, fmt.Errorf("retry.max_attempts / retry.backoff_ms 不能为负")
+		}
+		if cfg.Retry.MaxAttempts > 5 {
+			cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
+				"retry.max_attempts=%d 过多：重试会掩盖服务端不稳定，压测语义下建议 ≤2", cfg.Retry.MaxAttempts))
+		}
+	}
+	if cfg.Correctness != nil && cfg.Correctness.Samples < 0 {
+		return nil, fmt.Errorf("correctness.samples 不能为负")
+	}
+	if cfg.WarmupRequests < 0 {
+		return nil, fmt.Errorf("warmup_requests 不能为负")
+	}
+	if cfg.SeedSalt < 0 {
+		return nil, fmt.Errorf("seed_salt 不能为负")
+	}
+
+	// max_prompt_tokens 联动：档位截断预告
+	if cfg.MaxPromptTokens > 0 {
+		if cfg.MaxPromptTokens < 1000 {
+			cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
+				"max_prompt_tokens=%d 过小（<1k）：所有场景都会被截到该值，确认单位是 token 而非其它", cfg.MaxPromptTokens))
+		}
+		clamped, didClamp := cfg.ClampLadder(cfg.Single.PromptTokens)
+		if didClamp {
+			cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
+				"single 档位超过 max_prompt_tokens=%d，截断去重后实际档位 → %v；多轮会话到顶后提前停轮",
+				cfg.MaxPromptTokens, clamped))
+		}
+	}
+
 	return cfg, nil
+}
+
+// anyLevelEnabled 判断 levels 里是否存在思考开启的变体。
+func anyLevelEnabled(th Thinking) bool {
+	for _, lv := range th.Levels {
+		if lv.Enabled {
+			return true
+		}
+	}
+	return false
 }
 
 // Timeout 返回超时 Duration。
