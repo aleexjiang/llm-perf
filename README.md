@@ -168,7 +168,8 @@ server_metrics: true   # 抓推理服务原生 /metrics（vLLM 默认暴露）�
 ```
 
 指标命名经 `MetricsProvider` 抽象，**按抓取样本的指标名前缀自动识别引擎**（`vllm:` → vLLM、
-`sglang:` → SGLang，无法识别回落 vLLM）；SGLang 的缓存 counter 命名待真机校准（待真机校准）。
+`sglang:` → SGLang；无法识别时日志显式告警"按 vLLM 命名尝试，服务端指标大概率拿不到数"，
+不静默套错——自研网关属预期）；SGLang 的缓存 counter 命名待真机校准。
 gauge 轮询自带健康度：从未成功或连续失败 ≥5 时 JSON 标记 `observation_degraded`，报告出红色警示。
 
 对标 NVIDIA AIPerf / inference-perf 的 server metrics 层，给客户端计时补上服务端视角：
