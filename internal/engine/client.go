@@ -28,10 +28,12 @@ import (
 	"github.com/aleexjiang/llm-perf/internal/smetrics"
 )
 
-// Message 是一条对话消息。
+// Message 是一条对话消息。ToolCallID 仅 role=tool 时使用（OpenAI 协议必填，
+// full 回放时从 trace 透传；缺失会被服务端 400）。
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string `json:"role"`
+	Content    string `json:"content"`
+	ToolCallID string `json:"tool_call_id,omitempty"`
 }
 
 // RetryPolicy 可选的连接层重试策略。压测语义下默认关闭（重试会掩盖服务端的不稳定），
@@ -46,12 +48,23 @@ type RetryPolicy struct {
 type Client struct {
 	BaseURL      string       // 如 http://host:30082/router/v1
 	APIKey       string       // 为空则不带 Authorization
+	Auth         Auth         // 认证方案（默认 bearer + Authorization；客户网关裸 key / 自定义 header 时配置）
+	ChatPath     string       // 接口路径，默认 /chat/completions（客户 router 路径不同时配置）
 	IncludeUsage bool         // 请求 stream_options.include_usage
 	HTTP         *http.Client //
 	DebugDir     string       // 非空时留存每个请求的原始响应到该目录（排查魔改引擎）；请求失败时即使为空也会留存
 	Retry        *RetryPolicy // nil = 不重试（压测默认）
 
 	seq atomic.Int64 // 原始流量转储文件序号
+}
+
+// ChatURL 返回完整接口地址。
+func (c *Client) ChatURL() string {
+	p := c.ChatPath
+	if p == "" {
+		p = "/chat/completions"
+	}
+	return strings.TrimRight(c.BaseURL, "/") + p
 }
 
 // NewClient 创建客户端。timeout 作用于整个请求（含流式读取）。
@@ -74,6 +87,14 @@ func NewClient(baseURL, apiKey string, timeout time.Duration, includeUsage bool)
 		IncludeUsage: includeUsage,
 		HTTP:         &http.Client{Timeout: timeout, Transport: transport},
 	}
+}
+
+// ToolCall 一次结构化工具调用（probe tool-call 检查用）。
+// Arguments 是 OpenAI 口径的 JSON 对象字符串（流式时由增量拼接而成）。
+type ToolCall struct {
+	ID        string `json:"id,omitempty"`
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments,omitempty"`
 }
 
 // TurnMetrics 记录一次请求的完整计时与 token 统计。时间字段为毫秒。
@@ -150,6 +171,11 @@ type TurnMetrics struct {
 	// 引擎兼容性告警（usage 缺失、未知增量字段、流未正常终止等）——排查魔改引擎的关键线索
 	Warnings []string `json:"warnings,omitempty"`
 
+	// ToolCalls 结构化工具调用（probe tool-call 检查读取；流式在 closeOutWarnings 聚合成型）。
+	// 不进压测数据契约（json:"-"）——主压测不带 tools，该字段只有 probe 检查项消费
+	ToolCalls []ToolCall `json:"-"`
+	toolCallBuckets map[int]*ToolCall // 流式按 index 分桶的聚合状态
+
 	contentTimes []time.Time
 	// 解析状态（sse.go 的 ingest 逻辑使用；probe 也读它们做兼容性判定）
 	seenDeltaKeys  map[string]bool // 流中出现过的全部 delta 键名
@@ -173,6 +199,19 @@ func PreviewHeadTail(s string) string {
 		return s
 	}
 	return string(r[:120]) + fmt.Sprintf("……[中略 %d 字]……", len(r)-240) + string(r[len(r)-120:])
+}
+
+// TruncateRunes 按 rune 截断到 n 个字符（中文安全）。n<=0 返回原文。
+// scenario 层的 assistant history 截断用——之前按字节切（reply[:2000]），中文会切出半个 UTF-8 字符
+func TruncateRunes(s string, n int) string {
+	if n <= 0 {
+		return s
+	}
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n])
 }
 
 func (m *TurnMetrics) warn(format string, args ...any) {
@@ -337,14 +376,12 @@ func (c *Client) attempt(ctx context.Context, o ChatOptions) (m *TurnMetrics, er
 
 	m = &TurnMetrics{Model: o.Model, Stream: o.Stream, Thinking: o.Thinking}
 	m.appendRaw(string(payload) + "\n--- RESPONSE ---\n")
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/chat/completions", bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.ChatURL(), bytes.NewReader(payload))
 	if err != nil {
 		return nil, err, false
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if c.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+c.APIKey)
-	}
+	c.Auth.Apply(req, c.APIKey)
 
 	m.SentAt = time.Now()
 	resp, err := c.HTTP.Do(req)

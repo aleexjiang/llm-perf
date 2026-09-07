@@ -56,11 +56,26 @@ type ProbeResult struct {
 type ProbeOptions struct {
 	Endpoint     string
 	APIKey       string
-	Model        string         // 为空则取 /models 列表第一个
+	Auth         Auth   // 认证方案（默认 bearer + Authorization）
+	ChatPath     string // 接口路径，默认 /chat/completions
+	MetricsPath  string // 服务端 metrics 路径，默认 /metrics
+	Model        string // 为空则取 /models 列表第一个
 	ThinkingOn   map[string]any // 思考开启的 extra_body（可空）
 	ThinkingOff  map[string]any // 思考关闭的 extra_body（可空）
 	IncludeUsage bool
 	MaxContext   int // 计划压测的最大上下文（config.LargestPromptTokens()），与服务端上限对比
+
+	// Timeout 单请求超时（chat 与 models 共用；0 = 默认 120s）。
+	// 之前硬编码 120s，配置的 timeout_seconds 完全不作用于 probe——慢网关误判超时
+	Timeout time.Duration
+
+	// ToolCall 是否执行 tool-call 健康检查（默认开；--no-toolcall 关闭）。
+	// 只做前置门禁：检出引擎能否正常调工具 + 可行动结论；不测性能、不进主压测路径
+	ToolCall bool
+
+	// CaptureDir 非空时把 tool-call 检查的原始响应落盘到该目录（给厂商排障证据 + 判据回归 fixture）。
+	// 必须显式指定才生效（不默认落盘）；内容含业务数据，外发前请按需脱敏
+	CaptureDir string
 
 	// 交叉验证命令映射用的计划压测参数
 	XVPromptTokens int
@@ -83,6 +98,14 @@ type probeModelsResp struct {
 // Probe 对目标端点执行全套兼容性探测。
 func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 	base := strings.TrimRight(o.Endpoint, "/")
+	chatPath := o.ChatPath
+	if chatPath == "" {
+		chatPath = "/chat/completions"
+	}
+	timeout := o.Timeout
+	if timeout <= 0 {
+		timeout = 120 * time.Second
+	}
 	res := &ProbeResult{GeneratedAt: time.Now(), Endpoint: o.Endpoint}
 	check := func(name string, ok bool, detail string) {
 		res.Checks = append(res.Checks, ProbeCheck{Name: name, OK: ok, Detail: detail})
@@ -90,10 +113,8 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 
 	// ── 1. 模型列表 + Server 头 ──
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, base+"/models", nil)
-	if o.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+o.APIKey)
-	}
-	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	o.Auth.Apply(req, o.APIKey)
+	resp, err := (&http.Client{Timeout: timeout}).Do(req)
 	if err != nil {
 		res.Checks = append(res.Checks, ProbeCheck{Name: "models_list", OK: false, Detail: err.Error()})
 		res.Verdicts = append(res.Verdicts, "端点不可达，先解决网络/认证再继续")
@@ -160,12 +181,10 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 			payload["stream_options"] = map[string]any{"include_usage": true}
 		}
 		pj, _ := json.Marshal(payload)
-		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, base+"/chat/completions", bytes.NewReader(pj))
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, base+chatPath, bytes.NewReader(pj))
 		req.Header.Set("Content-Type", "application/json")
-		if o.APIKey != "" {
-			req.Header.Set("Authorization", "Bearer "+o.APIKey)
-		}
-		resp, err := (&http.Client{Timeout: 120 * time.Second}).Do(req)
+		o.Auth.Apply(req, o.APIKey)
+		resp, err := (&http.Client{Timeout: timeout}).Do(req)
 		if err != nil {
 			return 0, nil, nil, err
 		}
@@ -324,17 +343,30 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 	}
 
 	// ── 6. /metrics 可用性（服务端观测层的前置条件；vLLM 默认暴露） ──
-	s := smetrics.NewScraper(o.Endpoint)
+	metricsPath := o.MetricsPath
+	if metricsPath == "" {
+		metricsPath = "/metrics"
+	}
+	s := smetrics.NewScraperAt(o.Endpoint, metricsPath)
 	if ok, detail := s.Available(ctx); ok {
 		res.ServerMetrics = "available: " + detail
-		check("server_metrics", true, "/metrics 可用（"+detail+"）→ 配置 server_metrics: true 可开启观测层（缓存命中率/排队/prefill-decode 分解）")
+		check("server_metrics", true, metricsPath+" 可用（"+detail+"）→ 配置 server_metrics: true 可开启观测层（缓存命中率/排队/prefill-decode 分解）")
 	} else {
 		res.ServerMetrics = "unavailable: " + detail
-		check("server_metrics", false, "/metrics 不可达（"+detail+"）→ 观测层不可用，压测时自动降级为纯客户端计时")
+		check("server_metrics", false, metricsPath+" 不可达（"+detail+"）→ 观测层不可用，压测时自动降级为纯客户端计时")
 	}
 
-	// ── 7. 交叉验证建议：引擎 → 原生 perf 工具 ──
+	// ── 7. tool-call 健康检查（默认开；--no-toolcall 关闭）──
+	if o.ToolCall {
+		runToolCallCheck(ctx, res, check, o, base, chatPath, timeout, model, streamAnalyze)
+	}
+
+	// ── 8. 交叉验证建议：引擎 → 原生 perf 工具 ──
 	res.CrossChecks = crossChecks(o, res.EngineGuess, model)
+	if _, ok := nativeTools[res.EngineGuess]; !ok {
+		res.Verdicts = append(res.Verdicts,
+			"无法识别引擎（Server 头不吐特征）——交叉验证命令不可用，自研网关/魔改版属预期；其余探测项不受影响")
+	}
 
 	return res
 }

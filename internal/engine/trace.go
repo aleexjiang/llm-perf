@@ -8,7 +8,12 @@
 //   - sessions：本工具自定义精简格式
 //     [ {"turns": ["user1", "user2", ...]} , ... ]  或  [ ["user1", "user2"], ... ]
 //
-// 只取 user 侧消息作为回放轮次；assistant 回复由被测服务实时生成（keep_assistant 决定是否进 history）。
+// 回放保真度（dataset.replay_mode）：
+//   - user_only（默认）：只取 user 侧消息作为回放轮次，assistant 回复由被测服务实时生成——
+//     与旧行为完全兼容，但真实会话里的 assistant/tool 消息（含大段工具结果）不进上下文，
+//     回放上下文系统性偏小
+//   - full：按原序注入全部 role（user / assistant / tool / system），第 i 轮请求 =
+//     完整消息序列到第 i 条 user 消息为止的前缀——测的是真实 history 深度下的增量 prefill
 package engine
 
 import (
@@ -20,9 +25,17 @@ import (
 	"strings"
 )
 
-// TraceSession 是一个回放会话（按序的 user 消息列表）。
+// TraceMessage 是 full 回放模式的一条原始消息（原序、原 role）。
+type TraceMessage struct {
+	Role       string `json:"role"`
+	Content    string `json:"content"`
+	ToolCallID string `json:"tool_call_id,omitempty"`
+}
+
+// TraceSession 是一个回放会话。
 type TraceSession struct {
-	UserTurns []string
+	UserTurns []string       // user_only 视图：按序的 user 消息（兼容既有场景代码）
+	Messages  []TraceMessage // full 视图：原序全部 role（replay_mode=full 时使用）
 }
 
 // TraceSet 是加载后的会话集合。
@@ -30,20 +43,29 @@ type TraceSet struct {
 	Sessions []TraceSession
 	Source   string // 文件路径（报告追溯用）
 	Format   string // 实际识别的格式
+	// FullReplay load 时的回放模式（true = 已填充 Messages）
+	FullReplay bool
+	// MissingToolCallID full 模式下 role=tool 但缺 tool_call_id 被跳过的消息数（不静默丢弃）
+	MissingToolCallID int
+	// NoAssistantContent 数据源不含 assistant/tool 内容（如 sessions 格式只有 user 轮），
+	// full 模式下 Messages 退化为 user 序列——回放深度与 user_only 相同
+	NoAssistantContent bool
 }
 
 // maxTraceFileBytes 单文件内存上限：工具全量载入 trace（非流式），超限直接给出可行动的错误。
 const maxTraceFileBytes = 512 << 20
 
 // LoadTrace 读取 trace 文件（.json / .json.gz），按 format 解析（""=自动识别）。
-// minTurns 过滤掉 user 轮数不足的会话（多轮场景至少 2），maxSessions 限制总量（0=不限）。
-func LoadTrace(path, format string, minTurns, maxSessions int) (*TraceSet, error) {
+// replayMode 为 "full" 时按原序保留全部 role；minTurns 过滤掉 user 轮数不足的会话
+// （多轮场景至少 2），maxSessions 限制总量（0=不限）。
+func LoadTrace(path, format, replayMode string, minTurns, maxSessions int) (*TraceSet, error) {
 	if path == "" {
 		return nil, fmt.Errorf("trace 模式需要 dataset.path")
 	}
 	if minTurns <= 0 {
 		minTurns = 2
 	}
+	full := replayMode == "full"
 	// 非压缩文件先查大小：超限时给出可行动的错误，而不是截断后报晦涩的 JSON 解析失败
 	if !strings.HasSuffix(path, ".gz") {
 		if fi, statErr := os.Stat(path); statErr == nil && fi.Size() > maxTraceFileBytes {
@@ -55,10 +77,11 @@ func LoadTrace(path, format string, minTurns, maxSessions int) (*TraceSet, error
 	if err != nil {
 		return nil, err
 	}
-	sessions, detected, err := parseTrace(data, format)
+	sessions, detected, err := parseTrace(data, format, full)
 	if err != nil {
 		return nil, fmt.Errorf("parse trace %s: %w", path, err)
 	}
+	set := &TraceSet{Sessions: sessions, Source: path, Format: detected, FullReplay: full}
 	// 过滤轮数不足的会话
 	kept := sessions[:0]
 	for _, s := range sessions {
@@ -66,13 +89,39 @@ func LoadTrace(path, format string, minTurns, maxSessions int) (*TraceSet, error
 			kept = append(kept, s)
 		}
 	}
+	set.Sessions = kept
 	if maxSessions > 0 && len(kept) > maxSessions {
-		kept = kept[:maxSessions]
+		set.Sessions = kept[:maxSessions]
 	}
-	if len(kept) == 0 {
+	if len(set.Sessions) == 0 {
 		return nil, fmt.Errorf("trace %s 过滤后没有可用会话（min_turns=%d）", path, minTurns)
 	}
-	return &TraceSet{Sessions: kept, Source: path, Format: detected}, nil
+	// full 模式数据质量统计：tool_call_id 缺失已按消息跳过（不可静默）；assistant 缺失要如实告知
+	if full {
+		missing := 0
+		for si := range set.Sessions {
+			kept := set.Sessions[si].Messages[:0]
+			for _, m := range set.Sessions[si].Messages {
+				if m.Role == "tool" && strings.TrimSpace(m.ToolCallID) == "" {
+					missing++ // 跳过并计数，不静默丢弃
+					continue
+				}
+				kept = append(kept, m)
+			}
+			set.Sessions[si].Messages = kept
+		}
+		set.MissingToolCallID = missing
+		noAssistant := true
+		for _, s := range set.Sessions {
+			for _, m := range s.Messages {
+				if m.Role != "user" {
+					noAssistant = false
+				}
+			}
+		}
+		set.NoAssistantContent = noAssistant
+	}
+	return set, nil
 }
 
 // Pick 第 i 个会话（越界回绕），空集合返回空会话。
@@ -100,9 +149,9 @@ func readFile(path string) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(f, 512*1024*1024))
 }
 
-func parseTrace(data []byte, format string) ([]TraceSession, string, error) {
+func parseTrace(data []byte, format string, full bool) ([]TraceSession, string, error) {
 	if format == "" || format == "sharegpt" {
-		if s, err := parseShareGPT(data); err == nil && len(s) > 0 {
+		if s, err := parseShareGPT(data, full); err == nil && len(s) > 0 {
 			return s, "sharegpt", nil
 		}
 		if format == "sharegpt" {
@@ -118,18 +167,38 @@ func parseTrace(data []byte, format string) ([]TraceSession, string, error) {
 }
 
 type sharegptTurn struct {
-	From    string `json:"from"`
-	Role    string `json:"role"`
-	Value   string `json:"value"`
-	Content string `json:"content"`
+	From       string `json:"from"`
+	Role       string `json:"role"`
+	Value      string `json:"value"`
+	Content    string `json:"content"`
+	ToolCallID string `json:"tool_call_id"`
 }
 
-func (t sharegptTurn) isUser() bool {
-	role := strings.ToLower(t.From)
-	if role == "" {
-		role = strings.ToLower(t.Role)
+func (t sharegptTurn) role() string {
+	r := strings.ToLower(t.From)
+	if r == "" {
+		r = strings.ToLower(t.Role)
 	}
-	return role == "human" || role == "user"
+	return r
+}
+
+func (t sharegptTurn) isUser() bool { return t.role() == "human" || t.role() == "user" }
+
+// normRole ShareGPT 词表 → OpenAI role（human→user、gpt/bot→assistant、
+// system→system、function/tool/observation→tool；其余原样保留并视为 assistant 兜底）。
+func (t sharegptTurn) normRole() string {
+	switch r := t.role(); r {
+	case "human", "user":
+		return "user"
+	case "gpt", "bot", "chatgpt", "assistant":
+		return "assistant"
+	case "system":
+		return "system"
+	case "function", "tool", "observation":
+		return "tool"
+	default:
+		return "assistant"
+	}
 }
 
 func (t sharegptTurn) text() string {
@@ -144,7 +213,7 @@ type sharegptConv struct {
 	Messages      []sharegptTurn `json:"messages"` // 兼容变体
 }
 
-func parseShareGPT(data []byte) ([]TraceSession, error) {
+func parseShareGPT(data []byte, full bool) ([]TraceSession, error) {
 	var convs []sharegptConv
 	if err := json.Unmarshal(data, &convs); err != nil {
 		return nil, err
@@ -157,8 +226,16 @@ func parseShareGPT(data []byte) ([]TraceSession, error) {
 		}
 		s := TraceSession{}
 		for _, t := range turns {
-			if t.isUser() && strings.TrimSpace(t.text()) != "" {
+			if strings.TrimSpace(t.text()) == "" {
+				continue
+			}
+			if t.isUser() {
 				s.UserTurns = append(s.UserTurns, t.text())
+			}
+			if full {
+				s.Messages = append(s.Messages, TraceMessage{
+					Role: t.normRole(), Content: t.text(), ToolCallID: t.ToolCallID,
+				})
 			}
 		}
 		if len(s.UserTurns) > 0 {

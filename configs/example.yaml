@@ -3,8 +3,13 @@
 
 endpoint: "http://<客户路由IP>:30082/router/v1"
 api_key: ""                      # 字面量 key，直接写这里（仅用于不入库的本地配置）；也可改用 api_key_env 从环境变量读
+auth_scheme: "bearer"            # 认证格式：bearer（默认，Authorization: Bearer <key>）/ raw（裸 key 无 Bearer 前缀，
+                                 # 部分网关如此）/ none（免认证端点）；配合 auth_header 可用自定义 header 名
+# auth_header: "X-API-Key"       # 自定义认证 header 名（默认 Authorization）；AgentLens 等网关用自定义 header 时配
 output_dir: "output"              # 输出 JSON 的默认目录（-o 可覆盖）
-timeout_seconds: 600              # 客户环境慢 + 并发高档位排队，放宽（300s 可能不够）
+timeout_seconds: 600              # 客户环境慢 + 并发高档位排队，放宽（300s 可能不够）；对 bench probe 同样生效
+chat_path: "/chat/completions"    # 接口路径（默认 /chat/completions）；客户 router 路径不同时改
+metrics_path: "/metrics"          # 服务端指标路径（默认 /metrics）；如挂在 /actuator/prometheus 时改
 include_usage: true               # 请求 stream_options.include_usage，从 usage 字段取精确 token 数
 filler_lang: "en"                 # 填充文本语言：en（约 1 word ≈ 0.75 token）/ zh（约 1 字 ≈ 1 token）
 filler_corpus: "en"               # 真实文本语料填充："en"=战争与和平+白鲸记(内置,≈99万token) / "zh"=红楼梦(内置,≈62万token) /
@@ -27,6 +32,9 @@ dataset:
   # format: "sharegpt"       # sharegpt | sessions（自定义 [{"turns":[...]}]；留空自动识别）
   # min_turns: 2             # 会话最少 user 轮数
   # max_sessions: 64         # 最多加载多少会话（0=不限）
+  # replay_mode: "user_only" # 回放保真度：user_only（默认，只回放 user 轮，行为同历史版本）|
+                             # full（按原序注入全部 role——assistant/tool 消息进上下文，测真实 history 深度。
+                             # user_only 的回放上下文系统性偏小，真实 agent 会话里工具结果往往占大头）
 
 # goodput（SLO 约束吞吐）：同时满足以下两条的请求才算有效（concurrent 结果里出 goodput 列）
 # goodput:
@@ -98,6 +106,7 @@ multiturn:
                                   # 每轮 12k 量级比大轮次更贴近真实 agent；多轮滚到 200k ≠ 单条塞 200k，两者推理行为不同
   max_tokens: 256
   keep_assistant: true            # assistant 回复保留进 history（真实 agent 行为）
+  max_reply_chars: 2000           # assistant 回复进 history 的截断长度（按字符计，中文安全；默认 2000）
 
 # 场景三：并发（单轮或多轮由 multiturn 决定；闭环 levels 与开环到达率二选一）
 concurrent:

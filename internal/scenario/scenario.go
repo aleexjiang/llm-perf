@@ -92,7 +92,7 @@ type env struct {
 func newEnv(ctx context.Context, cfg *config.Config, client *engine.Client) (*env, error) {
 	e := &env{cfg: cfg, client: client}
 	if cfg.ServerMetrics {
-		s := smetrics.NewScraper(cfg.Endpoint)
+		s := smetrics.NewScraperAt(cfg.Endpoint, cfg.MetricsPath)
 		// 判定口径与 probe 一致：HTTP 200 但 0 项 vLLM 指标（网关占位响应）也算不可用，
 		// 否则观测层会带着空指标集白跑，报告里出现假"可用"
 		ok, detail := s.Available(ctx)
@@ -103,20 +103,36 @@ func newEnv(ctx context.Context, cfg *config.Config, client *engine.Client) (*en
 			if err != nil {
 				log.Printf("⚠️ server_metrics=true 但 /metrics 抓取失败（%v）——降级为纯客户端计时", err)
 			} else {
+				name := smetrics.DetectProviderName(sample)
+				if name == "" {
+					// 自研引擎指标名不带 vllm:/sglang: 前缀——不静默套错命名，显式告知
+					log.Printf("⚠️ 无法识别服务端指标命名（无 vllm:/sglang: 前缀，自研网关属预期）——按 vLLM 命名尝试，服务端指标大概率拿不到数")
+					name = "vllm"
+				}
 				e.srv = s
 				e.provider = smetrics.DetectProvider(sample)
 				n := len(sample.Counters) + len(sample.Gauges) + len(sample.Hists)
-				log.Printf("服务端观测层: /metrics 可用（%d 项指标，%s 命名）", n, e.provider.Name())
+				log.Printf("服务端观测层: %s 可用（%d 项指标，%s 命名）", cfg.MetricsPath, n, name)
 			}
 		}
 	}
 	if cfg.Dataset.Mode == "trace" {
-		ts, err := engine.LoadTrace(cfg.Dataset.Path, cfg.Dataset.Format, cfg.Dataset.MinTurns, cfg.Dataset.MaxSessions)
+		ts, err := engine.LoadTrace(cfg.Dataset.Path, cfg.Dataset.Format, cfg.Dataset.ReplayMode, cfg.Dataset.MinTurns, cfg.Dataset.MaxSessions)
 		if err != nil {
 			return nil, err
 		}
 		e.trace = ts
-		log.Printf("trace 回放: %s（%s 格式，%d 个会话）", ts.Source, ts.Format, len(ts.Sessions))
+		mode := "user_only"
+		if ts.FullReplay {
+			mode = "full"
+		}
+		log.Printf("trace 回放: %s（%s 格式，%d 个会话，replay_mode=%s）", ts.Source, ts.Format, len(ts.Sessions), mode)
+		if ts.MissingToolCallID > 0 {
+			log.Printf("    ⚠️ full 回放：%d 条 role=tool 消息缺 tool_call_id，已跳过（OpenAI 协议要求 tool 消息必须带该字段，缺失会被服务端 400）", ts.MissingToolCallID)
+		}
+		if ts.NoAssistantContent {
+			log.Printf("    ⚠️ full 回放：数据源不含 assistant/tool 消息（%s 格式只有 user 轮）——实际回放深度与 user_only 相同，请改用 sharegpt 等含完整会话的数据", ts.Format)
+		}
 	}
 	return e, nil
 }
@@ -235,10 +251,10 @@ func startWindow(ctx context.Context, e *env) (*smetrics.Sample, *smetrics.Gauge
 	}
 	before, err := e.srv.Scrape(ctx)
 	if err != nil {
-		log.Printf("⚠️ /metrics 起始快照失败（%v）——本场景无服务端观测", err)
+		log.Printf("⚠️ %s 起始快照失败（%v）——本场景无服务端观测", e.cfg.MetricsPath, err)
 		return nil, nil
 	}
-	poller := smetrics.StartGaugePoller(ctx, e.cfg.Endpoint, time.Duration(e.cfg.MetricsIntervalMS)*time.Millisecond, e.provider)
+	poller := smetrics.StartGaugePoller(ctx, e.srv, time.Duration(e.cfg.MetricsIntervalMS)*time.Millisecond, e.provider)
 	return before, poller
 }
 
@@ -315,10 +331,7 @@ func runCorrectness(ctx context.Context, e *env, model string) []report.Correctn
 			prompt = fmt.Sprintf("Reply with exactly this number and nothing else: %d", num)
 		}
 		m := runOne(ctx, e, model, []engine.Message{{Role: "user", Content: prompt}}, 16, vOff)
-		reply := m.ReplyText
-		if len(reply) > 200 {
-			reply = reply[:200]
-		}
+		reply := engine.TruncateRunes(m.ReplyText, 200)
 		rows = append(rows, report.CorrectnessRow{
 			Number: strconv.Itoa(num), Reply: reply,
 			Match: m.Error == "" && strings.Contains(m.ReplyText, strconv.Itoa(num)),
@@ -430,6 +443,29 @@ func (e *env) sessionUserTurns(sessionIdx int) []string {
 	return e.trace.Pick(sessionIdx).UserTurns
 }
 
+// fullReplay full 回放是否生效（replay_mode=full 且数据源为 trace 且含非 user 消息）。
+func (e *env) fullReplay() bool {
+	return e.trace != nil && e.trace.FullReplay && !e.trace.NoAssistantContent
+}
+
+// fullPrefixes full 回放：返回会话按 user 消息边界的累计消息前缀——
+// 第 i 轮请求 = 原序消息到第 i 条 user 消息为止的全部内容（含其前的 assistant/tool 消息）。
+// 这是"真实 agent 会话"的忠实回放：工具结果与助手回复都占着真实上下文深度。
+func (e *env) fullPrefixes(sessionIdx int) [][]engine.Message {
+	s := e.trace.Pick(sessionIdx)
+	var out [][]engine.Message
+	for i, m := range s.Messages {
+		if m.Role == "user" {
+			prefix := make([]engine.Message, 0, i+1)
+			for _, mm := range s.Messages[:i+1] {
+				prefix = append(prefix, engine.Message{Role: mm.Role, Content: mm.Content, ToolCallID: mm.ToolCallID})
+			}
+			out = append(out, prefix)
+		}
+	}
+	return out
+}
+
 func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, modelFilter string) (*report.Report, error) {
 	e, err := newEnv(ctx, cfg, client)
 	if err != nil {
@@ -438,7 +474,7 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 	mt := cfg.Multiturn
 	dataSrc := "filler"
 	if e.trace != nil {
-		dataSrc = "trace:" + e.trace.Source
+		dataSrc = "trace:" + e.trace.Source + "（replay_mode=" + cfg.Dataset.ReplayMode + "）"
 	}
 	rep := &report.Report{
 		Tool:        report.Version,
@@ -458,54 +494,64 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 		th := cfg.ThinkingFor(model)
 		for _, v := range th.Variants() {
 			ctxAborted := false // 触发模型上下文上限：剩余会话必然同样超限，全部跳过
-			for s := 0; s < mt.Sessions; s++ {
-				run := report.MultiturnRun{Model: model, Thinking: v.Name, Session: s + 1}
-				log.Printf("[multiturn] %s thinking=%s session%d", model, v.Name, s+1)
-				baseSeed := sessionSeed(s, cfg.SeedSalt)
-				msgs := []engine.Message{}
-				if e.trace == nil {
-					if sys := engine.SystemMsg(mt.SystemTokens, mt.ToolDefsTokens, baseSeed, cfg.Fillers()); sys.Content != "" {
-						msgs = append(msgs, sys)
-					}
+		for s := 0; s < mt.Sessions; s++ {
+			run := report.MultiturnRun{Model: model, Thinking: v.Name, Session: s + 1}
+			log.Printf("[multiturn] %s thinking=%s session%d", model, v.Name, s+1)
+			baseSeed := sessionSeed(s, cfg.SeedSalt)
+			msgs := []engine.Message{}
+			if e.trace == nil {
+				if sys := engine.SystemMsg(mt.SystemTokens, mt.ToolDefsTokens, baseSeed, cfg.Fillers()); sys.Content != "" {
+					msgs = append(msgs, sys)
 				}
-				userTurns := e.sessionUserTurns(s)
-				maxTok := th.MaxTokens(mt.MaxTokens, v)
-				lastPrompt := 0 // 上一轮服务端实测 prompt_tokens（截止计算与新增 tokens 计算）
-				for turn := 0; turn < mt.Turns; turn++ {
-					if e.trace != nil {
-						if turn >= len(userTurns) {
-							log.Printf("    回放会话只有 %d 轮 user 消息，提前结束", len(userTurns))
-							break
-						}
-						msgs = append(msgs, engine.Message{Role: "user", Content: userTurns[turn]})
+			}
+			userTurns := e.sessionUserTurns(s)
+			var fullPrefixes [][]engine.Message
+			if e.fullReplay() {
+				fullPrefixes = e.fullPrefixes(s)
+				if len(fullPrefixes) < len(userTurns) {
+					userTurns = userTurns[:len(fullPrefixes)] // 两视图按 user 消息对齐
+				}
+			}
+			maxTok := th.MaxTokens(mt.MaxTokens, v)
+			lastPrompt := 0 // 上一轮服务端实测 prompt_tokens（截止计算与新增 tokens 计算）
+			for turn := 0; turn < mt.Turns; turn++ {
+				if e.fullReplay() {
+					if turn >= len(fullPrefixes) {
+						log.Printf("    回放会话只有 %d 轮 user 消息，提前结束", len(fullPrefixes))
+						break
+					}
+					msgs = fullPrefixes[turn] // full：原序全部 role，assistant/tool 都在上下文里
+				} else if e.trace != nil {
+					if turn >= len(userTurns) {
+						log.Printf("    回放会话只有 %d 轮 user 消息，提前结束", len(userTurns))
+						break
+					}
+					msgs = append(msgs, engine.Message{Role: "user", Content: userTurns[turn]})
+				} else {
+					tt := nextTurnTokens(cfg, mt.TurnTokens, lastPrompt)
+					if tt <= 0 {
+						log.Printf("    已达 max_prompt_tokens=%d 截止，提前结束会话（%d/%d 轮）", cfg.MaxPromptTokens, turn, mt.Turns)
+						break
+					}
+					msgs = append(msgs, engine.UserMsg(tt, baseSeed+int64(turn), cfg.Fillers()))
+				}
+				m := runOne(ctx, e, model, msgs, maxTok, v)
+				if m.PromptTokens > 0 {
+					if lastPrompt > 0 {
+						m.NewTokens = m.PromptTokens - lastPrompt
 					} else {
-						tt := nextTurnTokens(cfg, mt.TurnTokens, lastPrompt)
-						if tt <= 0 {
-							log.Printf("    已达 max_prompt_tokens=%d 截止，提前结束会话（%d/%d 轮）", cfg.MaxPromptTokens, turn, mt.Turns)
-							break
-						}
-						msgs = append(msgs, engine.UserMsg(tt, baseSeed+int64(turn), cfg.Fillers()))
+						m.NewTokens = m.PromptTokens
 					}
-					m := runOne(ctx, e, model, msgs, maxTok, v)
-					if m.PromptTokens > 0 {
-						if lastPrompt > 0 {
-							m.NewTokens = m.PromptTokens - lastPrompt
-						} else {
-							m.NewTokens = m.PromptTokens
-						}
-						// 只有成功的轮次才推进基准：失败的轮次（ctx=0）不能把 lastPrompt 清零，
-						// 否则下一轮会把整条 history 都算成"新增"，增量 prefill 指标错乱
-						lastPrompt = m.PromptTokens
-					}
-					log.Printf("    turn%d (ctx≈%dtk +%dtk)", turn+1, m.PromptTokens, m.NewTokens)
-					if mt.KeepAssistant && m.ReplyText != "" {
-						reply := m.ReplyText
-						if len(reply) > 2000 {
-							reply = reply[:2000]
-						}
-						msgs = append(msgs, engine.Message{Role: "assistant", Content: reply})
-					}
-					run.Turns = append(run.Turns, m)
+					// 只有成功的轮次才推进基准：失败的轮次（ctx=0）不能把 lastPrompt 清零，
+					// 否则下一轮会把整条 history 都算成"新增"，增量 prefill 指标错乱
+					lastPrompt = m.PromptTokens
+				}
+				log.Printf("    turn%d (ctx≈%dtk +%dtk)", turn+1, m.PromptTokens, m.NewTokens)
+				if mt.KeepAssistant && m.ReplyText != "" && !e.fullReplay() {
+					// full 模式 history 来自 trace 原文，不追加生成回复（追加会与原始 assistant 重复）
+					msgs = append(msgs, engine.Message{Role: "assistant", Content: engine.TruncateRunes(m.ReplyText, mt.MaxReplyChars)})
+				}
+				run.Turns = append(run.Turns, m)
 					if interrupted(ctx) {
 						log.Printf("    🛑 收到中断信号——提前结束会话（已完成 %d/%d 轮保留）", len(run.Turns), mt.Turns)
 						break
@@ -554,6 +600,13 @@ func collectSessionTurns(ctx context.Context, e *env, cfg *config.Config,
 	baseSeed := sessionSeed(sessionIdx, cfg.SeedSalt)
 	msgs := []engine.Message{}
 	userTurns := e.sessionUserTurns(sessionIdx)
+	var fullPrefixes [][]engine.Message
+	if e.fullReplay() {
+		fullPrefixes = e.fullPrefixes(sessionIdx)
+		if len(fullPrefixes) < len(userTurns) {
+			userTurns = userTurns[:len(fullPrefixes)]
+		}
+	}
 	if e.trace == nil {
 		if sys := engine.SystemMsg(mt.SystemTokens, mt.ToolDefsTokens, baseSeed, cfg.Fillers()); sys.Content != "" {
 			msgs = append(msgs, sys)
@@ -566,7 +619,12 @@ func collectSessionTurns(ctx context.Context, e *env, cfg *config.Config,
 	var out []*engine.TurnMetrics
 	lastPrompt := 0
 	for turn := 0; turn < turns; turn++ {
-		if userTurns != nil {
+		if e.fullReplay() {
+			if turn >= len(fullPrefixes) {
+				break
+			}
+			msgs = fullPrefixes[turn]
+		} else if userTurns != nil {
 			if turn >= len(userTurns) {
 				break
 			}
@@ -590,12 +648,8 @@ func collectSessionTurns(ctx context.Context, e *env, cfg *config.Config,
 			lastPrompt = m.PromptTokens
 		}
 		out = append(out, m)
-		if mt.KeepAssistant && m.ReplyText != "" {
-			reply := m.ReplyText
-			if len(reply) > 2000 {
-				reply = reply[:2000]
-			}
-			msgs = append(msgs, engine.Message{Role: "assistant", Content: reply})
+		if mt.KeepAssistant && m.ReplyText != "" && !e.fullReplay() {
+			msgs = append(msgs, engine.Message{Role: "assistant", Content: engine.TruncateRunes(m.ReplyText, mt.MaxReplyChars)})
 		}
 	}
 	return out

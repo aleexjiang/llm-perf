@@ -51,11 +51,14 @@ type Scraper struct {
 }
 
 // NewScraper 从 OpenAI 端点推导 /metrics 地址：http://host:port/v1 → http://host:port/metrics。
-func NewScraper(endpoint string) *Scraper {
+func NewScraper(endpoint string) *Scraper { return NewScraperAt(endpoint, "/metrics") }
+
+// NewScraperAt 显式指定 metrics 路径（客户环境不一定挂在根路径，如 /actuator/prometheus）。
+func NewScraperAt(endpoint, metricsPath string) *Scraper {
 	base := strings.TrimRight(endpoint, "/")
 	base = strings.TrimSuffix(base, "/v1")
 	return &Scraper{
-		URL:        base + "/metrics",
+		URL:        base + metricsPath,
 		Client:     &http.Client{Timeout: 5 * time.Second},
 		MaxRetries: 2,
 	}
@@ -300,9 +303,22 @@ func (sglangProvider) HistNames() []string { return nil }
 func SGLang() MetricsProvider { return sglangProvider{} }
 
 // DetectProvider 按抓取样本里的指标名前缀识别引擎命名；无法识别回落 vLLM。
+// 需要区分"识别到"与"回落"时用 DetectProviderName（"" = 未识别）。
 func DetectProvider(sample *Sample) MetricsProvider {
-	if sample == nil {
+	switch DetectProviderName(sample) {
+	case "sglang":
+		return SGLang()
+	default:
 		return VLLM()
+	}
+}
+
+// DetectProviderName 返回识别出的命名族名（"vllm" / "sglang"），未识别返回 ""。
+// 自研引擎的指标名不带 vllm:/sglang: 前缀——之前静默回落 vLLM 会"套错命名还无告警"，
+// 调用方应显式提示（指标大概率拿不到数，属预期而非 bug）。
+func DetectProviderName(sample *Sample) string {
+	if sample == nil {
+		return "vllm"
 	}
 	has := func(prefix string) bool {
 		for k := range sample.Counters {
@@ -323,9 +339,12 @@ func DetectProvider(sample *Sample) MetricsProvider {
 		return false
 	}
 	if has("sglang:") && !has("vllm:") {
-		return SGLang()
+		return "sglang"
 	}
-	return VLLM()
+	if has("vllm:") {
+		return "vllm"
+	}
+	return ""
 }
 
 // CounterDelta 是两次快照之间关心的 counter 增量（tokens / 次）。
@@ -486,13 +505,12 @@ func (h GaugeHealth) Degraded() bool {
 	return h.Samples == 0 || h.ConsecutiveFailures >= 5
 }
 
-// StartGaugePoller 启动后台轮询（首次立即抓一次）。endpoint 为 OpenAI 端点（自动推导
-// /metrics 地址），p 为指标命名提供者（nil 回落 vLLM）。
-func StartGaugePoller(ctx context.Context, endpoint string, interval time.Duration, p MetricsProvider) *GaugePoller {
+// StartGaugePoller 启动后台轮询（首次立即抓一次）。sc 为已构造好的 Scraper
+// （调用方用 NewScraperAt 指定 metrics 路径），p 为指标命名提供者（nil 回落 vLLM）。
+func StartGaugePoller(ctx context.Context, sc *Scraper, interval time.Duration, p MetricsProvider) *GaugePoller {
 	if p == nil {
 		p = VLLM()
 	}
-	sc := NewScraper(endpoint)
 	sc.MaxRetries = 0 // 轮询快速失败：失败计数即降级信号，下一 tick 天然是重试
 	g := &GaugePoller{
 		scraper:  sc,

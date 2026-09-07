@@ -6,6 +6,8 @@
 - stream=false -> 一次性 JSON 响应
 - chat_template_kwargs.enable_thinking -> 先输出 reasoning_content 段（带延迟）再输出 content
 - usage 恒定返回（含 completion_tokens_details.reasoning_tokens）
+- 请求带 tools -> 返回结构化 tool_calls（非流式 message.tool_calls /
+  流式 delta.tool_calls 按 index 分片增量拼 arguments），probe tool-call 检查的"好引擎"路径
 """
 import json, time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -51,6 +53,7 @@ class H(BaseHTTPRequestHandler):
         body = json.loads(raw)
         thinking = bool(body.get("chat_template_kwargs", {}).get("enable_thinking"))
         stream = bool(body.get("stream", True))
+        tools = body.get("tools")
         prompt_tokens = sum(len(m["content"]) for m in body["messages"]) // 4 or 1
         n_reason, n_content = (4, 3) if thinking else (0, 3)
         usage = {
@@ -59,6 +62,42 @@ class H(BaseHTTPRequestHandler):
             "total_tokens": prompt_tokens + n_reason + n_content,
             "completion_tokens_details": {"reasoning_tokens": n_reason},
         }
+
+        # ── tool-call 路径：请求带 tools 即返回结构化调用（好引擎形态） ──
+        if tools:
+            call = {"index": 0, "id": "call_mock1", "type": "function",
+                    "function": {"name": tools[0]["function"]["name"],
+                                 "arguments": "{\"city\": \"北京\"}"}}
+            if not stream:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "",
+                                    "tool_calls": [call]},
+                        "finish_reason": "tool_calls",
+                    }], "usage": usage,
+                }, ensure_ascii=False).encode())
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+
+            def emit(d):
+                self.wfile.write(f"data: {json.dumps(d, ensure_ascii=False)}\n\n".encode())
+                self.wfile.flush()
+
+            # 首片带 id/name；arguments 按增量分片拼接（真实引擎的流式形态）
+            emit({"choices": [{"delta": {"tool_calls": [{
+                "index": 0, "id": call["id"], "type": "function",
+                "function": {"name": call["function"]["name"], "arguments": "{\"ci"}}]}}]})
+            emit({"choices": [{"delta": {"tool_calls": [{
+                "index": 0, "function": {"arguments": "ty\": \"北京\"}"}}]}}]})
+            emit({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]})
+            emit({"choices": [], "usage": usage})
+            self.wfile.write(b"data: [DONE]\n\n")
+            return
 
         if not stream:
             time.sleep(0.2)

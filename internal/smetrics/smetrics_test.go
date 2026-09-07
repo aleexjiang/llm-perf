@@ -137,7 +137,7 @@ func TestPollerSGLangNaming(t *testing.T) {
 	defer srv.Close()
 
 	ctx := context.Background()
-	g := StartGaugePoller(ctx, srv.URL, 10*time.Millisecond, SGLang())
+	g := StartGaugePoller(ctx, NewScraperAt(srv.URL, "/metrics"), 10*time.Millisecond, SGLang())
 	defer g.Stop()
 	time.Sleep(80 * time.Millisecond)
 	h := g.Health()
@@ -157,7 +157,7 @@ func TestPollerDegraded(t *testing.T) {
 	defer srv.Close()
 
 	ctx := context.Background()
-	g := StartGaugePoller(ctx, srv.URL, 5*time.Millisecond, VLLM())
+	g := StartGaugePoller(ctx, NewScraperAt(srv.URL, "/metrics"), 5*time.Millisecond, VLLM())
 	defer g.Stop()
 	time.Sleep(120 * time.Millisecond)
 	h := g.Health()

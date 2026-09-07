@@ -51,6 +51,12 @@ func usage() {
   -m 模型子串                   只测包含该子串的模型
   --corpus en|zh|路径           填充语料；--max-ctx N 上下文截止
 
+probe 选项:
+  --no-toolcall                关闭 tool-call 健康检查（默认开启：检出引擎能否正常调工具，
+                               失败时给可行动结论；多 4 次请求、秒级、不进压测路径）
+  --probe-capture 目录          tool-call 检查的原始响应落盘（厂商排障证据/判据回归 fixture；
+                               含业务数据，外发前按需脱敏）
+
 组合语义:
   --concurrency 1 --turns single            单发单轮档位矩阵（ladder × runs，缓存对照）
   --concurrency 1 --turns multi             单发多轮会话（逐轮 history 滚动）
@@ -129,6 +135,8 @@ func main() {
 	maxCtxFlag := fs.Int("max-ctx", 0, "上下文截止（tokens）：>0 时所有请求 prompt 不超过该值；覆盖配置 max_prompt_tokens")
 	saltFlag := fs.Int("seed-salt", 0, "种子盐值：隔离测试战役（服务端 prefix cache 未清空时重测用）；覆盖配置 seed_salt")
 	thinkingFlag := fs.String("thinking", "", "只跑某个思考变体：on/off（开思考费 token，建议 off/on 分开两轮跑，互不连坐）；覆盖配置 thinking.mode")
+	noToolCallFlag := fs.Bool("no-toolcall", false, "probe: 关闭 tool-call 健康检查（默认开启，多 4 次请求秒级）")
+	captureFlag := fs.String("probe-capture", "", "probe: tool-call 检查原始响应落盘目录（排障证据/判据 fixture；含业务数据外发前脱敏）")
 	fs.Parse(args)
 	userSetTurns, userSetConc := false, false
 	fs.Visit(func(f *flag.Flag) {
@@ -241,6 +249,14 @@ func main() {
 	}
 
 	client := engine.NewClient(cfg.Endpoint, cfg.APIKey, cfg.Timeout(), *cfg.IncludeUsage)
+	client.Auth = engine.Auth{Scheme: cfg.AuthScheme, Header: cfg.AuthHeader}
+	client.ChatPath = cfg.ChatPath
+	if cfg.AuthScheme != "" && cfg.AuthScheme != "bearer" || cfg.AuthHeader != "" {
+		log.Printf("认证方案: %s", client.Auth.Describe())
+	}
+	if cfg.ChatPath != "/chat/completions" {
+		log.Printf("接口路径（自定义）: %s", cfg.ChatPath)
+	}
 	if cfg.Retry != nil && cfg.Retry.MaxAttempts > 1 {
 		backoff := time.Duration(cfg.Retry.BackoffMS) * time.Millisecond
 		client.Retry = &engine.RetryPolicy{MaxAttempts: cfg.Retry.MaxAttempts, Backoff: backoff}
@@ -276,11 +292,17 @@ func main() {
 		res := engine.Probe(ctx, engine.ProbeOptions{
 			Endpoint:       cfg.Endpoint,
 			APIKey:         cfg.APIKey,
+			Auth:           engine.Auth{Scheme: cfg.AuthScheme, Header: cfg.AuthHeader},
+			ChatPath:       cfg.ChatPath,
+			MetricsPath:    cfg.MetricsPath,
 			Model:          model,
 			ThinkingOn:     th.ExtraBodyOn,
 			ThinkingOff:    th.ExtraBodyOff,
 			IncludeUsage:   *cfg.IncludeUsage,
 			MaxContext:     cfg.LargestPromptTokens(),
+			Timeout:        cfg.Timeout(),
+			ToolCall:       !*noToolCallFlag,
+			CaptureDir:     *captureFlag,
 			XVPromptTokens: cfg.Concurrent.PromptTokens,
 			XVMaxTokens:    cfg.Concurrent.MaxTokens,
 			ThinkingBudget: th.MaxTokensFloor,

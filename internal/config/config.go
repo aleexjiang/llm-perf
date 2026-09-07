@@ -27,6 +27,9 @@ type Multiturn struct {
 	TurnTokens     int  `yaml:"turn_tokens"`
 	MaxTokens      int  `yaml:"max_tokens"`
 	KeepAssistant  bool `yaml:"keep_assistant"`
+	// MaxReplyChars assistant 回复保留进 history 的截断长度（按 rune 计，中文安全），默认 2000。
+	// 之前按字节切（reply[:2000]），中文会切出半个 UTF-8 字符发给服务端
+	MaxReplyChars int `yaml:"max_reply_chars"`
 }
 
 type Concurrent struct {
@@ -52,6 +55,10 @@ type DatasetCfg struct {
 	Format      string `yaml:"format"`       // sharegpt | sessions（空=自动识别）
 	MinTurns    int    `yaml:"min_turns"`    // 会话最少 user 轮数（sharegpt 过滤），默认 2
 	MaxSessions int    `yaml:"max_sessions"` // 最多加载多少会话，0=不限
+	// ReplayMode 回放保真度：user_only（默认，只回放 user 轮，行为与历史版本一致）
+	// | full（按原序注入全部 role——assistant/tool 消息进上下文，测真实 history 深度）。
+	// user_only 的回放上下文系统性偏小（真实 agent 会话里工具结果往往占大头），full 才是忠实回放
+	ReplayMode string `yaml:"replay_mode"`
 }
 
 // GoodputCfg SLO 约束（goodput 口径）：同时满足 TTFT 与 TPOT 上限的请求才算有效吞吐。
@@ -203,8 +210,12 @@ type Config struct {
 	Endpoint       string   `yaml:"endpoint"`
 	APIKeyLiteral  string   `yaml:"api_key"`     // 字面量 key，直接写配置文件（该配置文件应避免入库）；环境变量 LLM_PERF_API_KEY 优先级更高
 	APIKeyEnv      string   `yaml:"api_key_env"` // 从哪个环境变量读 key（留空则跳过）；字面量 api_key 与环境变量都未提供时不带认证头
+	AuthScheme     string   `yaml:"auth_scheme"` // bearer（默认）| raw（裸 key 无 Bearer 前缀）| none（不带认证头）
+	AuthHeader     string   `yaml:"auth_header"` // 自定义认证 header 名（如 X-API-Key）；空 = Authorization
 	OutputDir      string   `yaml:"output_dir"`
 	TimeoutSeconds int      `yaml:"timeout_seconds"`
+	ChatPath       string   `yaml:"chat_path"`    // 接口路径（默认 /chat/completions）；客户 router 路径不同时配置
+	MetricsPath    string   `yaml:"metrics_path"` // 服务端 metrics 路径（默认 /metrics）；如 /actuator/prometheus
 	IncludeUsage   *bool    `yaml:"include_usage"`
 	FillerLang     string   `yaml:"filler_lang"`
 	FillerCorpus   string   `yaml:"filler_corpus"` // "":合成词表 | "en"/"zh":内置公版书语料 | 文件路径(.txt/.txt.gz):自定义语料
@@ -295,6 +306,28 @@ func Load(path string) (*Config, error) {
 	if v := os.Getenv("LLM_PERF_API_KEY"); v != "" {
 		cfg.APIKey = v
 	}
+	// 认证方案：枚举校验（engine.ValidScheme 口径一致）
+	switch strings.ToLower(cfg.AuthScheme) {
+	case "", "bearer", "raw", "none":
+	default:
+		return nil, fmt.Errorf("auth_scheme 无效值 %q（可选 bearer/raw/none）", cfg.AuthScheme)
+	}
+	// 接口路径：默认 /chat/completions；必须以 / 开头
+	if cfg.ChatPath == "" {
+		cfg.ChatPath = "/chat/completions"
+	}
+	if !strings.HasPrefix(cfg.ChatPath, "/") {
+		return nil, fmt.Errorf("chat_path %q 必须以 / 开头（是路径不是 URL）", cfg.ChatPath)
+	}
+	if strings.Contains(cfg.ChatPath, "://") {
+		return nil, fmt.Errorf("chat_path %q 不能是完整 URL——endpoint 填到 /v1 为止，chat_path 只填接口路径", cfg.ChatPath)
+	}
+	if cfg.MetricsPath == "" {
+		cfg.MetricsPath = "/metrics"
+	}
+	if !strings.HasPrefix(cfg.MetricsPath, "/") {
+		return nil, fmt.Errorf("metrics_path %q 必须以 / 开头", cfg.MetricsPath)
+	}
 	if len(cfg.Models) == 0 {
 		return nil, fmt.Errorf("models 未配置")
 	}
@@ -382,6 +415,27 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Dataset.Mode == "trace" && cfg.Dataset.Path == "" {
 		return nil, fmt.Errorf("dataset.mode=trace 需要 dataset.path（trace 文件路径）")
+	}
+	// 回放保真度：枚举校验 + 数据源联动
+	switch cfg.Dataset.ReplayMode {
+	case "":
+		cfg.Dataset.ReplayMode = "user_only"
+	case "user_only", "full":
+	default:
+		return nil, fmt.Errorf("dataset.replay_mode 无效值 %q（可选 user_only/full）", cfg.Dataset.ReplayMode)
+	}
+	if cfg.Dataset.ReplayMode == "full" && cfg.Dataset.Mode != "trace" {
+		cfg.Warnings = append(cfg.Warnings,
+			"dataset.replay_mode=full 仅在 dataset.mode=trace 下生效（filler 模式没有原始会话可回放，忽略）")
+	}
+	// 多轮回复截断：rune 口径，默认 2000
+	if cfg.Multiturn.MaxReplyChars <= 0 {
+		cfg.Multiturn.MaxReplyChars = 2000
+	}
+	if cfg.Multiturn.MaxReplyChars < 100 {
+		cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
+			"multiturn.max_reply_chars=%d 过小：assistant 回复几乎全被截掉，history 深度失真（默认 2000）",
+			cfg.Multiturn.MaxReplyChars))
 	}
 	if cfg.Concurrent.RequestRate < 0 {
 		return nil, fmt.Errorf("concurrent.request_rate 不能为负")
@@ -654,6 +708,11 @@ func anyLevelEnabled(th Thinking) bool {
 
 // Timeout 返回超时 Duration。
 func (c *Config) Timeout() time.Duration { return time.Duration(c.TimeoutSeconds) * time.Second }
+
+// ChatURL 返回完整 chat 接口地址（endpoint + chat_path，兼容 endpoint 带尾斜杠）。
+func (c *Config) ChatURL() string {
+	return strings.TrimRight(c.Endpoint, "/") + c.ChatPath
+}
 
 // Fillers 返回填充文本语言设置。
 func (c *Config) Fillers() string { return c.FillerLang }

@@ -53,7 +53,11 @@
   用于前缀缓存对照、上下文深度阶梯等**变量控制实验**
 - **trace**（`dataset.mode: trace`）：真实会话回放，多轮长度来自真实分布（贴近客户实际流量）。
   支持 ShareGPT 格式与自定义 `sessions` 格式（`[{"turns": ["...", ...]}]`，`.json`/`.json.gz`），
-  token 以服务端 usage 为准；trace 模式下 system_tokens/turn_tokens 不生效（会话形状由回放决定）
+  token 以服务端 usage 为准；trace 模式下 system_tokens/turn_tokens 不生效（会话形状由回放决定）。
+  `dataset.replay_mode` 控制回放保真度：`user_only`（默认，只回放 user 轮，行为同历史版本）；
+  `full`（按原序注入全部 role——assistant/tool 消息进上下文，测真实 history 深度。
+  真实 agent 会话里工具结果往往占上下文大头，user_only 的回放深度系统性偏小）；
+  full 模式下 `role: tool` 消息缺 `tool_call_id` 会被跳过并计数告警（不静默丢弃）
 
 另有 `bench probe` 兼容性探针（换引擎先跑）、`debug` 原始流量留存与 `/metrics` 服务端观测层，
 见下文[兼容性](#兼容性多推理引擎支持)与[服务端观测层](#服务端观测层metrics)。
@@ -111,7 +115,19 @@
 ```
 
 输出：引擎猜测（Server 头 + 响应特征）、模型列表、逐项检查（非流式/流式/usage/[DONE]/思考开关有效性）、
-结论提示（哪些配置要改、哪些魔改需要适配），落盘 `probe-<时间戳>.json`。
+**tool-call 健康检查**（默认开启，`--no-toolcall` 关闭）、结论提示（哪些配置要改、哪些魔改需要适配），
+落盘 `probe-<时间戳>.json`。
+
+tool-call 健康检查是**前置门禁**：检出引擎能否正常调工具（parser 是否启用、流式调用是否丢失、
+内容是否泄漏 `<tool_call>` 标记），失败时给出可行动结论（可直接贴给客户/厂商）；
+不测性能、不进主压测路径。判据分级：硬特征（标记泄漏/裸 JSON/参数非法）→ ❌；
+软特征（网关 4xx/finish_reason 错位）→ ⚠️；检查自身超时/网关错 → "检查未完成"，不计入结论。
+`--probe-capture <目录>` 把检查的原始响应落盘（厂商排障证据 + 判据回归 fixture；含业务数据，外发前脱敏）。
+
+**认证格式**：默认 `Authorization: Bearer <key>`；客户网关用裸 key 时配 `auth_scheme: raw`，
+免认证端点配 `auth_scheme: none`，自定义 header 名配 `auth_header`（如 `X-API-Key`）。
+接口路径与指标路径也可配：`chat_path`（默认 `/chat/completions`）、`metrics_path`（默认 `/metrics`）；
+probe 的请求超时直接读 `timeout_seconds`（此前硬编码 120s 不受配置影响）。
 
 **2. 请求级兼容性告警（自动）**
 

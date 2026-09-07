@@ -22,6 +22,18 @@ var knownDeltaKeys = map[string]bool{
 	"tool_calls": true, "function_call": true,
 }
 
+// toolCallDelta 流式 tool_calls 增量分片（OpenAI 协议：按 index 分桶，name 只在首片，
+// arguments 是增量字符串需拼接）。
+type toolCallDelta struct {
+	Index    int    `json:"index"`
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
 type deltaPayload struct {
 	Content string `json:"content"`
 	// 思考增量字段两代命名并存：
@@ -29,6 +41,10 @@ type deltaPayload struct {
 	//   reasoning         — 新版 vLLM(v0.27+) 官方口径
 	Reasoning        string `json:"reasoning"`
 	ReasoningContent string `json:"reasoning_content"`
+
+	// tool_calls 增量分片。白名单里本就有该键，但之前没有对应字段——值被丢弃的同时
+	// 还压制了 unknown_delta_fields 告警（附录 C #23），probe 的 tool-call 检查依赖这里
+	ToolCalls []toolCallDelta `json:"tool_calls"`
 
 	// Keys 是 delta 里出现过的全部键名（已排序，probe 用）；UnknownKeys 是其中的非标字段（告警用）
 	Keys        []string `json:"-"`
@@ -199,6 +215,25 @@ func (m *TurnMetrics) ingestEvent(ev *SSEEvent, now time.Time) {
 			m.FirstContentAt = &t
 		}
 	}
+	// tool_calls 增量分桶：按 index 聚合（name 首片携带、arguments 增量拼接、空片容错）。
+	// 只为 probe 检查项服务，不进计时指标、不进压测原始数据（TurnMetrics.ToolCalls 为 json:"-"）
+	for _, tcd := range d.ToolCalls {
+		if m.toolCallBuckets == nil {
+			m.toolCallBuckets = map[int]*ToolCall{}
+		}
+		b, ok := m.toolCallBuckets[tcd.Index]
+		if !ok {
+			b = &ToolCall{}
+			m.toolCallBuckets[tcd.Index] = b
+		}
+		if tcd.ID != "" && b.ID == "" {
+			b.ID = tcd.ID
+		}
+		if tcd.Function.Name != "" && b.Name == "" {
+			b.Name = tcd.Function.Name
+		}
+		b.Arguments += tcd.Function.Arguments
+	}
 }
 
 // reasoningFieldName 返回思考增量实际使用的字段名（"reasoning" / "reasoning_content" / ""）。
@@ -253,8 +288,19 @@ func ingestSSEBody(m *TurnMetrics, body io.Reader, clock func() time.Time, inclu
 	return nil
 }
 
-// closeOutWarnings 流结束后的兼容性收尾告警。
+// closeOutWarnings 流结束后的兼容性收尾告警 + tool-call 聚合成型（按 index 排序）。
 func (m *TurnMetrics) closeOutWarnings(includeUsage bool) {
+	// 流式 tool_calls 聚合成型（probe T4 读取；非流式在 applyWholeBody 直接赋值）
+	if len(m.toolCallBuckets) > 0 {
+		idxs := make([]int, 0, len(m.toolCallBuckets))
+		for i := range m.toolCallBuckets {
+			idxs = append(idxs, i)
+		}
+		sort.Ints(idxs)
+		for _, i := range idxs {
+			m.ToolCalls = append(m.ToolCalls, *m.toolCallBuckets[i])
+		}
+	}
 	if len(m.unknownKeys) > 0 {
 		keys := make([]string, 0, len(m.unknownKeys))
 		for k := range m.unknownKeys {
@@ -298,6 +344,12 @@ func (m *TurnMetrics) applyWholeBody(data []byte) {
 			m.ReasoningChars = len(rt)
 			m.reasoningBuf = rt
 			m.reasoningField = msg.reasoningFieldName()
+		}
+		// 非流式 tool_calls：message.tool_calls 结构与 delta 分片同构（Index 恒 0 或缺省）
+		for _, tcd := range msg.ToolCalls {
+			m.ToolCalls = append(m.ToolCalls, ToolCall{
+				ID: tcd.ID, Name: tcd.Function.Name, Arguments: tcd.Function.Arguments,
+			})
 		}
 	}
 }
