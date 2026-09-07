@@ -69,6 +69,11 @@ probe 选项:
   任何请求失败时即使不开 debug 也会自动留存转储（写到系统临时目录）。
   Ctrl+C 优雅中断：已完成数据照常落盘；再按一次强制退出。
 
+按模型组织:
+  model_overrides.<模型>.enabled: false 跳过该模型（分批重测时临时关掉，全部禁用报错）；
+  多模型数据按模型分区落 <output_dir>/<模型>/<场景>-<ts>.json（单模型仍直接落 output_dir）；
+  run.log 与 raw/ 仍在 output_dir 顶层（战役级共享）。
+
 示例:
   bench probe -c configs/customer.yaml
   bench -c configs/customer.yaml --turns single --concurrency 1 --thinking off -o out-single-off --seed-salt 1
@@ -91,6 +96,30 @@ func resolveOutPath(o, outputDir, scenarioName string) string {
 	default:
 		return filepath.Join(o, def)
 	}
+}
+
+// modelDirName 模型名 → 输出子目录名：取 "/" 后末段并清洗路径非法字符。
+// 与 engine.sanitize 不同：保留 Unicode 字母/数字（中文模型名不清洗成同形碰撞的
+// 连字符串），只把控制字符与文件系统不安全字符（/ \ : * ? " < > | 空格等）替换为 '-'。
+// "/models/DeepSeek-V4-Flash-0731" → "DeepSeek-V4-Flash-0731"；清洗后为空回退 unknown。
+func modelDirName(model string) string {
+	if i := strings.LastIndex(model, "/"); i >= 0 {
+		model = model[i+1:]
+	}
+	name := strings.Map(func(r rune) rune {
+		switch {
+		case r < 0x20 || r == 0x7f:
+			return '-'
+		case strings.ContainsRune(`/\:*?"<>| `, r):
+			return '-'
+		default:
+			return r // 字母数字与 - . _ 等安全字符原样保留（含中文）
+		}
+	}, model)
+	if strings.Trim(name, "-.") == "" {
+		return "unknown"
+	}
+	return name
 }
 
 func main() {
@@ -189,10 +218,15 @@ func main() {
 				anyLevels = true
 			}
 		}
+		for _, ov := range cfg.ModelOverrides {
+			if ov != nil && ov.Thinking != nil && len(ov.Thinking.Levels) > 0 {
+				anyLevels = true
+			}
+		}
 		switch {
 		case *thinkingFlag == "on" || *thinkingFlag == "off" || *thinkingFlag == "both":
 			if anyLevels {
-				fmt.Fprintln(os.Stderr, "配置已使用 thinking.levels（含 model_thinking 覆盖），--thinking on/off/both 不适用——请用档位名过滤（如 --thinking low）")
+				fmt.Fprintln(os.Stderr, "配置已使用 thinking.levels（含 model_thinking/model_overrides 覆盖），--thinking on/off/both 不适用——请用档位名过滤（如 --thinking low）")
 				os.Exit(1)
 			}
 			cfg.Thinking.Mode = *thinkingFlag
@@ -213,6 +247,11 @@ func main() {
 			for _, ov := range cfg.ModelThinking {
 				if ov != nil {
 					addVariantNames(*ov)
+				}
+			}
+			for _, ov := range cfg.ModelOverrides {
+				if ov != nil && ov.Thinking != nil {
+					addVariantNames(*ov.Thinking)
 				}
 			}
 			if !nameSet[strings.ToLower(*thinkingFlag)] {
@@ -285,8 +324,8 @@ func main() {
 		model := ""
 		if fs.Arg(0) != "" {
 			model = fs.Arg(0)
-		} else if len(cfg.Models) > 0 {
-			model = cfg.Models[0]
+		} else if active := cfg.ActiveModels(); len(active) > 0 {
+			model = active[0] // enabled=false 的模型不作为默认探测对象
 		}
 		th := cfg.ThinkingFor(model) // probe 也按模型解析思考配置（model_thinking 覆盖生效）
 		res := engine.Probe(ctx, engine.ProbeOptions{
@@ -309,6 +348,10 @@ func main() {
 			ThinkingBudget: th.MaxTokensFloor,
 		})
 		outPath := resolveOutPath(*outFlag, cfg.OutputDir, "probe")
+		if !strings.HasSuffix(*outFlag, ".json") {
+			// 按模型分区落盘：probe 结果归到模型子目录（显式 -o xxx.json 尊重用户路径）
+			outPath = filepath.Join(filepath.Dir(outPath), modelDirName(model), filepath.Base(outPath))
+		}
 		if err := report.SaveJSONAny(res, outPath); err != nil {
 			fmt.Fprintln(os.Stderr, "写出探针 JSON 失败:", err)
 			os.Exit(1)
@@ -435,16 +478,45 @@ func main() {
 			os.Exit(1)
 		}
 		outPath := resolveOutPath(*outFlag, cfg.OutputDir, name)
-		if err := rep.SaveJSON(outPath); err != nil {
-			fmt.Fprintf(os.Stderr, "[%s] 写出 JSON 失败: %v\n", name, err)
+		// 按模型分区落盘：多模型战役各落 <output_dir>/<模型>/，重测/作废单模型不纠缠；
+		// 单模型（或 -m 过滤后只剩一个）保持原布局直接落 output_dir，报告工具兼容两种布局
+		parts := rep.PartitionByModel()
+		if len(parts) == 0 {
+			parts = []*report.Report{rep}
+		}
+		if len(parts) > 1 && strings.HasSuffix(*outFlag, ".json") {
+			fmt.Fprintln(os.Stderr, "本次跑了多个模型（数据按模型分区落盘），-o 请给目录而不是单个 .json 文件")
 			os.Exit(1)
+		}
+		write := func(p *report.Report, path string) {
+			if err := p.SaveJSON(path); err != nil {
+				fmt.Fprintf(os.Stderr, "[%s] 写出 JSON 失败: %v\n", name, err)
+				os.Exit(1)
+			}
+		}
+		if len(parts) == 1 {
+			write(parts[0], outPath)
+		} else {
+			dir := filepath.Dir(outPath)
+			for _, p := range parts {
+				write(p, filepath.Join(dir, modelDirName(p.PartitionModel), filepath.Base(outPath)))
+			}
 		}
 		if ctx.Err() != nil {
 			fmt.Printf("[%s] ⚠️ 中断——已完成的 %d 组数据已保存: %s\n",
 				name, len(rep.Single)+len(rep.Multiturn)+len(rep.Concurrent), outPath)
 			return
 		}
-		fmt.Printf("[%s] 完成，用时 %s，输出: %s\n", name, time.Since(start).Round(time.Second), outPath)
+		if len(parts) > 1 {
+			var dirs []string
+			for _, p := range parts {
+				dirs = append(dirs, modelDirName(p.PartitionModel)+"/")
+			}
+			fmt.Printf("[%s] 完成，用时 %s，输出: %s（按模型分区: %s）\n",
+				name, time.Since(start).Round(time.Second), filepath.Dir(outPath), strings.Join(dirs, " "))
+		} else {
+			fmt.Printf("[%s] 完成，用时 %s，输出: %s\n", name, time.Since(start).Round(time.Second), outPath)
+		}
 	}
 
 	for _, it := range items {

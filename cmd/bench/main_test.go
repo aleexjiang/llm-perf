@@ -31,3 +31,19 @@ func TestResolveOutPath(t *testing.T) {
 		})
 	}
 }
+
+// modelDirName：取 "/" 后末段 + 非法字符清洗；空段回退 unknown
+func TestModelDirName(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"/models/DeepSeek-V4-Flash-0731", "DeepSeek-V4-Flash-0731"},
+		{"Qwen3.8-27B", "Qwen3.8-27B"},
+		{"openai/gpt-4:latest", "gpt-4-latest"}, // ":" 清洗
+		{"/models/中文 模型", "中文-模型"},              // 空格清洗，中文保留（Unicode 感知，避免碰撞）
+		{"/models/..", "unknown"},               // 全是点：防路径逃逸，回退
+	}
+	for _, c := range cases {
+		if got := modelDirName(c.in); got != c.want {
+			t.Fatalf("modelDirName(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}

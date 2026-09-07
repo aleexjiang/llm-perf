@@ -80,8 +80,9 @@ thinking:
   # CLI 只跑单档：bench -c xxx.yaml --turns single --concurrency 1 --thinking low
 
 # 按模型覆盖思考配置（可选）：不同模型/引擎的思考参数与档位词汇不同时用。
+# 建议统一写到文件底部的 model_overrides.<模型>.thinking（下面的 model_thinking 为旧写法，仍然兼容）。
 # 键=模型名（必须在 models 列表内，否则配置报错）；只写要改的字段，其余继承全局 thinking。
-# 建议先对各模型分别跑 probe（bench probe -c xxx.yaml <模型名>）确认可控参数再填：
+# 先对各模型分别跑 probe（bench probe -c xxx.yaml <模型名>）确认可控参数再填：
 # model_thinking:
 #   "/models/Qwen3.8-27B":
 #     levels:
@@ -122,3 +123,30 @@ concurrent:
   # rate_sweep: [1, 2, 4, 8, 16]  # 多档扫描（饱和点寻找）
   # num_prompts: 64               # 总请求数（multiturn 时为总会话数），默认 32
   # max_concurrency: 8            # 并发上限（0=不限），防到达率超容量时请求无限堆积
+
+# ─────────────────────────────────────────────────────────────
+# 按模型覆盖（可选，配置组织的推荐方式）：顶部通用 + 底部差异
+# 键=模型名（必须在 models 列表内，否则配置报错）；只写与通用配置不同的项，
+# 未写的键继承顶层（思考覆盖支持字段级：thinking 内只写要改的字段）。
+# 多模型战役的数据按模型分区落 <output_dir>/<模型>/<场景>-<ts>.json，重测/作废
+# 单模型不纠缠；单模型配置仍直接落 output_dir。
+#
+# model_overrides:
+#   "/models/Qwen3.8-27B":
+#     enabled: false                # 本次不测该模型（分批重测时临时关掉；全禁用会报错）
+#     max_prompt_tokens: 131072     # 该模型上下文较小：档位提前截止、多轮提前停轮
+#     stream: true                  # 引擎能力差异：个别模型不支持流式时关掉
+#     thinking:
+#       max_tokens_floor: 16384     # 字段级覆盖，mode/extra_body 继承全局
+#     single:
+#       prompt_tokens: [4000, 10000, 20000]   # 只爬到该模型上下文内
+#       runs: 3
+#     multiturn:
+#       turns: 12
+#     concurrent:
+#       levels: [1, 4, 16]
+#   "/models/DeepSeek-V4-Flash-0731":
+#     thinking:
+#       levels:
+#         - {name: low,  enabled: true,  extra_body: {chat_template_kwargs: {thinking_budget: 1024}}}
+#         - {name: high, enabled: true,  extra_body: {chat_template_kwargs: {thinking_budget: 16384}}}

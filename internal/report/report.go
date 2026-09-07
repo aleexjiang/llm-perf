@@ -111,6 +111,9 @@ type Report struct {
 	Concurrent  []ConcurrentLevel     `json:"concurrent,omitempty"`
 	Correctness []CorrectnessRow      `json:"correctness,omitempty"`
 	Server      *ServerMetricsSummary `json:"server_metrics,omitempty"`
+
+	// PartitionModel 按模型分区时该分区归属的模型名（不落盘）：main 据此拼 <output_dir>/<模型>/ 子目录
+	PartitionModel string `json:"-"`
 }
 
 // SaveJSON 将报告写入单个 JSON 文件（自动创建父目录）。
@@ -149,13 +152,14 @@ func (r *Report) PartitionByModel() []*Report {
 			return p
 		}
 		p := &Report{
-			Tool:        r.Tool,
-			Scenario:    r.Scenario,
-			GeneratedAt: r.GeneratedAt,
-			Endpoint:    r.Endpoint,
-			Note:        r.Note,
-			SLO:         r.SLO,
-			Server:      r.Server,
+			Tool:           r.Tool,
+			Scenario:       r.Scenario,
+			GeneratedAt:    r.GeneratedAt,
+			Endpoint:       r.Endpoint,
+			Note:           r.Note,
+			SLO:            r.SLO,
+			Server:         r.Server,
+			PartitionModel: model,
 		}
 		buckets[model] = p
 		order = append(order, model)

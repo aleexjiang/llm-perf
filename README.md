@@ -219,6 +219,23 @@ mv bench-linux-amd64 bench && chmod +x bench
 ./bench -c example.yaml --turns both --concurrency 1,2,4 -o results/  # → 指定输出目录
 ```
 
+**按模型分区**：配置了多个模型时，数据按模型分区落 `<output_dir>/<模型>/<场景>-<ts>.json`
+（模型名取 `/` 后末段），重测/作废单模型数据不纠缠；`run.log` 与 `raw/` 仍在 output_dir
+顶层（战役级共享）。单模型配置（或 `-m` 过滤后只剩一个）保持原布局直接落 output_dir：
+
+```bash
+output/
+├── run.log
+├── DeepSeek-V4-Flash-0731/
+│   ├── single-<ts>.json
+│   └── multiturn-<ts>.json
+└── Qwen3.8-27B/
+    ├── single-<ts>.json
+    └── multiturn-<ts>.json
+```
+
+多模型 + `-o xxx.json` 会报错（一个文件装不下多个分区），请给目录。
+
 JSON 结构见 `internal/report/report.go`：`single` / `multiturn` / `concurrent` 三个数组，
 元素分别为档位 / 会话 / 并发档位，每条请求是 `engine.TurnMetrics`；观测层开启时附
 `server_metrics` 汇总（缓存命中率/排队/prefill-decode 分解）与逐请求 `server_counter_delta`。
@@ -243,6 +260,11 @@ node scripts/validate_report.js <报告.html>   # JS 端校验（占位符/图�
 
 见 `configs/example.yaml`，含详细注释。端点与认证优先写配置文件（`endpoint` + `api_key` 字面量）；
 环境变量 `LLM_PERF_ENDPOINT`、`LLM_PERF_API_KEY` 优先级最高（应急通道；另有 `api_key_env` 指定从哪个变量读 key）。
+
+**配置组织：顶部通用 + 底部 `model_overrides`**。一份文件写所有模型共享的通用配置，
+底部按模型只写差异项（场景参数/思考/max_prompt_tokens/stream 等，未写的键继承顶层）。
+每个模型可带 `enabled` 开关控制本次是否测试（分批重测时临时关掉，`enabled: false` 的模型
+不进场景循环、probe 也不选；全部禁用直接报错）。
 
 ## 开发
 

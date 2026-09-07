@@ -386,7 +386,7 @@ func Single(ctx context.Context, cfg *config.Config, client *engine.Client, mode
 	before, poller := startWindow(ctx, e)
 	defer func() { rep.Server = finishWindow(ctx, e, before, poller) }()
 
-	for _, model := range filterModels(cfg.Models, modelFilter) {
+	for _, model := range filterModels(cfg.ActiveModels(), modelFilter) {
 		_, mc := forModel(e, cfg, model) // 该模型生效配置（model_overrides 差异覆盖）
 		warmup(ctx, e, model)
 		th := mc.Thinking
@@ -403,7 +403,7 @@ func Single(ctx context.Context, cfg *config.Config, client *engine.Client, mode
 					content := e.trace.Pick(i).UserTurns[0]
 					row := report.SingleRow{Model: model, Thinking: v.Name, PromptTokens: len(content) / 4}
 					log.Printf("[single] %s thinking=%s trace#%d (~%dtk)", model, v.Name, i+1, row.PromptTokens)
-					for run := 0; run < cfg.Single.Runs; run++ {
+					for run := 0; run < mc.Single.Runs; run++ {
 						msgs := []engine.Message{{Role: "user", Content: content}}
 						log.Printf("[single] %s thinking=%s trace#%d (~%dtk) run%d", model, v.Name, i+1, row.PromptTokens, run+1)
 						m := runOne(ctx, e, model, msgs, maxTok, v)
@@ -509,72 +509,72 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 	before, poller := startWindow(ctx, e)
 	defer func() { rep.Server = finishWindow(ctx, e, before, poller) }()
 
-	for _, model := range filterModels(cfg.Models, modelFilter) {
+	for _, model := range filterModels(cfg.ActiveModels(), modelFilter) {
 		_, mc := forModel(e, cfg, model) // 该模型生效配置（model_overrides 差异覆盖）
-		mt := mc.Multiturn // 遮蔽外层通用值（Note 仍描述通用基线；覆盖差异见 thinkingNoteSuffix）
+		mt := mc.Multiturn               // 遮蔽外层通用值（Note 仍描述通用基线；覆盖差异见 thinkingNoteSuffix）
 		warmup(ctx, e, model)
 		e.warnTraceWrap(mt.Sessions)
 		th := mc.Thinking
 		for _, v := range th.Variants() {
 			ctxAborted := false // 触发模型上下文上限：剩余会话必然同样超限，全部跳过
-		for s := 0; s < mt.Sessions; s++ {
-			run := report.MultiturnRun{Model: model, Thinking: v.Name, Session: s + 1}
-			log.Printf("[multiturn] %s thinking=%s session%d", model, v.Name, s+1)
-			baseSeed := sessionSeed(s, mc.SeedSalt)
-			msgs := []engine.Message{}
-			if e.trace == nil {
-				if sys := engine.SystemMsg(mt.SystemTokens, mt.ToolDefsTokens, baseSeed, mc.Fillers()); sys.Content != "" {
-					msgs = append(msgs, sys)
+			for s := 0; s < mt.Sessions; s++ {
+				run := report.MultiturnRun{Model: model, Thinking: v.Name, Session: s + 1}
+				log.Printf("[multiturn] %s thinking=%s session%d", model, v.Name, s+1)
+				baseSeed := sessionSeed(s, mc.SeedSalt)
+				msgs := []engine.Message{}
+				if e.trace == nil {
+					if sys := engine.SystemMsg(mt.SystemTokens, mt.ToolDefsTokens, baseSeed, mc.Fillers()); sys.Content != "" {
+						msgs = append(msgs, sys)
+					}
 				}
-			}
-			userTurns := e.sessionUserTurns(s)
-			var fullPrefixes [][]engine.Message
-			if e.fullReplay() {
-				fullPrefixes = e.fullPrefixes(s)
-				if len(fullPrefixes) < len(userTurns) {
-					userTurns = userTurns[:len(fullPrefixes)] // 两视图按 user 消息对齐
-				}
-			}
-			maxTok := th.MaxTokens(mt.MaxTokens, v)
-			lastPrompt := 0 // 上一轮服务端实测 prompt_tokens（截止计算与新增 tokens 计算）
-			for turn := 0; turn < mt.Turns; turn++ {
+				userTurns := e.sessionUserTurns(s)
+				var fullPrefixes [][]engine.Message
 				if e.fullReplay() {
-					if turn >= len(fullPrefixes) {
-						log.Printf("    回放会话只有 %d 轮 user 消息，提前结束", len(fullPrefixes))
-						break
+					fullPrefixes = e.fullPrefixes(s)
+					if len(fullPrefixes) < len(userTurns) {
+						userTurns = userTurns[:len(fullPrefixes)] // 两视图按 user 消息对齐
 					}
-					msgs = fullPrefixes[turn] // full：原序全部 role，assistant/tool 都在上下文里
-				} else if e.trace != nil {
-					if turn >= len(userTurns) {
-						log.Printf("    回放会话只有 %d 轮 user 消息，提前结束", len(userTurns))
-						break
-					}
-					msgs = append(msgs, engine.Message{Role: "user", Content: userTurns[turn]})
-			} else {
-				tt := nextTurnTokens(mc, mt.TurnTokens, lastPrompt)
-				if tt <= 0 {
-					log.Printf("    已达 max_prompt_tokens=%d 截止，提前结束会话（%d/%d 轮）", mc.MaxPromptTokens, turn, mt.Turns)
-					break
 				}
-				msgs = append(msgs, engine.UserMsg(tt, baseSeed+int64(turn), mc.Fillers()))
-				}
-				m := runOne(ctx, e, model, msgs, maxTok, v)
-				if m.PromptTokens > 0 {
-					if lastPrompt > 0 {
-						m.NewTokens = m.PromptTokens - lastPrompt
+				maxTok := th.MaxTokens(mt.MaxTokens, v)
+				lastPrompt := 0 // 上一轮服务端实测 prompt_tokens（截止计算与新增 tokens 计算）
+				for turn := 0; turn < mt.Turns; turn++ {
+					if e.fullReplay() {
+						if turn >= len(fullPrefixes) {
+							log.Printf("    回放会话只有 %d 轮 user 消息，提前结束", len(fullPrefixes))
+							break
+						}
+						msgs = fullPrefixes[turn] // full：原序全部 role，assistant/tool 都在上下文里
+					} else if e.trace != nil {
+						if turn >= len(userTurns) {
+							log.Printf("    回放会话只有 %d 轮 user 消息，提前结束", len(userTurns))
+							break
+						}
+						msgs = append(msgs, engine.Message{Role: "user", Content: userTurns[turn]})
 					} else {
-						m.NewTokens = m.PromptTokens
+						tt := nextTurnTokens(mc, mt.TurnTokens, lastPrompt)
+						if tt <= 0 {
+							log.Printf("    已达 max_prompt_tokens=%d 截止，提前结束会话（%d/%d 轮）", mc.MaxPromptTokens, turn, mt.Turns)
+							break
+						}
+						msgs = append(msgs, engine.UserMsg(tt, baseSeed+int64(turn), mc.Fillers()))
 					}
-					// 只有成功的轮次才推进基准：失败的轮次（ctx=0）不能把 lastPrompt 清零，
-					// 否则下一轮会把整条 history 都算成"新增"，增量 prefill 指标错乱
-					lastPrompt = m.PromptTokens
-				}
-				log.Printf("    turn%d (ctx≈%dtk +%dtk)", turn+1, m.PromptTokens, m.NewTokens)
-				if mt.KeepAssistant && m.ReplyText != "" && !e.fullReplay() {
-					// full 模式 history 来自 trace 原文，不追加生成回复（追加会与原始 assistant 重复）
-					msgs = append(msgs, engine.Message{Role: "assistant", Content: engine.TruncateRunes(m.ReplyText, mt.MaxReplyChars)})
-				}
-				run.Turns = append(run.Turns, m)
+					m := runOne(ctx, e, model, msgs, maxTok, v)
+					if m.PromptTokens > 0 {
+						if lastPrompt > 0 {
+							m.NewTokens = m.PromptTokens - lastPrompt
+						} else {
+							m.NewTokens = m.PromptTokens
+						}
+						// 只有成功的轮次才推进基准：失败的轮次（ctx=0）不能把 lastPrompt 清零，
+						// 否则下一轮会把整条 history 都算成"新增"，增量 prefill 指标错乱
+						lastPrompt = m.PromptTokens
+					}
+					log.Printf("    turn%d (ctx≈%dtk +%dtk)", turn+1, m.PromptTokens, m.NewTokens)
+					if mt.KeepAssistant && m.ReplyText != "" && !e.fullReplay() {
+						// full 模式 history 来自 trace 原文，不追加生成回复（追加会与原始 assistant 重复）
+						msgs = append(msgs, engine.Message{Role: "assistant", Content: engine.TruncateRunes(m.ReplyText, mt.MaxReplyChars)})
+					}
+					run.Turns = append(run.Turns, m)
 					if interrupted(ctx) {
 						log.Printf("    🛑 收到中断信号——提前结束会话（已完成 %d/%d 轮保留）", len(run.Turns), mt.Turns)
 						break
@@ -705,9 +705,9 @@ func Concurrent(ctx context.Context, cfg *config.Config, client *engine.Client, 
 	before, poller := startWindow(ctx, e)
 	defer func() { rep.Server = finishWindow(ctx, e, before, poller) }()
 
-	for _, model := range filterModels(cfg.Models, modelFilter) {
+	for _, model := range filterModels(cfg.ActiveModels(), modelFilter) {
 		_, mc := forModel(e, cfg, model) // 该模型生效配置（model_overrides 差异覆盖）
-		cc := mc.Concurrent // 遮蔽外层通用值：模型层可覆盖 levels/开环参数（Note 仍描述通用基线）
+		cc := mc.Concurrent              // 遮蔽外层通用值：模型层可覆盖 levels/开环参数（Note 仍描述通用基线）
 		rates := openRates(cc)
 		warmup(ctx, e, model)
 		th := mc.Thinking

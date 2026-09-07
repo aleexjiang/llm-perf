@@ -328,13 +328,36 @@ func (c *Config) ForModel(model string) *Config {
 // 这类全局形状请保持各模型一致或拆分配置。端点级配置（endpoint/认证/timeout_seconds/
 // server_metrics）不在此覆盖——一个战役一个端点，超时由 client 统一持有。
 type ModelOverride struct {
-	Thinking        *Thinking   `yaml:"thinking"` // 覆盖全局 thinking（字段级，未写的继承）
-	Single          *Single     `yaml:"single"`
-	Multiturn       *Multiturn  `yaml:"multiturn"`
-	Concurrent      *Concurrent `yaml:"concurrent"`
+	Thinking   *Thinking   `yaml:"thinking"` // 覆盖全局 thinking（字段级，未写的继承）
+	Single     *Single     `yaml:"single"`
+	Multiturn  *Multiturn  `yaml:"multiturn"`
+	Concurrent *Concurrent `yaml:"concurrent"`
 	// MaxPromptTokens 模型上下文截止：0 = 未写（继承顶层）；指针区分"未写"与"显式写 0（解除上限）"
-	MaxPromptTokens *int  `yaml:"max_prompt_tokens"`
-	Stream          *bool `yaml:"stream"` // 引擎能力差异：个别模型不支持流式时按模型关掉
+	MaxPromptTokens *int `yaml:"max_prompt_tokens"`
+	// Enabled 本次是否测试该模型：分批重测/单模型对照时临时关掉其他模型用。
+	// 指针区分"未写"（默认 true）与显式 false；禁用的模型不进场景循环，probe 也不选它
+	Enabled *bool `yaml:"enabled"`
+	Stream  *bool `yaml:"stream"` // 引擎能力差异：个别模型不支持流式时按模型关掉
+}
+
+// EnabledFor 模型本次是否参与测试：model_overrides[m].enabled，未写默认 true。
+func (c *Config) EnabledFor(model string) bool {
+	if ov := c.ModelOverrides[model]; ov != nil && ov.Enabled != nil {
+		return *ov.Enabled
+	}
+	return true
+}
+
+// ActiveModels 返回本次参与测试的模型（enabled=false 的剔除，保持 models 声明顺序）。
+// 场景循环与 probe 的模型选取都从这里取——enabled 是"本次测谁"的唯一事实来源。
+func (c *Config) ActiveModels() []string {
+	var out []string
+	for _, m := range c.Models {
+		if c.EnabledFor(m) {
+			out = append(out, m)
+		}
+	}
+	return out
 }
 
 type Config struct {
@@ -538,6 +561,15 @@ func Load(path string) (*Config, error) {
 			}
 			ov.Single.PromptTokens = normalized
 		}
+	}
+	// enabled 开关联动：全禁用直接拒绝（跑了个寂寞）；部分禁用提示跳过名单
+	for _, m := range cfg.Models {
+		if !cfg.EnabledFor(m) {
+			cfg.Warnings = append(cfg.Warnings, fmt.Sprintf("模型 %s enabled=false，本次跳过", m))
+		}
+	}
+	if len(cfg.ActiveModels()) == 0 {
+		return nil, fmt.Errorf("models 全部被 model_overrides enabled=false 禁用——本次没有可测试的模型（至少启用一个，或删掉 enabled 开关）")
 	}
 	// 各场景默认值
 	if cfg.Single.Runs <= 0 {

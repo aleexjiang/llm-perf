@@ -167,3 +167,71 @@ func TestModelThinkingUnknownModelError(t *testing.T) {
 		t.Fatalf("未知模型键应报错且提到 m2: %v", err)
 	}
 }
+
+// enabled 开关：EnabledFor/ActiveModels 语义（未写默认 true、显式 false 剔除、保序）
+func TestEnabledForAndActiveModels(t *testing.T) {
+	c := &Config{
+		Models: []string{"/models/A", "/models/B", "/models/C"},
+		ModelOverrides: map[string]*ModelOverride{
+			"/models/B": {Enabled: boolPtr(false)},
+			"/models/C": {Stream: boolPtr(false)}, // 有覆盖但没写 enabled → 默认参与
+		},
+	}
+	if !c.EnabledFor("/models/A") || c.EnabledFor("/models/B") || !c.EnabledFor("/models/C") {
+		t.Fatal("EnabledFor 语义错误：未写默认 true，显式 false 剔除")
+	}
+	got := c.ActiveModels()
+	if len(got) != 2 || got[0] != "/models/A" || got[1] != "/models/C" {
+		t.Fatalf("ActiveModels 应剔除 B 且保持声明顺序: %v", got)
+	}
+}
+
+func boolPtr(b bool) *bool { return &b }
+
+// enabled 全部禁用 → Load 报错；部分禁用 → 提示跳过名单
+func TestLoadEnabledSwitch(t *testing.T) {
+	all := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1", "m2"]
+model_overrides:
+  m1: {enabled: false}
+  m2: {enabled: false}
+`)
+	if _, err := Load(all); err == nil || !strings.Contains(err.Error(), "enabled") {
+		t.Fatalf("全部禁用应报错: %v", err)
+	}
+	partial := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1", "m2"]
+model_overrides:
+  m1: {enabled: false}
+`)
+	cfg, err := Load(partial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.ActiveModels()) != 1 || cfg.ActiveModels()[0] != "m2" {
+		t.Fatalf("部分禁用后应只剩 m2: %v", cfg.ActiveModels())
+	}
+	joined := strings.Join(cfg.Warnings, "\n")
+	if !strings.Contains(joined, "m1") {
+		t.Fatalf("部分禁用应有跳过提示: %v", cfg.Warnings)
+	}
+}
+
+// normalizeLadder：排序去重 + 增量 <10% 拒绝 + 非正值报错（模型覆盖段复用同一校验）
+func TestNormalizeLadder(t *testing.T) {
+	got, changed, err := normalizeLadder([]int{10000, 4000, 10000}, "x")
+	if err != nil || !changed {
+		t.Fatalf("排序去重: %v %v", got, err)
+	}
+	if len(got) != 2 || got[0] != 4000 || got[1] != 10000 {
+		t.Fatalf("应排序去重为 [4000 10000]: %v", got)
+	}
+	if _, _, err := normalizeLadder([]int{0}, "x"); err == nil {
+		t.Fatal("非正值应报错")
+	}
+	if _, _, err := normalizeLadder([]int{40000, 41000}, "x"); err == nil {
+		t.Fatal("增量 <10% 应报错")
+	}
+}
