@@ -1,4 +1,6 @@
 // Package config 负责加载 yaml 配置并用环境变量覆盖。
+// 配置按"通用 + 模型差异"组织：一份文件顶部写所有模型共享的通用配置，
+// 底部用 model_overrides 按模型只写差异项（缺省继承通用配置），见 ForModel。
 package config
 
 import (
@@ -206,6 +208,135 @@ func (c *Config) ThinkingFor(model string) *Thinking {
 	return &t
 }
 
+// ForModel 返回某模型生效的配置视图：顶层通用配置为底，model_overrides[model] 只覆盖差异项。
+// 场景层在模型循环内用视图取代顶层配置（并同步换掉 env.cfg），取该模型实际生效的
+// workload 形状/思考/流式开关；无覆盖时返回原配置。视图与 c 共享只读字段
+// （指针、slice 底层数组），调用方不得修改视图内容。
+func (c *Config) ForModel(model string) *Config {
+	ov := c.ModelOverrides[model]
+	if ov == nil {
+		return c
+	}
+	v := *c
+	// thinking：全局为底 + model_thinking 旧机制，再叠加 overrides.thinking（字段级覆盖）
+	th := *c.ThinkingFor(model)
+	if ov.Thinking != nil {
+		if ov.Thinking.Mode != "" {
+			th.Mode = ov.Thinking.Mode
+		}
+		if ov.Thinking.ExtraBodyOn != nil {
+			th.ExtraBodyOn = ov.Thinking.ExtraBodyOn
+		}
+		if ov.Thinking.ExtraBodyOff != nil {
+			th.ExtraBodyOff = ov.Thinking.ExtraBodyOff
+		}
+		if ov.Thinking.MaxTokensFloor > 0 {
+			th.MaxTokensFloor = ov.Thinking.MaxTokensFloor
+		}
+		if len(ov.Thinking.Levels) > 0 {
+			th.Levels = ov.Thinking.Levels
+		}
+	}
+	v.Thinking = th
+	if s := ov.Single; s != nil {
+		m := v.Single
+		if s.Runs > 0 {
+			m.Runs = s.Runs
+		}
+		if len(s.PromptTokens) > 0 {
+			m.PromptTokens = s.PromptTokens
+		}
+		if s.MaxTokens > 0 {
+			m.MaxTokens = s.MaxTokens
+		}
+		if s.FixedSeed {
+			m.FixedSeed = true
+		}
+		v.Single = m
+	}
+	if s := ov.Multiturn; s != nil {
+		m := v.Multiturn
+		if s.Sessions > 0 {
+			m.Sessions = s.Sessions
+		}
+		if s.Turns > 0 {
+			m.Turns = s.Turns
+		}
+		if s.SystemTokens > 0 {
+			m.SystemTokens = s.SystemTokens
+		}
+		if s.ToolDefsTokens > 0 {
+			m.ToolDefsTokens = s.ToolDefsTokens
+		}
+		if s.TurnTokens > 0 {
+			m.TurnTokens = s.TurnTokens
+		}
+		if s.MaxTokens > 0 {
+			m.MaxTokens = s.MaxTokens
+		}
+		if s.KeepAssistant {
+			m.KeepAssistant = true
+		}
+		if s.MaxReplyChars > 0 {
+			m.MaxReplyChars = s.MaxReplyChars
+		}
+		v.Multiturn = m
+	}
+	if s := ov.Concurrent; s != nil {
+		m := v.Concurrent
+		if len(s.Levels) > 0 {
+			m.Levels = s.Levels
+		}
+		if s.RunsPerWorker > 0 {
+			m.RunsPerWorker = s.RunsPerWorker
+		}
+		if s.PromptTokens > 0 {
+			m.PromptTokens = s.PromptTokens
+		}
+		if s.MaxTokens > 0 {
+			m.MaxTokens = s.MaxTokens
+		}
+		if s.Multiturn {
+			m.Multiturn = true
+		}
+		if s.RequestRate > 0 {
+			m.RequestRate = s.RequestRate
+		}
+		if len(s.RateSweep) > 0 {
+			m.RateSweep = s.RateSweep
+		}
+		if s.NumPrompts > 0 {
+			m.NumPrompts = s.NumPrompts
+		}
+		if s.MaxConcurrency > 0 {
+			m.MaxConcurrency = s.MaxConcurrency
+		}
+		v.Concurrent = m
+	}
+	if ov.MaxPromptTokens != nil {
+		v.MaxPromptTokens = *ov.MaxPromptTokens
+	}
+	if ov.Stream != nil {
+		v.Stream = ov.Stream
+	}
+	return &v
+}
+
+// ModelOverride 单个模型的差异配置：只写与通用配置不同的项，未写的键继承顶层。
+// 段内覆盖语义与 ThinkingFor 一致——零值/缺省 = 继承；因此布尔与"合法零值"字段
+// （fixed_seed、keep_assistant、concurrent.multiturn 等）无法在模型层显式改回 false，
+// 这类全局形状请保持各模型一致或拆分配置。端点级配置（endpoint/认证/timeout_seconds/
+// server_metrics）不在此覆盖——一个战役一个端点，超时由 client 统一持有。
+type ModelOverride struct {
+	Thinking        *Thinking   `yaml:"thinking"` // 覆盖全局 thinking（字段级，未写的继承）
+	Single          *Single     `yaml:"single"`
+	Multiturn       *Multiturn  `yaml:"multiturn"`
+	Concurrent      *Concurrent `yaml:"concurrent"`
+	// MaxPromptTokens 模型上下文截止：0 = 未写（继承顶层）；指针区分"未写"与"显式写 0（解除上限）"
+	MaxPromptTokens *int  `yaml:"max_prompt_tokens"`
+	Stream          *bool `yaml:"stream"` // 引擎能力差异：个别模型不支持流式时按模型关掉
+}
+
 type Config struct {
 	Endpoint       string   `yaml:"endpoint"`
 	APIKeyLiteral  string   `yaml:"api_key"`     // 字面量 key，直接写配置文件（该配置文件应避免入库）；环境变量 LLM_PERF_API_KEY 优先级更高
@@ -259,6 +390,12 @@ type Config struct {
 	// 不同模型/引擎的思考参数与档位词汇不同（Qwen thinking_budget / OpenAI reasoning_effort / GLM thinking.type），
 	// probe 会探测哪个参数可控；每个模型配各自己的 levels/extra_body。
 	ModelThinking map[string]*Thinking `yaml:"model_thinking"`
+
+	// ModelOverrides 按模型覆盖通用配置（键=模型名，必须在 models 列表内）。
+	// 组织方式：一份配置顶部写所有模型共享的通用配置，底部按模型只写差异项，
+	// 未写的键继承顶层——场景层在模型循环内通过 ForModel 取该模型生效的配置视图。
+	// 思考覆盖建议统一写这里的 thinking（model_thinking 为旧写法，仍然兼容）。
+	ModelOverrides map[string]*ModelOverride `yaml:"model_overrides"`
 
 	Single     Single     `yaml:"single"`
 	Multiturn  Multiturn  `yaml:"multiturn"`
@@ -378,6 +515,30 @@ func Load(path string) (*Config, error) {
 			return nil, fmt.Errorf("model_thinking[%s].mode 无效值 %q（可选 both/on/off；留空继承全局）", name, ov.Mode)
 		}
 	}
+	// model_overrides 覆盖校验：键必须在 models 列表内；thinking.mode 值合法
+	for name, ov := range cfg.ModelOverrides {
+		if ov == nil {
+			continue
+		}
+		if !inModels[name] {
+			return nil, fmt.Errorf("model_overrides 键 %q 不在 models 列表中（models: %v）", name, cfg.Models)
+		}
+		if ov.Thinking != nil {
+			switch ov.Thinking.Mode {
+			case "", "both", "on", "off":
+			default:
+				return nil, fmt.Errorf("model_overrides[%s].thinking.mode 无效值 %q（可选 both/on/off；留空继承全局）", name, ov.Thinking.Mode)
+			}
+		}
+		if ov.Single != nil && len(ov.Single.PromptTokens) > 0 {
+			normalized, _, err := normalizeLadder(ov.Single.PromptTokens,
+				fmt.Sprintf("model_overrides[%s].single.prompt_tokens", name))
+			if err != nil {
+				return nil, err
+			}
+			ov.Single.PromptTokens = normalized
+		}
+	}
 	// 各场景默认值
 	if cfg.Single.Runs <= 0 {
 		cfg.Single.Runs = 3
@@ -455,35 +616,14 @@ func Load(path string) (*Config, error) {
 
 	// 单发档位：拒绝非正值；排序去重（被修正时提示）；相邻增量 <10% 拒绝
 	if len(cfg.Single.PromptTokens) > 0 {
-		for _, t := range cfg.Single.PromptTokens {
-			if t <= 0 {
-				return nil, fmt.Errorf("single.prompt_tokens 含非正值 %d——档位必须是正整数 token 数", t)
-			}
+		normalized, changed, err := normalizeLadder(cfg.Single.PromptTokens, "single.prompt_tokens")
+		if err != nil {
+			return nil, err
 		}
-		orig := append([]int(nil), cfg.Single.PromptTokens...)
-		sort.Ints(cfg.Single.PromptTokens)
-		ded := cfg.Single.PromptTokens[:0]
-		for i, t := range cfg.Single.PromptTokens {
-			if i == 0 || t != ded[len(ded)-1] {
-				ded = append(ded, t)
-			}
-		}
-		cfg.Single.PromptTokens = ded
-		changed := len(orig) != len(ded)
-		for i := 0; !changed && i < len(orig); i++ {
-			changed = orig[i] != ded[i]
-		}
+		cfg.Single.PromptTokens = normalized
 		if changed {
 			cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
-				"single.prompt_tokens 已排序去重 → %v（原顺序/重复档位不影响结果，但图表与日志按修正后顺序展示）", ded))
-		}
-		for i := 1; i < len(ded); i++ {
-			prev, cur := ded[i-1], ded[i]
-			if cur-prev < prev/10 {
-				return nil, fmt.Errorf(
-					"single.prompt_tokens 档位 %d 与前一档 %d 增量仅 %.1f%%（<10%%）——同量级档位的 TTFT 差异会淹没在请求间抖动里，测了也测不出结论；请拉开差距或删除多余档位（如 40000 之后想探更深，用 60000/80000 而不是 41000）",
-					cur, prev, float64(cur-prev)/float64(prev)*100)
-			}
+				"single.prompt_tokens 已排序去重 → %v（原顺序/重复档位不影响结果，但图表与日志按修正后顺序展示）", normalized))
 		}
 	}
 
@@ -521,6 +661,15 @@ func Load(path string) (*Config, error) {
 			continue
 		}
 		if err := validateThinkingLevels(*ov, "model_thinking["+name+"]"); err != nil {
+			return nil, err
+		}
+	}
+
+	for name, ov := range cfg.ModelOverrides {
+		if ov == nil || ov.Thinking == nil {
+			continue
+		}
+		if err := validateThinkingLevels(*ov.Thinking, "model_overrides["+name+"].thinking"); err != nil {
 			return nil, err
 		}
 	}
@@ -704,6 +853,39 @@ func Load(path string) (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// normalizeLadder 校验并规范化单发 token 档位：非正值报错、排序去重、相邻增量 <10% 报错。
+// where 用于错误信息定位（顶层或某个模型覆盖段）。返回规范化后的档位与是否发生过修正。
+// 档位必须升序：场景按档位顺序执行，命中上下文上限时靠升序跳过更大档位。
+func normalizeLadder(tokens []int, where string) ([]int, bool, error) {
+	for _, t := range tokens {
+		if t <= 0 {
+			return nil, false, fmt.Errorf("%s 含非正值 %d——档位必须是正整数 token 数", where, t)
+		}
+	}
+	orig := append([]int(nil), tokens...)
+	sort.Ints(tokens)
+	ded := tokens[:0]
+	for i, t := range tokens {
+		if i == 0 || t != ded[len(ded)-1] {
+			ded = append(ded, t)
+		}
+	}
+	tokens = ded
+	changed := len(orig) != len(ded)
+	for i := 0; !changed && i < len(orig); i++ {
+		changed = orig[i] != ded[i]
+	}
+	for i := 1; i < len(tokens); i++ {
+		prev, cur := tokens[i-1], tokens[i]
+		if cur-prev < prev/10 {
+			return nil, false, fmt.Errorf(
+				"%s 档位 %d 与前一档 %d 增量仅 %.1f%%（<10%%）——同量级档位的 TTFT 差异会淹没在请求间抖动里，测了也测不出结论；请拉开差距或删除多余档位（如 40000 之后想探更深，用 60000/80000 而不是 41000）",
+				where, cur, prev, float64(cur-prev)/float64(prev)*100)
+		}
+	}
+	return tokens, changed, nil
 }
 
 // anyLevelEnabled 判断 levels 里是否存在思考开启的变体。

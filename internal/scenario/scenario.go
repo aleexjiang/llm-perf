@@ -206,12 +206,12 @@ func runOne(ctx context.Context, e *env, model string,
 	return m
 }
 
-// thinkingNoteSuffix model_thinking 有按模型覆盖时，报告备注追加标记（Note 只描述全局基线）
+// thinkingNoteSuffix 存在按模型覆盖时，报告备注追加标记（Note 描述的是通用基线）
 func thinkingNoteSuffix(cfg *config.Config) string {
-	if len(cfg.ModelThinking) == 0 {
+	if len(cfg.ModelThinking) == 0 && len(cfg.ModelOverrides) == 0 {
 		return ""
 	}
-	return "；部分模型的思考配置由 model_thinking 按模型覆盖"
+	return "；部分模型的场景/思考配置按模型覆盖（model_thinking/model_overrides），与通用基线不一致"
 }
 
 // interrupted 中断检查：SIGINT 取消 ctx 后返回 true，外层循环据此停止并保留已完成数据。
@@ -349,6 +349,24 @@ func runCorrectness(ctx context.Context, e *env, model string) []report.Correctn
 	return rows
 }
 
+// runCorrectnessFor 金丝雀结果带上模型归属（数据按模型分区落盘时据此分桶）。
+func runCorrectnessFor(ctx context.Context, e *env, model string) []report.CorrectnessRow {
+	rows := runCorrectness(ctx, e, model)
+	for i := range rows {
+		rows[i].Model = model
+	}
+	return rows
+}
+
+// forModel 切换到某模型生效的配置视图（model_overrides 差异覆盖）：
+// 场景内所有经 cfg/e.cfg 读配置的路径（runOne 的 stream、warmup、goodput、
+// nextTurnTokens 的上下文截止等）随之取到该模型的实际生效值。
+// 模型循环串行且档位内 worker 全部 join 后才进下一模型，e.cfg 不会被并发改写。
+func forModel(e *env, cfg *config.Config, model string) (*env, *config.Config) {
+	e.cfg = cfg.ForModel(model)
+	return e, e.cfg
+}
+
 // ── Single 单发单轮 ──
 
 func Single(ctx context.Context, cfg *config.Config, client *engine.Client, modelFilter string) (*report.Report, error) {
@@ -369,10 +387,11 @@ func Single(ctx context.Context, cfg *config.Config, client *engine.Client, mode
 	defer func() { rep.Server = finishWindow(ctx, e, before, poller) }()
 
 	for _, model := range filterModels(cfg.Models, modelFilter) {
+		_, mc := forModel(e, cfg, model) // 该模型生效配置（model_overrides 差异覆盖）
 		warmup(ctx, e, model)
-		th := cfg.ThinkingFor(model)
+		th := mc.Thinking
 		for _, v := range th.Variants() {
-			maxTok := th.MaxTokens(cfg.Single.MaxTokens, v)
+			maxTok := th.MaxTokens(mc.Single.MaxTokens, v)
 			if e.trace != nil {
 				// trace 模式：用回放会话的首轮 user 消息做档位（prompt_tokens 粗估，服务端 usage 为准）
 				n := len(e.trace.Sessions)
@@ -400,15 +419,15 @@ func Single(ctx context.Context, cfg *config.Config, client *engine.Client, mode
 				}
 				continue
 			}
-			ladder, clamped := cfg.ClampLadder(cfg.Single.PromptTokens)
+			ladder, clamped := mc.ClampLadder(mc.Single.PromptTokens)
 			if clamped {
-				log.Printf("[single] 档位已按 max_prompt_tokens=%d 截断: %v", cfg.MaxPromptTokens, ladder)
+				log.Printf("[single] 档位已按 max_prompt_tokens=%d 截断: %v", mc.MaxPromptTokens, ladder)
 			}
 			for _, tokens := range ladder {
 				row := report.SingleRow{Model: model, Thinking: v.Name, PromptTokens: tokens}
-				for run := 0; run < cfg.Single.Runs; run++ {
-					seed := singleSeed(cfg.Single.FixedSeed, tokens, run, cfg.SeedSalt)
-					msgs := []engine.Message{engine.UserMsg(tokens, seed, cfg.Fillers())}
+				for run := 0; run < mc.Single.Runs; run++ {
+					seed := singleSeed(mc.Single.FixedSeed, tokens, run, mc.SeedSalt)
+					msgs := []engine.Message{engine.UserMsg(tokens, seed, mc.Fillers())}
 					log.Printf("[single] %s thinking=%s %dtk run%d", model, v.Name, tokens, run+1)
 					m := runOne(ctx, e, model, msgs, maxTok, v)
 					row.Runs = append(row.Runs, m)
@@ -430,7 +449,7 @@ func Single(ctx context.Context, cfg *config.Config, client *engine.Client, mode
 				}
 			}
 		}
-		rep.Correctness = append(rep.Correctness, runCorrectness(ctx, e, model)...)
+		rep.Correctness = append(rep.Correctness, runCorrectnessFor(ctx, e, model)...)
 	}
 	return rep, nil
 }
@@ -491,18 +510,20 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 	defer func() { rep.Server = finishWindow(ctx, e, before, poller) }()
 
 	for _, model := range filterModels(cfg.Models, modelFilter) {
+		_, mc := forModel(e, cfg, model) // 该模型生效配置（model_overrides 差异覆盖）
+		mt := mc.Multiturn // 遮蔽外层通用值（Note 仍描述通用基线；覆盖差异见 thinkingNoteSuffix）
 		warmup(ctx, e, model)
 		e.warnTraceWrap(mt.Sessions)
-		th := cfg.ThinkingFor(model)
+		th := mc.Thinking
 		for _, v := range th.Variants() {
 			ctxAborted := false // 触发模型上下文上限：剩余会话必然同样超限，全部跳过
 		for s := 0; s < mt.Sessions; s++ {
 			run := report.MultiturnRun{Model: model, Thinking: v.Name, Session: s + 1}
 			log.Printf("[multiturn] %s thinking=%s session%d", model, v.Name, s+1)
-			baseSeed := sessionSeed(s, cfg.SeedSalt)
+			baseSeed := sessionSeed(s, mc.SeedSalt)
 			msgs := []engine.Message{}
 			if e.trace == nil {
-				if sys := engine.SystemMsg(mt.SystemTokens, mt.ToolDefsTokens, baseSeed, cfg.Fillers()); sys.Content != "" {
+				if sys := engine.SystemMsg(mt.SystemTokens, mt.ToolDefsTokens, baseSeed, mc.Fillers()); sys.Content != "" {
 					msgs = append(msgs, sys)
 				}
 			}
@@ -529,13 +550,13 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 						break
 					}
 					msgs = append(msgs, engine.Message{Role: "user", Content: userTurns[turn]})
-				} else {
-					tt := nextTurnTokens(cfg, mt.TurnTokens, lastPrompt)
-					if tt <= 0 {
-						log.Printf("    已达 max_prompt_tokens=%d 截止，提前结束会话（%d/%d 轮）", cfg.MaxPromptTokens, turn, mt.Turns)
-						break
-					}
-					msgs = append(msgs, engine.UserMsg(tt, baseSeed+int64(turn), cfg.Fillers()))
+			} else {
+				tt := nextTurnTokens(mc, mt.TurnTokens, lastPrompt)
+				if tt <= 0 {
+					log.Printf("    已达 max_prompt_tokens=%d 截止，提前结束会话（%d/%d 轮）", mc.MaxPromptTokens, turn, mt.Turns)
+					break
+				}
+				msgs = append(msgs, engine.UserMsg(tt, baseSeed+int64(turn), mc.Fillers()))
 				}
 				m := runOne(ctx, e, model, msgs, maxTok, v)
 				if m.PromptTokens > 0 {
@@ -575,7 +596,7 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 				}
 			}
 		}
-		rep.Correctness = append(rep.Correctness, runCorrectness(ctx, e, model)...)
+		rep.Correctness = append(rep.Correctness, runCorrectnessFor(ctx, e, model)...)
 	}
 	return rep, nil
 }
@@ -685,12 +706,15 @@ func Concurrent(ctx context.Context, cfg *config.Config, client *engine.Client, 
 	defer func() { rep.Server = finishWindow(ctx, e, before, poller) }()
 
 	for _, model := range filterModels(cfg.Models, modelFilter) {
+		_, mc := forModel(e, cfg, model) // 该模型生效配置（model_overrides 差异覆盖）
+		cc := mc.Concurrent // 遮蔽外层通用值：模型层可覆盖 levels/开环参数（Note 仍描述通用基线）
+		rates := openRates(cc)
 		warmup(ctx, e, model)
-		th := cfg.ThinkingFor(model)
+		th := mc.Thinking
 		for _, v := range th.Variants() {
 			if rates != nil {
 				for _, rate := range rates {
-					lv := runOpenRound(ctx, e, cfg, model, v, rate)
+					lv := runOpenRound(ctx, e, mc, model, v, rate)
 					logConcurrent(&lv)
 					rep.Concurrent = append(rep.Concurrent, lv)
 					if interrupted(ctx) {
@@ -701,7 +725,7 @@ func Concurrent(ctx context.Context, cfg *config.Config, client *engine.Client, 
 				continue
 			}
 			for _, level := range cc.Levels {
-				lv := runClosedRound(ctx, e, cfg, model, v, level)
+				lv := runClosedRound(ctx, e, mc, model, v, level)
 				logConcurrent(&lv)
 				rep.Concurrent = append(rep.Concurrent, lv)
 				if interrupted(ctx) {
@@ -710,7 +734,7 @@ func Concurrent(ctx context.Context, cfg *config.Config, client *engine.Client, 
 				}
 			}
 		}
-		rep.Correctness = append(rep.Correctness, runCorrectness(ctx, e, model)...)
+		rep.Correctness = append(rep.Correctness, runCorrectnessFor(ctx, e, model)...)
 	}
 	return rep, nil
 }

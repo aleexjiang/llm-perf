@@ -57,6 +57,9 @@ type SLO struct {
 
 // CorrectnessRow 一条正确性金丝雀请求的结果。
 type CorrectnessRow struct {
+	// Model 该金丝雀请求发往的模型（按模型分区落盘时据此归属；历史数据可能缺省，
+	// 缺省行会复制进每个分区）
+	Model  string  `json:"model,omitempty"`
 	Number string  `json:"number"` // 要求转写的目标数字
 	Reply  string  `json:"reply"`
 	Match  bool    `json:"match"`
@@ -132,4 +135,56 @@ func SaveJSONAny(v any, path string) error {
 // DefaultName 生成默认输出文件名：<scenario>-<timestamp>.json
 func DefaultName(scenario string) string {
 	return fmt.Sprintf("%s-%s.json", scenario, time.Now().Format("20060102-150405"))
+}
+
+// PartitionByModel 按模型把报告拆成每模型一份（数据落盘以模型为单位：output/<model>/）。
+// Single/Multiturn/Concurrent 按各行 Model 字段分桶；Correctness 按 Model 归属，
+// 缺 model 的历史行复制进每个分区；Endpoint 级的 Note/SLO/Server 原样带入每个分区。
+// 分区顺序按模型首次出现的顺序；空模型名的行归入 unknown 桶（正常数据不会出现）。
+func (r *Report) PartitionByModel() []*Report {
+	order := []string{}
+	buckets := map[string]*Report{}
+	get := func(model string) *Report {
+		if p, ok := buckets[model]; ok {
+			return p
+		}
+		p := &Report{
+			Tool:        r.Tool,
+			Scenario:    r.Scenario,
+			GeneratedAt: r.GeneratedAt,
+			Endpoint:    r.Endpoint,
+			Note:        r.Note,
+			SLO:         r.SLO,
+			Server:      r.Server,
+		}
+		buckets[model] = p
+		order = append(order, model)
+		return p
+	}
+	for i := range r.Single {
+		p := get(r.Single[i].Model)
+		p.Single = append(p.Single, r.Single[i])
+	}
+	for i := range r.Multiturn {
+		p := get(r.Multiturn[i].Model)
+		p.Multiturn = append(p.Multiturn, r.Multiturn[i])
+	}
+	for i := range r.Concurrent {
+		p := get(r.Concurrent[i].Model)
+		p.Concurrent = append(p.Concurrent, r.Concurrent[i])
+	}
+	for _, row := range r.Correctness {
+		if row.Model == "" {
+			for _, m := range order {
+				buckets[m].Correctness = append(buckets[m].Correctness, row)
+			}
+			continue
+		}
+		get(row.Model).Correctness = append(buckets[row.Model].Correctness, row)
+	}
+	parts := make([]*Report, 0, len(order))
+	for _, m := range order {
+		parts = append(parts, buckets[m])
+	}
+	return parts
 }
