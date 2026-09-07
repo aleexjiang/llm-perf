@@ -5,7 +5,6 @@ package engine
 
 import (
 	"net/http"
-	"strings"
 )
 
 // Auth 认证方案（对应 config 的 auth_scheme / auth_header）。
@@ -52,13 +51,4 @@ func (a Auth) Describe() string {
 	default:
 		return "Bearer（" + a.Header + ": Bearer <key>）"
 	}
-}
-
-// ValidScheme 认证方案枚举校验（config.Load 用）。
-func ValidScheme(s string) bool {
-	switch strings.ToLower(s) {
-	case "", "bearer", "raw", "none":
-		return true
-	}
-	return false
 }

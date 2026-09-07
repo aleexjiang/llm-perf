@@ -354,10 +354,6 @@ func TestScenarioRegistry(t *testing.T) {
 	if _, ok := Lookup("nope"); ok {
 		t.Fatal("未注册场景不应查到")
 	}
-	all := All()
-	if len(all) != 3 || all[0].Name() != "single" || all[2].Name() != "concurrent" {
-		t.Fatalf("All 应按注册顺序返回: %v", all)
-	}
 }
 
 func TestCtxLimitHit(t *testing.T) {

@@ -307,7 +307,7 @@ func Load(path string) (*Config, error) {
 	if v := os.Getenv("LLM_PERF_API_KEY"); v != "" {
 		cfg.APIKey = v
 	}
-	// 认证方案：枚举校验（engine.ValidScheme 口径一致）
+	// 认证方案：枚举校验（可选值与 engine.Auth 支持的方案一致；engine.Auth 对未知值按 bearer 处理，这里提前拒绝）
 	switch strings.ToLower(cfg.AuthScheme) {
 	case "", "bearer", "raw", "none":
 	default:
@@ -718,11 +718,6 @@ func anyLevelEnabled(th Thinking) bool {
 
 // Timeout 返回超时 Duration。
 func (c *Config) Timeout() time.Duration { return time.Duration(c.TimeoutSeconds) * time.Second }
-
-// ChatURL 返回完整 chat 接口地址（endpoint + chat_path，兼容 endpoint 带尾斜杠）。
-func (c *Config) ChatURL() string {
-	return strings.TrimRight(c.Endpoint, "/") + c.ChatPath
-}
 
 // Fillers 返回填充文本语言设置。
 func (c *Config) Fillers() string { return c.FillerLang }

@@ -48,30 +48,17 @@ func (s funcScenario) Run(ctx context.Context, cfg *config.Config, c *engine.Cli
 	return s.fn(ctx, cfg, c, filter)
 }
 
-var (
-	scenarioRegistry = map[string]Scenario{}
-	scenarioOrder    []string
-)
+var scenarioRegistry = map[string]Scenario{}
 
 // Register 注册场景（init 期调用，无并发）。
 func Register(s Scenario) {
 	scenarioRegistry[s.Name()] = s
-	scenarioOrder = append(scenarioOrder, s.Name())
 }
 
-// Lookup 按名字查场景。
+// Lookup 按名字查场景（main 按 turns×concurrency 组合精确取名，不遍历）。
 func Lookup(name string) (Scenario, bool) {
 	s, ok := scenarioRegistry[name]
 	return s, ok
-}
-
-// All 返回注册顺序的场景列表（bench all 的执行顺序）。
-func All() []Scenario {
-	out := make([]Scenario, 0, len(scenarioOrder))
-	for _, n := range scenarioOrder {
-		out = append(out, scenarioRegistry[n])
-	}
-	return out
 }
 
 func init() {

@@ -76,9 +76,6 @@ func (s *Scraper) applyAuth(req *http.Request) {
 	req.Header.Set(header, v)
 }
 
-// NewScraper 从 OpenAI 端点推导 /metrics 地址：http://host:port/v1 → http://host:port/metrics。
-func NewScraper(endpoint string) *Scraper { return NewScraperAt(endpoint, "/metrics") }
-
 // NewScraperAt 显式指定 metrics 路径（客户环境不一定挂在根路径，如 /actuator/prometheus）。
 func NewScraperAt(endpoint, metricsPath string) *Scraper {
 	base := strings.TrimRight(endpoint, "/")
