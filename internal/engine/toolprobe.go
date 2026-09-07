@@ -55,6 +55,10 @@ var builtinTools = []map[string]any{
 
 const toolCallPrompt = "北京今天的天气怎么样？请调用工具查询，不要自己编造。"
 
+// probeToolMaxTokens 工具调用探测的输出预算：足够容纳一条完整 tool_calls JSON，
+// 又能在坏引擎把调用泄漏成文本时观察到截断形态。
+const probeToolMaxTokens = 256
+
 // leakRe 工具标记泄漏特征：U+2581（▁）私有标记 / DSML / XML 标记——正常回答几乎不可能出现。
 var leakRe = regexp.MustCompile(`DSML|tool▁calls|▁tool|<tool_call>`)
 
@@ -259,7 +263,7 @@ func runToolCallCheck(ctx context.Context, res *ProbeResult, check func(string, 
 	// T2 非流式结构化（auto）
 	base2 := map[string]any{
 		"model": model, "messages": []Message{{Role: "user", Content: toolCallPrompt}},
-		"max_tokens": 256, "stream": false, "tools": builtinTools, "tool_choice": "auto",
+		"max_tokens": probeToolMaxTokens, "stream": false, "tools": builtinTools, "tool_choice": "auto",
 	}
 	st2, raw2, err2 := send(base2)
 	capture("T2-auto", st2, raw2)
@@ -275,7 +279,7 @@ func runToolCallCheck(ctx context.Context, res *ProbeResult, check func(string, 
 	// T3 required（与 T2 联合判定；4xx 是软特征——可能网关不透传）
 	p3 := map[string]any{
 		"model": model, "messages": []Message{{Role: "user", Content: toolCallPrompt}},
-		"max_tokens": 256, "stream": false, "tools": builtinTools, "tool_choice": "required",
+		"max_tokens": probeToolMaxTokens, "stream": false, "tools": builtinTools, "tool_choice": "required",
 	}
 	st3, raw3, err3 := send(p3)
 	capture("T3-required", st3, raw3)
@@ -294,7 +298,7 @@ func runToolCallCheck(ctx context.Context, res *ProbeResult, check func(string, 
 	// T4 流式聚合（auto + stream），与非流式对照
 	p4 := map[string]any{
 		"model": model, "messages": []Message{{Role: "user", Content: toolCallPrompt}},
-		"max_tokens": 256, "stream": true, "tools": builtinTools, "tool_choice": "auto",
+		"max_tokens": probeToolMaxTokens, "stream": true, "tools": builtinTools, "tool_choice": "auto",
 	}
 	st4, raw4, err4 := send(p4)
 	capture("T4-stream", st4, raw4)

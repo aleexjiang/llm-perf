@@ -59,6 +59,7 @@ type ProbeOptions struct {
 	Auth         Auth   // 认证方案（默认 bearer + Authorization）
 	ChatPath     string // 接口路径，默认 /chat/completions
 	MetricsPath  string // 服务端 metrics 路径，默认 /metrics
+	ModelsPath   string // 模型列表路径，默认 /models
 	Model        string // 为空则取 /models 列表第一个
 	ThinkingOn   map[string]any // 思考开启的 extra_body（可空）
 	ThinkingOff  map[string]any // 思考关闭的 extra_body（可空）
@@ -112,7 +113,11 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 	}
 
 	// ── 1. 模型列表 + Server 头 ──
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, base+"/models", nil)
+	modelsPath := o.ModelsPath
+	if modelsPath == "" {
+		modelsPath = "/models"
+	}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, base+modelsPath, nil)
 	o.Auth.Apply(req, o.APIKey)
 	resp, err := (&http.Client{Timeout: timeout}).Do(req)
 	if err != nil {

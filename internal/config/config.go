@@ -216,6 +216,7 @@ type Config struct {
 	TimeoutSeconds int      `yaml:"timeout_seconds"`
 	ChatPath       string   `yaml:"chat_path"`    // 接口路径（默认 /chat/completions）；客户 router 路径不同时配置
 	MetricsPath    string   `yaml:"metrics_path"` // 服务端 metrics 路径（默认 /metrics）；如 /actuator/prometheus
+	ModelsPath     string   `yaml:"models_path"`  // 模型列表路径（默认 /models）；probe 用，个别网关路径不同
 	IncludeUsage   *bool    `yaml:"include_usage"`
 	FillerLang     string   `yaml:"filler_lang"`
 	FillerCorpus   string   `yaml:"filler_corpus"` // "":合成词表 | "en"/"zh":内置公版书语料 | 文件路径(.txt/.txt.gz):自定义语料
@@ -325,8 +326,17 @@ func Load(path string) (*Config, error) {
 	if cfg.MetricsPath == "" {
 		cfg.MetricsPath = "/metrics"
 	}
+	if cfg.ModelsPath == "" {
+		cfg.ModelsPath = "/models"
+	}
 	if !strings.HasPrefix(cfg.MetricsPath, "/") {
 		return nil, fmt.Errorf("metrics_path %q 必须以 / 开头", cfg.MetricsPath)
+	}
+	if !strings.HasPrefix(cfg.ModelsPath, "/") {
+		return nil, fmt.Errorf("models_path %q 必须以 / 开头（是路径不是 URL）", cfg.ModelsPath)
+	}
+	if strings.Contains(cfg.ModelsPath, "://") {
+		return nil, fmt.Errorf("models_path %q 不能是完整 URL——endpoint 填到 /v1 为止，models_path 只填接口路径", cfg.ModelsPath)
 	}
 	if len(cfg.Models) == 0 {
 		return nil, fmt.Errorf("models 未配置")

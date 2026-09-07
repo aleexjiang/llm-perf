@@ -295,6 +295,7 @@ func main() {
 			Auth:           engine.Auth{Scheme: cfg.AuthScheme, Header: cfg.AuthHeader},
 			ChatPath:       cfg.ChatPath,
 			MetricsPath:    cfg.MetricsPath,
+			ModelsPath:     cfg.ModelsPath,
 			Model:          model,
 			ThinkingOn:     th.ExtraBodyOn,
 			ThinkingOff:    th.ExtraBodyOff,

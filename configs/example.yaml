@@ -10,6 +10,7 @@ output_dir: "output"              # 输出 JSON 的默认目录（-o 可覆盖�
 timeout_seconds: 600              # 客户环境慢 + 并发高档位排队，放宽（300s 可能不够）；对 bench probe 同样生效
 chat_path: "/chat/completions"    # 接口路径（默认 /chat/completions）；客户 router 路径不同时改
 metrics_path: "/metrics"          # 服务端指标路径（默认 /metrics）；如挂在 /actuator/prometheus 时改
+# models_path: "/models"          # 模型列表路径（默认 /models）；个别网关列表接口路径不同时改（probe 用）
 include_usage: true               # 请求 stream_options.include_usage，从 usage 字段取精确 token 数
 filler_lang: "en"                 # 填充文本语言：en（约 1 word ≈ 0.75 token）/ zh（约 1 字 ≈ 1 token）
 filler_corpus: "en"               # 真实文本语料填充："en"=战争与和平+白鲸记(内置,≈99万token) / "zh"=红楼梦(内置,≈62万token) /

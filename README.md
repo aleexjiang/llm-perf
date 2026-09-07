@@ -126,7 +126,8 @@ tool-call 健康检查是**前置门禁**：检出引擎能否正常调工具（
 
 **认证格式**：默认 `Authorization: Bearer <key>`；客户网关用裸 key 时配 `auth_scheme: raw`，
 免认证端点配 `auth_scheme: none`，自定义 header 名配 `auth_header`（如 `X-API-Key`）。
-接口路径与指标路径也可配：`chat_path`（默认 `/chat/completions`）、`metrics_path`（默认 `/metrics`）；
+接口路径与指标路径也可配：`chat_path`（默认 `/chat/completions`）、`metrics_path`（默认 `/metrics`）、
+`models_path`（默认 `/models`，probe 拉模型列表用）；
 probe 的请求超时直接读 `timeout_seconds`（此前硬编码 120s 不受配置影响）。
 
 **2. 请求级兼容性告警（自动）**
