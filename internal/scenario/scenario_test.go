@@ -231,11 +231,6 @@ func sseStub(t *testing.T, state *stubState) *httptest.Server {
 	return srv
 }
 
-func mustJSON(v any) string {
-	b, _ := json.Marshal(v)
-	return string(b)
-}
-
 func testCfg(t *testing.T, endpoint string) *config.Config {
 	t.Helper()
 	on := true
