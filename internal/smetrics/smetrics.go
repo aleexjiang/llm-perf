@@ -48,6 +48,32 @@ type Scraper struct {
 	URL        string // 如 http://host:port/metrics
 	Client     *http.Client
 	MaxRetries int // Scrape 失败后的额外重试次数（默认 2；轮询场景置 0——下一个 tick 天然是重试）
+
+	// 认证（语义与 engine.Auth 一致；不直接复用是因 smetrics 不能反向 import engine）。
+	// 客户网关常把 /metrics 和业务接口用同一套认证保护——不带认证头时观测层会静默降级。
+	AuthScheme string // "" = bearer；raw = 裸 key；none = 不带认证头
+	AuthHeader string // "" = Authorization
+	APIKey     string
+}
+
+// applyAuth 把认证头写进 metrics 请求（与 engine.Auth.Apply 行为一致）。
+func (s *Scraper) applyAuth(req *http.Request) {
+	scheme := s.AuthScheme
+	if scheme == "" {
+		scheme = "bearer"
+	}
+	if scheme == "none" || s.APIKey == "" {
+		return
+	}
+	header := s.AuthHeader
+	if header == "" {
+		header = "Authorization"
+	}
+	v := s.APIKey
+	if scheme != "raw" {
+		v = "Bearer " + v
+	}
+	req.Header.Set(header, v)
 }
 
 // NewScraper 从 OpenAI 端点推导 /metrics 地址：http://host:port/v1 → http://host:port/metrics。
@@ -103,6 +129,7 @@ func (s *Scraper) scrapeOnce(ctx context.Context) (*Sample, error) {
 	if err != nil {
 		return nil, err
 	}
+	s.applyAuth(req)
 	resp, err := s.Client.Do(req)
 	if err != nil {
 		return nil, err

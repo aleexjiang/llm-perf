@@ -168,3 +168,32 @@ func TestPollerDegraded(t *testing.T) {
 		t.Fatalf("失败计数/原因缺失: %+v", h)
 	}
 }
+
+// metrics 抓取的认证头与 engine.Auth 语义一致（bearer 默认/raw 裸 key/none 不带）。
+func TestScraperApplyAuth(t *testing.T) {
+	mk := func() *http.Request { req, _ := http.NewRequest("GET", "http://x/metrics", nil); return req }
+
+	req := mk()
+	(&Scraper{APIKey: "k"}).applyAuth(req)
+	if got := req.Header.Get("Authorization"); got != "Bearer k" {
+		t.Fatalf("默认应为 Bearer: %q", got)
+	}
+
+	req = mk()
+	(&Scraper{AuthScheme: "raw", AuthHeader: "X-Key", APIKey: "k"}).applyAuth(req)
+	if got := req.Header.Get("X-Key"); got != "k" {
+		t.Fatalf("raw 应为裸 key: %q", got)
+	}
+
+	req = mk()
+	(&Scraper{AuthScheme: "none", APIKey: "k"}).applyAuth(req)
+	if req.Header.Get("Authorization") != "" {
+		t.Fatal("none 不应带认证头")
+	}
+
+	req = mk()
+	(&Scraper{APIKey: ""}).applyAuth(req)
+	if req.Header.Get("Authorization") != "" {
+		t.Fatal("无 key 不应带认证头")
+	}
+}

@@ -93,6 +93,10 @@ func newEnv(ctx context.Context, cfg *config.Config, client *engine.Client) (*en
 	e := &env{cfg: cfg, client: client}
 	if cfg.ServerMetrics {
 		s := smetrics.NewScraperAt(cfg.Endpoint, cfg.MetricsPath)
+		// /metrics 常与业务接口同一套认证保护——认证格式与 chat 请求保持一致
+		s.AuthScheme = cfg.AuthScheme
+		s.AuthHeader = cfg.AuthHeader
+		s.APIKey = cfg.APIKey
 		// 判定口径与 probe 一致：HTTP 200 但 0 项 vLLM 指标（网关占位响应）也算不可用，
 		// 否则观测层会带着空指标集白跑，报告里出现假"可用"
 		ok, detail := s.Available(ctx)
@@ -227,6 +231,16 @@ func thinkingNoteSuffix(cfg *config.Config) string {
 func interrupted(ctx context.Context) bool { return ctx.Err() != nil }
 
 // warmup 场景开始前的预热：暖连接池/首包路径；唯一内容（时间戳 seed）避免污染被测前缀的缓存对照。
+// 预热请求形状：小 prompt + 1 token 输出，只为建连/暖机，不构成有效负载。
+const (
+	warmupPromptTokens = 128
+	warmupMaxTokens    = 1
+)
+
+// traceSingleSampleLimit trace 模式下单发档位最多取样的回放会话数：
+// 单发矩阵的价值在"首轮长度分布"，取前 N 个即可代表分布，避免大数据集拖长单发矩阵。
+const traceSingleSampleLimit = 16
+
 func warmup(ctx context.Context, e *env, model string) {
 	n := e.cfg.WarmupRequests
 	if n <= 0 {
@@ -235,9 +249,9 @@ func warmup(ctx context.Context, e *env, model string) {
 	vOff := config.ThinkingVariant{Name: "off", Enabled: false, ExtraBody: e.cfg.ThinkingFor(model).ExtraBodyOff}
 	now := time.Now().UnixNano()
 	for i := 0; i < n; i++ {
-		msgs := []engine.Message{engine.UserMsg(128, now+int64(i), e.cfg.Fillers())}
+		msgs := []engine.Message{engine.UserMsg(warmupPromptTokens, now+int64(i), e.cfg.Fillers())}
 		e.client.Chat(ctx, engine.ChatOptions{
-			Model: model, Messages: msgs, MaxTokens: 1,
+			Model: model, Messages: msgs, MaxTokens: warmupMaxTokens,
 			Stream: e.cfg.StreamEnabled(), ExtraBody: vOff.ExtraBody,
 		})
 	}
@@ -375,8 +389,9 @@ func Single(ctx context.Context, cfg *config.Config, client *engine.Client, mode
 			if e.trace != nil {
 				// trace 模式：用回放会话的首轮 user 消息做档位（prompt_tokens 粗估，服务端 usage 为准）
 				n := len(e.trace.Sessions)
-				if n > 16 {
-					n = 16
+				if n > traceSingleSampleLimit {
+					log.Printf("  trace 单发档位只取样前 %d 个会话（数据集共 %d 个，避免拖长单发矩阵）", traceSingleSampleLimit, n)
+					n = traceSingleSampleLimit
 				}
 				for i := 0; i < n; i++ {
 					content := e.trace.Pick(i).UserTurns[0]

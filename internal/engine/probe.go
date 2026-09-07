@@ -353,6 +353,9 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 		metricsPath = "/metrics"
 	}
 	s := smetrics.NewScraperAt(o.Endpoint, metricsPath)
+	s.AuthScheme = o.Auth.Scheme // /metrics 与业务接口同一套认证（网关保护 metrics 端点时探测不至误报不可用）
+	s.AuthHeader = o.Auth.Header
+	s.APIKey = o.APIKey
 	if ok, detail := s.Available(ctx); ok {
 		res.ServerMetrics = "available: " + detail
 		check("server_metrics", true, metricsPath+" 可用（"+detail+"）→ 配置 server_metrics: true 可开启观测层（缓存命中率/排队/prefill-decode 分解）")
