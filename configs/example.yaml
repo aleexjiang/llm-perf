@@ -79,17 +79,9 @@ thinking:
   #   - {name: high, enabled: true,  extra_body: {reasoning_effort: "high"}}
   # CLI 只跑单档：bench -c xxx.yaml --turns single --concurrency 1 --thinking low
 
-# 按模型覆盖思考配置（可选）：不同模型/引擎的思考参数与档位词汇不同时用。
-# 建议统一写到文件底部的 model_overrides.<模型>.thinking（下面的 model_thinking 为旧写法，仍然兼容）。
-# 键=模型名（必须在 models 列表内，否则配置报错）；只写要改的字段，其余继承全局 thinking。
-# 先对各模型分别跑 probe（bench probe -c xxx.yaml <模型名>）确认可控参数再填：
-# model_thinking:
-#   "/models/Qwen3.8-27B":
-#     levels:
-#       - {name: low,  enabled: true,  extra_body: {chat_template_kwargs: {thinking_budget: 1024}}}
-#       - {name: high, enabled: true,  extra_body: {chat_template_kwargs: {thinking_budget: 16384}}}
-#   "/models/DeepSeek-V4-Flash-0731":
-#     max_tokens_floor: 16384          # 只覆盖这一项，mode/extra_body 继承全局
+# 按模型覆盖思考配置：写到文件底部的 model_overrides.<模型>.thinking（字段级覆盖，
+# 只写要改的字段，其余继承全局 thinking）。不同模型/引擎的思考参数与档位词汇不同时用，
+# 先对各模型分别跑 probe（bench probe -c xxx.yaml <模型名>）确认可控参数再填。
 
 # 场景一：单发单轮（同 prompt 重复 runs 次，用于观察前缀缓存命中）
 single:

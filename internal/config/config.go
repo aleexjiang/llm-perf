@@ -183,25 +183,26 @@ func (t Thinking) MaxTokens(maxTokens int, v ThinkingVariant) int {
 	return maxTokens
 }
 
-// ThinkingFor 返回某模型生效的思考配置：全局 thinking 为底，model_thinking[model] 的
-// 非零字段覆盖（零值 = 未写 = 继承全局）；CLI --thinking 的变体过滤始终继承。
+// ThinkingFor 返回某模型生效的思考配置：全局 thinking 为底，model_overrides[model].thinking
+// 字段级覆盖（零值 = 未写 = 继承全局）；CLI --thinking 的变体过滤始终继承。
 func (c *Config) ThinkingFor(model string) *Thinking {
 	t := c.Thinking // 值拷贝（map/slice 共享底层数组但只读，安全）
-	if ov := c.ModelThinking[model]; ov != nil {
-		if ov.Mode != "" {
-			t.Mode = ov.Mode
+	if ov := c.ModelOverrides[model]; ov != nil && ov.Thinking != nil {
+		ot := ov.Thinking
+		if ot.Mode != "" {
+			t.Mode = ot.Mode
 		}
-		if ov.ExtraBodyOn != nil {
-			t.ExtraBodyOn = ov.ExtraBodyOn
+		if ot.ExtraBodyOn != nil {
+			t.ExtraBodyOn = ot.ExtraBodyOn
 		}
-		if ov.ExtraBodyOff != nil {
-			t.ExtraBodyOff = ov.ExtraBodyOff
+		if ot.ExtraBodyOff != nil {
+			t.ExtraBodyOff = ot.ExtraBodyOff
 		}
-		if ov.MaxTokensFloor > 0 {
-			t.MaxTokensFloor = ov.MaxTokensFloor
+		if ot.MaxTokensFloor > 0 {
+			t.MaxTokensFloor = ot.MaxTokensFloor
 		}
-		if len(ov.Levels) > 0 {
-			t.Levels = ov.Levels
+		if len(ot.Levels) > 0 {
+			t.Levels = ot.Levels
 		}
 	}
 	t.filter = c.Thinking.filter
@@ -218,26 +219,8 @@ func (c *Config) ForModel(model string) *Config {
 		return c
 	}
 	v := *c
-	// thinking：全局为底 + model_thinking 旧机制，再叠加 overrides.thinking（字段级覆盖）
-	th := *c.ThinkingFor(model)
-	if ov.Thinking != nil {
-		if ov.Thinking.Mode != "" {
-			th.Mode = ov.Thinking.Mode
-		}
-		if ov.Thinking.ExtraBodyOn != nil {
-			th.ExtraBodyOn = ov.Thinking.ExtraBodyOn
-		}
-		if ov.Thinking.ExtraBodyOff != nil {
-			th.ExtraBodyOff = ov.Thinking.ExtraBodyOff
-		}
-		if ov.Thinking.MaxTokensFloor > 0 {
-			th.MaxTokensFloor = ov.Thinking.MaxTokensFloor
-		}
-		if len(ov.Thinking.Levels) > 0 {
-			th.Levels = ov.Thinking.Levels
-		}
-	}
-	v.Thinking = th
+	// thinking：ThinkingFor 已按 overrides.thinking 做字段级覆盖
+	v.Thinking = *c.ThinkingFor(model)
 	if s := ov.Single; s != nil {
 		m := v.Single
 		if s.Runs > 0 {
@@ -408,16 +391,10 @@ type Config struct {
 
 	Thinking Thinking `yaml:"thinking"`
 
-	// ModelThinking 按模型覆盖思考配置（键=模型名，必须在 models 列表内）。
-	// 覆盖语义：只写要改的字段，未写的字段继承全局 thinking（零值 = 未写）。
-	// 不同模型/引擎的思考参数与档位词汇不同（Qwen thinking_budget / OpenAI reasoning_effort / GLM thinking.type），
-	// probe 会探测哪个参数可控；每个模型配各自己的 levels/extra_body。
-	ModelThinking map[string]*Thinking `yaml:"model_thinking"`
-
 	// ModelOverrides 按模型覆盖通用配置（键=模型名，必须在 models 列表内）。
 	// 组织方式：一份配置顶部写所有模型共享的通用配置，底部按模型只写差异项，
 	// 未写的键继承顶层——场景层在模型循环内通过 ForModel 取该模型生效的配置视图。
-	// 思考覆盖建议统一写这里的 thinking（model_thinking 为旧写法，仍然兼容）。
+	// 思考按模型覆盖写 model_overrides.<模型>.thinking（字段级覆盖）。
 	ModelOverrides map[string]*ModelOverride `yaml:"model_overrides"`
 
 	Single     Single     `yaml:"single"`
@@ -520,25 +497,11 @@ func Load(path string) (*Config, error) {
 	if cfg.Thinking.MaxTokensFloor <= 0 {
 		cfg.Thinking.MaxTokensFloor = 2048
 	}
-	// model_thinking 覆盖校验：模型必须在 models 列表内；mode 值合法
+	// model_overrides 覆盖校验：键必须在 models 列表内；thinking.mode 值合法
 	inModels := make(map[string]bool, len(cfg.Models))
 	for _, m := range cfg.Models {
 		inModels[m] = true
 	}
-	for name, ov := range cfg.ModelThinking {
-		if ov == nil {
-			continue
-		}
-		if !inModels[name] {
-			return nil, fmt.Errorf("model_thinking 键 %q 不在 models 列表中（models: %v）", name, cfg.Models)
-		}
-		switch ov.Mode {
-		case "", "both", "on", "off":
-		default:
-			return nil, fmt.Errorf("model_thinking[%s].mode 无效值 %q（可选 both/on/off；留空继承全局）", name, ov.Mode)
-		}
-	}
-	// model_overrides 覆盖校验：键必须在 models 列表内；thinking.mode 值合法
 	for name, ov := range cfg.ModelOverrides {
 		if ov == nil {
 			continue
@@ -687,14 +650,6 @@ func Load(path string) (*Config, error) {
 	if len(cfg.Thinking.Levels) > 0 {
 		cfg.Warnings = append(cfg.Warnings,
 			"thinking.levels 已配置：mode 与 extra_body_on/off 不再参与思考展开（以 levels 为准）")
-	}
-	for name, ov := range cfg.ModelThinking {
-		if ov == nil {
-			continue
-		}
-		if err := validateThinkingLevels(*ov, "model_thinking["+name+"]"); err != nil {
-			return nil, err
-		}
 	}
 
 	for name, ov := range cfg.ModelOverrides {

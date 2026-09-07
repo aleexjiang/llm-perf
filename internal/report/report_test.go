@@ -74,7 +74,7 @@ func TestPartitionByModel(t *testing.T) {
 		Multiturn: []MultiturnRun{{Model: "m2", Session: 1}},
 		Correctness: []CorrectnessRow{
 			{Model: "m2", Number: "12345", Match: true},
-			{Number: "67890", Match: false}, // 历史缺省行：复制进每个分区
+			{Model: "m1", Number: "67890", Match: false},
 		},
 	}
 	parts := r.PartitionByModel()
@@ -90,8 +90,7 @@ func TestPartitionByModel(t *testing.T) {
 	if len(parts[1].Single) != 1 || len(parts[1].Multiturn) != 1 {
 		t.Fatalf("m2 分区数据错误: %+v", parts[1])
 	}
-	// 缺 model 的 correctness 行两个分区都有
-	if len(parts[0].Correctness) != 1 || len(parts[1].Correctness) != 2 {
+	if len(parts[0].Correctness) != 1 || len(parts[1].Correctness) != 1 {
 		t.Fatalf("correctness 归属错误: m1=%d m2=%d", len(parts[0].Correctness), len(parts[1].Correctness))
 	}
 	// Endpoint 级字段原样带入

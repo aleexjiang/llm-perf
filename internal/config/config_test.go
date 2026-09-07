@@ -124,7 +124,7 @@ func TestThinkingLevelsVariants(t *testing.T) {
 	}
 }
 
-// model_thinking 按模型覆盖：只写要改的字段，其余继承全局；CLI filter 始终继承
+// model_overrides 按模型覆盖思考配置：只写要改的字段，其余继承全局；CLI filter 始终继承
 func TestThinkingForModelOverride(t *testing.T) {
 	c := &Config{
 		Thinking: Thinking{
@@ -132,11 +132,11 @@ func TestThinkingForModelOverride(t *testing.T) {
 			MaxTokensFloor: 8192,
 			ExtraBodyOn:    map[string]any{"chat_template_kwargs": map[string]any{"enable_thinking": true}},
 		},
-		ModelThinking: map[string]*Thinking{
-			"/models/Qwen3.8-27B": {
+		ModelOverrides: map[string]*ModelOverride{
+			"/models/Qwen3.8-27B": {Thinking: &Thinking{
 				Levels: []LevelVariant{{Name: "low", Enabled: true, ExtraBody: map[string]any{"reasoning_effort": "low"}}},
-			},
-			"/models/DeepSeek": {MaxTokensFloor: 16384},
+			}},
+			"/models/DeepSeek": {Thinking: &Thinking{MaxTokensFloor: 16384}},
 		},
 	}
 	q := c.ThinkingFor("/models/Qwen3.8-27B")
@@ -156,13 +156,18 @@ func TestThinkingForModelOverride(t *testing.T) {
 	if got := c.ThinkingFor("/models/Qwen3.8-27B").Variants(); len(got) != 1 || got[0].Name != "low" {
 		t.Fatalf("filter 应继承进 ThinkingFor: %+v", got)
 	}
+	// ForModel 视图的 thinking 与 ThinkingFor 一致（重复调用幂等）
+	fm := c.ForModel("/models/DeepSeek")
+	if fm.Thinking.MaxTokensFloor != 16384 || len(fm.Thinking.Levels) != 0 {
+		t.Fatalf("ForModel thinking 覆盖错误: %+v", fm.Thinking)
+	}
 }
 
-// model_thinking 键不在 models 列表 → 配置报错
-func TestModelThinkingUnknownModelError(t *testing.T) {
+// model_overrides 键不在 models 列表 → 配置报错
+func TestModelOverridesUnknownModelError(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "c.yaml")
-	os.WriteFile(p, []byte("endpoint: \"http://x/v1\"\nmodels: [\"m1\"]\nmodel_thinking:\n  \"m2\":\n    mode: \"on\"\n"), 0644)
+	os.WriteFile(p, []byte("endpoint: \"http://x/v1\"\nmodels: [\"m1\"]\nmodel_overrides:\n  \"m2\":\n    thinking: {mode: \"on\"}\n"), 0644)
 	if _, err := Load(p); err == nil || !strings.Contains(err.Error(), "m2") {
 		t.Fatalf("未知模型键应报错且提到 m2: %v", err)
 	}

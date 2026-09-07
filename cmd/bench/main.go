@@ -127,26 +127,11 @@ func main() {
 		usage() // 裸调用不给参数：展示用法而不是拿默认配置开跑
 	}
 	args := os.Args[1:]
-	// 旧场景子命令 → 新语法自动翻译（兼容旧文档与肌肉记忆，翻译时打印提示）
-	var aliasTurns, aliasConc, aliasName string
 	mode := "bench"
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		aliasName = args[0]
 		switch args[0] {
 		case "probe":
 			mode = "probe"
-			args = args[1:]
-		case "single":
-			aliasTurns, aliasConc = "single", "1"
-			args = args[1:]
-		case "multiturn":
-			aliasTurns, aliasConc = "multi", "1"
-			args = args[1:]
-		case "concurrent":
-			aliasConc = "cfg" // turns 由配置 concurrent.multiturn 决定
-			args = args[1:]
-		case "all":
-			aliasTurns, aliasConc = "both", "1,cfg"
 			args = args[1:]
 		default:
 			fmt.Fprintf(os.Stderr, "未知参数 %q——压测模式没有场景子命令，用 --turns × --concurrency 组合（见下）\n\n", args[0])
@@ -167,15 +152,6 @@ func main() {
 	noToolCallFlag := fs.Bool("no-toolcall", false, "probe: 关闭 tool-call 健康检查（默认开启，多 4 次请求秒级）")
 	captureFlag := fs.String("probe-capture", "", "probe: tool-call 检查原始响应落盘目录（排障证据/判据 fixture；含业务数据外发前脱敏）")
 	fs.Parse(args)
-	userSetTurns, userSetConc := false, false
-	fs.Visit(func(f *flag.Flag) {
-		switch f.Name {
-		case "turns":
-			userSetTurns = true
-		case "concurrency":
-			userSetConc = true
-		}
-	})
 
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
@@ -184,23 +160,6 @@ func main() {
 	}
 	for _, w := range cfg.Warnings {
 		log.Printf("配置提示: %s", w)
-	}
-	// 别名翻译：仅当用户没显式给 --turns/--concurrency 时生效
-	if aliasTurns != "" || aliasConc != "" {
-		if aliasName == "concurrent" && !userSetTurns {
-			if cfg.Concurrent.Multiturn {
-				aliasTurns = "multi"
-			} else {
-				aliasTurns = "single"
-			}
-		}
-		if aliasTurns != "" && !userSetTurns {
-			*turnsFlag = aliasTurns
-		}
-		if aliasConc != "" && !userSetConc {
-			*concFlag = aliasConc
-		}
-		log.Printf("兼容模式: 旧子命令 %q 等价于 --turns %s --concurrency %s（下次可直接用新语法）", aliasName, *turnsFlag, *concFlag)
 	}
 	if *corpusFlag != "" {
 		cfg.FillerCorpus = *corpusFlag
@@ -213,11 +172,6 @@ func main() {
 	}
 	if *thinkingFlag != "" {
 		anyLevels := len(cfg.Thinking.Levels) > 0
-		for _, ov := range cfg.ModelThinking {
-			if ov != nil && len(ov.Levels) > 0 {
-				anyLevels = true
-			}
-		}
 		for _, ov := range cfg.ModelOverrides {
 			if ov != nil && ov.Thinking != nil && len(ov.Thinking.Levels) > 0 {
 				anyLevels = true
@@ -226,7 +180,7 @@ func main() {
 		switch {
 		case *thinkingFlag == "on" || *thinkingFlag == "off" || *thinkingFlag == "both":
 			if anyLevels {
-				fmt.Fprintln(os.Stderr, "配置已使用 thinking.levels（含 model_thinking/model_overrides 覆盖），--thinking on/off/both 不适用——请用档位名过滤（如 --thinking low）")
+				fmt.Fprintln(os.Stderr, "配置已使用 thinking.levels（含 model_overrides 覆盖），--thinking on/off/both 不适用——请用档位名过滤（如 --thinking low）")
 				os.Exit(1)
 			}
 			cfg.Thinking.Mode = *thinkingFlag
@@ -244,11 +198,6 @@ func main() {
 				}
 			}
 			addVariantNames(cfg.Thinking)
-			for _, ov := range cfg.ModelThinking {
-				if ov != nil {
-					addVariantNames(*ov)
-				}
-			}
 			for _, ov := range cfg.ModelOverrides {
 				if ov != nil && ov.Thinking != nil {
 					addVariantNames(*ov.Thinking)
@@ -327,7 +276,7 @@ func main() {
 		} else if active := cfg.ActiveModels(); len(active) > 0 {
 			model = active[0] // enabled=false 的模型不作为默认探测对象
 		}
-		th := cfg.ThinkingFor(model) // probe 也按模型解析思考配置（model_thinking 覆盖生效）
+		th := cfg.ThinkingFor(model) // probe 也按模型解析思考配置（model_overrides.thinking 覆盖生效）
 		res := engine.Probe(ctx, engine.ProbeOptions{
 			Endpoint:       cfg.Endpoint,
 			APIKey:         cfg.APIKey,

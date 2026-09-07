@@ -208,10 +208,10 @@ func runOne(ctx context.Context, e *env, model string,
 
 // thinkingNoteSuffix 存在按模型覆盖时，报告备注追加标记（Note 描述的是通用基线）
 func thinkingNoteSuffix(cfg *config.Config) string {
-	if len(cfg.ModelThinking) == 0 && len(cfg.ModelOverrides) == 0 {
+	if len(cfg.ModelOverrides) == 0 {
 		return ""
 	}
-	return "；部分模型的场景/思考配置按模型覆盖（model_thinking/model_overrides），与通用基线不一致"
+	return "；部分模型的场景/思考配置按模型覆盖（model_overrides），与通用基线不一致"
 }
 
 // interrupted 中断检查：SIGINT 取消 ctx 后返回 true，外层循环据此停止并保留已完成数据。

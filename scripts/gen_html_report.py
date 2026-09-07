@@ -5,7 +5,6 @@
 用法:
   python3 gen_html_report.py output/                      # 目录模式：合并目录下全部 single-/multiturn-/concurrent-*.json
   python3 gen_html_report.py a.json b.json [标题]          # 文件模式：显式指定一份或多份报告 JSON
-  python3 gen_html_report.py output/ 标题 multiturn       # 旧用法兼容（第三参数=场景过滤）
 
 输出: <输入目录>/llm-perf-报告.html（Chart.js 内嵌，离线可用）
 
@@ -104,8 +103,6 @@ def load_inputs(argv):
             out_dir = os.path.dirname(os.path.abspath(a))
         elif title is None:
             title = a
-        else:
-            scenario = a  # 旧用法第三参数
         i += 1
     if not paths:
         sys.exit("没有输入：请给 output 目录或 .json 文件路径")

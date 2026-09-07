@@ -247,7 +247,6 @@ JSON → HTML 分析报告（自包含、Chart.js 内嵌离线可用）。自动
 ```bash
 python3 scripts/gen_html_report.py output/                    # 目录模式：递归合并目录下全部场景 JSON
 python3 scripts/gen_html_report.py a.json b.json [标题]        # 文件模式：显式指定一份或多份报告
-python3 scripts/gen_html_report.py output/ 标题 multiturn      # 旧用法兼容（第三参数=场景过滤）
 # 四象限报告：--scenarios 选场景，缺省 = 四象限合并报告
 #   single=单发·单轮  multiturn=单发·多轮  conc-single=多发·单轮  conc-multi=多发·多轮
 #   支持中文别名与 + 分隔：--scenarios 单发单轮+多发多轮
