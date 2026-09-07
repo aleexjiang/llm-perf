@@ -18,7 +18,7 @@
 endpoint: "http://<实例IP>:8849/v1"
 api_key_env: ""                   # 该实例未启用 API key 校验，留空即不带认证头
 output_dir: "output"
-timeout_seconds: 600              # 长档位 + max-num-seqs=2 排队，放宽超时
+timeout_seconds: 600              # 长档位 + max-num-seqs=4 排队，放宽超时
 include_usage: true
 filler_lang: "en"
 filler_corpus: "en"               # 真实文本语料填充（内置公版书），比合成词表更贴近真实 tokenization

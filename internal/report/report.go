@@ -57,7 +57,7 @@ type SLO struct {
 
 // CorrectnessRow 一条正确性金丝雀请求的结果。
 type CorrectnessRow struct {
-	Model  string  `json:"model"` // 该金丝雀请求发往的模型（按模型分区落盘时据此归属）
+	Model  string  `json:"model"`  // 该金丝雀请求发往的模型（按模型分区落盘时据此归属）
 	Number string  `json:"number"` // 要求转写的目标数字
 	Reply  string  `json:"reply"`
 	Match  bool    `json:"match"`

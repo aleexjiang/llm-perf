@@ -4,11 +4,12 @@
 // 不测性能、不进主压测路径（压测核心场景不带 tools）。
 //
 // 检查项：
-//   T1 基线连通 = 复用现有 chat_nonstream（失败即跳过）
-//   T2 非流式结构化（tools + tool_choice: auto）
-//   T3 tool_choice 探针（required，与 T2 联合判定）
-//   T4 流式聚合（按 index 分桶，与非流式对照：函数名丢失 / 调用数变少是流式丢调用的签名）
-//   T5 标记泄漏（DSML / tool▁calls / <tool_call> 出现在 content = 内容污染）
+//
+//	T1 基线连通 = 复用现有 chat_nonstream（失败即跳过）
+//	T2 非流式结构化（tools + tool_choice: auto）
+//	T3 tool_choice 探针（required，与 T2 联合判定）
+//	T4 流式聚合（按 index 分桶，与非流式对照：函数名丢失 / 调用数变少是流式丢调用的签名）
+//	T5 标记泄漏（DSML / tool▁calls / <tool_call> 出现在 content = 内容污染）
 //
 // 判据分级：硬特征（结构性错误，正常回答不可能出现）→ FAIL；
 // 软特征（可能是配置/网关问题而非引擎能力）→ WARN；
@@ -70,7 +71,8 @@ type toolCallVerdict struct {
 }
 
 // judgeToolCall T2/T3 判据（纯函数，fixture 单测覆盖六种失败形态）。
-//   status=0 表示请求没发出去（网络错）；wantName 为请求里声明的工具名。
+//
+//	status=0 表示请求没发出去（网络错）；wantName 为请求里声明的工具名。
 func judgeToolCall(status int, apiErr string, pm *TurnMetrics, wantName string) toolCallVerdict {
 	if status == 0 {
 		return toolCallVerdict{Level: "INCOMPLETE", Detail: "请求未送达: " + apiErr,

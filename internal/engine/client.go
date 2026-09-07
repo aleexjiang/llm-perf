@@ -173,7 +173,7 @@ type TurnMetrics struct {
 
 	// ToolCalls 结构化工具调用（probe tool-call 检查读取；流式在 closeOutWarnings 聚合成型）。
 	// 不进压测数据契约（json:"-"）——主压测不带 tools，该字段只有 probe 检查项消费
-	ToolCalls []ToolCall `json:"-"`
+	ToolCalls       []ToolCall        `json:"-"`
 	toolCallBuckets map[int]*ToolCall // 流式按 index 分桶的聚合状态
 
 	contentTimes []time.Time

@@ -74,8 +74,8 @@ def filter_scenarios(data, sel):
 
 
 def load_inputs(argv):
-    """返回 (reports, title, scenario, out_dir, scenarios)。reports: [(路径, dict)]"""
-    paths, title, scenario = [], None, "all"
+    """返回 (reports, title, out_dir, scenarios)。reports: [(路径, dict)]"""
+    paths, title = [], None
     out_dir = None
     sel_spec = None
     rest = list(argv)
@@ -90,10 +90,6 @@ def load_inputs(argv):
             sel_spec = a.split("=", 1)[1]
             i += 1
             continue
-        if a == "--scenario":
-            scenario = rest[i + 1]
-            i += 2
-            continue
         if os.path.isdir(a):
             for k in SCENARIOS:
                 paths.extend(sorted(glob.glob(os.path.join(a, "**", k + "-*.json"), recursive=True)))
@@ -107,16 +103,16 @@ def load_inputs(argv):
     if not paths:
         sys.exit("没有输入：请给 output 目录或 .json 文件路径")
     reports = [(p, json.load(open(p, encoding="utf-8"))) for p in paths]
-    return reports, title, scenario, out_dir, parse_scenarios(sel_spec)
+    return reports, title, out_dir, parse_scenarios(sel_spec)
 
 
-def merge(reports, scenario_filter):
+def merge(reports):
     """合并多份同场景报告 → {scenario: [entries...]}，并收集元信息。"""
     data = {k: [] for k in SCENARIOS}
     meta = {"endpoint": "?", "tool": "?", "notes": [], "generated": [], "slo": None}
     for p, d in reports:
         scen = d.get("scenario")
-        if scen not in data or (scenario_filter != "all" and scen != scenario_filter):
+        if scen not in data:
             continue
         data[scen].extend(d.get(scen) or [])
         meta["endpoint"] = d.get("endpoint") or meta["endpoint"]
@@ -893,8 +889,8 @@ def summary_json(data, A, meta, conclusions, recommendations, limits):
 # ────────────────────────── 主流程 ──────────────────────────
 
 def main():
-    reports, title, scenario, out_dir, scenarios = load_inputs(sys.argv[1:])
-    data, meta = merge(reports, scenario)
+    reports, title, out_dir, scenarios = load_inputs(sys.argv[1:])
+    data, meta = merge(reports)
     data = filter_scenarios(data, scenarios)
     if not any(data[k] for k in SCENARIOS):
         sys.exit("输入中没有可用场景数据（过滤条件 --scenarios={}）".format("+".join(sorted(scenarios))))

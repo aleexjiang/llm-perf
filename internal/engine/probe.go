@@ -56,11 +56,11 @@ type ProbeResult struct {
 type ProbeOptions struct {
 	Endpoint     string
 	APIKey       string
-	Auth         Auth   // 认证方案（默认 bearer + Authorization）
-	ChatPath     string // 接口路径，默认 /chat/completions
-	MetricsPath  string // 服务端 metrics 路径，默认 /metrics
-	ModelsPath   string // 模型列表路径，默认 /models
-	Model        string // 为空则取 /models 列表第一个
+	Auth         Auth           // 认证方案（默认 bearer + Authorization）
+	ChatPath     string         // 接口路径，默认 /chat/completions
+	MetricsPath  string         // 服务端 metrics 路径，默认 /metrics
+	ModelsPath   string         // 模型列表路径，默认 /models
+	Model        string         // 为空则取 /models 列表第一个
 	ThinkingOn   map[string]any // 思考开启的 extra_body（可空）
 	ThinkingOff  map[string]any // 思考关闭的 extra_body（可空）
 	IncludeUsage bool
