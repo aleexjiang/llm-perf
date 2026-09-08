@@ -641,7 +641,8 @@ func openRates(cc config.Concurrent) []float64 {
 	return nil
 }
 
-// collectSessionTurns 执行一次完整会话重放并采集逐 turn 指标（并发多轮用：每个虚拟用户一次）。
+// collectSessionTurns 执行一次完整多轮会话并采集逐 turn 指标（并发多轮用：每个虚拟用户一次）。
+// filler 模式为合成模拟对话（逐轮滚动 history）；trace 数据源才是真实会话重放。
 // maxTok 由调用方传入（输出长度扫描维度，已含思考 floor 抬高）。
 func collectSessionTurns(ctx context.Context, e *env, cfg *config.Config,
 	model string, v config.ThinkingVariant, sessionIdx int, turnLimit int, maxTok int) []*engine.TurnMetrics {
@@ -714,7 +715,10 @@ func Concurrent(ctx context.Context, cfg *config.Config, client *engine.Client, 
 	rates := openRates(cc)
 	mode := "单轮"
 	if cc.Multiturn {
-		mode = "多轮会话重放"
+		mode = "多轮会话模拟" // filler=合成模拟对话；trace 数据源才是"重放"（见 collectSessionTurns）
+		if e.trace != nil {
+			mode = "多轮会话重放(trace)"
+		}
 	}
 	loadModel := "闭环并发"
 	if rates != nil {

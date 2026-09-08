@@ -32,7 +32,8 @@ type MultiturnRun struct {
 }
 
 // ConcurrentLevel：一个模型在一个并发档位 × 思考模式下的结果。
-// Multiturn=false 时 Requests 为各虚拟用户的单轮请求；true 时 Sessions 为各虚拟用户的完整会话重放。
+// Multiturn=false 时 Requests 为各虚拟用户的单轮请求；true 时 Sessions 为各虚拟用户的
+// 完整多轮会话（filler=合成模拟对话，trace 数据源为真实会话重放），逐 turn 计量。
 // RequestRate>0 为开环到达率模式（Level=0，rate 为实际到达率）。
 type ConcurrentLevel struct {
 	Model         string                `json:"model"`

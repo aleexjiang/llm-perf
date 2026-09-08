@@ -30,7 +30,7 @@
 |---|---|
 | `single`（conc=1, turns=single） | 单请求 TTFT / decode 速度随上下文长度如何增长？前缀缓存有没有命中？ |
 | `multiturn`（conc=1, turns=multi） | 多轮对话**滚**到 40k 时每轮 TTFT 如何？（模拟 agent：system + tool defs + 逐轮增长 history） |
-| `concurrent`（conc>1） | 并发 1→2→4→8→16 时 TTFT 衰减多少？整体吞吐峰值在哪？（turns=multi 时每个虚拟用户各自跑完整会话重放） |
+| `concurrent`（conc>1） | 并发 1→2→4→8→16 时 TTFT 衰减多少？整体吞吐峰值在哪？（turns=multi 时每个虚拟用户各自跑完整多轮会话；filler=模拟对话，trace 数据源=真实会话重放） |
 
 两个正交开关贯穿全部场景：
 

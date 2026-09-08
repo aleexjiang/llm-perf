@@ -28,7 +28,7 @@
 - 未经用户明确许可不 commit / push；提交时单个 commit 收口。
 - `configs/customer.yaml`、`configs/customer-*.md` 含客户端点与 key，已被 .gitignore 覆盖，严禁入库。
 - ROADMAP 只写"接下来加什么能力"的清单，不展开论证；重要设计拍板沉淀到本文件。
-- 验证基线：`go build ./... && go vet ./... && go test ./... -count=1` 全绿再交付；HTML 报告改动用真实 JSON 渲染人工核对。
+- 验证基线：`gofmt -l internal/ cmd/` 必须无输出（连续多轮提交遗漏 gofmt 格式，已成惯性问题——提交前必跑，新文件也不例外）+ `go build ./... && go vet ./... && go test ./... -count=1` 全绿再交付；HTML 报告改动用真实 JSON 渲染人工核对。
 
 ## 工程陷阱
 

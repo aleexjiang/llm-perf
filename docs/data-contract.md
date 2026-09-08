@@ -29,7 +29,7 @@ Report
 ├── single[]       # SingleRow: model, thinking, prompt_tokens, max_tokens, runs[]→TurnMetrics
 ├── multiturn[]    # MultiturnRun: model, thinking, session, max_tokens, turns[]→TurnMetrics
 ├── concurrent[]   # ConcurrentLevel: model, thinking, level, request_rate(开环>0),
-│                  #   requests[]→TurnMetrics（单轮）或 sessions[]→MultiturnRun（多轮重放）,
+│                  #   requests[]→TurnMetrics（单轮）或 sessions[]→MultiturnRun（多轮会话，逐 turn 计量）,
 │                  #   wall_seconds, throughput_tps, slo_meet/slo_total/goodput_rps/goodput_tps,
 │                  #   shapes[]→ShapeStat（concurrent.mix 形状分解，中位数）
 ├── correctness[]  # 金丝雀：{model, number, reply, match, e2e_ms, error}

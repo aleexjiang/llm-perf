@@ -87,7 +87,7 @@ type Concurrent struct {
 	RunsPerWorker int        `yaml:"runs_per_worker"`
 	PromptTokens  int        `yaml:"prompt_tokens"`
 	MaxTokens     IntList    `yaml:"max_tokens"` // 标量或列表（列表 = 输出长度扫描）
-	Multiturn     bool       `yaml:"multiturn"`  // true=每个虚拟用户各自跑完整多轮会话（会话重放）
+	Multiturn     bool       `yaml:"multiturn"`  // true=每个虚拟用户各自跑完整多轮会话（filler=模拟对话，trace=真实会话重放）
 	Mix           []MixShape `yaml:"mix"`        // 混合负载：非空时按权重混跑各形状（与 multiturn 互斥，
 	// prompt_tokens/max_tokens 单值与 max_tokens 扫描失效）
 
@@ -679,7 +679,7 @@ func Load(path string) (*Config, error) {
 	// 混合负载（5.6）：形状校验 + 与单值/扫描维度的冲突告警
 	if len(cfg.Concurrent.Mix) > 0 {
 		if cfg.Concurrent.Multiturn {
-			return nil, fmt.Errorf("concurrent.mix 与 multiturn: true 互斥：会话重放的形状由数据集决定，无法按权重混跑")
+			return nil, fmt.Errorf("concurrent.mix 与 multiturn: true 互斥：多轮会话的形状由 multiturn 配置（或 trace 数据）决定，无法按权重混跑")
 		}
 		seen := map[string]bool{}
 		for i := range cfg.Concurrent.Mix {

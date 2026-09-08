@@ -55,7 +55,7 @@ def parse_scenarios(spec):
 
 
 def lv_quad(lv):
-    """并发等级条目属于哪个象限：有 sessions=多轮会话重放；有 requests=单轮。"""
+    """并发等级条目属于哪个象限：有 sessions=多轮会话；有 requests=单轮。"""
     if lv.get("multiturn") or (lv.get("sessions") and "requests" not in lv):
         return "conc-multi"
     return "conc-single"
@@ -746,7 +746,7 @@ def concurrent_table(A, quad):
     note = '<div class="note">单元数：{}。TTFT/E2E 为该并发等级下全部请求的中位数（min–max）；' \
            'p95/p99 仅在请求总数 ≥ {} 时计算——长短混跑时中位数可能几乎不动而 p99 数倍膨胀，' \
            '请对照 p95/p99 列判断尾部时延风险。</div>'.format(
-        "独立多轮会话（每用户各自重放完整会话）" if quad == "conc_multi" else "独立单轮请求", MIN_PCT_SAMPLE)
+        "独立多轮会话（每用户各自跑完整会话）" if quad == "conc_multi" else "独立单轮请求", MIN_PCT_SAMPLE)
     return table(head, rows) + note if rows else "<p>无数据</p>"
 
 
@@ -1314,7 +1314,7 @@ def main():
     if A["coverage"]["has_conc_single"]:
         cov.append("多发·单轮（并发 × 独立单轮请求）")
     if A["coverage"]["has_conc_multi"]:
-        cov.append("多发·多轮（并发 × 每用户独立会话重放）")
+        cov.append("多发·多轮（并发 × 每用户独立多轮会话）")
     notes_html = "".join("<p><b>{}</b>：{}</p>".format(esc(f), esc(n)) for f, n in meta["notes"][-4:])
     sec2_body = table_kv([("端点", meta["endpoint"]), ("工具版本", meta["tool"]),
                           ("场景覆盖", "；".join(cov)),
@@ -1390,7 +1390,7 @@ def main():
     if A["coverage"]["has_concurrent"]:
         body = ""
         for quad, qname, cids in (("conc_single", "6.1 多发·单轮（并发 × 独立单轮请求）", ("c_cs_tps", "c_cs_ttft")),
-                                  ("conc_multi", "6.2 多发·多轮（并发 × 每用户独立会话重放）", ("c_cm_tps", "c_cm_ttft"))):
+                                  ("conc_multi", "6.2 多发·多轮（并发 × 每用户独立多轮会话）", ("c_cm_tps", "c_cm_ttft"))):
             if not A.get(quad):
                 continue
             body += "<h3>{}</h3>".format(qname)

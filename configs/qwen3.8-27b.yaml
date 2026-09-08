@@ -10,7 +10,7 @@
 # 200K 专项会话形状（原 qwen3.8-27b-200k.yaml，战役已跑完归档 output-200k，配置并入本文件备注）：
 #   multiturn: turns 9 × turn_tokens 25000 → base 3k + 滚到 ~223k；预算 223k+8192思考+256输出≈232k < 262144
 #   9 轮而非 8 轮：实测每轮净增 ~24.1k（filler 校准偏差+reply），8 轮只到 ~197.7k 不足 200k
-#   并发多轮（concurrent.multiturn: true）复用该会话形状，每虚拟用户独立 seed 重放
+#   并发多轮（concurrent.multiturn: true）复用该会话形状，每虚拟用户独立 seed 模拟会话
 #
 # 端点说明：云上实例，docker-compose 见 deploy/docker-compose.qwen3.8-27b.yml；
 #   宿主机上跑 bench → 127.0.0.1:8849；其他机器跑 → <实例IP>:8849

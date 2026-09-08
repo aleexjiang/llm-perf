@@ -111,7 +111,7 @@ multiturn:
 
 # 场景三：并发（单轮或多轮由 multiturn 决定；闭环 levels 与开环到达率二选一）
 concurrent:
-  multiturn: false                # false=每用户独立单轮请求；true=每用户各自跑完整多轮会话重放
+  multiturn: false                # false=每用户独立单轮请求；true=每用户各自跑完整多轮会话（filler=模拟对话，trace=真实会话重放）
   levels: [1, 2, 4, 8, 16]        # 闭环并发档位（request_rate/rate_sweep 未配置时生效）
   runs_per_worker: 2              # 单轮模式下每个虚拟用户连续发几次
   prompt_tokens: 10000
