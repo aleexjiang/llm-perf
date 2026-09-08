@@ -852,20 +852,20 @@ func aggregateShapes(mp *mixPlan, reqs []*engine.TurnMetrics, idxs []int) []repo
 		if len(ms) == 0 {
 			continue
 		}
-			med := func(get func(*engine.TurnMetrics) float64) float64 {
-				vals := make([]float64, 0, len(ms))
-				for _, m := range ms {
-					vals = append(vals, get(m))
-				}
-				sort.Float64s(vals)
-				// 偶数样本取两中值平均（与报告侧 Python st.median 口径一致，
-				// 否则小样本混跑下形状中位系统性偏高半步）
-				n := len(vals)
-				if n%2 == 0 {
-					return (vals[n/2-1] + vals[n/2]) / 2
-				}
-				return vals[n/2]
+		med := func(get func(*engine.TurnMetrics) float64) float64 {
+			vals := make([]float64, 0, len(ms))
+			for _, m := range ms {
+				vals = append(vals, get(m))
 			}
+			sort.Float64s(vals)
+			// 偶数样本取两中值平均（与报告侧 Python st.median 口径一致，
+			// 否则小样本混跑下形状中位系统性偏高半步）
+			n := len(vals)
+			if n%2 == 0 {
+				return (vals[n/2-1] + vals[n/2]) / 2
+			}
+			return vals[n/2]
+		}
 		out = append(out, report.ShapeStat{
 			Label:        sh.Label,
 			Weight:       sh.Weight,
