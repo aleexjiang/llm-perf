@@ -49,8 +49,9 @@ thinking:
 # 场景一：单发单轮（fixed_seed 复用同一 prompt，观察前缀缓存命中幅度）
 single:
   runs: 3
-  prompt_tokens: [4096, 10240, 20480, 40960, 102400, 204800]   # 204800 档：204.8K+8192思考+512输出≈213.5K < 262144 上限
-  max_tokens: 512
+  prompt_tokens: [4096, 10240, 20480, 40960, 102400, 204800]   # 204800 档：204.8K+8192思考+1024输出≈214K < 262144 上限
+  # 输出长度扫描（5.1）：thinking=on 时各档会被 floor(8192) 抬高收敛为单档，扫描只在 thinking=off 侧展开——属预期
+  max_tokens: [256, 512, 1024]
   fixed_seed: true
 
 # 场景二：单发多轮（模拟 WorkBuddy agent：system + tool defs + 逐轮滚大的 history）
@@ -60,7 +61,7 @@ multiturn:
   system_tokens: 1000
   tool_defs_tokens: 2000
   turn_tokens: 2000
-  max_tokens: 256
+  max_tokens: 256                 # 标量或列表，同 single
   keep_assistant: true
 
 # 场景三：并发。服务端 --max-num-seqs 4：
@@ -70,4 +71,4 @@ concurrent:
   levels: [1, 2, 4, 8]
   runs_per_worker: 2
   prompt_tokens: 10240
-  max_tokens: 256
+  max_tokens: 256                 # 标量或列表，同 single（列表会与 levels 相乘，注意总请求量）

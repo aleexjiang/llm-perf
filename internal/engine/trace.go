@@ -250,7 +250,7 @@ type sessionsFile struct {
 }
 
 func parseSessions(data []byte) ([]TraceSession, error) {
-	// 形态 1：[{"turns": [...]}, ...]
+	// 唯一形态：[{"turns": [...]}, ...]（裸数组 [["u1","u2"]] 形态未文档化，已删除）
 	var objs []sessionsFile
 	if err := json.Unmarshal(data, &objs); err == nil && len(objs) > 0 && len(objs[0].Turns) > 0 {
 		out := make([]TraceSession, 0, len(objs))
@@ -263,18 +263,5 @@ func parseSessions(data []byte) ([]TraceSession, error) {
 			return out, nil
 		}
 	}
-	// 形态 2：[["u1","u2"], ...]
-	var arrs [][]string
-	if err := json.Unmarshal(data, &arrs); err == nil && len(arrs) > 0 {
-		out := make([]TraceSession, 0, len(arrs))
-		for _, a := range arrs {
-			if len(a) > 0 {
-				out = append(out, TraceSession{UserTurns: a})
-			}
-		}
-		if len(out) > 0 {
-			return out, nil
-		}
-	}
-	return nil, fmt.Errorf("sessions 格式不合法")
+	return nil, fmt.Errorf("sessions 格式不合法（应为 [{\"turns\": [...]}]）")
 }

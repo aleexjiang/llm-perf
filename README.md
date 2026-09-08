@@ -54,9 +54,9 @@
 - **trace**（`dataset.mode: trace`）：真实会话回放，多轮长度来自真实分布（贴近客户实际流量）。
   支持 ShareGPT 格式与自定义 `sessions` 格式（`[{"turns": ["...", ...]}]`，`.json`/`.json.gz`），
   token 以服务端 usage 为准；trace 模式下 system_tokens/turn_tokens 不生效（会话形状由回放决定）。
-  `dataset.replay_mode` 控制回放保真度：`user_only`（默认，只回放 user 轮，行为同历史版本）；
-  `full`（按原序注入全部 role——assistant/tool 消息进上下文，测真实 history 深度。
-  真实 agent 会话里工具结果往往占上下文大头，user_only 的回放深度系统性偏小）；
+  `dataset.replay_mode` 控制回放保真度：`full`（默认，按原序注入全部 role——assistant/tool 消息进上下文，
+  测真实 history 深度。真实 agent 会话里工具结果往往占上下文大头，user_only 的回放深度系统性偏小）；
+  `user_only`（只回放 user 轮，需对比历史口径时显式配置）；
   full 模式下 `role: tool` 消息缺 `tool_call_id` 会被跳过并计数告警（不静默丢弃）
 
 另有 `bench probe` 兼容性探针（换引擎先跑）、`debug` 原始流量留存与 `/metrics` 服务端观测层，

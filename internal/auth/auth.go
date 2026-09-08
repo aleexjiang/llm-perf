@@ -1,7 +1,8 @@
-// auth.go：认证格式抽象。客户环境的 key 形态五花八门——标准 `Authorization: Bearer <key>`、
+// Package auth 认证格式抽象。客户环境的 key 形态五花八门——标准 `Authorization: Bearer <key>`、
 // 网关裸 key（`Authorization: <key>` 无 Bearer 前缀）、自定义 header（如 X-API-Key）。
-// 之前 Bearer 硬编码在 probe 与 client 共 3 处，裸 key 环境直接 401。
-package engine
+// 独立成低层包：engine（chat 请求）与 smetrics（/metrics 抓取）共用，
+// 消除之前 smetrics 里语义重复的 applyAuth 实现。
+package auth
 
 import (
 	"net/http"

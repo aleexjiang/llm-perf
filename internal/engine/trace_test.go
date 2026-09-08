@@ -49,19 +49,18 @@ func TestLoadTraceShareGPT(t *testing.T) {
 
 func TestLoadTraceSessions(t *testing.T) {
 	dir := t.TempDir()
-	// 形态 1：对象数组
+	// 唯一合法形态：对象数组 [{"turns": [...]}]
 	p := filepath.Join(dir, "s.json")
 	os.WriteFile(p, []byte(`[{"turns":["u1","u2","u3"]},{"turns":["v1"]}]`), 0o644)
 	ts, err := LoadTrace(p, "sessions", "user_only", 2, 0)
 	if err != nil || len(ts.Sessions) != 1 || len(ts.Sessions[0].UserTurns) != 3 {
 		t.Fatalf("sessions 对象形态解析失败: %v %+v", err, ts.Sessions)
 	}
-	// 形态 2：二维数组
+	// 裸数组形态（[["u1","u2"]]）已删除：必须报格式错误
 	p2 := filepath.Join(dir, "a.json")
 	os.WriteFile(p2, []byte(`[["u1","u2"],["v1","v2"]]`), 0o644)
-	ts2, err := LoadTrace(p2, "sessions", "user_only", 2, 0)
-	if err != nil || len(ts2.Sessions) != 2 {
-		t.Fatalf("sessions 数组形态解析失败: %v", err)
+	if _, err := LoadTrace(p2, "sessions", "user_only", 2, 0); err == nil {
+		t.Fatal("裸数组形态应报 sessions 格式不合法")
 	}
 }
 

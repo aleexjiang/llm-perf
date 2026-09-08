@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -14,32 +15,87 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// fileExists 判断路径是否存在（文件或目录）。
+func fileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
+}
+
+// IntList max_tokens 类字段：YAML 接受标量（max_tokens: 512）或列表（max_tokens: [128, 256, 512]）。
+// 列表 = 输出长度扫描：输出长度是 decode 指标的一级变量（同输入下输出 64→512 可使 TPOT
+// 变化 54–77%），多档对照才能把 prefill/decode 效应分开归因。
+type IntList []int
+
+func (l *IntList) UnmarshalYAML(node *yaml.Node) error {
+	var one int
+	if err := node.Decode(&one); err == nil {
+		*l = IntList{one}
+		return nil
+	}
+	var many []int
+	if err := node.Decode(&many); err != nil {
+		return fmt.Errorf("应为整数或整数列表（如 512 或 [128, 512]）: %w", err)
+	}
+	*l = many
+	return nil
+}
+
+// First 返回第一个值；Load 的默认值逻辑保证列表非空，这里防御性返回 0。
+func (l IntList) First() int {
+	if len(l) == 0 {
+		return 0
+	}
+	return l[0]
+}
+
+// Max 返回最大值：probe 上下文探测按最大输出预算（prompt+output 最坏组合）发请求。
+func (l IntList) Max() int {
+	mx := 0
+	for _, v := range l {
+		if v > mx {
+			mx = v
+		}
+	}
+	return mx
+}
+
 type Single struct {
-	Runs         int   `yaml:"runs"`
-	PromptTokens []int `yaml:"prompt_tokens"`
-	MaxTokens    int   `yaml:"max_tokens"`
-	FixedSeed    bool  `yaml:"fixed_seed"`
+	Runs         int     `yaml:"runs"`
+	PromptTokens []int   `yaml:"prompt_tokens"`
+	MaxTokens    IntList `yaml:"max_tokens"` // 标量或列表（列表 = 输出长度扫描）
+	FixedSeed    bool    `yaml:"fixed_seed"`
 }
 
 type Multiturn struct {
-	Sessions       int  `yaml:"sessions"`
-	Turns          int  `yaml:"turns"`
-	SystemTokens   int  `yaml:"system_tokens"`
-	ToolDefsTokens int  `yaml:"tool_defs_tokens"`
-	TurnTokens     int  `yaml:"turn_tokens"`
-	MaxTokens      int  `yaml:"max_tokens"`
-	KeepAssistant  bool `yaml:"keep_assistant"`
+	Sessions       int     `yaml:"sessions"`
+	Turns          int     `yaml:"turns"`
+	SystemTokens   int     `yaml:"system_tokens"`
+	ToolDefsTokens int     `yaml:"tool_defs_tokens"`
+	TurnTokens     int     `yaml:"turn_tokens"`
+	MaxTokens      IntList `yaml:"max_tokens"` // 标量或列表（列表 = 输出长度扫描）
+	KeepAssistant  bool    `yaml:"keep_assistant"`
 	// MaxReplyChars assistant 回复保留进 history 的截断长度（按 rune 计，中文安全），默认 2000。
 	// 之前按字节切（reply[:2000]），中文会切出半个 UTF-8 字符发给服务端
 	MaxReplyChars int `yaml:"max_reply_chars"`
 }
 
+// MixShape 混合负载的请求形状（5.6）：并发场景按 weight 确定性混跑长短请求。
+// 线上流量从不均匀——均匀负载测出的吞吐/p99 系统性偏乐观，混跑才能测出容量折扣与真实尾延迟。
+type MixShape struct {
+	Weight       int    `yaml:"weight"`        // 相对权重（正整数），按平滑加权轮转展开成确定性序列
+	Label        string `yaml:"label"`         // 形状名（报告分组用，留空自动 shape1/shape2…不可重复）
+	PromptTokens int    `yaml:"prompt_tokens"` // 该形状输入长度
+	MaxTokens    int    `yaml:"max_tokens"`    // 该形状输出上限（标量；与输出长度扫描正交，不做列表）
+}
+
 type Concurrent struct {
-	Levels        []int `yaml:"levels"`
-	RunsPerWorker int   `yaml:"runs_per_worker"`
-	PromptTokens  int   `yaml:"prompt_tokens"`
-	MaxTokens     int   `yaml:"max_tokens"`
-	Multiturn     bool  `yaml:"multiturn"` // true=每个虚拟用户各自跑完整多轮会话（会话重放）
+	Levels        []int      `yaml:"levels"`
+	RunsPerWorker int        `yaml:"runs_per_worker"`
+	PromptTokens  int        `yaml:"prompt_tokens"`
+	MaxTokens     IntList    `yaml:"max_tokens"` // 标量或列表（列表 = 输出长度扫描）
+	Multiturn     bool       `yaml:"multiturn"`  // true=每个虚拟用户各自跑完整多轮会话（会话重放）
+	Mix           []MixShape `yaml:"mix"`        // 混合负载：非空时按权重混跑各形状（与 multiturn 互斥，
+	// prompt_tokens/max_tokens 单值与 max_tokens 扫描失效）
 
 	// 开环到达率模式（对齐 vLLM bench serve / inference-perf）：request_rate>0 或 rate_sweep
 	// 非空时替代 levels 闭环——请求按 Poisson 过程到达，能测出排队-延迟曲线
@@ -183,6 +239,20 @@ func (t Thinking) MaxTokens(maxTokens int, v ThinkingVariant) int {
 	return maxTokens
 }
 
+// MaxTokensList 对输出长度列表逐值应用思考 floor 保护（返回新切片；列表 = 输出长度扫描维度）。
+// 输入列表须已升序：floor 抬高可能把多个小档位收敛成同一值，相邻去重避免重复扫同一档。
+func (t Thinking) MaxTokensList(list []int, v ThinkingVariant) []int {
+	out := make([]int, 0, len(list))
+	for _, mt := range list {
+		adj := t.MaxTokens(mt, v)
+		if len(out) > 0 && out[len(out)-1] == adj {
+			continue
+		}
+		out = append(out, adj)
+	}
+	return out
+}
+
 // ThinkingFor 返回某模型生效的思考配置：全局 thinking 为底，model_overrides[model].thinking
 // 字段级覆盖（零值 = 未写 = 继承全局）；CLI --thinking 的变体过滤始终继承。
 func (c *Config) ThinkingFor(model string) *Thinking {
@@ -229,7 +299,7 @@ func (c *Config) ForModel(model string) *Config {
 		if len(s.PromptTokens) > 0 {
 			m.PromptTokens = s.PromptTokens
 		}
-		if s.MaxTokens > 0 {
+		if len(s.MaxTokens) > 0 {
 			m.MaxTokens = s.MaxTokens
 		}
 		if s.FixedSeed {
@@ -254,7 +324,7 @@ func (c *Config) ForModel(model string) *Config {
 		if s.TurnTokens > 0 {
 			m.TurnTokens = s.TurnTokens
 		}
-		if s.MaxTokens > 0 {
+		if len(s.MaxTokens) > 0 {
 			m.MaxTokens = s.MaxTokens
 		}
 		if s.KeepAssistant {
@@ -276,8 +346,11 @@ func (c *Config) ForModel(model string) *Config {
 		if s.PromptTokens > 0 {
 			m.PromptTokens = s.PromptTokens
 		}
-		if s.MaxTokens > 0 {
+		if len(s.MaxTokens) > 0 {
 			m.MaxTokens = s.MaxTokens
+		}
+		if len(s.Mix) > 0 {
+			m.Mix = s.Mix // 形状切片运行期只读，浅拷贝即可
 		}
 		if s.Multiturn {
 			m.Multiturn = true
@@ -344,6 +417,9 @@ func (c *Config) ActiveModels() []string {
 }
 
 type Config struct {
+	// Raw 配置文件原文（Load 时填充）：随报告存档，保证几周后能复现"当时是什么配置跑的"。
+	// 注释、键序、书写习惯都只有原文能保留——结构化字段回放不出这些信息。
+	Raw            string   `yaml:"-"`
 	Endpoint       string   `yaml:"endpoint"`
 	APIKeyLiteral  string   `yaml:"api_key"`     // 字面量 key，直接写配置文件（该配置文件应避免入库）；环境变量 LLM_PERF_API_KEY 优先级更高
 	APIKeyEnv      string   `yaml:"api_key_env"` // 从哪个环境变量读 key（留空则跳过）；字面量 api_key 与环境变量都未提供时不带认证头
@@ -425,6 +501,16 @@ func Load(path string) (*Config, error) {
 		if err := dec.Decode(cfg); err != nil {
 			return nil, fmt.Errorf("parse config: %w", err)
 		}
+		cfg.Raw = string(data)
+		// 相对路径以配置文件所在目录为基准（dataset.path / filler_corpus 等），
+		// 与启动时的工作目录解耦——从任何目录 `bench -f configs/xxx.yaml` 结果一致
+		if isRel := !filepath.IsAbs(cfg.Dataset.Path) && cfg.Dataset.Path != ""; isRel {
+			cfg.Dataset.Path = filepath.Join(filepath.Dir(path), cfg.Dataset.Path)
+		}
+		if cfg.FillerCorpus != "" && !filepath.IsAbs(cfg.FillerCorpus) &&
+			fileExists(filepath.Join(filepath.Dir(path), cfg.FillerCorpus)) {
+			cfg.FillerCorpus = filepath.Join(filepath.Dir(path), cfg.FillerCorpus)
+		}
 	}
 
 	// env 覆盖
@@ -444,7 +530,7 @@ func Load(path string) (*Config, error) {
 	if v := os.Getenv("LLM_PERF_API_KEY"); v != "" {
 		cfg.APIKey = v
 	}
-	// 认证方案：枚举校验（可选值与 engine.Auth 支持的方案一致；engine.Auth 对未知值按 bearer 处理，这里提前拒绝）
+	// 认证方案：枚举校验（可选值与 internal/auth 支持的方案一致；auth.Auth 对未知值按 bearer 处理，这里提前拒绝）
 	switch strings.ToLower(cfg.AuthScheme) {
 	case "", "bearer", "raw", "none":
 	default:
@@ -541,8 +627,17 @@ func Load(path string) (*Config, error) {
 	if len(cfg.Single.PromptTokens) == 0 {
 		cfg.Single.PromptTokens = []int{4000, 10000, 20000, 40000}
 	}
-	if cfg.Single.MaxTokens <= 0 {
-		cfg.Single.MaxTokens = 512
+	if mt, changed, err := normalizeMaxTokens(cfg.Single.MaxTokens, "single.max_tokens"); err != nil {
+		return nil, err
+	} else if len(mt) > 0 {
+		cfg.Single.MaxTokens = mt
+		if changed {
+			cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
+				"single.max_tokens 已排序去重 → %v（输出长度扫描按升序执行）", mt))
+		}
+	}
+	if len(cfg.Single.MaxTokens) == 0 {
+		cfg.Single.MaxTokens = IntList{512}
 	}
 	if cfg.Multiturn.Sessions <= 0 {
 		cfg.Multiturn.Sessions = 2
@@ -553,8 +648,17 @@ func Load(path string) (*Config, error) {
 	if cfg.Multiturn.TurnTokens <= 0 {
 		cfg.Multiturn.TurnTokens = 2000
 	}
-	if cfg.Multiturn.MaxTokens <= 0 {
-		cfg.Multiturn.MaxTokens = 256
+	if mt, changed, err := normalizeMaxTokens(cfg.Multiturn.MaxTokens, "multiturn.max_tokens"); err != nil {
+		return nil, err
+	} else if len(mt) > 0 {
+		cfg.Multiturn.MaxTokens = mt
+		if changed {
+			cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
+				"multiturn.max_tokens 已排序去重 → %v（输出长度扫描按升序执行）", mt))
+		}
+	}
+	if len(cfg.Multiturn.MaxTokens) == 0 {
+		cfg.Multiturn.MaxTokens = IntList{256}
 	}
 	if len(cfg.Concurrent.Levels) == 0 {
 		cfg.Concurrent.Levels = []int{1, 2, 4, 8, 16}
@@ -565,8 +669,45 @@ func Load(path string) (*Config, error) {
 	if cfg.Concurrent.PromptTokens <= 0 {
 		cfg.Concurrent.PromptTokens = 10000
 	}
-	if cfg.Concurrent.MaxTokens <= 0 {
-		cfg.Concurrent.MaxTokens = 256
+	if mt, changed, err := normalizeMaxTokens(cfg.Concurrent.MaxTokens, "concurrent.max_tokens"); err != nil {
+		return nil, err
+	} else if len(mt) > 0 {
+		cfg.Concurrent.MaxTokens = mt
+		if changed {
+			cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
+				"concurrent.max_tokens 已排序去重 → %v（输出长度扫描按升序执行）", mt))
+		}
+	}
+	if len(cfg.Concurrent.MaxTokens) == 0 {
+		cfg.Concurrent.MaxTokens = IntList{256}
+	}
+	// 混合负载（5.6）：形状校验 + 与单值/扫描维度的冲突告警
+	if len(cfg.Concurrent.Mix) > 0 {
+		if cfg.Concurrent.Multiturn {
+			return nil, fmt.Errorf("concurrent.mix 与 multiturn: true 互斥：会话重放的形状由数据集决定，无法按权重混跑")
+		}
+		seen := map[string]bool{}
+		for i := range cfg.Concurrent.Mix {
+			s := &cfg.Concurrent.Mix[i]
+			if s.Weight <= 0 {
+				return nil, fmt.Errorf("concurrent.mix[%d].weight 必须为正整数（相对权重）", i)
+			}
+			if s.PromptTokens <= 0 {
+				return nil, fmt.Errorf("concurrent.mix[%d].prompt_tokens 必须为正（该形状输入长度）", i)
+			}
+			if s.MaxTokens <= 0 {
+				return nil, fmt.Errorf("concurrent.mix[%d].max_tokens 必须为正（该形状输出上限，标量）", i)
+			}
+			if s.Label == "" {
+				s.Label = fmt.Sprintf("shape%d", i+1)
+			}
+			if seen[s.Label] {
+				return nil, fmt.Errorf("concurrent.mix label %q 重复（报告按 label 分组）", s.Label)
+			}
+			seen[s.Label] = true
+		}
+		cfg.Warnings = append(cfg.Warnings,
+			"concurrent.mix 已配置：该场景下请求形状由 mix 各项决定，prompt_tokens/max_tokens 单值与 max_tokens 输出扫描失效")
 	}
 	// 新增能力默认值与校验
 	if cfg.MetricsIntervalMS <= 0 {
@@ -582,15 +723,18 @@ func Load(path string) (*Config, error) {
 	if cfg.Dataset.Mode == "trace" && cfg.Dataset.Path == "" {
 		return nil, fmt.Errorf("dataset.mode=trace 需要 dataset.path（trace 文件路径）")
 	}
-	// 回放保真度：枚举校验 + 数据源联动
+	// 回放保真度：枚举校验 + 数据源联动。默认 full（完整 role 序列——agent 会话的 token
+	// 大头在 assistant/tool 回灌，user_only 会系统性低估上下文；需要旧口径时显式配置）。
+	rawReplayMode := cfg.Dataset.ReplayMode
 	switch cfg.Dataset.ReplayMode {
 	case "":
-		cfg.Dataset.ReplayMode = "user_only"
+		cfg.Dataset.ReplayMode = "full"
 	case "user_only", "full":
 	default:
 		return nil, fmt.Errorf("dataset.replay_mode 无效值 %q（可选 user_only/full）", cfg.Dataset.ReplayMode)
 	}
-	if cfg.Dataset.ReplayMode == "full" && cfg.Dataset.Mode != "trace" {
+	// 仅在用户显式配置了 full + 非 trace 时提醒（默认值触达 filler 场景不打扰）
+	if rawReplayMode == "full" && cfg.Dataset.Mode != "trace" {
 		cfg.Warnings = append(cfg.Warnings,
 			"dataset.replay_mode=full 仅在 dataset.mode=trace 下生效（filler 模式没有原始会话可回放，忽略）")
 	}
@@ -721,6 +865,37 @@ func Load(path string) (*Config, error) {
 			"timeout_seconds=%d 偏小：思考开启 + 100k 级上下文时单请求可达 3–8 分钟，会被误判超时", cfg.TimeoutSeconds))
 	}
 
+	// 测量守卫：输出长度是影响 decode 指标方向的一级变量——同输入下输出 64→512
+	// 可使 TPOT 变化 54–77%（decode 爬坡段在短输出里占比过大）。单一短输出档
+	// 测出的 TPOT/tok/s 系统性偏悲观，容量结论会整体偏保守且无任何报错。
+	guardShortOutput := func(scen string, mt int) {
+		if mt > 0 && mt < 128 {
+			cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
+				"%s.max_tokens=%d 偏小：decode 爬坡段占比过大，TPOT/tok/s 系统性偏悲观"+
+					"（同输入下输出 64→512 可使 TPOT 变化 54–77%%）。"+
+					"冒烟跑通可忽略；出容量/性能结论请用 ≥256 档或多档输出扫描校核", scen, mt))
+		}
+	}
+	for _, mt := range cfg.Single.MaxTokens {
+		guardShortOutput("single", mt)
+	}
+	for _, mt := range cfg.Multiturn.MaxTokens {
+		guardShortOutput("multiturn", mt)
+	}
+	// mix 模式下 concurrent 的输出上限由各形状自带，单值守卫不适用
+	if len(cfg.Concurrent.Mix) == 0 {
+		for _, mt := range cfg.Concurrent.MaxTokens {
+			guardShortOutput("concurrent", mt)
+		}
+	}
+	// 输入扫了多档但输出只有一档：prefill/decode 效应混在一起，斜率结论归因不清
+	if len(cfg.Single.PromptTokens) > 1 && len(cfg.Single.MaxTokens) == 1 {
+		cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
+			"single.prompt_tokens 扫了 %d 档但 max_tokens 只有单档 %d：输入/输出两个一级变量只扫了一个，"+
+				"TTFT 斜率里混着 decode 效应；容量规划建议输出长度也做多档对照",
+			len(cfg.Single.PromptTokens), cfg.Single.MaxTokens[0]))
+	}
+
 	// runs/sessions 统计充分性
 	if cfg.Single.Runs < 2 {
 		cfg.Warnings = append(cfg.Warnings,
@@ -737,15 +912,19 @@ func Load(path string) (*Config, error) {
 
 	// 思考 floor 联动：on 时 max_tokens 会被抬高，off/on 的 E2E 口径不同
 	if thinkMayOn && cfg.Thinking.MaxTokensFloor > 0 {
-		if cfg.Single.MaxTokens > 0 && cfg.Single.MaxTokens < cfg.Thinking.MaxTokensFloor {
-			cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
-				"single.max_tokens=%d < max_tokens_floor=%d：thinking=on 的请求会被抬高到 floor，off/on 的 E2E 不可直接横向比（off 受 512 钳制、on 受 floor 抬高）",
-				cfg.Single.MaxTokens, cfg.Thinking.MaxTokensFloor))
+		for _, mt := range cfg.Single.MaxTokens {
+			if mt < cfg.Thinking.MaxTokensFloor {
+				cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
+					"single.max_tokens=%d < max_tokens_floor=%d：thinking=on 的请求会被抬高到 floor，off/on 的 E2E 不可直接横向比（off 受输出档钳制、on 受 floor 抬高）",
+					mt, cfg.Thinking.MaxTokensFloor))
+			}
 		}
-		if cfg.Multiturn.MaxTokens > 0 && cfg.Multiturn.MaxTokens < cfg.Thinking.MaxTokensFloor {
-			cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
-				"multiturn.max_tokens=%d < max_tokens_floor=%d：thinking=on 的请求会被抬高到 floor",
-				cfg.Multiturn.MaxTokens, cfg.Thinking.MaxTokensFloor))
+		for _, mt := range cfg.Multiturn.MaxTokens {
+			if mt < cfg.Thinking.MaxTokensFloor {
+				cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
+					"multiturn.max_tokens=%d < max_tokens_floor=%d：thinking=on 的请求会被抬高到 floor",
+					mt, cfg.Thinking.MaxTokensFloor))
+			}
 		}
 	}
 
@@ -842,6 +1021,33 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
+// normalizeMaxTokens 校验并规范化输出长度档位（max_tokens 标量或列表）：
+// 单值 ≤0 视为未配置（交默认值处理，与历史口径一致）；列表含非正值报错；排序去重。
+func normalizeMaxTokens(l IntList, where string) (IntList, bool, error) {
+	if len(l) == 0 || (len(l) == 1 && l[0] <= 0) {
+		return nil, false, nil
+	}
+	for _, v := range l {
+		if v <= 0 {
+			return nil, false, fmt.Errorf("%s 含非正值 %d——输出长度必须是正整数 token 数", where, v)
+		}
+	}
+	orig := append([]int(nil), l...)
+	sort.Ints(l)
+	ded := l[:0]
+	for i, t := range l {
+		if i == 0 || t != ded[len(ded)-1] {
+			ded = append(ded, t)
+		}
+	}
+	l = ded
+	changed := len(orig) != len(ded)
+	for i := 0; !changed && i < len(orig); i++ {
+		changed = orig[i] != ded[i]
+	}
+	return l, changed, nil
+}
+
 // normalizeLadder 校验并规范化单发 token 档位：非正值报错、排序去重、相邻增量 <10% 报错。
 // where 用于错误信息定位（顶层或某个模型覆盖段）。返回规范化后的档位与是否发生过修正。
 // 档位必须升序：场景按档位顺序执行，命中上下文上限时靠升序跳过更大档位。
@@ -887,9 +1093,6 @@ func anyLevelEnabled(th Thinking) bool {
 
 // Timeout 返回超时 Duration。
 func (c *Config) Timeout() time.Duration { return time.Duration(c.TimeoutSeconds) * time.Second }
-
-// Fillers 返回填充文本语言设置。
-func (c *Config) Fillers() string { return c.FillerLang }
 
 // StreamEnabled 返回是否使用流式请求。
 func (c *Config) StreamEnabled() bool { return *c.Stream }

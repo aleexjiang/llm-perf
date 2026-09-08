@@ -13,20 +13,22 @@ import (
 	"github.com/aleexjiang/llm-perf/internal/smetrics"
 )
 
-// SingleRow：一个模型在一个 token 档位 × 思考模式下的多次 run。
+// SingleRow：一个模型在一个 token 档位 × 思考模式 × 输出长度下的多次 run。
 type SingleRow struct {
 	Model        string                `json:"model"`
 	Thinking     string                `json:"thinking"` // "on" / "off"
 	PromptTokens int                   `json:"prompt_tokens"`
+	MaxTokens    int                   `json:"max_tokens"` // 输出长度（max_tokens 扫描维度；thinking=on 时已含 floor 抬高）
 	Runs         []*engine.TurnMetrics `json:"runs"`
 }
 
 // MultiturnRun：一个模型的一次多轮会话（每 turn 均含思考时长）。
 type MultiturnRun struct {
-	Model    string                `json:"model"`
-	Thinking string                `json:"thinking"` // "on" / "off"
-	Session  int                   `json:"session"`
-	Turns    []*engine.TurnMetrics `json:"turns"`
+	Model     string                `json:"model"`
+	Thinking  string                `json:"thinking"` // "on" / "off"
+	Session   int                   `json:"session"`
+	MaxTokens int                   `json:"max_tokens"` // 输出长度（max_tokens 扫描维度；thinking=on 时已含 floor 抬高）
+	Turns     []*engine.TurnMetrics `json:"turns"`
 }
 
 // ConcurrentLevel：一个模型在一个并发档位 × 思考模式下的结果。
@@ -34,7 +36,8 @@ type MultiturnRun struct {
 // RequestRate>0 为开环到达率模式（Level=0，rate 为实际到达率）。
 type ConcurrentLevel struct {
 	Model         string                `json:"model"`
-	Thinking      string                `json:"thinking"` // "on" / "off"
+	Thinking      string                `json:"thinking"`   // "on" / "off"
+	MaxTokens     int                   `json:"max_tokens"` // 输出长度（max_tokens 扫描维度；thinking=on 时已含 floor 抬高）
 	Level         int                   `json:"level"`
 	RequestRate   float64               `json:"request_rate,omitempty"` // 开环模式的到达率（req/s）
 	Requests      []*engine.TurnMetrics `json:"requests,omitempty"`
@@ -47,6 +50,21 @@ type ConcurrentLevel struct {
 	SLOTotal   int     `json:"slo_total,omitempty"`
 	GoodputRPS float64 `json:"goodput_rps,omitempty"` // 达标请求 / 墙钟
 	GoodputTPS float64 `json:"goodput_tps,omitempty"` // 达标请求的 completion tokens / 墙钟
+
+	// 混合负载形状分解（concurrent.mix，5.6）：按形状聚合的中位数统计；Requests 全量不动
+	Shapes []ShapeStat `json:"shapes,omitempty"`
+}
+
+// ShapeStat 混跑单形状统计（中位数口径与并发表一致）。
+type ShapeStat struct {
+	Label        string  `json:"label"`
+	Weight       int     `json:"weight"`
+	PromptTokens int     `json:"prompt_tokens"`
+	MaxTokens    int     `json:"max_tokens"` // 已过思考 floor 抬高
+	Count        int     `json:"count"`      // 本轮实际发出的该形状请求数
+	TTFTS        float64 `json:"ttft_s"`     // 中位
+	E2ES         float64 `json:"e2e_s"`      // 中位
+	TokPS        float64 `json:"tok_s"`      // 中位
 }
 
 // SLO 记录本次评测的 goodput 约束（报告侧据此计算达标口径）。
@@ -110,6 +128,10 @@ type Report struct {
 	Correctness []CorrectnessRow      `json:"correctness,omitempty"`
 	Server      *ServerMetricsSummary `json:"server_metrics,omitempty"`
 
+	// 环境存档：几周后回看数据时"当时是什么引擎/什么配置跑的"必须有据可查。
+	Environment *engine.ProbeResult `json:"environment,omitempty"`
+	ConfigRaw   string              `json:"config_raw,omitempty"`
+
 	// PartitionModel 按模型分区时该分区归属的模型名（不落盘）：main 据此拼 <output_dir>/<模型>/ 子目录
 	PartitionModel string `json:"-"`
 }
@@ -156,6 +178,8 @@ func (r *Report) PartitionByModel() []*Report {
 			Note:           r.Note,
 			SLO:            r.SLO,
 			Server:         r.Server,
+			Environment:    r.Environment,
+			ConfigRaw:      r.ConfigRaw,
 			PartitionModel: model,
 		}
 		buckets[model] = p

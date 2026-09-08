@@ -123,6 +123,10 @@ def merge(reports):
         if d.get("generated_at"):
             meta["generated"].append(d["generated_at"])
         meta["slo"] = d.get("slo") or meta["slo"]
+        if d.get("environment"):
+            meta["environment"] = d["environment"]
+        if d.get("config_raw"):
+            meta["config_raw"] = d["config_raw"]
     return data, meta
 
 
@@ -134,6 +138,35 @@ def mmm(vals, nd=2):
     if not vals:
         return None
     return (round(st.median(vals), nd), round(min(vals), nd), round(max(vals), nd))
+
+
+# p95/p99 最小样本量：低于它的分位数是纯噪音（n=3 时 p99 甚至超过 max），
+# 宁可留空也不硬算。并发场景 level × runs_per_worker 通常 ≥ 20 才出分位。
+MIN_PCT_SAMPLE = 20
+
+
+def pct9599(vals, nd=2):
+    """(p95, p99) 或 None（样本不足）。线性插值口径（与 numpy 默认一致）。"""
+    vals = sorted(v for v in vals if v is not None)
+    if len(vals) < MIN_PCT_SAMPLE:
+        return None
+
+    def p(q):
+        k = (len(vals) - 1) * q
+        f = int(k)
+        c = min(f + 1, len(vals) - 1)
+        if f == c:
+            return vals[f]
+        return vals[f] + (vals[c] - vals[f]) * (k - f)
+
+    return (round(p(0.95), nd), round(p(0.99), nd))
+
+
+def fpct(v, nd=2):
+    """p95/p99 表格单元格；样本不足时明示，而非留空让人误以为没算。"""
+    if v is None:
+        return '<span class="rng">n&lt;{}</span>'.format(MIN_PCT_SAMPLE)
+    return "{:.{nd}f} / {:.{nd}f}".format(v[0], v[1], nd=nd)
 
 
 def f3(v, unit="s"):
@@ -194,15 +227,16 @@ def esc(s):
 # ────────────────────────── 数据组织 ──────────────────────────
 
 def organize(data):
-    """single: model×thinking → {size: entry}; multiturn: model×thinking → [session...]"""
-    s_by, m_by, c_lvls = defaultdict(dict), defaultdict(list), []
+    """single: model×thinking×max_tokens → {size: entry}; multiturn: model×thinking×max_tokens → [session...]
+    max_tokens 是输出长度扫描维度（配置可为列表多档），同 (model, thinking) 下可有多组输出档。"""
+    s_by, m_by = defaultdict(dict), defaultdict(list)
     for e in data["single"]:
-        s_by[(e["model"], e.get("thinking", "off"))][e["prompt_tokens"]] = e
+        s_by[(e["model"], e.get("thinking", "off"), e.get("max_tokens", 0))][e["prompt_tokens"]] = e
     for e in data["multiturn"]:
-        m_by[(e["model"], e.get("thinking", "off"))].append(e)
+        m_by[(e["model"], e.get("thinking", "off"), e.get("max_tokens", 0))].append(e)
     c_lvls = list(data["concurrent"])
     models = []
-    for (m, _) in list(s_by) + list(m_by):
+    for (m, _, _) in list(s_by) + list(m_by):
         if m not in models:
             models.append(m)
     for lv in c_lvls:
@@ -211,15 +245,9 @@ def organize(data):
     return s_by, m_by, c_lvls, models
 
 
-def single_runs(s_by, model, thinking):
-    out = []
-    for size in sorted(s_by.get((model, thinking), {})):
-        out.extend(s_by[(model, thinking)][size]["runs"])
-    return out
-
-
-def mt_turns(m_by, model, thinking):
-    return [t for s in m_by.get((model, thinking), []) for t in s["turns"]]
+def mts_of(d, model, thinking):
+    """某 model×thinking 下出现过的输出长度档位（max_tokens，升序）。"""
+    return sorted({mt for (m, t, mt) in d if m == model and t == thinking})
 
 
 # ────────────────────────── 分析 ──────────────────────────
@@ -257,6 +285,7 @@ def analyze(data, meta):
         A[quad].append({
             "model": lv["model"],
             "thinking": lv.get("thinking", "off"),
+            "mt": lv.get("max_tokens", 0),
             "level": lv.get("level", 0),
             "n_units": n_units,
             "n_turns": len(turns),
@@ -264,84 +293,106 @@ def analyze(data, meta):
             "tps": lv.get("throughput_tps"),
             "ttft": mmm([t.get("ttft_ms", 0) / 1000 for t in turns], 2),
             "e2e": mmm([t.get("e2e_ms", 0) / 1000 for t in turns], 1),
+            "ttft_p": pct9599([t.get("ttft_ms", 0) / 1000 for t in turns], 2),
+            "e2e_p": pct9599([t.get("e2e_ms", 0) / 1000 for t in turns], 1),
             "think": mmm([(t.get("think_ms") or 0) / 1000 for t in turns], 1),
             "tokps": mmm([t.get("tokens_per_sec") for t in turns], 0),
             "finish": sorted({t.get("finish_reason", "?") for t in turns}),
+            "shapes": lv.get("shapes") or [],  # 5.6 混合负载：形状分解（非空 = 混跑轮）
+            "request_rate": lv.get("request_rate", 0),
         })
 
     for m in models:
         P = {}
-        # 单发各 thinking 变体
+        # 单发各 thinking 变体（max_tokens 可为多档输出长度扫描，按输出档分组）
         for th in ("off", "on"):
-            sizes = sorted(s_by.get((m, th), {}))
-            if not sizes:
+            mts = mts_of(s_by, m, th)
+            if not mts:
                 continue
-            ladder = []
-            for size in sizes:
-                rs = s_by[(m, th)][size]["runs"]
-                ladder.append({
-                    "size": size,
-                    "ttft": mmm([r.get("ttft_ms", 0) / 1000 for r in rs], 2),
-                    "ttft_content": mmm([r.get("ttft_content_ms", 0) / 1000 for r in rs], 2),
-                    "ttft_rea": mmm([r.get("ttft_reasoning_ms", 0) / 1000 for r in rs], 2),
-                    "think": mmm([(r.get("think_ms") or 0) / 1000 for r in rs], 1),
-                    "e2e": mmm([r.get("e2e_ms", 0) / 1000 for r in rs], 1),
-                    "decode": mmm([r.get("decode_ms", 0) / 1000 for r in rs], 1),
-                    "itl_p50": mmm([r.get("itl_p50_ms") for r in rs], 1),
-                    "itl_p99": mmm([r.get("itl_p99_ms") for r in rs], 1),
-                    "tokps": mmm([r.get("tokens_per_sec") for r in rs], 0),
-                    "comp": mmm([r.get("completion_tokens") for r in rs], 0),
-                    "rc": mmm([r.get("reasoning_chars", 0) for r in rs], 0),
-                    "finish": sorted({r.get("finish_reason", "?") for r in rs}),
-                    "n": len(rs),
-                })
+            ladder = []  # 全部（输出档 × 输入档）组合，表格用
+            for mt in mts:
+                for size in sorted(s_by[(m, th, mt)]):
+                    rs = s_by[(m, th, mt)][size]["runs"]
+                    ladder.append({
+                        "size": size,
+                        "mt": mt,
+                        "ttft": mmm([r.get("ttft_ms", 0) / 1000 for r in rs], 2),
+                        "ttft_content": mmm([r.get("ttft_content_ms", 0) / 1000 for r in rs], 2),
+                        "ttft_rea": mmm([r.get("ttft_reasoning_ms", 0) / 1000 for r in rs], 2),
+                        "think": mmm([(r.get("think_ms") or 0) / 1000 for r in rs], 1),
+                        "e2e": mmm([r.get("e2e_ms", 0) / 1000 for r in rs], 1),
+                        "decode": mmm([r.get("decode_ms", 0) / 1000 for r in rs], 1),
+                        "itl_p50": mmm([r.get("itl_p50_ms") for r in rs], 1),
+                        "itl_p99": mmm([r.get("itl_p99_ms") for r in rs], 1),
+                        "tokps": mmm([r.get("tokens_per_sec") for r in rs], 0),
+                        "comp": mmm([r.get("completion_tokens") for r in rs], 0),
+                        "rc": mmm([r.get("reasoning_chars", 0) for r in rs], 0),
+                        "finish": sorted({r.get("finish_reason", "?") for r in rs}),
+                        "n": len(rs),
+                    })
             P.setdefault(th, {})["ladder"] = ladder
+            P[th]["mt_list"] = mts
+            # 斜率/decode 基准取最大输出档组：输出越长 decode 爬坡段占比越小，
+            # TTFT 与 tok/s 越接近该输入规模下的成熟段读数（测量方法论 5.1）
+            P[th]["ladder_top"] = [l for l in ladder if l["mt"] == mts[-1]]
             P[th]["slope"] = slope_ms_per_token(
-                [(l["size"], l["ttft"][0]) for l in ladder if l["ttft"]]) if len(ladder) >= 2 else None
-            P[th]["tokps"] = mmm([l["tokps"][0] for l in ladder if l["tokps"]], 0)
+                [(l["size"], l["ttft"][0]) for l in P[th]["ladder_top"] if l["ttft"]]) if len(P[th]["ladder_top"]) >= 2 else None
+            P[th]["tokps"] = mmm([l["tokps"][0] for l in P[th]["ladder_top"] if l["tokps"]], 0)
             P[th]["finish_length"] = sum(1 for l in ladder if "length" in l["finish"])
-            P[th]["e2e_all"] = [r.get("e2e_ms", 0) / 1000 for l in ladder
-                                for r in s_by[(m, th)][l["size"]]["runs"]]
-            P[th]["think_all"] = [(r.get("think_ms") or 0) / 1000 for l in ladder
-                                  for r in s_by[(m, th)][l["size"]]["runs"]]
-            P[th]["rc_all"] = [r.get("reasoning_chars", 0) for l in ladder
-                               for r in s_by[(m, th)][l["size"]]["runs"]]
-            P[th]["no_content_runs"] = [r for l in ladder
-                                        for r in s_by[(m, th)][l["size"]]["runs"]
+            P[th]["e2e_all"] = [r.get("e2e_ms", 0) / 1000 for mt in mts
+                                for size in sorted(s_by[(m, th, mt)])
+                                for r in s_by[(m, th, mt)][size]["runs"]]
+            P[th]["think_all"] = [(r.get("think_ms") or 0) / 1000 for mt in mts
+                                  for size in sorted(s_by[(m, th, mt)])
+                                  for r in s_by[(m, th, mt)][size]["runs"]]
+            P[th]["rc_all"] = [r.get("reasoning_chars", 0) for mt in mts
+                               for size in sorted(s_by[(m, th, mt)])
+                               for r in s_by[(m, th, mt)][size]["runs"]]
+            P[th]["no_content_runs"] = [r for mt in mts
+                                        for size in sorted(s_by[(m, th, mt)])
+                                        for r in s_by[(m, th, mt)][size]["runs"]
                                         if r.get("content_chunks") == 0 or r.get("thinking_no_content")]
             # run1 vs run2+ TTFT（缓存冷/热形态）
             firsts, rests = [], []
-            for l in ladder:
-                rs = s_by[(m, th)][l["size"]]["runs"]
-                if rs:
-                    firsts.append(rs[0].get("ttft_ms", 0))
-                    rests.extend(r.get("ttft_ms", 0) for r in rs[1:])
+            for mt in mts:
+                for size in sorted(s_by[(m, th, mt)]):
+                    rs = s_by[(m, th, mt)][size]["runs"]
+                    if rs:
+                        firsts.append(rs[0].get("ttft_ms", 0))
+                        rests.extend(r.get("ttft_ms", 0) for r in rs[1:])
             if firsts and rests:
                 P[th]["cold_warm_ratio"] = (st.median(firsts) / max(st.median(rests), 1e-9))
-        # 多轮
+        # 多轮（max_tokens 可为多档输出长度扫描，按输出档分组聚合）
         for th in ("off", "on"):
-            sess = m_by.get((m, th), [])
-            if not sess:
+            mts = mts_of(m_by, m, th)
+            if not mts:
                 continue
-            nturn = max(len(s["turns"]) for s in sess)
-            turns = []
-            for i in range(nturn):
-                ts = [s["turns"][i] for s in sess if i < len(s["turns"])]
-                turns.append({
-                    "i": i + 1,
-                    "prompt": (min(t.get("prompt_tokens", 0) for t in ts),
-                               max(t.get("prompt_tokens", 0) for t in ts)),
-                    "new": st.median([t.get("new_tokens", 0) for t in ts]),
-                    "ttft": mmm([t.get("ttft_ms", 0) / 1000 for t in ts], 2),
-                    "think": mmm([(t.get("think_ms") or 0) / 1000 for t in ts], 1),
-                    "e2e": mmm([t.get("e2e_ms", 0) / 1000 for t in ts], 1),
-                    "sess_ttft": [t.get("ttft_ms", 0) / 1000 for t in ts],
-                    "sess_e2e": [t.get("e2e_ms", 0) / 1000 for t in ts],
-                })
-            P.setdefault(th, {})["turns"] = turns
+            turns_by_mt = {}
+            for mt in mts:
+                sess = m_by[(m, th, mt)]
+                nturn = max(len(s["turns"]) for s in sess)
+                turns = []
+                for i in range(nturn):
+                    ts = [s["turns"][i] for s in sess if i < len(s["turns"])]
+                    turns.append({
+                        "i": i + 1,
+                        "prompt": (min(t.get("prompt_tokens", 0) for t in ts),
+                                   max(t.get("prompt_tokens", 0) for t in ts)),
+                        "new": st.median([t.get("new_tokens", 0) for t in ts]),
+                        "ttft": mmm([t.get("ttft_ms", 0) / 1000 for t in ts], 2),
+                        "think": mmm([(t.get("think_ms") or 0) / 1000 for t in ts], 1),
+                        "e2e": mmm([t.get("e2e_ms", 0) / 1000 for t in ts], 1),
+                        "sess_ttft": [t.get("ttft_ms", 0) / 1000 for t in ts],
+                        "sess_e2e": [t.get("e2e_ms", 0) / 1000 for t in ts],
+                    })
+                turns_by_mt[mt] = turns
+            P.setdefault(th, {})["turns_by_mt"] = turns_by_mt
+            # 同单发：逐轮斜率与会话总时长取最大输出档组
+            top = turns_by_mt[mts[-1]]
+            P[th]["turns"] = top
             P[th]["slope_multi"] = slope_ms_per_token(
-                [(t["prompt"][0], t["ttft"][0]) for t in turns if t["ttft"]]) if len(turns) >= 2 else None
-            P[th]["mt_total"] = sum(t["e2e"][0] for t in turns if t["e2e"])
+                [(t["prompt"][0], t["ttft"][0]) for t in top if t["ttft"]]) if len(top) >= 2 else None
+            P[th]["mt_total"] = sum(t["e2e"][0] for t in top if t["e2e"])
         # 缓存判定：多轮斜率 / 单发斜率（优先 off）
         s_th = "off" if "off" in P else ("on" if "on" in P else None)
         m_th = "off" if "off" in P else ("on" if "on" in P else None)
@@ -409,43 +460,48 @@ def build_charts(data, A):
     def add(cid, title):
         canvases.append((cid, title))
 
-    # 单发 TTFT vs 档位（每个 thinking 变体一张图，每模型一条线）
+    # 单发 TTFT vs 档位（每个 thinking 变体一张图，每模型×输出档一条线）
     for th in ("off", "on"):
-        sizes = sorted({size for (m, t) in s_by for size in s_by[(m, t)] if t == th})
+        sizes = sorted({size for (m2, t, _mt) in s_by for size in s_by[(m2, t, _mt)] if t == th})
         if not sizes:
             continue
         ds = []
         for m in models:
-            if (m, th) not in s_by:
-                continue
-            ys = []
-            for size in sizes:
-                e = s_by[(m, th)].get(size)
-                ys.append(round(st.median([r.get("ttft_ms", 0) for r in e["runs"]])) if e else None)
-            ds.append(line_ds("{} (thinking={})".format(short(m), th), ys, color_of(models, m)))
+            mts = mts_of(s_by, m, th)
+            for i_mt, mt in enumerate(mts):
+                ys = []
+                for size in sizes:
+                    e = s_by[(m, th, mt)].get(size)
+                    ys.append(round(st.median([r.get("ttft_ms", 0) for r in e["runs"]])) if e else None)
+                lbl = "{} (thinking={})".format(short(m), th)
+                if len(mts) > 1:
+                    lbl += " out={}".format(mt)
+                ds.append(line_ds(lbl, ys, color_of(models, m), dash=[5, 4] if i_mt > 0 else None))
         scales = {"x": spread({"title": {"display": True, "text": "prompt tokens（目标档位）"}}),
                   "y": spread({"title": {"display": True, "text": "TTFT ms"}})}
         stmts.append(chart_js("c_s_ttft_" + th, "line", [str(s) for s in sizes], ds,
                               "单发 TTFT vs 上下文档位（3 runs 中位数）", scales))
         add("c_s_ttft_" + th, "单发 TTFT vs 档位（thinking={}）".format(th))
 
-    # 多轮 TTFT 逐轮（每个 thinking 变体一张图）
+    # 多轮 TTFT 逐轮（每个 thinking 变体一张图，输出档多时按输出档分线）
     for th in ("off", "on"):
-        keys = [(m, t) for (m, t) in m_by if t == th]
+        keys = [(m, t, mt) for (m, t, mt) in m_by if t == th]
         if not keys:
             continue
+        multi_mt = len({k[2] for k in keys}) > 1
         nturn = max(len(s["turns"]) for k in keys for s in m_by[k])
         labels = ["T{}".format(i + 1) for i in range(nturn)]
         ds = []
-        for (m, t) in keys:
+        for (m, t, mt) in keys:
             if t != th:
                 continue
             ys = []
             for i in range(nturn):
-                vals = [s["turns"][i].get("ttft_ms") for s in m_by[(m, t)] if i < len(s["turns"])
+                vals = [s["turns"][i].get("ttft_ms") for s in m_by[(m, t, mt)] if i < len(s["turns"])
                         and s["turns"][i].get("ttft_ms")]
                 ys.append(round(st.median(vals)) if vals else None)
-            ds.append(line_ds(short(m), ys, color_of(models, m)))
+            lbl = short(m) + (" out={}".format(mt) if multi_mt else "")
+            ds.append(line_ds(lbl, ys, color_of(models, m)))
         scales = {"x": spread({"title": {"display": True, "text": "多轮会话轮次"}}),
                   "y": spread({"title": {"display": True, "text": "TTFT ms"}})}
         stmts.append(chart_js("c_m_ttft_" + th, "line", labels, ds,
@@ -483,12 +539,14 @@ def build_charts(data, A):
         levels = sorted({e["level"] for e in items if e["level"]})
         if not levels:
             continue
-        groups = sorted({(e["model"], e["thinking"]) for e in items})
+        groups = sorted({(e["model"], e["thinking"], e["mt"]) for e in items})
+        multi_mt = len({g[2] for g in groups}) > 1
         ds_tps, ds_ttft = [], []
-        for m, th in groups:
+        for m, th, mt in groups:
             ys_tps, ys_ttft = [], []
             for lv in levels:
-                es = [e for e in items if e["model"] == m and e["thinking"] == th and e["level"] == lv]
+                es = [e for e in items if e["model"] == m and e["thinking"] == th
+                      and e["mt"] == mt and e["level"] == lv]
                 if es:
                     ys_tps.append(round(sum(x["tps"] or 0 for x in es) / len(es), 1))
                     med = st.median([x["ttft"][0] for x in es if x["ttft"]] or [None])
@@ -498,6 +556,8 @@ def build_charts(data, A):
                     ys_ttft.append(None)
             if any(v is not None for v in ys_tps):
                 lbl = "{} (thinking={})".format(short(m), th)
+                if multi_mt:
+                    lbl += " out={}".format(mt)
                 ds_tps.append(line_ds(lbl, ys_tps, color_of(models, m)))
                 ds_ttft.append(line_ds(lbl, ys_ttft, color_of(models, m)))
         if ds_tps:
@@ -529,7 +589,7 @@ def single_table(A, th):
             continue
         for l in P[th]["ladder"]:
             has_itl = l["itl_p50"] is not None
-            row = [esc(short(m)), "{:,}".format(l["size"]), str(l["n"]),
+            row = [esc(short(m)), str(l["mt"]), "{:,}".format(l["size"]), str(l["n"]),
                    f3(l["ttft"]), f3(l["ttft_content"])]
             if th == "on":
                 # 思考占比 = 思考总时长 / E2E（思考与正文输出交错，占比为口径近似）
@@ -542,7 +602,7 @@ def single_table(A, th):
                     f0(l["rc"]) if th == "on" else "—",
                     " / ".join(l["finish"])]
             rows.append(row)
-    head = ["模型", "档位 tk", "runs", "TTFT s", "首内容 s"] + \
+    head = ["模型", "输出 tk", "档位 tk", "runs", "TTFT s", "首内容 s"] + \
            (["思考 s", "思考占比"] if th == "on" else []) + \
            ["E2E s", "decode s", "ITL p50 ms", "ITL p99 ms", "tok/s", "输出 tok"] + \
            (["思考字符"] if th == "on" else []) + ["finish"]
@@ -552,57 +612,94 @@ def single_table(A, th):
 def concurrent_table(A, quad):
     qname = "多发·多轮" if quad == "conc_multi" else "多发·单轮"
     has_think = any(e["thinking"] != "off" or (e["think"] and e["think"][0] > 0) for e in A[quad])
-    head = ["模型", "thinking", "并发", "单元数", "请求总数", "墙钟 s", "吞吐 tok/s",
-            "TTFT s", "E2E s"] + (["思考 s"] if quad == "conc_multi" else []) + \
+    head = ["模型", "thinking", "输出 tk", "并发", "单元数", "请求总数", "墙钟 s", "吞吐 tok/s",
+            "TTFT s", "TTFT p95/p99 s", "E2E s", "E2E p95/p99 s"] + (["思考 s"] if quad == "conc_multi" else []) + \
            ["单请求 tok/s", "finish"]
     rows = []
-    for e in sorted(A[quad], key=lambda x: (x["model"], x["thinking"], x["level"])):
-        row = [esc(short(e["model"])), e["thinking"], str(e["level"]),
+    for e in sorted(A[quad], key=lambda x: (x["model"], x["thinking"], x["mt"], x["level"])):
+        mt_cell = "mix({})".format("/".join(s["label"] for s in e["shapes"])) if e["shapes"] else str(e["mt"])
+        row = [esc(short(e["model"])), e["thinking"], mt_cell, str(e["level"]),
                "{:,}".format(e["n_units"]), "{:,}".format(e["n_turns"]),
                "{:.1f}".format(e["wall"]) if e["wall"] else "—",
                "{:.0f}".format(e["tps"]) if e["tps"] else "—",
-               f3(e["ttft"]), f1(e["e2e"])]
+               f3(e["ttft"]), fpct(e["ttft_p"], 2), f1(e["e2e"]), fpct(e["e2e_p"], 1)]
         if quad == "conc_multi":
             row.append(f1(e["think"]))
         row += [f0(e["tokps"]), " / ".join(e["finish"])]
         rows.append(row)
-    note = '<div class="note">单元数：{}。TTFT/E2E 为该并发等级下全部请求的中位数（min–max）。</div>'.format(
-        "独立多轮会话（每用户各自重放完整会话）" if quad == "conc_multi" else "独立单轮请求")
+    note = '<div class="note">单元数：{}。TTFT/E2E 为该并发等级下全部请求的中位数（min–max）；' \
+           'p95/p99 仅在请求总数 ≥ {} 时计算——长短混跑时中位数可能几乎不动而 p99 数倍膨胀，' \
+           '请对照 p95/p99 列判断尾部时延风险。</div>'.format(
+        "独立多轮会话（每用户各自重放完整会话）" if quad == "conc_multi" else "独立单轮请求", MIN_PCT_SAMPLE)
     return table(head, rows) + note if rows else "<p>无数据</p>"
 
 
+def shapes_table(A, quad):
+    """混合负载（concurrent.mix）形状分解：每轮各形状的实测占比与中位数（5.6）。"""
+    rows = []
+    for e in sorted(A[quad], key=lambda x: (x["model"], x["thinking"], x["level"])):
+        if not e["shapes"]:
+            continue
+        lv_cell = "rate={:.1f}/s".format(e["request_rate"]) if e["request_rate"] else str(e["level"])
+        total = sum(s["count"] for s in e["shapes"]) or 1
+        for s in e["shapes"]:
+            rows.append([esc(short(e["model"])), e["thinking"], lv_cell,
+                         esc(s["label"]), str(s["weight"]), str(s["count"]),
+                         "{:.0%}".format(s["count"] / total),
+                         "{:,}".format(s["prompt_tokens"]), "{:,}".format(s["max_tokens"]),
+                         "{:.2f}s".format(s["ttft_s"]) if s["ttft_s"] else "—",
+                         "{:.1f}s".format(s["e2e_s"]) if s["e2e_s"] else "—",
+                         "{:,.0f}".format(s["tok_s"]) if s["tok_s"] else "—"])
+    if not rows:
+        return ""
+    note = '<div class="note">混跑：请求形状按权重确定性交错发射（平滑加权轮转），占比为实测值；' \
+           'TTFT/E2E/tok·s 为该形状内请求的中位数。短形状 TTFT 被长形状排队抬高的幅度 = 混跑尾延迟风险。</div>'
+    return "<h4>形状分解</h4>" + table(
+        ["模型", "thinking", "并发", "形状", "权重", "请求数", "占比", "prompt tk", "输出 tk", "TTFT s", "E2E s", "tok/s"],
+        rows) + note
+
+
 def multiturn_table(A, th):
-    head = ["轮次", "prompt tok 范围", "新增 tok"]
-    per_model_cols = []
-    for m, P in A["per_model"].items():
-        if th in P and "turns" in P[th]:
-            per_model_cols.append(m)
+    per_model = [(m, P) for m, P in A["per_model"].items()
+                 if th in P and P[th].get("turns_by_mt")]
+    if not per_model:
+        return "<p>无数据</p>"
+    mts = sorted({mt for _, P in per_model for mt in P[th]["turns_by_mt"]})
+    parts = []
+    for mt in mts:
+        head = ["轮次", "prompt tok 范围", "新增 tok"]
+        cols = []
+        for m, P in per_model:
+            turns = P[th]["turns_by_mt"].get(mt)
+            if not turns:
+                continue
+            cols.append((m, turns))
             head += ["{} TTFT s".format(short(m))]
             head += ["{} 思考 s".format(short(m))] if th == "on" else []
             head += ["{} E2E s".format(short(m))]
-    if not per_model_cols:
-        return "<p>无数据</p>"
-    nturn = max(len(P[th]["turns"]) for m in per_model_cols for P in [A["per_model"][m]])
-    rows = []
-    for i in range(nturn):
-        row = ["T{}".format(i + 1), "", ""]
-        first = True
-        for m in per_model_cols:
-            P = A["per_model"][m]
-            turns = P[th]["turns"]
-            if i < len(turns):
-                t = turns[i]
-                if first:
-                    row[1] = "{:,}–{:,}".format(*t["prompt"])
-                    row[2] = "{:,.0f}".format(t["new"])
-                    first = False
-                row += [f3(t["ttft"])]
-                row += [f1(t["think"])] if th == "on" else []
-                row += [f1(t["e2e"])]
-            else:
-                row += ["—"] + (["—"] if th == "on" else []) + ["—"]
-        rows.append(row)
-    return table(head, rows)
+        if not cols:
+            continue
+        nturn = max(len(turns) for _, turns in cols)
+        rows = []
+        for i in range(nturn):
+            row = ["T{}".format(i + 1), "", ""]
+            first = True
+            for m, turns in cols:
+                if i < len(turns):
+                    t = turns[i]
+                    if first:
+                        row[1] = "{:,}–{:,}".format(*t["prompt"])
+                        row[2] = "{:,.0f}".format(t["new"])
+                        first = False
+                    row += [f3(t["ttft"])]
+                    row += [f1(t["think"])] if th == "on" else []
+                    row += [f1(t["e2e"])]
+                else:
+                    row += ["—"] + (["—"] if th == "on" else []) + ["—"]
+            rows.append(row)
+        cap = '<p class="cap">输出 {} tk</p>'.format("{:,}".format(mt)) if len(mts) > 1 else ""
+        parts.append(cap + table(head, rows))
+    return "".join(parts) or "<p>无数据</p>"
 
 
 def appendix_single(data):
@@ -610,7 +707,7 @@ def appendix_single(data):
     for e in data["single"]:
         for i, r in enumerate(e["runs"], 1):
             rows.append([e.get("thinking", "?"), esc(short(e["model"])),
-                         "{:,}".format(e["prompt_tokens"]), str(i),
+                         str(e.get("max_tokens", 0)), "{:,}".format(e["prompt_tokens"]), str(i),
                          "{:.2f}".format(r.get("ttft_ms", 0) / 1000),
                          "{:.2f}".format(r["ttft_content_ms"] / 1000) if r.get("ttft_content_ms") else "—",
                          "{:.1f}".format(r.get("e2e_ms", 0) / 1000),
@@ -621,7 +718,7 @@ def appendix_single(data):
                          "{:,}".format(r["cached_tokens"]) if r.get("cached_tokens") else "—",
                          r.get("finish_reason", "—"),
                          "⚠️ " + ";".join(r["warnings"]) if r.get("warnings") else ""])
-    return table(["thinking", "模型", "档位", "run", "TTFT s", "首内容 s", "E2E s", "ITLavg ms",
+    return table(["thinking", "模型", "输出 tk", "档位", "run", "TTFT s", "首内容 s", "E2E s", "ITLavg ms",
                   "tok/s", "输出 tok", "思考字符", "缓存命中 tk", "finish", "告警"], rows)
 
 
@@ -637,8 +734,9 @@ def appendix_multiturn(data):
                          "{:.1f}".format(t["itl_p50_ms"]) if t.get("itl_p50_ms") else "—",
                          "{:,}".format(t.get("reasoning_chars", 0)),
                          t.get("finish_reason", "—")])
-        parts.append('<p class="cap">{} · thinking={} · session {}（{} 轮）</p>{}'.format(
-            esc(short(sess["model"])), sess.get("thinking", "?"), sess.get("session", "?"),
+        parts.append('<p class="cap">{} · thinking={} · out={} tk · session {}（{} 轮）</p>{}'.format(
+            esc(short(sess["model"])), sess.get("thinking", "?"), sess.get("max_tokens", 0),
+            sess.get("session", "?"),
             len(sess["turns"]),
             table(["轮次", "prompt tok", "新增 tok", "TTFT s", "E2E s", "ITL p50 ms", "思考字符", "finish"], rows)))
     return "".join(parts)
@@ -648,10 +746,10 @@ def appendix_multiturn(data):
 
 def gen_conclusions(A):
     cs = []
-    # 1 prefill 扩展性
+    # 1 prefill 扩展性（斜率取自最大输出档组 ladder_top，避免多输出档混线）
     for m, P in A["per_model"].items():
-        if "off" in P and P["off"].get("slope") is not None and len(P["off"]["ladder"]) >= 2:
-            l0, l1 = P["off"]["ladder"][0], P["off"]["ladder"][-1]
+        if "off" in P and P["off"].get("slope") is not None and len(P["off"].get("ladder_top") or []) >= 2:
+            l0, l1 = P["off"]["ladder_top"][0], P["off"]["ladder_top"][-1]
             sl = P["off"]["slope"]
             if sl < CACHE_EFFECTIVE_MS_PER_TOKEN:
                 cs.append("<b>{}</b>（单发·单轮）：TTFT 几乎不随档位变化（{}k→{}k 仅 {}s→{}s，≈{:.3f} ms/token）——"
@@ -723,9 +821,22 @@ def gen_conclusions(A):
     for quad, qname in (("conc_single", "多发·单轮"), ("conc_multi", "多发·多轮")):
         bymt = defaultdict(list)
         for e in A.get(quad, []):
-            bymt[(e["model"], e["thinking"])].append(e)
-        for (m, th), es in sorted(bymt.items()):
+            bymt[(e["model"], e["thinking"], e["mt"])].append(e)
+        multi_mt = len({e["mt"] for e in A.get(quad, [])}) > 1
+        for (m, th, mt), es in sorted(bymt.items()):
+            th_lbl = th + ("·out={}tk".format(mt) if multi_mt else "")
             es.sort(key=lambda x: x["level"])
+            lv_name = lambda e: e["level"] if e["level"] else "rate={:.1f}/s".format(e.get("request_rate") or 0)
+            # 尾部时延风险：p99 显著高于中位数（≥3×）时单独提示——只看中位数会完全隐身
+            for e in es:
+                if e.get("ttft_p") and e["ttft_p"][1] > 3 * max(e["ttft"][0], 1e-9):
+                    cs.append("<b>{}（{}·thinking={}，{}）</b>：TTFT 中位 {:.2f}s 但 p99 达 {:.2f}s"
+                              "（{:.0f}×）——尾部请求（长短混跑/排队抖动）时延风险被中位数掩盖，"
+                              "容量规划请按 p99 口径评估。".format(
+                        esc(short(m)), qname, th_lbl, lv_name(e),
+                        e["ttft"][0], e["ttft_p"][1], e["ttft_p"][1] / max(e["ttft"][0], 1e-9)))
+            # 扩展性对比只取闭环档位：开环轮次 level=0（按 rate 分档），混入会破坏并发比计算
+            es = [e for e in es if e["level"] > 0]
             if len(es) < 2 or not es[0]["tps"] or not es[-1]["tps"] or es[0]["level"] == es[-1]["level"]:
                 continue
             scale = es[-1]["tps"] / es[0]["tps"]
@@ -734,17 +845,42 @@ def gen_conclusions(A):
             if scale / lv_ratio < 0.7:
                 cs.append("<b>{}（{}·thinking={}）</b>：并发 {}→{} 吞吐仅 {:.1f}×（并发比 {:.0f}×）⇒ "
                           "扩展性受限（排队/抢占），TTFT 中位 {:.2f}s→{:.2f}s（{:.1f}×）。".format(
-                    esc(short(m)), qname, th, es[0]["level"], es[-1]["level"], scale, lv_ratio,
+                    esc(short(m)), qname, th_lbl, es[0]["level"], es[-1]["level"], scale, lv_ratio,
                     es[0]["ttft"][0], es[-1]["ttft"][0], ttft_infl))
             else:
                 cs.append("<b>{}（{}·thinking={}）</b>：并发 {}→{} 吞吐 {:.1f}×（并发比 {:.0f}×）近似线性，"
                           "TTFT 中位 {:.2f}s→{:.2f}s。".format(
-                    esc(short(m)), qname, th, es[0]["level"], es[-1]["level"], scale, lv_ratio,
+                    esc(short(m)), qname, th_lbl, es[0]["level"], es[-1]["level"], scale, lv_ratio,
                     es[0]["ttft"][0], es[-1]["ttft"][0]))
+    # 5.6 混合负载：形状间尾延迟差异 + 混跑 vs 均匀吞吐对比
+    for quad, qname in (("conc_single", "多发·单轮"), ("conc_multi", "多发·多轮")):
+        mix_es = [e for e in A.get(quad, []) if e.get("shapes")]
+        for e in mix_es:
+            shs = sorted((s for s in e["shapes"] if s["ttft_s"] > 0), key=lambda s: s["ttft_s"])
+            if len(shs) >= 2:
+                lo, hi = shs[0], shs[-1]
+                cs.append("<b>{}（{}·thinking={}，并发 {}）</b>：混跑下 {}（{:,}tk）TTFT 中位 {:.2f}s vs "
+                          "{}（{:,}tk）{:.2f}s（{:.1f}×）——短请求被长请求排队拖住，均匀负载测不出该差异；"
+                          "容量规划请按混跑口径评估。".format(
+                    esc(short(e["model"])), qname, e["thinking"], e["level"],
+                    esc(lo["label"]), lo["prompt_tokens"], lo["ttft_s"],
+                    esc(hi["label"]), hi["prompt_tokens"], hi["ttft_s"],
+                    hi["ttft_s"] / max(lo["ttft_s"], 1e-9)))
+        uni_by = {(e["model"], e["thinking"], e["level"]): e for e in A.get(quad, [])
+                  if not e.get("shapes") and e["tps"]}
+        for e in mix_es:
+            u = uni_by.get((e["model"], e["thinking"], e["level"]))
+            if u and e["tps"]:
+                ratio = e["tps"] / u["tps"]
+                cs.append("<b>{}（{}·thinking={}，并发 {}）</b>：混跑吞吐 {:.0f} tok/s 为均匀负载（{:,}tk）{:.0f} tok/s 的 "
+                          "{:.0f}%{}——长短混跑放大排队与抢占开销，容量规划请以混跑数为基准。".format(
+                    esc(short(e["model"])), qname, e["thinking"], e["level"],
+                    e["tps"], u["mt"], u["tps"], ratio * 100,
+                    "（⚠️ 明显衰减）" if ratio < 0.85 else ""))
     # 6 agent 时延推算
     for m, P in A["per_model"].items():
-        if "off" in P and P["off"].get("ladder"):
-            top = P["off"]["ladder"][-1]
+        if "off" in P and P["off"].get("ladder_top"):
+            top = P["off"]["ladder_top"][-1]
             if top["size"] >= 20000 and top["ttft"]:
                 cs.append("<b>agent 场景推算（{}）</b>：单次响应 5–7 次模型调用、每次携带全量上下文，"
                           "按单发 {}k TTFT {:.1f}s 计，仅首字等待累计即 {}–{}s。".format(
@@ -775,8 +911,8 @@ def gen_recommendations(A):
             esc(short(decs_sorted[0][0])), decs_sorted[0][1][0], decs_sorted[-1][1][0])))
     if not A["coverage"]["has_concurrent"]:
         rs.append(("后续", "本轮未测并发：单发结论不外推服务吞吐，建议补充并发爬坡（--concurrency 1,2,4）。"))
-    top_sizes = [P["off"]["ladder"][-1]["size"] for P in A["per_model"].values()
-                 if "off" in P and P["off"].get("ladder")]
+    top_sizes = [P["off"]["ladder_top"][-1]["size"] for P in A["per_model"].values()
+                 if "off" in P and P["off"].get("ladder_top")]
     if top_sizes and max(top_sizes) < 100000:
         rs.append(("后续", "本轮最大档位 {}k，如业务涉及更长上下文建议补测 100k/200k。".format(max(top_sizes) // 1000)))
     if not rs:
@@ -910,8 +1046,8 @@ def main():
     # KPI
     kpis = []
     for m, P in A["per_model"].items():
-        if "off" in P and P["off"].get("ladder"):
-            l0, l1 = P["off"]["ladder"][0], P["off"]["ladder"][-1]
+        if "off" in P and P["off"].get("ladder_top"):
+            l0, l1 = P["off"]["ladder_top"][0], P["off"]["ladder_top"][-1]
             kpis.append(("单发 TTFT @{}k ({})".format(l1["size"] // 1000, short(m)),
                          "{:.2f} s".format(l1["ttft"][0]) if l1["ttft"] else "—"))
         if P.get("decode_tps"):
@@ -922,11 +1058,13 @@ def main():
     for quad, qname in (("conc_single", "多发单轮"), ("conc_multi", "多发多轮")):
         bym = defaultdict(list)
         for e in A.get(quad, []):
-            bym[(e["model"], e["thinking"])].append(e)
-        for (m, th), es in sorted(bym.items()):
+            bym[(e["model"], e["thinking"], e["mt"])].append(e)
+        multi_mt = len({e["mt"] for e in A.get(quad, [])}) > 1
+        for (m, th, mt), es in sorted(bym.items()):
             top = max(es, key=lambda x: x["level"])
             if top["tps"]:
-                kpis.append(("吞吐@L{}·{} ({})".format(top["level"], qname, short(m)),
+                lbl_q = qname + ("·out={}tk".format(mt) if multi_mt else "")
+                kpis.append(("吞吐@L{}·{} ({})".format(top["level"], lbl_q, short(m)),
                              "{:.0f} tok/s".format(top["tps"])))
     kpi_html = "".join('<div class="kpi"><div class="kpi-v">{}</div><div class="kpi-l">{}</div></div>'.format(
         esc(v), esc(l)) for l, v in kpis)
@@ -945,10 +1083,27 @@ def main():
     if A["coverage"]["has_conc_multi"]:
         cov.append("多发·多轮（并发 × 每用户独立会话重放）")
     notes_html = "".join("<p><b>{}</b>：{}</p>".format(esc(f), esc(n)) for f, n in meta["notes"][-4:])
-    sec.append(("<h2>2 · 测试配置与方法</h2>",
-                table_kv([("端点", meta["endpoint"]), ("工具版本", meta["tool"]),
+    sec2_body = table_kv([("端点", meta["endpoint"]), ("工具版本", meta["tool"]),
                           ("场景覆盖", "；".join(cov)),
-                          ("请求总数", str(n_req))] ) +
+                          ("请求总数", str(n_req))])
+    # 环境存档：压测时自动探测的引擎信息 + 配置原文（复现"当时是什么配置跑的"）
+    env = meta.get("environment")
+    if env:
+        env_rows = [["引擎猜测", env.get("engine_guess") or "—"],
+                    ["Server 头", env.get("server_header") or "—"]]
+        if env.get("model_max_len"):
+            env_rows.append(["max_model_len", "{:,}".format(env["model_max_len"])])
+        if env.get("models"):
+            env_rows.append(["模型列表", "、".join(env["models"][:8]) + ("…" if len(env["models"]) > 8 else "")])
+        sec2_body += "<h3>引擎环境（压测时自动探测）</h3>" + table(["项目", "值"], env_rows)
+    else:
+        sec2_body += '<div class="note">本份数据未包含引擎环境存档（旧版本工具产出）。</div>'
+    if meta.get("config_raw"):
+        sec2_body += ('<details><summary>配置原文（YAML 存档）</summary>'
+                      '<pre style="white-space:pre-wrap;font-size:12px">{}</pre></details>').format(
+            esc(meta["config_raw"]))
+    sec.append(("<h2>2 · 测试配置与方法</h2>",
+                sec2_body +
                 (('<div class="note">' + notes_html + "</div>") if notes_html else "")))
     sec.append(("<h2>3 · 指标口径</h2>", table(
         ["指标", "定义"],
@@ -995,7 +1150,7 @@ def main():
             for cid in cids:
                 if any(c == cid for c, _ in canvases):
                     body += '<div class="chart"><canvas id="{}" height="110"></canvas></div>'.format(cid)
-            body += concurrent_table(A, quad)
+            body += concurrent_table(A, quad) + shapes_table(A, quad)
         if body:
             sec.append(("<h2>6 · 并发结果</h2>", body))
     # 分析
@@ -1033,8 +1188,8 @@ def main():
     if A["coverage"]["has_concurrent"]:
         sec.append(("<h2>附录 C · 并发逐等级明细</h2>",
                     "<details><summary>展开</summary>{}{}</details>".format(
-                        ("<h3>多发·单轮</h3>" + concurrent_table(A, "conc_single")) if A.get("conc_single") else "",
-                        ("<h3>多发·多轮</h3>" + concurrent_table(A, "conc_multi")) if A.get("conc_multi") else "")))
+                        ("<h3>多发·单轮</h3>" + concurrent_table(A, "conc_single") + shapes_table(A, "conc_single")) if A.get("conc_single") else "",
+                        ("<h3>多发·多轮</h3>" + concurrent_table(A, "conc_multi") + shapes_table(A, "conc_multi")) if A.get("conc_multi") else "")))
 
     body = "".join(h + '\n' + b + "\n" for h, b in sec)
     chart_block = ("<script>\n" + GRID_JS + "\n" + "\n".join(stmts) + "\n</script>") if stmts else ""

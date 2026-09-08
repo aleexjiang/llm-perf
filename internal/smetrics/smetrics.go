@@ -21,6 +21,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/aleexjiang/llm-perf/internal/auth"
 )
 
 // Bucket 是 histogram 的一个桶（LE 为上边界，+Inf 用 math.Inf(1)）。
@@ -49,31 +51,15 @@ type Scraper struct {
 	Client     *http.Client
 	MaxRetries int // Scrape 失败后的额外重试次数（默认 2；轮询场景置 0——下一个 tick 天然是重试）
 
-	// 认证（语义与 engine.Auth 一致；不直接复用是因 smetrics 不能反向 import engine）。
-	// 客户网关常把 /metrics 和业务接口用同一套认证保护——不带认证头时观测层会静默降级。
-	AuthScheme string // "" = bearer；raw = 裸 key；none = 不带认证头
-	AuthHeader string // "" = Authorization
-	APIKey     string
+	// 认证：与 chat 请求共用 internal/auth（客户网关常把 /metrics 和业务接口用同一套认证
+	// 保护——不带认证头时观测层会静默降级）。
+	Auth   auth.Auth // "" = bearer；raw = 裸 key；none = 不带认证头
+	APIKey string
 }
 
-// applyAuth 把认证头写进 metrics 请求（与 engine.Auth.Apply 行为一致）。
+// applyAuth 把认证头写进 metrics 请求。
 func (s *Scraper) applyAuth(req *http.Request) {
-	scheme := s.AuthScheme
-	if scheme == "" {
-		scheme = "bearer"
-	}
-	if scheme == "none" || s.APIKey == "" {
-		return
-	}
-	header := s.AuthHeader
-	if header == "" {
-		header = "Authorization"
-	}
-	v := s.APIKey
-	if scheme != "raw" {
-		v = "Bearer " + v
-	}
-	req.Header.Set(header, v)
+	s.Auth.Apply(req, s.APIKey)
 }
 
 // NewScraperAt 显式指定 metrics 路径（客户环境不一定挂在根路径，如 /actuator/prometheus）。
@@ -342,7 +328,7 @@ func DetectProvider(sample *Sample) MetricsProvider {
 // 调用方应显式提示（指标大概率拿不到数，属预期而非 bug）。
 func DetectProviderName(sample *Sample) string {
 	if sample == nil {
-		return "vllm"
+		return "" // 未识别（与文档口径一致；调用方负责显式回落并告警）
 	}
 	has := func(prefix string) bool {
 		for k := range sample.Counters {

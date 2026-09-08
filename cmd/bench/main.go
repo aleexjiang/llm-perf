@@ -26,6 +26,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aleexjiang/llm-perf/internal/auth"
 	"github.com/aleexjiang/llm-perf/internal/config"
 	"github.com/aleexjiang/llm-perf/internal/engine"
 	"github.com/aleexjiang/llm-perf/internal/report"
@@ -237,7 +238,7 @@ func main() {
 	}
 
 	client := engine.NewClient(cfg.Endpoint, cfg.APIKey, cfg.Timeout(), *cfg.IncludeUsage)
-	client.Auth = engine.Auth{Scheme: cfg.AuthScheme, Header: cfg.AuthHeader}
+	client.Auth = auth.Auth{Scheme: cfg.AuthScheme, Header: cfg.AuthHeader}
 	client.ChatPath = cfg.ChatPath
 	if cfg.AuthScheme != "" && cfg.AuthScheme != "bearer" || cfg.AuthHeader != "" {
 		log.Printf("认证方案: %s", client.Auth.Describe())
@@ -280,7 +281,7 @@ func main() {
 		res := engine.Probe(ctx, engine.ProbeOptions{
 			Endpoint:       cfg.Endpoint,
 			APIKey:         cfg.APIKey,
-			Auth:           engine.Auth{Scheme: cfg.AuthScheme, Header: cfg.AuthHeader},
+			Auth:           auth.Auth{Scheme: cfg.AuthScheme, Header: cfg.AuthHeader},
 			ChatPath:       cfg.ChatPath,
 			MetricsPath:    cfg.MetricsPath,
 			ModelsPath:     cfg.ModelsPath,
@@ -293,7 +294,7 @@ func main() {
 			ToolCall:       !*noToolCallFlag,
 			CaptureDir:     *captureFlag,
 			XVPromptTokens: cfg.Concurrent.PromptTokens,
-			XVMaxTokens:    cfg.Concurrent.MaxTokens,
+			XVMaxTokens:    cfg.Concurrent.MaxTokens.Max(), // probe 上下文探测按最大输出预算（prompt+output 最坏组合）
 			ThinkingBudget: th.MaxTokensFloor,
 		})
 		outPath := resolveOutPath(*outFlag, cfg.OutputDir, "probe")
@@ -330,6 +331,34 @@ func main() {
 		}
 		fmt.Printf("探针完成，输出: %s\n", outPath)
 		return
+	}
+
+	// ── 环境存档：引擎识别 + 配置原文随每份场景 JSON 落盘 ──
+	// 几周后回看数据时"当时是什么引擎、什么配置跑的"必须有据可查；probe 失败不阻塞压测。
+	var envInfo *engine.ProbeResult
+	if active := cfg.ActiveModels(); len(active) > 0 {
+		m := active[0]
+		th := cfg.ThinkingFor(m)
+		res := engine.Probe(ctx, engine.ProbeOptions{
+			Endpoint:     cfg.Endpoint,
+			APIKey:       cfg.APIKey,
+			Auth:         auth.Auth{Scheme: cfg.AuthScheme, Header: cfg.AuthHeader},
+			ChatPath:     cfg.ChatPath,
+			MetricsPath:  cfg.MetricsPath,
+			ModelsPath:   cfg.ModelsPath,
+			Model:        m,
+			ThinkingOn:   th.ExtraBodyOn,
+			ThinkingOff:  th.ExtraBodyOff,
+			IncludeUsage: *cfg.IncludeUsage,
+			Timeout:      30 * time.Second,
+			ToolCall:     false, // 存档用轻量探针：识别引擎即可，不做 tool-call 检查
+		})
+		if res == nil {
+			log.Printf("⚠️ 环境探测无结果（不影响压测继续）")
+		} else {
+			envInfo = res
+			log.Printf("环境存档: 引擎猜测 %s（Server 头: %s）", res.EngineGuess, res.Server)
+		}
 	}
 
 	// ── 组合模式解析：--turns × --concurrency → 场景执行计划 ──
@@ -427,6 +456,9 @@ func main() {
 			os.Exit(1)
 		}
 		outPath := resolveOutPath(*outFlag, cfg.OutputDir, name)
+		// 环境存档随每份分区落盘（引擎识别 + 配置原文）
+		rep.Environment = envInfo
+		rep.ConfigRaw = cfg.Raw
 		// 按模型分区落盘：多模型战役各落 <output_dir>/<模型>/，重测/作废单模型不纠缠；
 		// 单模型（或 -m 过滤后只剩一个）保持原布局直接落 output_dir，报告工具兼容两种布局
 		parts := rep.PartitionByModel()

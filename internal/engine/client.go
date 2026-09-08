@@ -25,6 +25,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/aleexjiang/llm-perf/internal/auth"
 	"github.com/aleexjiang/llm-perf/internal/smetrics"
 )
 
@@ -48,7 +49,7 @@ type RetryPolicy struct {
 type Client struct {
 	BaseURL      string       // 如 http://host:30082/router/v1
 	APIKey       string       // 为空则不带 Authorization
-	Auth         Auth         // 认证方案（默认 bearer + Authorization；客户网关裸 key / 自定义 header 时配置）
+	Auth         auth.Auth    // 认证方案（默认 bearer + Authorization；客户网关裸 key / 自定义 header 时配置）
 	ChatPath     string       // 接口路径，默认 /chat/completions（客户 router 路径不同时配置）
 	IncludeUsage bool         // 请求 stream_options.include_usage
 	HTTP         *http.Client //

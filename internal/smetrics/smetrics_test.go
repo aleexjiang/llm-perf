@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aleexjiang/llm-perf/internal/auth"
 )
 
 const sampleText = `# HELP vllm:prefix_cache_hits_total prefix cache hits
@@ -180,13 +182,13 @@ func TestScraperApplyAuth(t *testing.T) {
 	}
 
 	req = mk()
-	(&Scraper{AuthScheme: "raw", AuthHeader: "X-Key", APIKey: "k"}).applyAuth(req)
+	(&Scraper{Auth: auth.Auth{Scheme: "raw", Header: "X-Key"}, APIKey: "k"}).applyAuth(req)
 	if got := req.Header.Get("X-Key"); got != "k" {
 		t.Fatalf("raw 应为裸 key: %q", got)
 	}
 
 	req = mk()
-	(&Scraper{AuthScheme: "none", APIKey: "k"}).applyAuth(req)
+	(&Scraper{Auth: auth.Auth{Scheme: "none"}, APIKey: "k"}).applyAuth(req)
 	if req.Header.Get("Authorization") != "" {
 		t.Fatal("none 不应带认证头")
 	}

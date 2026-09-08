@@ -28,7 +28,7 @@ models: ["m1"]
 	if cfg.Thinking.Mode != "both" {
 		t.Errorf("mode default = %q", cfg.Thinking.Mode)
 	}
-	if cfg.Single.Runs != 3 || cfg.Concurrent.MaxTokens != 256 {
+	if cfg.Single.Runs != 3 || len(cfg.Concurrent.MaxTokens) != 1 || cfg.Concurrent.MaxTokens[0] != 256 {
 		t.Error("scenario defaults missing")
 	}
 	if !cfg.StreamEnabled() || !*cfg.IncludeUsage {
@@ -238,5 +238,152 @@ func TestNormalizeLadder(t *testing.T) {
 	}
 	if _, _, err := normalizeLadder([]int{40000, 41000}, "x"); err == nil {
 		t.Fatal("增量 <10% 应报错")
+	}
+}
+
+// 测量守卫：短输出档的方向性偏悲观提示 + 输入/输出只扫一维的归因提示
+func TestLoad_MeasurementGuards(t *testing.T) {
+	p := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+single:
+  runs: 1
+  prompt_tokens: [500, 1000, 2000]
+  max_tokens: 64
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(cfg.Warnings, "\n")
+	if !strings.Contains(joined, "single.max_tokens=64 偏小") {
+		t.Errorf("短输出档应有守卫告警，got: %v", cfg.Warnings)
+	}
+	if !strings.Contains(joined, "输出长度也做多档对照") {
+		t.Errorf("输入多档/输出单档应有归因提示，got: %v", cfg.Warnings)
+	}
+
+	// 正常工作点不应误报
+	p2 := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+single:
+  runs: 3
+  prompt_tokens: [500]
+  max_tokens: 512
+`)
+	cfg2, err := Load(p2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, w := range cfg2.Warnings {
+		if strings.Contains(w, "系统性偏悲观") || strings.Contains(w, "只扫了一个") {
+			t.Errorf("正常配置不应有测量守卫告警: %q", w)
+		}
+	}
+}
+
+// 5.1 输出长度扫描：max_tokens 接受标量或列表；列表排序去重、非正值报错；守卫逐档生效。
+func TestLoad_MaxTokensList(t *testing.T) {
+	p := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+single:
+  prompt_tokens: [500]
+  max_tokens: [512, 128, 512]
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Single.MaxTokens) != 2 || cfg.Single.MaxTokens[0] != 128 || cfg.Single.MaxTokens[1] != 512 {
+		t.Errorf("max_tokens 列表应排序去重为 [128 512]，got %v", cfg.Single.MaxTokens)
+	}
+	joined := strings.Join(cfg.Warnings, "\n")
+	if !strings.Contains(joined, "single.max_tokens 已排序去重") {
+		t.Errorf("应提示排序去重，got: %v", cfg.Warnings)
+	}
+
+	p2 := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+single:
+  max_tokens: [128, 0]
+`)
+	if _, err := Load(p2); err == nil {
+		t.Error("max_tokens 列表含非正值应报错")
+	}
+
+	// 标量写法不变；thinking floor 告警逐档判断（列表中只有 <floor 的档位才提示）
+	p3 := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+single:
+  max_tokens: [64, 4096]
+`)
+	cfg3, err := Load(p3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, w := range cfg3.Warnings {
+		if strings.Contains(w, "single.max_tokens=64 < max_tokens_floor") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("列表中 <floor 的档位应触发 floor 告警，got: %v", cfg3.Warnings)
+	}
+}
+
+// 5.6 混合负载：mix 校验（权重/长度为正、label 补默认查重、与 multiturn 互斥、单值失效告警）。
+func TestLoad_MixShapes(t *testing.T) {
+	p := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+concurrent:
+  levels: [2]
+  multiturn: true
+  mix:
+    - {weight: 7, label: short, prompt_tokens: 500, max_tokens: 64}
+    - {weight: 3, label: long, prompt_tokens: 8000, max_tokens: 256}
+`)
+	if _, err := Load(p); err == nil {
+		t.Error("mix 与 multiturn: true 应互斥报错")
+	}
+
+	p2 := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+concurrent:
+  levels: [2]
+  mix:
+    - {weight: 7, prompt_tokens: 500, max_tokens: 64}
+    - {weight: 0, label: bad, prompt_tokens: 8000, max_tokens: 256}
+`)
+	if _, err := Load(p2); err == nil {
+		t.Error("weight=0 应报错")
+	}
+
+	p3 := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+concurrent:
+  levels: [2]
+  prompt_tokens: 10000
+  mix:
+    - {weight: 7, prompt_tokens: 500, max_tokens: 64}
+    - {weight: 3, prompt_tokens: 8000, max_tokens: 256}
+`)
+	cfg, err := Load(p3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Concurrent.Mix[0].Label != "shape1" || cfg.Concurrent.Mix[1].Label != "shape2" {
+		t.Errorf("label 留空应补 shapeN，got %q / %q", cfg.Concurrent.Mix[0].Label, cfg.Concurrent.Mix[1].Label)
+	}
+	joined := strings.Join(cfg.Warnings, "\n")
+	if !strings.Contains(joined, "concurrent.mix 已配置") {
+		t.Errorf("应提示单值维度失效，got: %v", cfg.Warnings)
 	}
 }

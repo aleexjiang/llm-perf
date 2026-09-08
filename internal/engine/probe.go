@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aleexjiang/llm-perf/internal/auth"
 	"github.com/aleexjiang/llm-perf/internal/smetrics"
 )
 
@@ -56,7 +57,7 @@ type ProbeResult struct {
 type ProbeOptions struct {
 	Endpoint     string
 	APIKey       string
-	Auth         Auth           // 认证方案（默认 bearer + Authorization）
+	Auth         auth.Auth      // 认证方案（默认 bearer + Authorization）
 	ChatPath     string         // 接口路径，默认 /chat/completions
 	MetricsPath  string         // 服务端 metrics 路径，默认 /metrics
 	ModelsPath   string         // 模型列表路径，默认 /models
@@ -353,8 +354,7 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 		metricsPath = "/metrics"
 	}
 	s := smetrics.NewScraperAt(o.Endpoint, metricsPath)
-	s.AuthScheme = o.Auth.Scheme // /metrics 与业务接口同一套认证（网关保护 metrics 端点时探测不至误报不可用）
-	s.AuthHeader = o.Auth.Header
+	s.Auth = o.Auth // /metrics 与业务接口同一套认证（网关保护 metrics 端点时探测不至误报不可用）
 	s.APIKey = o.APIKey
 	if ok, detail := s.Available(ctx); ok {
 		res.ServerMetrics = "available: " + detail

@@ -5,3 +5,9 @@ output-*/
 *.test
 .DS_Store
 configs/customer.yaml
+configs/customer-*.md
+scripts/__pycache__/
+bench-linux-amd64
+bench-linux-arm64
+bench-windows-*.exe
+bench-darwin-*

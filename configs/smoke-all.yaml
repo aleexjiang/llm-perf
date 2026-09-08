@@ -8,7 +8,7 @@ server_metrics: true              # mock 无 /metrics → 应打印降级告警�
 warmup_requests: 2
 dataset:
   mode: "trace"
-  path: "/tmp/trace-sessions.json"
+  path: "fixtures/trace-sessions.json"   # 相对配置文件目录解析（原 /tmp 绝对路径导致新克隆环境测试必挂）
   format: "sessions"
 goodput:
   ttft_ms: 5000
@@ -29,7 +29,7 @@ thinking:
 single:
   runs: 1
   prompt_tokens: [500]
-  max_tokens: 64
+  max_tokens: [32, 64]   # 列表写法冒烟（5.1 输出长度扫描）；thinking=on 时会被 floor(512) 收敛为单档，属预期
 
 multiturn:
   sessions: 1

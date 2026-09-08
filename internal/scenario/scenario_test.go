@@ -253,7 +253,7 @@ func TestMultiturnFailureResume(t *testing.T) {
 	srv := sseStub(t, state)
 
 	cfg := testCfg(t, srv.URL)
-	cfg.Multiturn = config.Multiturn{Sessions: 1, Turns: 3, TurnTokens: 100, MaxTokens: 16, KeepAssistant: true}
+	cfg.Multiturn = config.Multiturn{Sessions: 1, Turns: 3, TurnTokens: 100, MaxTokens: config.IntList{16}, KeepAssistant: true}
 
 	rep, err := Multiturn(context.Background(), cfg, engine.NewClient(srv.URL, "", 10*time.Second, true), "")
 	if err != nil {
@@ -293,7 +293,7 @@ func TestConcurrentClosedBasic(t *testing.T) {
 	srv := sseStub(t, state)
 
 	cfg := testCfg(t, srv.URL)
-	cfg.Concurrent = config.Concurrent{Levels: []int{2}, RunsPerWorker: 1, PromptTokens: 100, MaxTokens: 16}
+	cfg.Concurrent = config.Concurrent{Levels: []int{2}, RunsPerWorker: 1, PromptTokens: 100, MaxTokens: config.IntList{16}}
 
 	rep, err := Concurrent(context.Background(), cfg, engine.NewClient(srv.URL, "", 10*time.Second, true), "")
 	if err != nil {
@@ -320,7 +320,7 @@ func TestSingleCacheSemantics(t *testing.T) {
 	srv := sseStub(t, state)
 
 	cfg := testCfg(t, srv.URL)
-	cfg.Single = config.Single{Runs: 2, PromptTokens: []int{200}, MaxTokens: 16, FixedSeed: true}
+	cfg.Single = config.Single{Runs: 2, PromptTokens: []int{200}, MaxTokens: config.IntList{16}, FixedSeed: true}
 
 	if _, err := Single(context.Background(), cfg, engine.NewClient(srv.URL, "", 10*time.Second, true), ""); err != nil {
 		t.Fatalf("Single: %v", err)

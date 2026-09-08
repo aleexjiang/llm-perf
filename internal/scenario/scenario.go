@@ -19,11 +19,14 @@ import (
 	"math"
 	"math/rand"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/aleexjiang/llm-perf/internal/auth"
 	"github.com/aleexjiang/llm-perf/internal/config"
 	"github.com/aleexjiang/llm-perf/internal/engine"
 	"github.com/aleexjiang/llm-perf/internal/report"
@@ -81,8 +84,7 @@ func newEnv(ctx context.Context, cfg *config.Config, client *engine.Client) (*en
 	if cfg.ServerMetrics {
 		s := smetrics.NewScraperAt(cfg.Endpoint, cfg.MetricsPath)
 		// /metrics 常与业务接口同一套认证保护——认证格式与 chat 请求保持一致
-		s.AuthScheme = cfg.AuthScheme
-		s.AuthHeader = cfg.AuthHeader
+		s.Auth = auth.Auth{Scheme: cfg.AuthScheme, Header: cfg.AuthHeader}
 		s.APIKey = cfg.APIKey
 		// 判定口径与 probe 一致：HTTP 200 但 0 项 vLLM 指标（网关占位响应）也算不可用，
 		// 否则观测层会带着空指标集白跑，报告里出现假"可用"
@@ -236,7 +238,7 @@ func warmup(ctx context.Context, e *env, model string) {
 	vOff := config.ThinkingVariant{Name: "off", Enabled: false, ExtraBody: e.cfg.ThinkingFor(model).ExtraBodyOff}
 	now := time.Now().UnixNano()
 	for i := 0; i < n; i++ {
-		msgs := []engine.Message{engine.UserMsg(warmupPromptTokens, now+int64(i), e.cfg.Fillers())}
+		msgs := []engine.Message{engine.UserMsg(warmupPromptTokens, now+int64(i), e.cfg.FillerLang)}
 		e.client.Chat(ctx, engine.ChatOptions{
 			Model: model, Messages: msgs, MaxTokens: warmupMaxTokens,
 			Stream: e.cfg.StreamEnabled(), ExtraBody: vOff.ExtraBody,
@@ -391,7 +393,7 @@ func Single(ctx context.Context, cfg *config.Config, client *engine.Client, mode
 		warmup(ctx, e, model)
 		th := mc.Thinking
 		for _, v := range th.Variants() {
-			maxTok := th.MaxTokens(mc.Single.MaxTokens, v)
+			maxToks := th.MaxTokensList(mc.Single.MaxTokens, v) // 输出长度扫描维度（列表多档 / 标量单档）
 			if e.trace != nil {
 				// trace 模式：用回放会话的首轮 user 消息做档位（prompt_tokens 粗估，服务端 usage 为准）
 				n := len(e.trace.Sessions)
@@ -399,22 +401,28 @@ func Single(ctx context.Context, cfg *config.Config, client *engine.Client, mode
 					log.Printf("  trace 单发档位只取样前 %d 个会话（数据集共 %d 个，避免拖长单发矩阵）", traceSingleSampleLimit, n)
 					n = traceSingleSampleLimit
 				}
-				for i := 0; i < n; i++ {
-					content := e.trace.Pick(i).UserTurns[0]
-					row := report.SingleRow{Model: model, Thinking: v.Name, PromptTokens: len(content) / 4}
-					log.Printf("[single] %s thinking=%s trace#%d (~%dtk)", model, v.Name, i+1, row.PromptTokens)
-					for run := 0; run < mc.Single.Runs; run++ {
-						msgs := []engine.Message{{Role: "user", Content: content}}
-						log.Printf("[single] %s thinking=%s trace#%d (~%dtk) run%d", model, v.Name, i+1, row.PromptTokens, run+1)
-						m := runOne(ctx, e, model, msgs, maxTok, v)
-						row.Runs = append(row.Runs, m)
-						if interrupted(ctx) {
-							break
-						}
+				ctxAborted := false
+				for _, maxTok := range maxToks {
+					if ctxAborted {
+						break
 					}
-					rep.Single = append(rep.Single, row)
-					if interrupted(ctx) {
-						return rep, nil
+					for i := 0; i < n; i++ {
+						content := e.trace.Pick(i).UserTurns[0]
+						row := report.SingleRow{Model: model, Thinking: v.Name, MaxTokens: maxTok, PromptTokens: len(content) / 4}
+						log.Printf("[single] %s thinking=%s out=%dtk trace#%d (~%dtk)", model, v.Name, maxTok, i+1, row.PromptTokens)
+						for run := 0; run < mc.Single.Runs; run++ {
+							msgs := []engine.Message{{Role: "user", Content: content}}
+							log.Printf("[single] %s thinking=%s out=%dtk trace#%d (~%dtk) run%d", model, v.Name, maxTok, i+1, row.PromptTokens, run+1)
+							m := runOne(ctx, e, model, msgs, maxTok, v)
+							row.Runs = append(row.Runs, m)
+							if interrupted(ctx) {
+								break
+							}
+						}
+						rep.Single = append(rep.Single, row)
+						if interrupted(ctx) {
+							return rep, nil
+						}
 					}
 				}
 				continue
@@ -423,29 +431,36 @@ func Single(ctx context.Context, cfg *config.Config, client *engine.Client, mode
 			if clamped {
 				log.Printf("[single] 档位已按 max_prompt_tokens=%d 截断: %v", mc.MaxPromptTokens, ladder)
 			}
-			for _, tokens := range ladder {
-				row := report.SingleRow{Model: model, Thinking: v.Name, PromptTokens: tokens}
-				for run := 0; run < mc.Single.Runs; run++ {
-					seed := singleSeed(mc.Single.FixedSeed, tokens, run, mc.SeedSalt)
-					msgs := []engine.Message{engine.UserMsg(tokens, seed, mc.Fillers())}
-					log.Printf("[single] %s thinking=%s %dtk run%d", model, v.Name, tokens, run+1)
-					m := runOne(ctx, e, model, msgs, maxTok, v)
-					row.Runs = append(row.Runs, m)
-					if limit := ctxLimitHit(m); limit != "" {
-						log.Printf("    🛑 触发模型上下文上限（limit=%stk）——跳过 %dtk 剩余 run 及更大档位（重试必然同样超限）", limit, tokens)
-						break
+			ctxAborted := false
+			for _, maxTok := range maxToks {
+				if ctxAborted {
+					break
+				}
+				for _, tokens := range ladder {
+					row := report.SingleRow{Model: model, Thinking: v.Name, MaxTokens: maxTok, PromptTokens: tokens}
+					for run := 0; run < mc.Single.Runs; run++ {
+						seed := singleSeed(mc.Single.FixedSeed, tokens, run, mc.SeedSalt)
+						msgs := []engine.Message{engine.UserMsg(tokens, seed, mc.FillerLang)}
+						log.Printf("[single] %s thinking=%s out=%dtk %dtk run%d", model, v.Name, maxTok, tokens, run+1)
+						m := runOne(ctx, e, model, msgs, maxTok, v)
+						row.Runs = append(row.Runs, m)
+						if limit := ctxLimitHit(m); limit != "" {
+							log.Printf("    🛑 触发模型上下文上限（limit=%stk）——跳过 %dtk 剩余 run 及更大档位（重试必然同样超限）", limit, tokens)
+							ctxAborted = true
+							break
+						}
+						if interrupted(ctx) {
+							break
+						}
 					}
+					rep.Single = append(rep.Single, row)
 					if interrupted(ctx) {
+						log.Printf("🛑 收到中断信号——停止新请求，已完成数据全部保留")
+						return rep, nil
+					}
+					if ctxAborted {
 						break
 					}
-				}
-				rep.Single = append(rep.Single, row)
-				if interrupted(ctx) {
-					log.Printf("🛑 收到中断信号——停止新请求，已完成数据全部保留")
-					return rep, nil
-				}
-				if len(row.Runs) > 0 && ctxLimitHit(row.Runs[len(row.Runs)-1]) != "" {
-					break // 更大档位必然同样超限，跳过该模型该变体的剩余档位
 				}
 			}
 		}
@@ -517,82 +532,86 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 		th := mc.Thinking
 		for _, v := range th.Variants() {
 			ctxAborted := false // 触发模型上下文上限：剩余会话必然同样超限，全部跳过
-			for s := 0; s < mt.Sessions; s++ {
-				run := report.MultiturnRun{Model: model, Thinking: v.Name, Session: s + 1}
-				log.Printf("[multiturn] %s thinking=%s session%d", model, v.Name, s+1)
-				baseSeed := sessionSeed(s, mc.SeedSalt)
-				msgs := []engine.Message{}
-				if e.trace == nil {
-					if sys := engine.SystemMsg(mt.SystemTokens, mt.ToolDefsTokens, baseSeed, mc.Fillers()); sys.Content != "" {
-						msgs = append(msgs, sys)
-					}
-				}
-				userTurns := e.sessionUserTurns(s)
-				var fullPrefixes [][]engine.Message
-				if e.fullReplay() {
-					fullPrefixes = e.fullPrefixes(s)
-					if len(fullPrefixes) < len(userTurns) {
-						userTurns = userTurns[:len(fullPrefixes)] // 两视图按 user 消息对齐
-					}
-				}
-				maxTok := th.MaxTokens(mt.MaxTokens, v)
-				lastPrompt := 0 // 上一轮服务端实测 prompt_tokens（截止计算与新增 tokens 计算）
-				for turn := 0; turn < mt.Turns; turn++ {
-					if e.fullReplay() {
-						if turn >= len(fullPrefixes) {
-							log.Printf("    回放会话只有 %d 轮 user 消息，提前结束", len(fullPrefixes))
-							break
-						}
-						msgs = fullPrefixes[turn] // full：原序全部 role，assistant/tool 都在上下文里
-					} else if e.trace != nil {
-						if turn >= len(userTurns) {
-							log.Printf("    回放会话只有 %d 轮 user 消息，提前结束", len(userTurns))
-							break
-						}
-						msgs = append(msgs, engine.Message{Role: "user", Content: userTurns[turn]})
-					} else {
-						tt := nextTurnTokens(mc, mt.TurnTokens, lastPrompt)
-						if tt <= 0 {
-							log.Printf("    已达 max_prompt_tokens=%d 截止，提前结束会话（%d/%d 轮）", mc.MaxPromptTokens, turn, mt.Turns)
-							break
-						}
-						msgs = append(msgs, engine.UserMsg(tt, baseSeed+int64(turn), mc.Fillers()))
-					}
-					m := runOne(ctx, e, model, msgs, maxTok, v)
-					if m.PromptTokens > 0 {
-						if lastPrompt > 0 {
-							m.NewTokens = m.PromptTokens - lastPrompt
-						} else {
-							m.NewTokens = m.PromptTokens
-						}
-						// 只有成功的轮次才推进基准：失败的轮次（ctx=0）不能把 lastPrompt 清零，
-						// 否则下一轮会把整条 history 都算成"新增"，增量 prefill 指标错乱
-						lastPrompt = m.PromptTokens
-					}
-					log.Printf("    turn%d (ctx≈%dtk +%dtk)", turn+1, m.PromptTokens, m.NewTokens)
-					if mt.KeepAssistant && m.ReplyText != "" && !e.fullReplay() {
-						// full 模式 history 来自 trace 原文，不追加生成回复（追加会与原始 assistant 重复）
-						msgs = append(msgs, engine.Message{Role: "assistant", Content: engine.TruncateRunes(m.ReplyText, mt.MaxReplyChars)})
-					}
-					run.Turns = append(run.Turns, m)
-					if interrupted(ctx) {
-						log.Printf("    🛑 收到中断信号——提前结束会话（已完成 %d/%d 轮保留）", len(run.Turns), mt.Turns)
-						break
-					}
-					if limit := ctxLimitHit(m); limit != "" {
-						// 会话 history 已超限，继续加轮必然失败——结束该会话并跳过剩余会话
-						log.Printf("    🛑 触发模型上下文上限（limit=%stk，ctx≈%dtk）——提前结束会话，跳过剩余会话", limit, m.PromptTokens)
-						ctxAborted = true
-						break
-					}
-				}
-				rep.Multiturn = append(rep.Multiturn, run)
-				if interrupted(ctx) {
-					log.Printf("🛑 收到中断信号——停止新请求，已完成会话全部保留")
-					return rep, nil
-				}
+			for _, maxTok := range th.MaxTokensList(mt.MaxTokens, v) {
 				if ctxAborted {
 					break
+				}
+				for s := 0; s < mt.Sessions; s++ {
+					run := report.MultiturnRun{Model: model, Thinking: v.Name, Session: s + 1, MaxTokens: maxTok}
+					log.Printf("[multiturn] %s thinking=%s out=%dtk session%d", model, v.Name, maxTok, s+1)
+					baseSeed := sessionSeed(s, mc.SeedSalt)
+					msgs := []engine.Message{}
+					if e.trace == nil {
+						if sys := engine.SystemMsg(mt.SystemTokens, mt.ToolDefsTokens, baseSeed, mc.FillerLang); sys.Content != "" {
+							msgs = append(msgs, sys)
+						}
+					}
+					userTurns := e.sessionUserTurns(s)
+					var fullPrefixes [][]engine.Message
+					if e.fullReplay() {
+						fullPrefixes = e.fullPrefixes(s)
+						if len(fullPrefixes) < len(userTurns) {
+							userTurns = userTurns[:len(fullPrefixes)] // 两视图按 user 消息对齐
+						}
+					}
+					lastPrompt := 0 // 上一轮服务端实测 prompt_tokens（截止计算与新增 tokens 计算）
+					for turn := 0; turn < mt.Turns; turn++ {
+						if e.fullReplay() {
+							if turn >= len(fullPrefixes) {
+								log.Printf("    回放会话只有 %d 轮 user 消息，提前结束", len(fullPrefixes))
+								break
+							}
+							msgs = fullPrefixes[turn] // full：原序全部 role，assistant/tool 都在上下文里
+						} else if e.trace != nil {
+							if turn >= len(userTurns) {
+								log.Printf("    回放会话只有 %d 轮 user 消息，提前结束", len(userTurns))
+								break
+							}
+							msgs = append(msgs, engine.Message{Role: "user", Content: userTurns[turn]})
+						} else {
+							tt := nextTurnTokens(mc, mt.TurnTokens, lastPrompt)
+							if tt <= 0 {
+								log.Printf("    已达 max_prompt_tokens=%d 截止，提前结束会话（%d/%d 轮）", mc.MaxPromptTokens, turn, mt.Turns)
+								break
+							}
+							msgs = append(msgs, engine.UserMsg(tt, baseSeed+int64(turn), mc.FillerLang))
+						}
+						m := runOne(ctx, e, model, msgs, maxTok, v)
+						if m.PromptTokens > 0 {
+							if lastPrompt > 0 {
+								m.NewTokens = m.PromptTokens - lastPrompt
+							} else {
+								m.NewTokens = m.PromptTokens
+							}
+							// 只有成功的轮次才推进基准：失败的轮次（ctx=0）不能把 lastPrompt 清零，
+							// 否则下一轮会把整条 history 都算成"新增"，增量 prefill 指标错乱
+							lastPrompt = m.PromptTokens
+						}
+						log.Printf("    turn%d (ctx≈%dtk +%dtk)", turn+1, m.PromptTokens, m.NewTokens)
+						if mt.KeepAssistant && m.ReplyText != "" && !e.fullReplay() {
+							// full 模式 history 来自 trace 原文，不追加生成回复（追加会与原始 assistant 重复）
+							msgs = append(msgs, engine.Message{Role: "assistant", Content: engine.TruncateRunes(m.ReplyText, mt.MaxReplyChars)})
+						}
+						run.Turns = append(run.Turns, m)
+						if interrupted(ctx) {
+							log.Printf("    🛑 收到中断信号——提前结束会话（已完成 %d/%d 轮保留）", len(run.Turns), mt.Turns)
+							break
+						}
+						if limit := ctxLimitHit(m); limit != "" {
+							// 会话 history 已超限，继续加轮必然失败——结束该会话并跳过剩余会话
+							log.Printf("    🛑 触发模型上下文上限（limit=%stk，ctx≈%dtk）——提前结束会话，跳过剩余会话", limit, m.PromptTokens)
+							ctxAborted = true
+							break
+						}
+					}
+					rep.Multiturn = append(rep.Multiturn, run)
+					if interrupted(ctx) {
+						log.Printf("🛑 收到中断信号——停止新请求，已完成会话全部保留")
+						return rep, nil
+					}
+					if ctxAborted {
+						break
+					}
 				}
 			}
 		}
@@ -615,11 +634,11 @@ func openRates(cc config.Concurrent) []float64 {
 }
 
 // collectSessionTurns 执行一次完整会话重放并采集逐 turn 指标（并发多轮用：每个虚拟用户一次）。
+// maxTok 由调用方传入（输出长度扫描维度，已含思考 floor 抬高）。
 func collectSessionTurns(ctx context.Context, e *env, cfg *config.Config,
-	model string, v config.ThinkingVariant, sessionIdx int, turnLimit int) []*engine.TurnMetrics {
+	model string, v config.ThinkingVariant, sessionIdx int, turnLimit int, maxTok int) []*engine.TurnMetrics {
 
 	mt := cfg.Multiturn
-	maxTok := cfg.ThinkingFor(model).MaxTokens(mt.MaxTokens, v)
 	baseSeed := sessionSeed(sessionIdx, cfg.SeedSalt)
 	msgs := []engine.Message{}
 	userTurns := e.sessionUserTurns(sessionIdx)
@@ -631,7 +650,7 @@ func collectSessionTurns(ctx context.Context, e *env, cfg *config.Config,
 		}
 	}
 	if e.trace == nil {
-		if sys := engine.SystemMsg(mt.SystemTokens, mt.ToolDefsTokens, baseSeed, cfg.Fillers()); sys.Content != "" {
+		if sys := engine.SystemMsg(mt.SystemTokens, mt.ToolDefsTokens, baseSeed, cfg.FillerLang); sys.Content != "" {
 			msgs = append(msgs, sys)
 		}
 	}
@@ -658,7 +677,7 @@ func collectSessionTurns(ctx context.Context, e *env, cfg *config.Config,
 				log.Printf("    worker 会话已达 max_prompt_tokens=%d 截止，提前结束（%d/%d 轮）", cfg.MaxPromptTokens, turn, turns)
 				break
 			}
-			msgs = append(msgs, engine.UserMsg(tt, baseSeed+int64(turn), cfg.Fillers()))
+			msgs = append(msgs, engine.UserMsg(tt, baseSeed+int64(turn), cfg.FillerLang))
 		}
 		m := runOne(ctx, e, model, msgs, maxTok, v)
 		if m.PromptTokens > 0 {
@@ -693,6 +712,13 @@ func Concurrent(ctx context.Context, cfg *config.Config, client *engine.Client, 
 	if rates != nil {
 		loadModel = fmt.Sprintf("开环到达率 %v req/s", rates)
 	}
+	if len(cc.Mix) > 0 {
+		labels := make([]string, len(cc.Mix))
+		for i, s := range cc.Mix {
+			labels[i] = fmt.Sprintf("%s×%d", s.Label, s.Weight)
+		}
+		loadModel += " 混跑[" + strings.Join(labels, " ") + "]"
+	}
 	rep := &report.Report{
 		Tool:        report.Version,
 		Scenario:    "concurrent",
@@ -712,25 +738,31 @@ func Concurrent(ctx context.Context, cfg *config.Config, client *engine.Client, 
 		warmup(ctx, e, model)
 		th := mc.Thinking
 		for _, v := range th.Variants() {
-			if rates != nil {
-				for _, rate := range rates {
-					lv := runOpenRound(ctx, e, mc, model, v, rate)
+			tiers := th.MaxTokensList(cc.MaxTokens, v)
+			if len(cc.Mix) > 0 {
+				tiers = []int{0} // 混跑：输出上限由各形状自带（floor 在 plan 内逐形状应用），不走外层扫描
+			}
+			for _, maxTok := range tiers {
+				if rates != nil {
+					for _, rate := range rates {
+						lv := runOpenRound(ctx, e, mc, model, v, rate, maxTok)
+						logConcurrent(&lv)
+						rep.Concurrent = append(rep.Concurrent, lv)
+						if interrupted(ctx) {
+							log.Printf("🛑 收到中断信号——停止新请求，已完成档位全部保留")
+							return rep, nil
+						}
+					}
+					continue
+				}
+				for _, level := range cc.Levels {
+					lv := runClosedRound(ctx, e, mc, model, v, level, maxTok)
 					logConcurrent(&lv)
 					rep.Concurrent = append(rep.Concurrent, lv)
 					if interrupted(ctx) {
 						log.Printf("🛑 收到中断信号——停止新请求，已完成档位全部保留")
 						return rep, nil
 					}
-				}
-				continue
-			}
-			for _, level := range cc.Levels {
-				lv := runClosedRound(ctx, e, mc, model, v, level)
-				logConcurrent(&lv)
-				rep.Concurrent = append(rep.Concurrent, lv)
-				if interrupted(ctx) {
-					log.Printf("🛑 收到中断信号——停止新请求，已完成档位全部保留")
-					return rep, nil
 				}
 			}
 		}
@@ -744,8 +776,12 @@ func logConcurrent(lv *report.ConcurrentLevel) {
 	if lv.RequestRate > 0 {
 		extra = fmt.Sprintf(" rate=%.1f/s", lv.RequestRate)
 	}
-	log.Printf("[concurrent] %s thinking=%s level%d%s: wall=%.1fs throughput=%.0f tok/s%s",
-		lv.Model, lv.Thinking, lv.Level, extra, lv.WallSeconds, lv.ThroughputTPS, goodputLog(lv))
+	outDesc := fmt.Sprintf("out=%dtk", lv.MaxTokens)
+	if len(lv.Shapes) > 0 {
+		outDesc = "mix"
+	}
+	log.Printf("[concurrent] %s thinking=%s %s level%d%s: wall=%.1fs throughput=%.0f tok/s%s",
+		lv.Model, lv.Thinking, outDesc, lv.Level, extra, lv.WallSeconds, lv.ThroughputTPS, goodputLog(lv))
 }
 
 func goodputLog(lv *report.ConcurrentLevel) string {
@@ -755,56 +791,162 @@ func goodputLog(lv *report.ConcurrentLevel) string {
 	return fmt.Sprintf(" goodput=%d/%d", lv.SLOMeet, lv.SLOTotal)
 }
 
+// mixPlan 混合负载（concurrent.mix，5.6）的每轮形状计划。
+// 平滑加权轮转（nginx 同款算法）把权重展开成确定性交错序列：请求按发射序取模对号入座
+// （闭环=发车序，开环=到达序），不引入随机——同配置重跑形状分布一致，run 间可复现。
+type mixPlan struct {
+	shapes  []config.MixShape
+	maxToks []int // 每形状已过思考 floor 的输出上限
+	seq     []int // 展开的形状下标序列（长度 = 权重之和）
+}
+
+func newMixPlan(cfg *config.Config, model string, v config.ThinkingVariant) *mixPlan {
+	shapes := cfg.Concurrent.Mix
+	if len(shapes) == 0 {
+		return nil
+	}
+	total := 0
+	for _, s := range shapes {
+		total += s.Weight
+	}
+	maxToks := make([]int, len(shapes))
+	for i, s := range shapes {
+		maxToks[i] = cfg.ThinkingFor(model).MaxTokens(s.MaxTokens, v)
+	}
+	cur := make([]int, len(shapes))
+	seq := make([]int, 0, total)
+	for j := 0; j < total; j++ {
+		best, bestVal := 0, -1
+		for i := range shapes {
+			cur[i] += shapes[i].Weight
+			if cur[i] > bestVal {
+				best, bestVal = i, cur[i]
+			}
+		}
+		cur[best] -= total
+		seq = append(seq, best)
+	}
+	return &mixPlan{shapes: shapes, maxToks: maxToks, seq: seq}
+}
+
+// at 返回第 i 个发射请求的形状与输出上限（已含 floor）。
+func (p *mixPlan) at(i int) (config.MixShape, int) {
+	k := p.seq[i%len(p.seq)]
+	return p.shapes[k], p.maxToks[k]
+}
+
+// aggregateShapes 把本轮请求按形状聚合出中位数统计（idxs 与 Requests 一一对应，混跑时记录形状下标）。
+func aggregateShapes(mp *mixPlan, reqs []*engine.TurnMetrics, idxs []int) []report.ShapeStat {
+	if mp == nil {
+		return nil
+	}
+	by := map[int][]*engine.TurnMetrics{}
+	for i, m := range reqs {
+		if i < len(idxs) && idxs[i] >= 0 {
+			by[idxs[i]] = append(by[idxs[i]], m)
+		}
+	}
+	out := make([]report.ShapeStat, 0, len(mp.shapes))
+	for i, sh := range mp.shapes {
+		ms := by[i]
+		if len(ms) == 0 {
+			continue
+		}
+		med := func(get func(*engine.TurnMetrics) float64) float64 {
+			vals := make([]float64, 0, len(ms))
+			for _, m := range ms {
+				vals = append(vals, get(m))
+			}
+			sort.Float64s(vals)
+			return vals[len(vals)/2]
+		}
+		out = append(out, report.ShapeStat{
+			Label:        sh.Label,
+			Weight:       sh.Weight,
+			PromptTokens: sh.PromptTokens,
+			MaxTokens:    mp.maxToks[i],
+			Count:        len(ms),
+			TTFTS:        med(func(m *engine.TurnMetrics) float64 { return m.TTFT / 1000 }),
+			E2ES:         med(func(m *engine.TurnMetrics) float64 { return m.E2EMS / 1000 }),
+			TokPS:        med(func(m *engine.TurnMetrics) float64 { return m.TokensPerSec }),
+		})
+	}
+	return out
+}
+
 // runClosedRound 闭环并发档位：level 个 worker 同时发车，各自跑 runs_per_worker 次请求（或一次完整会话）。
+// maxTok 输出长度由调用方传入（输出长度扫描维度，已含思考 floor 抬高）。
 func runClosedRound(ctx context.Context, e *env, cfg *config.Config,
-	model string, v config.ThinkingVariant, level int) report.ConcurrentLevel {
+	model string, v config.ThinkingVariant, level int, maxTok int) report.ConcurrentLevel {
 
 	cc := cfg.Concurrent
 	if cc.Multiturn {
 		e.warnTraceWrap(level)
 	}
-	lv := &report.ConcurrentLevel{Model: model, Thinking: v.Name, Level: level}
+	lv := &report.ConcurrentLevel{Model: model, Thinking: v.Name, MaxTokens: maxTok, Level: level}
+	mp := newMixPlan(cfg, model, v)
+	if mp != nil {
+		lv.MaxTokens = 0 // 混跑：输出上限由各形状自带（Shapes 内逐形状记录）
+	}
+	var shapeIdxs []int // 与 Requests 一一对应的形状下标（-1 = 非混跑）
 	start := time.Now()
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	startBarrier := make(chan struct{})
+	var reqSeq atomic.Int64
 	for w := 0; w < level; w++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
 			<-startBarrier // 所有 worker 就绪后同时发车
 			if cc.Multiturn {
-				s := report.MultiturnRun{Model: model, Thinking: v.Name, Session: workerID + 1}
-				s.Turns = collectSessionTurns(ctx, e, cfg, model, v, workerID, 0)
+				s := report.MultiturnRun{Model: model, Thinking: v.Name, Session: workerID + 1, MaxTokens: maxTok}
+				s.Turns = collectSessionTurns(ctx, e, cfg, model, v, workerID, 0, maxTok)
 				mu.Lock()
 				lv.Sessions = append(lv.Sessions, s)
 				mu.Unlock()
 				return
 			}
-			maxTok := cfg.ThinkingFor(model).MaxTokens(cc.MaxTokens, v)
-			promptTokens := cfg.ClampOne(cc.PromptTokens)
 			for r := 0; r < cc.RunsPerWorker; r++ {
+				promptTokens := cfg.ClampOne(cc.PromptTokens)
+				reqMaxTok := maxTok
+				si := -1
+				if mp != nil {
+					seqNo := int(reqSeq.Add(1)) - 1
+					sh, mt := mp.at(seqNo)
+					promptTokens = cfg.ClampOne(sh.PromptTokens)
+					reqMaxTok = mt
+					si = mp.seq[seqNo%len(mp.seq)]
+				}
 				seed := workerSeed(workerID, r, cfg.SeedSalt) // 每用户不同 prompt
-				msgs := []engine.Message{engine.UserMsg(promptTokens, seed, cfg.Fillers())}
-				m := runOne(ctx, e, model, msgs, maxTok, v)
+				msgs := []engine.Message{engine.UserMsg(promptTokens, seed, cfg.FillerLang)}
+				m := runOne(ctx, e, model, msgs, reqMaxTok, v)
 				mu.Lock()
 				lv.Requests = append(lv.Requests, m)
+				shapeIdxs = append(shapeIdxs, si)
 				mu.Unlock()
 			}
 		}(w)
 	}
 	close(startBarrier)
 	wg.Wait()
+	lv.Shapes = aggregateShapes(mp, lv.Requests, shapeIdxs)
 	finalizeLevel(e, lv, time.Since(start).Seconds())
 	return *lv
 }
 
 // runOpenRound 开环到达率：请求按 Poisson 过程到达（对齐 vLLM bench serve），测排队-延迟曲线。
+// maxTok 输出长度由调用方传入（输出长度扫描维度，已含思考 floor 抬高）。
 func runOpenRound(ctx context.Context, e *env, cfg *config.Config,
-	model string, v config.ThinkingVariant, rate float64) report.ConcurrentLevel {
+	model string, v config.ThinkingVariant, rate float64, maxTok int) report.ConcurrentLevel {
 
 	cc := cfg.Concurrent
-	lv := &report.ConcurrentLevel{Model: model, Thinking: v.Name, Level: 0, RequestRate: rate}
+	lv := &report.ConcurrentLevel{Model: model, Thinking: v.Name, MaxTokens: maxTok, Level: 0, RequestRate: rate}
+	mp := newMixPlan(cfg, model, v)
+	if mp != nil {
+		lv.MaxTokens = 0
+	}
+	var shapeIdxs []int
 	n := cc.NumPrompts
 	if n <= 0 {
 		n = 32
@@ -826,7 +968,6 @@ func runOpenRound(ctx context.Context, e *env, cfg *config.Config,
 	// 固定种子：同一 rate 重复跑到达序列一致（可复现）。
 	// 用 Float64bits 而非 rate*1000——浮点截断会让 0.5001/0.5002 这类相邻档位碰撞出同一种子
 	rng := rand.New(rand.NewSource(int64(math.Float64bits(rate))))
-	maxTok := cfg.ThinkingFor(model).MaxTokens(cc.MaxTokens, v)
 	launch := func(i int) {
 		wg.Add(1)
 		go func(i int) {
@@ -836,18 +977,28 @@ func runOpenRound(ctx context.Context, e *env, cfg *config.Config,
 				defer func() { <-sem }()
 			}
 			if cc.Multiturn {
-				s := report.MultiturnRun{Model: model, Thinking: v.Name, Session: i + 1}
-				s.Turns = collectSessionTurns(ctx, e, cfg, model, v, i, 0)
+				s := report.MultiturnRun{Model: model, Thinking: v.Name, Session: i + 1, MaxTokens: maxTok}
+				s.Turns = collectSessionTurns(ctx, e, cfg, model, v, i, 0, maxTok)
 				mu.Lock()
 				lv.Sessions = append(lv.Sessions, s)
 				mu.Unlock()
 				return
 			}
+			promptTokens := cfg.ClampOne(cc.PromptTokens)
+			reqMaxTok := maxTok
+			si := -1
+			if mp != nil {
+				sh, mt := mp.at(i)
+				promptTokens = cfg.ClampOne(sh.PromptTokens)
+				reqMaxTok = mt
+				si = mp.seq[i%len(mp.seq)]
+			}
 			seed := openWorkerSeed(i, cfg.SeedSalt)
-			msgs := []engine.Message{engine.UserMsg(cfg.ClampOne(cc.PromptTokens), seed, cfg.Fillers())}
-			m := runOne(ctx, e, model, msgs, maxTok, v)
+			msgs := []engine.Message{engine.UserMsg(promptTokens, seed, cfg.FillerLang)}
+			m := runOne(ctx, e, model, msgs, reqMaxTok, v)
 			mu.Lock()
 			lv.Requests = append(lv.Requests, m)
+			shapeIdxs = append(shapeIdxs, si)
 			mu.Unlock()
 		}(i)
 	}
@@ -863,6 +1014,7 @@ func runOpenRound(ctx context.Context, e *env, cfg *config.Config,
 	}()
 	<-schedDone // 全部请求已按到达序列发射
 	wg.Wait()
+	lv.Shapes = aggregateShapes(mp, lv.Requests, shapeIdxs)
 	finalizeLevel(e, lv, time.Since(start).Seconds())
 	return *lv
 }

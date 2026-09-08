@@ -77,6 +77,84 @@
 
 ---
 
+## 5. 测量方法论补强（来自两篇生产实测报告的借鉴）
+
+> 背景：vLLM 生产工程 / ModelDoctor 两篇实测显示，工具测得出"正确但无意义"的数：
+> 同输入同并发下输出 64→512 让 TPOT 降 54–77%；长短混跑时 TTFT 中位数几乎不动、p99 涨 5.9 倍。
+> 前提：per-request `TurnMetrics` 已全量落盘，纯报告侧可算的就不碰 Go。
+
+**5.0 开工前清理（无用兼容逻辑审查结论，2026-09-08）**【已实现，2026-09-08】
+
+配置不保向后兼容（见 5.1），开发前先清掉三类存量：
+
+*因"保兼容"而存在的默认值与格式：*
+- `dataset.replay_mode` 默认值 `user_only` → 翻转为 `full`（`config.go:587` 注释明写"与历史版本一致"）；
+  `user_only` 降为显式选项（ShareGPT 问答类数据集、快速对比仍有用）。连带更新 README 与本文件第 2 节。✅
+- trace sessions 裸二维数组形态（`[["u1","u2"],...]`，`trace.go:266-278`）：README 与示例均未文档化，
+  仅 `trace_test.go:61` 在测——无使用者，删除（连带测试子用例）。✅
+- `Config.Fillers()`（`config.go:892`）：纯转发 `c.FillerLang` 的包装，11 处调用点内联后删除。✅
+
+*重复实现（改造未收敛）：*
+- `smetrics.go:59-77` `applyAuth` 与 `engine/auth.go` 同构（注释自述"不能反向 import engine"）；
+  `scenario.go:84-86` 手动三字段复制是同一裂痕。解法：Auth 下沉为独立低层包（engine 与 smetrics 共同依赖）。✅
+- `smetrics.go:344` `DetectProviderName(nil)` 返回 `"vllm"`，与其注释『""=未识别』矛盾；
+  实际调用路径 sample 恒非 nil——nil 分支改返回 `""`，统一走"未识别"告警。✅
+
+*仓库卫生：*
+- `configs/smoke-all.yaml:11` 指向 `/tmp/trace-sessions.json`（不存在、无生成脚本）→ 新克隆 `go test` 必挂；改用仓库内 fixture。✅
+- `bench-linux-amd64`（10MB）移出 git，`.gitignore` 补条目。✅
+
+*排查过、确认保留的*：报告工具单/多模型两种落盘布局（递归 glob 一条覆盖，无分支）；
+probe 120s 兜底（零值 fallback，配置已生效）；sharegpt 键名/词表变体与引擎指标命名候选表（数据集与引擎生态兼容，是功能）；
+thinking mode/levels 双轨（levels 优先已显式声明并告警）；api_key 三来源优先级（设计非遗留）。
+
+**5.1 输出长度作为扫描维度**（防结论方向性错误——最优先）【已实现，2026-09-08】
+
+- `max_tokens` 直接改为「标量或列表」：`max_tokens: 256` 或 `max_tokens: [128, 256, 512]`，
+  Go 侧自定义 `IntList` 反序列化（一个 unmarshaler，`config.go` 三处字段共用），**不新增 ladder 字段**。✅
+  项目在迭代期，配置 schema 不保向后兼容（2026-09-08 拍板），直接改类型。
+- 场景层对列表逐值构造场景；结果行加 `MaxTokens` 字段（SingleRow/MultiturnRun/ConcurrentLevel）；✅
+  报告按（场景 × 长度）分组出曲线。✅
+- 配置守卫：`max_tokens` 为单值时打提示"输出长度未扫描，容量结论可能系统性偏悲观"。✅（随 5.3 落地）
+- 实现中的两个补充决策：① 加载时对列表排序去重（升序执行）；② 思考 floor 抬高后相邻同值去重
+  （floor=2048 会把 32/64 两档收敛成同一档，不去重就重复扫）。✅
+- `Thinking.MaxTokensList()`：逐档应用 floor 保护的辅助方法，三场景共用。
+
+**5.2 并发报告补 p95 / p99**（防中位数骗人）【已实现，2026-09-08】
+
+- `gen_html_report.py` 的 `stats3()`（median/min/max）扩为含 p95/p99；数据已在原始 JSON 里，纯 Python。✅
+- 注意样本量陷阱：p95/p99 只在并发场景显示（level × runs_per_worker 样本充足）；
+  single/multiturn 样本少（默认 3），显示样本数、不足时留空不硬算。✅（MIN_PCT_SAMPLE=20，不足显示 `n<20`）
+
+**5.3 配置守卫**（防"测的工作点不对"）【已实现，2026-09-08】
+
+- 加载配置时检查：输出长度远小于典型业务值、并发档位未覆盖、扫描维度缺省——追加进现有 `cfg.Warnings`，约 30 行。✅
+
+**5.4 运行环境与配置原文存档**【已实现，2026-09-08】
+
+- `Report` 加 `Environment *ProbeResult`（probe 已有 Server / EngineGuess / ModelMaxLen）+ `ConfigRaw string`（YAML 原文塞进 JSON，约 5 行）。防止几周后无法复现"上次那组数是什么配置跑的"。✅
+
+**5.5 跨运行复现性比对**（待做，恒为脚本不进 CLI）
+
+- 新增 `scripts/compare_runs.py`：传两份结果 JSON，输出各指标变异系数，回答"这两个数差 8% 是真的吗"。保持脚本形态，不进 CLI。
+
+**5.6 混合负载**【已实现，2026-09-08】
+
+- `Concurrent` 加 `mix: [{weight, label, prompt_tokens, max_tokens}]`：请求形状按权重混跑；✅
+  闭环按平滑加权轮转（nginx 同款）展开成确定性序列、请求按发射序对号入座（同配置可复现），开环按到达序号轮转。
+- `ConcurrentLevel.Shapes` 逐形状聚合（count/TTFT/E2E/tok·s 中位数）落盘，`Requests` 全量不动——压测 JSON 契约未污染。✅
+- `mix` 与 `multiturn: true` 互斥报错；配置后 prompt_tokens/max_tokens 单值与 max_tokens 扫描失效（告警）；
+  各形状 max_tokens 独立过思考 floor。✅
+- 报告：并发表"输出 tk"列显示 mix(labels)；新增"形状分解"表（权重/实测占比/逐形状中位数）；
+  结论区自动出形状间尾延迟差异（长短形状 TTFT 比）与混跑 vs 均匀吞吐对比（<85% 标注明显衰减）。✅
+- 背景依据：客户线上长短混跑实测吞吐减半；vLLM 该版本插队机制直接崩，只能实例隔离。
+  5.1 输出扫描与 5.2 p95/p99 与本能力配套：均匀负载下 p99 意义有限，混跑才能测出真实尾延迟与容量折扣。
+
+**批次建议**：先做 5.2 + 5.3 + 5.4（半天、零风险、不动 Go 主流程）→ 5.1（防方向性错误）→ 5.6（等场景）。
+（2026-09-08 更新：5.0–5.4 及 5.6 已全部实现；仅 5.5 待做，恒为脚本不进 CLI。）
+
+---
+
 ## 实施顺序
 
 ```
@@ -84,4 +162,5 @@
 2. probe tool-call 检测 ← 不依赖数据集，fixture 单测 + 好端点即可交付
 3. trace 回放增强       ← 依赖真实 agent trace 验收
 4. 硬编码其余项（路径/超时/引擎识别）与回放改造合并一次提交
+5. 测量方法论 5.2/5.3/5.4 → 5.1 → 5.6
 ```

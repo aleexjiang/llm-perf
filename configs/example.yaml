@@ -33,9 +33,9 @@ dataset:
   # format: "sharegpt"       # sharegpt | sessions（自定义 [{"turns":[...]}]；留空自动识别）
   # min_turns: 2             # 会话最少 user 轮数
   # max_sessions: 64         # 最多加载多少会话（0=不限）
-  # replay_mode: "user_only" # 回放保真度：user_only（默认，只回放 user 轮，行为同历史版本）|
-                             # full（按原序注入全部 role——assistant/tool 消息进上下文，测真实 history 深度。
-                             # user_only 的回放上下文系统性偏小，真实 agent 会话里工具结果往往占大头）
+  # replay_mode: "full"      # 回放保真度：full（默认，按原序注入全部 role——assistant/tool 消息进上下文，
+                             # 测真实 history 深度）| user_only（只回放 user 轮——上下文系统性偏小，
+                             # 仅问答类数据集或快速对比用）
 
 # goodput（SLO 约束吞吐）：同时满足以下两条的请求才算有效（concurrent 结果里出 goodput 列）
 # goodput:
@@ -58,6 +58,7 @@ dataset:
 
 models:
   - "/models/DeepSeek-V4-Flash-0731"
+  - "/models/Qwen3.8-Flash-Next"
   - "/models/Qwen3.8-27B"
 
 # 思考模式：both=每个场景自动跑 off/on 各一遍（A/B 对照）；on / off=只跑其一。
@@ -87,7 +88,9 @@ thinking:
 single:
   runs: 3
   prompt_tokens: [4000, 10000, 20000, 40000]  # 默认到 40k；需更长上下文自行追加 100000, 200000（若超模型上限该档 400 报错自带上限数字，不影响其他档位）
-  max_tokens: 512
+  # max_tokens 标量或列表（5.1 输出长度扫描）：列表时逐档扫描，报告按输出档分线。
+  # 注意 thinking=on 时各档会被 max_tokens_floor 抬高——要扫输出长度需档位 > floor（否则收敛为 floor 单档）
+  max_tokens: [256, 512, 1024]
   fixed_seed: true                # true=各 run 用同一 prompt（测缓存）；false=每次换 prompt（测冷启动）
 
 # 场景二：单发多轮（模拟 agent：system + tool defs + 逐轮滚大的 history）
@@ -98,7 +101,7 @@ multiturn:
   tool_defs_tokens: 2000          # 模拟 agent 的 tool definitions 持续开销
   turn_tokens: 12300              # 每轮新增 user 消息：16 轮滚到 ~200k（base 3k + 16×12.3k）
                                   # 每轮 12k 量级比大轮次更贴近真实 agent；多轮滚到 200k ≠ 单条塞 200k，两者推理行为不同
-  max_tokens: 256
+  max_tokens: 256                 # 标量或列表，同 single（多轮列表会与 sessions 相乘，注意总时长）
   keep_assistant: true            # assistant 回复保留进 history（真实 agent 行为）
   max_reply_chars: 2000           # assistant 回复进 history 的截断长度（按字符计，中文安全；默认 2000）
 
@@ -108,13 +111,21 @@ concurrent:
   levels: [1, 2, 4, 8, 16]        # 闭环并发档位（request_rate/rate_sweep 未配置时生效）
   runs_per_worker: 2              # 单轮模式下每个虚拟用户连续发几次
   prompt_tokens: 10000
-  max_tokens: 256
+  max_tokens: 256                 # 标量或列表，同 single（列表会与 levels 相乘，注意总请求量）
   # 开环到达率模式（对齐 vLLM bench serve / inference-perf）：请求按 Poisson 过程到达，
   # 能测出排队-延迟曲线与饱和点；与 levels 互斥，两者都配时 rate_sweep 优先
   # request_rate: 4                # 到达率 req/s
   # rate_sweep: [1, 2, 4, 8, 16]  # 多档扫描（饱和点寻找）
   # num_prompts: 64               # 总请求数（multiturn 时为总会话数），默认 32
   # max_concurrency: 8            # 并发上限（0=不限），防到达率超容量时请求无限堆积
+  # 混合负载（5.6）：按权重确定性混跑长短请求（平滑加权轮转，小请求数下低权重形状不饿死）。
+  # 线上流量从不均匀——均匀负载测出的吞吐/p99 系统性偏乐观，混跑才能测出容量折扣与真实尾延迟。
+  # 与 multiturn: true 互斥；配置后本场景形状由 mix 各项决定，上方 prompt_tokens/max_tokens
+  # 单值与 max_tokens 输出扫描失效（配置告警提示）。可与开环 request_rate/rate_sweep 组合，
+  # 开环混跑更贴近线上到达模式。报告附形状分解表 + 混跑 vs 均匀对照（<85% 标 ⚠️）。
+  # mix:
+  #   - {weight: 7, label: short, prompt_tokens: 1000,  max_tokens: 128}
+  #   - {weight: 3, label: long,  prompt_tokens: 20000, max_tokens: 1024}
 
 # ─────────────────────────────────────────────────────────────
 # 按模型覆盖（可选，配置组织的推荐方式）：顶部通用 + 底部差异
