@@ -11,3 +11,5 @@ bench-linux-amd64
 bench-linux-arm64
 bench-windows-*.exe
 bench-darwin-*
+
+/bench
