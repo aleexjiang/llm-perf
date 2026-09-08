@@ -1,0 +1,46 @@
+# CLI 优先级回归冒烟：复刻 2026-09-08 客户现场踩坑形状——全局 thinking.mode=off +
+# 单模型 model_overrides.thinking.mode=both。配 scripts/smoke.sh 用：断言 --thinking off/on
+# 按变体名过滤生效、不被 overrides 反超（旧 bug：-thinking off 后 mock-model-b 仍混入 on 数据）。
+endpoint: "http://127.0.0.1:18099/router/v1"
+api_key_env: ""
+output_dir: "output-smoke-overrides"
+timeout_seconds: 30
+filler_lang: "en"
+stream: true
+
+models: ["mock-model-a", "mock-model-b"]
+
+thinking:
+  mode: "off"                     # 全局 off：mock-model-a 只有 off 变体
+  extra_body_on:
+    chat_template_kwargs: {enable_thinking: true}
+  extra_body_off:
+    chat_template_kwargs: {enable_thinking: false}
+  max_tokens_floor: 2048
+
+model_overrides:
+  "mock-model-b":
+    thinking:
+      mode: "both"                # 踩坑形状：overrides 给 b 带来 on 变体
+
+single:
+  runs: 1
+  prompt_tokens: [500]
+  max_tokens: 64
+  fixed_seed: true
+
+multiturn:
+  sessions: 1
+  turns: 2
+  system_tokens: 100
+  tool_defs_tokens: 100
+  turn_tokens: 200
+  max_tokens: 32
+  keep_assistant: true
+
+concurrent:
+  multiturn: true
+  levels: [2]
+  runs_per_worker: 1
+  prompt_tokens: 300
+  max_tokens: 32
