@@ -512,13 +512,21 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 	if e.trace != nil {
 		dataSrc = "trace:" + e.trace.Source + "（replay_mode=" + cfg.Dataset.ReplayMode + "）"
 	}
+	// 上下文口径（5.9）：filler 模式注明起步/增量形状——逐轮增量比早前 12.3k 小是刻意设计
+	// （模拟"每轮新增工具结果 + 追问"），报告中可追溯，防止被当成配置失误
+	ctxShape := ""
+	if e.trace == nil && mt.TurnTokens > 0 {
+		base := mt.SystemTokens + mt.ToolDefsTokens
+		ctxShape = fmt.Sprintf("，上下文 ~%.0fk 起步 → 末轮 ~%.0fk（每轮增量 %dtk：模拟每轮新增工具结果+追问）",
+			float64(base+mt.TurnTokens)*1.07/1000, float64(base+mt.Turns*mt.TurnTokens)*1.07/1000, mt.TurnTokens)
+	}
 	rep := &report.Report{
 		Tool:        report.Version,
 		Scenario:    "multiturn",
 		GeneratedAt: time.Now(),
 		Endpoint:    cfg.Endpoint,
-		Note: fmt.Sprintf("单发多轮 sessions=%d turns=%d stream=%v thinking=%s 数据源=%s（trace 模式下轮次来自回放会话，system/turn_tokens 不生效）%s",
-			mt.Sessions, mt.Turns, cfg.StreamEnabled(), cfg.Thinking.Mode, dataSrc, thinkingNoteSuffix(cfg)),
+		Note: fmt.Sprintf("单发多轮 sessions=%d turns=%d stream=%v thinking=%s 数据源=%s%s（trace 模式下轮次来自回放会话，system/turn_tokens 不生效）%s",
+			mt.Sessions, mt.Turns, cfg.StreamEnabled(), cfg.Thinking.Mode, dataSrc, ctxShape, thinkingNoteSuffix(cfg)),
 	}
 	applySLO(e, rep)
 	before, poller := startWindow(ctx, e)

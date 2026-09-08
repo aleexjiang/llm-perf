@@ -443,6 +443,18 @@ func main() {
 	}
 	log.Printf("执行计划: turns=%s concurrency=%v → %s（并发=1 即单发串行）", *turnsFlag, vals, strings.Join(names, " → "))
 
+	// 战役画像（5.10）：开跑前打印"这次要跑什么形状"总览；同一份数据随每份 JSON 落盘
+	planItems := make([]scenario.PlanItem, len(items))
+	for i, it := range items {
+		planItems[i] = scenario.PlanItem{Name: it.name, Highs: it.highs, MT: it.mt}
+	}
+	campaignPlan := scenario.PlanSummary(cfg, *modelFilter, planItems)
+	if campaignPlan != nil {
+		for _, l := range campaignPlan.Render() {
+			log.Print(l)
+		}
+	}
+
 	if len(items) > 1 && strings.HasSuffix(*outFlag, ".json") {
 		fmt.Fprintln(os.Stderr, "本次组合会跑多个场景（各落一个 JSON），-o 请给目录而不是单个 .json 文件")
 		os.Exit(1)
@@ -456,9 +468,10 @@ func main() {
 			os.Exit(1)
 		}
 		outPath := resolveOutPath(*outFlag, cfg.OutputDir, name)
-		// 环境存档随每份分区落盘（引擎识别 + 配置原文）
+		// 环境存档随每份分区落盘（引擎识别 + 配置原文）；战役画像同附（回溯"当时的计划"）
 		rep.Environment = envInfo
 		rep.ConfigRaw = cfg.Raw
+		rep.Plan = campaignPlan
 		// 按模型分区落盘：多模型战役各落 <output_dir>/<模型>/，重测/作废单模型不纠缠；
 		// 单模型（或 -m 过滤后只剩一个）保持原布局直接落 output_dir，报告工具兼容两种布局
 		parts := rep.PartitionByModel()

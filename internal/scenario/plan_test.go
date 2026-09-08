@@ -1,0 +1,94 @@
+package scenario
+
+import (
+	"testing"
+
+	"github.com/aleexjiang/llm-perf/internal/config"
+)
+
+// PlanSummary 请求估算与场景循环同构：变体 × 输出档 × (档位×runs | sessions×turns | levels×每档请求)。
+func TestPlanSummary(t *testing.T) {
+	cfg := &config.Config{
+		Endpoint:  "http://x:1/v1",
+		Models:    []string{"m1", "m2"},
+		TimeoutSeconds: 300,
+		Single:    config.Single{Runs: 2, PromptTokens: []int{4000, 10000}, MaxTokens: config.IntList{256}},
+		Multiturn: config.Multiturn{Sessions: 2, Turns: 8, SystemTokens: 18000, ToolDefsTokens: 3000,
+			TurnTokens: 10000, MaxTokens: config.IntList{256}},
+		Concurrent: config.Concurrent{RunsPerWorker: 2, MaxTokens: config.IntList{256}}, // Load 后的默认形状
+	}
+	cfg.Thinking.Mode = "both" // off + on 两个变体
+	items := []PlanItem{
+		{Name: "single"},
+		{Name: "multiturn"},
+		{Name: "concurrent", Highs: []int{2, 4}},
+	}
+	p := PlanSummary(cfg, "", items)
+	if p == nil {
+		t.Fatal("plan 为 nil")
+	}
+	if p.NumModels != 2 || len(p.Models) != 2 {
+		t.Fatalf("模型数: %d/%d", p.NumModels, len(p.Models))
+	}
+	m := p.Models[0]
+	if len(m.Scenarios) != 3 {
+		t.Fatalf("场景数 %d ≠ 3", len(m.Scenarios))
+	}
+	// single: 2 变体 × 1 输出档 × 2 档位 × 2 runs = 8
+	if got := m.Scenarios[0].Requests; got != 8 {
+		t.Fatalf("single 估算 %d ≠ 8", got)
+	}
+	// multiturn: 2 变体 × 1 输出档 × 2 sessions × 8 turns = 32
+	if got := m.Scenarios[1].Requests; got != 32 {
+		t.Fatalf("multiturn 估算 %d ≠ 32", got)
+	}
+	// concurrent: 2 变体 × 1 输出档 × (2×2 + 4×2) = 24
+	if got := m.Scenarios[2].Requests; got != 24 {
+		t.Fatalf("concurrent 估算 %d ≠ 24", got)
+	}
+	if m.Requests != 64 || p.TotalRequests != 128 {
+		t.Fatalf("汇总: 模型 %d / 总 %d，want 64/128", m.Requests, p.TotalRequests)
+	}
+	if len(p.Render()) != 8 { // 总览 1 行 + 2 模型 × 3 场景 + 总计
+		t.Fatalf("Render 行数 %d ≠ 8", len(p.Render()))
+	}
+}
+
+// max_prompt_tokens 截止：多轮有效轮数提前（与场景层停轮口径一致）。
+func TestPlanSummaryCtxCutoff(t *testing.T) {
+	cfg := &config.Config{
+		Endpoint: "http://x:1/v1",
+		Models:   []string{"m1"},
+		Single:   config.Single{Runs: 1, PromptTokens: []int{4000}, MaxTokens: config.IntList{64}},
+		Multiturn: config.Multiturn{Sessions: 1, Turns: 8, SystemTokens: 18000, ToolDefsTokens: 3000,
+			TurnTokens: 10000, MaxTokens: config.IntList{64}},
+		MaxPromptTokens: 50000, // base 21k + 10k×2 → 第 3 轮起超限，有效轮数 2
+	}
+	cfg.Thinking.Mode = "off"
+	p := PlanSummary(cfg, "", []PlanItem{{Name: "multiturn"}})
+	got := p.Models[0].Scenarios[0]
+	if got.Requests != 2 {
+		t.Fatalf("截止后 multiturn 估算 %d ≠ 2（1 变体 × 1 session × 2 轮）", got.Requests)
+	}
+}
+
+// 混跑：不走外层输出扫描，请求数 = levels × runs/worker（tiers=1）。
+func TestPlanSummaryMix(t *testing.T) {
+	cfg := &config.Config{
+		Endpoint: "http://x:1/v1",
+		Models:   []string{"m1"},
+		Single:   config.Single{Runs: 1, PromptTokens: []int{4000}, MaxTokens: config.IntList{64}},
+		Concurrent: config.Concurrent{Levels: []int{4}, RunsPerWorker: 2, PromptTokens: 10000,
+			MaxTokens: config.IntList{256},
+			Mix: []config.MixShape{
+				{Weight: 7, Label: "short", PromptTokens: 1000, MaxTokens: 128},
+				{Weight: 3, Label: "long", PromptTokens: 8000, MaxTokens: 256},
+			}},
+	}
+	cfg.Thinking.Mode = "on"
+	p := PlanSummary(cfg, "", []PlanItem{{Name: "concurrent", Highs: []int{4}}})
+	got := p.Models[0].Scenarios[0]
+	if got.Requests != 8 { // 1 变体 × level4 × runs2（mix 下输出档不乘）
+		t.Fatalf("mix 估算 %d ≠ 8", got.Requests)
+	}
+}

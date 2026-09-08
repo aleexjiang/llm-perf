@@ -275,3 +275,9 @@ scripts/gen_html_report.py  # JSON → 自包含 HTML 分析报告（多文件�
 scripts/validate_report.js  # 报告 JS 校验（占位符/图表可执行）
 deploy/             # 模型服务 docker-compose 存档（与 bench 配置对齐说明）
 ```
+
+## 设计文档
+
+- [docs/architecture.md](docs/architecture.md) — 内部架构：模块边界、数据流、扩展点、已知坑位（二开/维护者向）
+- [docs/data-contract.md](docs/data-contract.md) — 数据契约：JSON 输出结构、聚合口径、报告侧对齐规则
+- [docs/latency-baselines.md](docs/latency-baselines.md) — 体验基线 3 档制的依据与原文链接

@@ -127,6 +127,8 @@ def merge(reports):
             meta["environment"] = d["environment"]
         if d.get("config_raw"):
             meta["config_raw"] = d["config_raw"]
+        if d.get("plan"):
+            meta["plan"] = d["plan"]
     return data, meta
 
 
@@ -143,6 +145,23 @@ def mmm(vals, nd=2):
 # p95/p99 最小样本量：低于它的分位数是纯噪音（n=3 时 p99 甚至超过 max），
 # 宁可留空也不硬算。并发场景 level × runs_per_worker 通常 ≥ 20 才出分位。
 MIN_PCT_SAMPLE = 20
+
+# ── 体验基线（3 档制，5.8）：判据与出处见 docs/latency-baselines.md §7 ──
+# 档1/档2（短输入 ≤4K）= MLPerf Interactive / Server 直引；档3（≥24K agent 大上下文）= 推导值
+# TPOT 与输入长度无关（decode 只看逐 token 生成），各档共用 40/200ms
+SLO_TIERS = {
+    "short_max_tokens": 4000,   # 短输入档上界
+    "long_min_tokens": 24000,   # agent 大上下文档下界（默认边界，未来可由 slo: 配置覆盖）
+    "short_good_ttft": 0.45,    # s，MLPerf Interactive p99
+    "short_pass_ttft": 2.0,     # s，MLPerf Server p99（锚定 ~240 wpm 阅读速度）
+    "long_good_ttft": 3.0,      # s，推导值：particula 10K 实测 0.75–1.6s 线性外推
+    "long_pass_ttft": 6.0,      # s，推导值：MLPerf 405B 档 6s @9.4K 作宽松上限佐证
+    "good_tpot": 40.0,          # ms，ITL p99（MLPerf Interactive）
+    "pass_tpot": 200.0,         # ms（MLPerf Server）
+    "good_tps": 25.0,           # 单请求输出速度 tok/s（>30–50 超过所有读者感知，再快无感）
+    "pass_tps": 10.0,           # 阅读速度 ~5–6 tok/s × 2 安全系数
+}
+BUCKET_LABEL = {"short": "≤4K", "mid": "4–24K", "long": "≥24K"}
 
 
 def pct9599(vals, nd=2):
@@ -417,6 +436,98 @@ def analyze(data, meta):
         # decode 基准（优先 off 单发）
         P["decode_tps"] = P.get("off", {}).get("tokps") or P.get("on", {}).get("tokps")
         A["per_model"][m] = P
+
+    # ── 5.8 体验基线评估单元（3 档制；判据与出处 docs/latency-baselines.md §7）──
+    # TTFT 按输入档池化（跨输出档——TTFT 与输出长度无关）；TPOT/tok/s 取最大输出档组
+    # （输出越长 decode 爬坡段占比越小，与 ladder_top 的口径一致）
+    def bucket_of(p):
+        if p <= SLO_TIERS["short_max_tokens"]:
+            return "short"
+        if p >= SLO_TIERS["long_min_tokens"]:
+            return "long"
+        return "mid"
+
+    def prompt_lbl(ps):
+        lo, hi = min(ps), max(ps)
+        return "{:,}".format(lo) if lo == hi else "{:,}–{:,}".format(lo, hi)
+
+    def mk_unit(scene, model, th, bkt, lbl, ttfts, itls, tpss, n):
+        ttfts = [v for v in ttfts if v]
+        itls = [v for v in itls if v]
+        tpss = [v for v in tpss if v]
+        pp = pct9599(ttfts)
+        return {
+            "scene": scene, "model": model, "thinking": th, "bucket": bkt,
+            "prompt": lbl, "n": n,
+            "ttft_med": round(st.median(ttfts), 2) if ttfts else None,
+            "ttft_p99": pp[1] if pp else None,  # 样本 < MIN_PCT_SAMPLE 时退回中位数判级
+            "itl_p99": round(st.median(itls), 1) if itls else None,
+            "tps": round(st.median(tpss), 0) if tpss else None,
+        }
+
+    base = []
+    for m, P in A["per_model"].items():
+        for th in ("off", "on"):
+            if th not in P:
+                continue
+            mts = P[th]["mt_list"]
+            # 单发·单轮
+            for bkt in ("short", "mid", "long"):
+                groups = []
+                for mt in mts:
+                    for size in sorted(s_by[(m, th, mt)]):
+                        if bucket_of(size) != bkt:
+                            continue
+                        rs = s_by[(m, th, mt)][size]["runs"]
+                        if rs:
+                            groups.append((mt, size, rs))
+                if not groups:
+                    continue
+                ttfts = [r.get("ttft_ms", 0) / 1000 for _, _, rs in groups for r in rs]
+                top_mt = max(mt for mt, _, _ in groups)
+                top_rs = [r for mt, _, rs in groups if mt == top_mt for r in rs]
+                base.append(mk_unit(
+                    "单发·单轮", m, th, bkt, prompt_lbl([size for _, size, _ in groups]),
+                    ttfts, [r.get("itl_p99_ms") for r in top_rs],
+                    [r.get("tokens_per_sec") for r in top_rs], len(ttfts)))
+            # 单发·多轮：逐轮按该轮 prompt 归档（会话越深输入越大）
+            top_mt = mts[-1]
+            turns = [t for sess in m_by[(m, th, top_mt)] for t in sess["turns"]]
+            for bkt in ("short", "mid", "long"):
+                ts = [t for t in turns if bucket_of(t.get("prompt_tokens", 0)) == bkt]
+                if not ts:
+                    continue
+                base.append(mk_unit(
+                    "单发·多轮", m, th, bkt, prompt_lbl([t.get("prompt_tokens", 0) for t in ts]),
+                    [t.get("ttft_ms", 0) / 1000 for t in ts],
+                    [t.get("itl_p99_ms") for t in ts],
+                    [t.get("tokens_per_sec") for t in ts], len(ts)))
+    # 并发：均匀轮按请求 prompt 归档；混跑轮逐形状评估（形状即输入档，只有中位数）
+    for lv in c_lvls:
+        is_mt = bool(lv.get("multiturn") or lv.get("sessions"))
+        kind = "多轮" if is_mt else "单轮"
+        load = "rate{}/s".format(lv["request_rate"]) if lv.get("request_rate") else "L{}".format(lv.get("level", 0))
+        if lv.get("shapes"):
+            scene = "并发混跑·{} {}".format(kind, load)
+            for s in lv["shapes"]:
+                base.append(mk_unit(scene, lv["model"], lv.get("thinking", "off"),
+                                    bucket_of(s["prompt_tokens"]), "{:,}".format(s["prompt_tokens"]),
+                                    [s["ttft_s"]] if s["ttft_s"] else [], [],
+                                    [s["tok_s"]] if s["tok_s"] else [], s["count"]))
+            continue
+        turns = ([t for sess in lv.get("sessions", []) for t in sess.get("turns", [])] if is_mt
+                 else lv.get("requests", []))
+        scene = "并发·{} {}".format(kind, load)
+        for bkt in ("short", "mid", "long"):
+            ts = [t for t in turns if bucket_of(t.get("prompt_tokens", 0)) == bkt]
+            if not ts:
+                continue
+            base.append(mk_unit(scene, lv["model"], lv.get("thinking", "off"), bkt,
+                                prompt_lbl([t.get("prompt_tokens", 0) for t in ts]),
+                                [t.get("ttft_ms", 0) / 1000 for t in ts],
+                                [t.get("itl_p99_ms") for t in ts],
+                                [t.get("tokens_per_sec") for t in ts], len(ts)))
+    A["baseline"] = base
 
     # 全局事件
     trunc = sum(1 for r in all_single_runs + all_mt_turns if r.get("thinking_no_content"))
@@ -749,6 +860,107 @@ def appendix_multiturn(data):
 
 # ────────────────────────── 结论/建议/局限（数据条件生成） ──────────────────────────
 
+def baseline_section(A):
+    """5.8 体验基线评估（3 档制）：徽章 + 结论段 + 出处。基线不进退出码、不污染原始 JSON。"""
+    base = A.get("baseline") or []
+    if not base:
+        return ""
+
+    def badge(v, good, pas):
+        """越低越好的指标（TTFT/ITL，单位 s 或 ms）。"""
+        if v is None:
+            return "—"
+        if v <= good:
+            return "✅"
+        if v <= pas:
+            return "⚠️"
+        return "❌"
+
+    def badge_hi(v, good, pas):
+        """越高越好的指标（输出速度 tok/s）。"""
+        if v is None:
+            return "—"
+        if v >= good:
+            return "✅"
+        if v >= pas:
+            return "⚠️"
+        return "❌"
+
+    seen_notes = set()
+
+    def note_once(txt):
+        if txt not in seen_notes:
+            seen_notes.add(txt)
+            return "<li>{}</li>".format(txt)
+        return ""
+
+    note_html = []
+    rows, summary = [], {"short": [], "long": []}
+    for u in base:
+        bkt = u["bucket"]
+        # TTFT：优先 p99，样本不足退回中位数（标注口径）
+        t_v = u["ttft_p99"] if u["ttft_p99"] is not None else u["ttft_med"]
+        t_kind = "p99" if u["ttft_p99"] is not None else "中位"
+        t_txt = "—" if t_v is None else "{:.2f}s（{}）".format(t_v, t_kind)
+        t_b = "—"
+        if u["thinking"] == "on":
+            note_html.append(note_once(
+                "thinking=on 的 TTFT 含思考时长（TTFAT 口径），不套用 TTFT 徽章；TPOT 与输出速度仍可判级。"))
+        elif bkt == "mid":
+            note_html.append(note_once("输入 4K–24K 区间两档之间无权威锚点，只报数值不打徽章。"))
+        else:
+            g = SLO_TIERS["short_good_ttft"] if bkt == "short" else SLO_TIERS["long_good_ttft"]
+            p = SLO_TIERS["short_pass_ttft"] if bkt == "short" else SLO_TIERS["long_pass_ttft"]
+            t_b = badge(t_v, g, p)
+        tp_b = badge(u["itl_p99"], SLO_TIERS["good_tpot"], SLO_TIERS["pass_tpot"])
+        if u["thinking"] == "on" and u["tps"] is not None:
+            note_html.append(note_once(
+                "tok/s 为整响应吞吐（thinking=on 时含思考 token），速度判级仅供参考。"))
+        ts_b = badge_hi(u["tps"], SLO_TIERS["good_tps"], SLO_TIERS["pass_tps"])
+        bs = [x for x in (t_b, tp_b, ts_b) if x != "—"]
+        if not bs:
+            verdict = "—"
+        elif "❌" in bs:
+            verdict = "❌ 未达标"
+        elif "⚠️" in bs:
+            verdict = "⚠️ 及格"
+        else:
+            verdict = "✅ 优"
+        if bkt in summary:
+            summary[bkt].append(verdict)
+        rows.append([u["scene"], esc(short(u["model"])), u["thinking"], BUCKET_LABEL[bkt],
+                     u["prompt"], "{:,}".format(u["n"]), t_txt, t_b,
+                     "{:.0f}ms".format(u["itl_p99"]) if u["itl_p99"] is not None else "—", tp_b,
+                     "{:.0f}".format(u["tps"]) if u["tps"] is not None else "—", ts_b, verdict])
+
+    ps = []
+    for bkt, name in (("long", "agent 大上下文（≥24K）"), ("short", "短输入（≤4K）")):
+        vs = summary.get(bkt) or []
+        if not vs:
+            continue
+        n_g, n_p, n_b = vs.count("✅ 优"), vs.count("⚠️ 及格"), vs.count("❌ 未达标")
+        ps.append("<b>{}</b>：{} 项配置中 {} 优 / {} 及格 / {} 未达标。".format(name, len(vs), n_g, n_p, n_b))
+    if any(u["bucket"] == "long" for u in base):
+        ps.append("现代 agent 产品基线上下文即约 35K（系统提示 + 工具定义 + RAG 注入，用户发一句「你好」请求就已带 35K），"
+                  "<b>agent 场景的 TTFT 体验主判据是 ≥24K 档</b>，短输入档徽章代表不了 agent 体验。")
+        ps.append("暖路径提示：prefix cache 命中时大输入的 TTFT 只由新增 token 决定，会显著好于档位数字——"
+                  "≥24K 档判的是冷 prefill 最坏角落；命中率的实测见第 7 节缓存判定。")
+    note_html.append("<li>判级口径：TTFT 优先 p99，样本不足 {} 时退回中位数（括号内标注）；"
+                     "TPOT 以每请求 ITL p99 的中位数为代理。基线不进退出码、不影响原始数据。</li>"
+                     .format(MIN_PCT_SAMPLE))
+    note_html.append("<li>判据出处：<code>docs/latency-baselines.md</code> §7 —— "
+                     "MLPerf Server（TTFT p99 ≤2s / TPOT ≤200ms，锚定 ~240 wpm 阅读速度）、"
+                     "MLPerf Interactive（450ms / 40ms，基于 ChatGPT/Perplexity 实测修订）、"
+                     "≥24K 档为推导值（particula 10K 实测 0.75–1.6s 线性外推 + MLPerf 405B 档 6s 上限佐证）。</li>")
+
+    head = ["场景", "模型", "thinking", "输入档", "prompt tk", "样本", "TTFT", "TTFT 判级",
+            "ITL p99", "TPOT 判级", "tok/s", "速度判级", "综合"]
+    html_tbl = table(head, rows)
+    concl = '<div class="finding">{}</div>'.format("".join("<p>{}</p>".format(x) for x in ps)) if ps else ""
+    notes = '<ul class="tight">{}</ul>'.format("".join(note_html))
+    return concl + html_tbl + '<div class="note">' + notes + "</div>"
+
+
 def gen_conclusions(A):
     cs = []
     # 1 prefill 扩展性（斜率取自最大输出档组 ladder_top，避免多输出档混线）
@@ -794,7 +1006,9 @@ def gen_conclusions(A):
         if cw and cw > 3:
             cs.append("{}（单发）同档位 run1 TTFT 约为 run2/3 的 {:.0f} 倍，符合缓存冷 miss 形态。".format(esc(short(m)), cw))
     # 3 decode
-    decs = [(m, P.get("decode_tps")) for m, P in A["per_model"].items() if P.get("decode_tps")]
+    # hi[1][0] 守卫：mock/异常数据下吞吐可为 0，直接除会 ZeroDivisionError
+    decs = [(m, P.get("decode_tps")) for m, P in A["per_model"].items()
+            if P.get("decode_tps") and P["decode_tps"][0] > 0]
     if len(decs) >= 2:
         decs_sorted = sorted(decs, key=lambda x: -x[1][0])
         hi, lo = decs_sorted[0], decs_sorted[-1]
@@ -1031,6 +1245,7 @@ def summary_json(data, A, meta, conclusions, recommendations, limits):
         "endpoint": meta["endpoint"], "tool": meta["tool"],
         "generated_at": meta["generated"],
         "coverage": A["coverage"],
+        "baseline": A.get("baseline", []),  # 5.8 体验基线评估单元（3 档制）
         "events": {k: (len(v) if isinstance(v, list) else v) for k, v in A["events"].items()},
         "per_model": {short(m): clean(P) for m, P in A["per_model"].items()},
         "conclusions": [re.sub(r"<[^>]+>", "", c) for c in conclusions],
@@ -1120,6 +1335,20 @@ def main():
         sec2_body += ('<details><summary>配置原文（YAML 存档）</summary>'
                       '<pre style="white-space:pre-wrap;font-size:12px">{}</pre></details>').format(
             esc(meta["config_raw"]))
+    # 战役画像（5.10）：开跑前估算的计划，随数据落盘——核对"当时的计划"与实际产出是否一致
+    plan = meta.get("plan")
+    if plan and (plan.get("models") or []):
+        rows = []
+        for m in plan.get("models") or []:
+            for s in m.get("scenarios") or []:
+                rows.append([s.get("name"), m.get("model"), s.get("detail"),
+                             "{:,}".format(s.get("requests") or 0)])
+        if rows:
+            sec2_body += ('<h3>战役画像（开跑前估算；展示口径 = 执行口径）</h3>'
+                          + table(["场景", "模型", "形状明细", "请求估算"], rows)
+                          + '<div class="note">总请求估算 ≈ {:,}（不含预热与金丝雀）。'
+                            'token 数字为估算值（~4 字符/token + 1.07 模板开销），带 ~ 前缀。</div>'.format(
+                              plan.get("total_requests") or 0))
     sec.append(("<h2>2 · 测试配置与方法</h2>",
                 sec2_body +
                 (('<div class="note">' + notes_html + "</div>") if notes_html else "")))
@@ -1191,12 +1420,16 @@ def main():
         "比值 &gt;80% ⇒ 未命中。单发参照系本身可能被缓存污染（同题 runs 全命中时两者斜率同样低），此时候比值失效、以绝对判据为准。"
         "思考行为：no_reasoning=开关未产生思考输出；budget_exhausted=思考耗尽 max_tokens（正文 0 token）；"
         "normal=有思考草稿且正文正常。</div>".format(CACHE_EFFECTIVE_MS_PER_TOKEN)))
+    # 体验基线评估（5.8，3 档制）
+    base_html = baseline_section(A)
+    if base_html:
+        sec.append(("<h2>8 · 体验基线评估（3 档制）</h2>", base_html))
     # 结论建议
     rec_html = "".join('<p><b>【{}】</b>{}</p>'.format(esc(p), t) for p, t in recommendations)
-    sec.append(("<h2>8 · 结论与建议</h2>", '<div class="good">{}</div>'.format(rec_html)))
-    sec.append(("<h2>9 · 局限与备注</h2>", "<ul class='tight'>{}</ul>".format(
+    sec.append(("<h2>9 · 结论与建议</h2>", '<div class="good">{}</div>'.format(rec_html)))
+    sec.append(("<h2>10 · 局限与备注</h2>", "<ul class='tight'>{}</ul>".format(
         "".join("<li>{}</li>".format(esc(l)) for l in limits))))
-    sec.append(("<h2>10 · 数据质量</h2>", quality_block(data)))
+    sec.append(("<h2>11 · 数据质量</h2>", quality_block(data)))
     sec.append(("<h2>附录 A · 单发逐 run 明细</h2>",
                 "<details><summary>展开</summary>{}</details>".format(appendix_single(data))
                 if data["single"] else ""))

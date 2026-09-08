@@ -73,6 +73,48 @@ type SLO struct {
 	TPOTMS float64 `json:"tpot_ms"`
 }
 
+// Plan 战役画像（5.10）：配置校验通过后、发首个请求前估算的"这次要跑什么形状"总览。
+// 估算口径 = 执行口径（复用 ClampLadder / MaxTokensList / Variants / ForModel），
+// 开跑前打印 + 随每份场景 JSON 落盘（与 Environment/ConfigRaw 合并消费，回溯"当时的计划"）。
+type Plan struct {
+	Endpoint      string      `json:"endpoint"`
+	Auth          string      `json:"auth,omitempty"` // 认证方案描述（bearer 为默认时不省略，落盘完整）
+	TimeoutS      int         `json:"timeout_seconds"`
+	NumModels     int         `json:"num_models"`
+	Warmup        int         `json:"warmup_requests"`
+	Correctness   int         `json:"correctness_samples"`
+	Models        []PlanModel `json:"models"`
+	TotalRequests int         `json:"total_requests"` // 所有模型所有场景之和；不含预热与金丝雀
+}
+
+// PlanModel 单模型的战役计划（model_overrides 覆盖后各模型请求量可能不同）。
+type PlanModel struct {
+	Model     string         `json:"model"`
+	Scenarios []PlanScenario `json:"scenarios"`
+	Requests  int            `json:"requests"`
+}
+
+// PlanScenario 单场景估算：Detail 为人读明细行，Requests 为该模型该场景的请求估算。
+type PlanScenario struct {
+	Name     string `json:"name"` // single | multiturn | concurrent | concurrent-multi
+	Detail   string `json:"detail"`
+	Requests int    `json:"requests"`
+}
+
+// Render 输出人读总览行（bench 启动时逐行打印；HTML 报告另按结构渲染）。
+func (p *Plan) Render() []string {
+	lines := []string{fmt.Sprintf(
+		"战役画像：端点 %s ｜ 模型 %d 个 ｜ 认证 %s ｜ 超时 %ds ｜ 预热 %d/场景 ｜ 金丝雀 %d/模型",
+		p.Endpoint, p.NumModels, p.Auth, p.TimeoutS, p.Warmup, p.Correctness)}
+	for _, m := range p.Models {
+		for _, s := range m.Scenarios {
+			lines = append(lines, fmt.Sprintf("  [%s] %s ≈ %d 请求", s.Name, s.Detail, s.Requests))
+		}
+	}
+	lines = append(lines, fmt.Sprintf("总请求估算（不含预热与金丝雀）≈ %d", p.TotalRequests))
+	return lines
+}
+
 // CorrectnessRow 一条正确性金丝雀请求的结果。
 type CorrectnessRow struct {
 	Model  string  `json:"model"`  // 该金丝雀请求发往的模型（按模型分区落盘时据此归属）
@@ -122,6 +164,7 @@ type Report struct {
 	Endpoint    string                `json:"endpoint"`
 	Note        string                `json:"note,omitempty"`
 	SLO         *SLO                  `json:"slo,omitempty"`
+	Plan        *Plan                 `json:"plan,omitempty"`
 	Single      []SingleRow           `json:"single,omitempty"`
 	Multiturn   []MultiturnRun        `json:"multiturn,omitempty"`
 	Concurrent  []ConcurrentLevel     `json:"concurrent,omitempty"`
@@ -177,6 +220,7 @@ func (r *Report) PartitionByModel() []*Report {
 			Endpoint:       r.Endpoint,
 			Note:           r.Note,
 			SLO:            r.SLO,
+			Plan:           r.Plan,
 			Server:         r.Server,
 			Environment:    r.Environment,
 			ConfigRaw:      r.ConfigRaw,

@@ -163,8 +163,59 @@ thinking mode/levels 双轨（levels 优先已显式声明并告警）；api_key
   会话滚完换新内容重开（上下文清零重涨），暂态后在途会话年龄铺满 0~turns 区间，测稳态吞吐与 KV cache 压力；
   报告标注稳态窗口（暂态剔除或单独标注）。与爬坡组合 = 最接近线上稳态负载。
 
+**5.8 报告体验基线评估（3 档制）**（报告侧已实现；`slo:` 配置段待做。判据与出处见 `docs/latency-baselines.md` 第 7 节）
+
+- 已实现（`gen_html_report.py`）：报告新增"8 · 体验基线评估"区——三场景按输入档归组
+  （单发 TTFT 跨输出档池化、TPOT/tok/s 取最大输出档；多轮逐轮归档；混跑逐形状评估），
+  ✅/⚠️/❌ 徽章 + 结论段 + 出处注释；TTFT 优先 p99、样本 <20 退回中位数并标注；
+  thinking=on 不打 TTFT 徽章（TTFAT 口径）；基线单元写入 perf-summary JSON；不进退出码
+- 待做：`slo:` 配置段合流 goodput 阈值 + `baseline: true`（默认开），阈值内置默认可覆盖
+  （当前阈值为脚本内置常量 `SLO_TIERS`）
+- 档1 优（≤4K：450ms/40ms）、档2 及格（≤4K：2s/200ms）= MLPerf Interactive/Server 直引；
+  档3 agent 大上下文（30–40K：优 3s / 及格 6s）= 推导值（particula 10K 实测线性外推 + 405B 档上限佐证），
+  报告中标注"推导值"
+- 档位归组：≤4K 打档1/2 徽章，≥24K 打档3 徽章，4K–24K 只报数值（prefill 斜率见第 7 节分析表）；
+  agent 场景 TTFT 判据以档3 为准（现代 agent 产品基线上下文即 ~35K）
+
+**5.9 负载保真度：multiturn 起步上下文对齐 agent 真实形状**（配置联动已实现，2026-09-08；AgentLens 取证待做）
+
+- 问题：filler 模式 turn1 ≈ 15.5k（system 基座 `system_tokens 1000` + `tool_defs_tokens 2000`，×1.07 模板开销），
+  远低于真实 agent 产品的首调上下文规模 → multiturn turn1 测不出"大 prefill 冷启动"，而首字延迟恰是 agent 产品的真实痛点。
+- 目标：turn1 起步 ≈ **35k**。**假设值，待取证**：与 5.8 档3"现代 agent 产品基线上下文 ~35K"同一来源，均为推导值。
+- 取证（待做）：AgentLens `codebuddy-model-request-prod` 空间按 `session_id` 聚合，取每个 session **第一次** LLM 调用的
+  `inputTokens` 分布（P50/P90）回填基线。session 内 prompt 是包含关系 → 只取首调，不差分、不拼接（第 4 节坑 2）。
+  需内网环境 + `X-Agentlens-Token`，本机不可达，取证后如 P50 偏离 35k 再回填调整。
+- 配置联动 ✅（无需改代码，按预期）：`example.yaml` 与 `customer.yaml` multiturn 已改为
+  `system_tokens: 18000` + `tool_defs_tokens: 3000` + `turn_tokens: 10000`、`turns: 8`（turn1 ≈ 32.5k，末轮 ≈108k）。
+  qwen3.8-27b.yaml（256k 模型自算预算）与 smoke 系列保持不变。
+- 末端约束（2026-09-08 定，方案 B）：`turn_tokens` 由 12300 降到 **10000**、保持 `turns: 8`
+  → 末端 prompt ≈108k（thinking on 含 8k 输出 ≈116k），128k 模型留 ~12k 余量；probe 确认各模型上限后再微调。
+  代价：逐轮增量变小（模拟"每轮新增工具结果 + 追问"，10k 仍不失真）。✅ 口径已注明：multiturn 报告 Note
+  追加"上下文 ~Xk 起步 → 末轮 ~Yk（每轮增量 Ntk：模拟每轮新增工具结果+追问）"，防止被当配置失误。
+- 可选（不占决策位）：借 schema 不保兼容窗口把 `system_tokens` 语义拆为 `base_context_tokens`（system + tools + memory 三段）。
+- 连带：`config.go:851` 深上下文告警（base + turns×turn_tokens ≥ 100k）改后必触发，属预期 ✅；
+  probe `LargestPromptTokens`（`config.go:1134`）随配置自动跟上，无需改动 ✅。
+
+**5.10 启动时打印战役画像（campaign profile）**【已实现，2026-09-08】
+
+- 问题：`sessions` / `turns` / 上下文爬升 / 请求数只在逐请求日志或结果 JSON 里间接可见，
+  开跑前没有"这次要跑什么形状"的总览，核对配置只能翻 YAML。
+- 实现 ✅：`internal/scenario/plan.go` 新增 `PlanSummary(cfg, modelFilter, items)` 纯函数 +
+  `internal/report` 的 `Plan/PlanModel/PlanScenario` 结构与 `Render()`；`cmd/bench/main.go` 在"执行计划"行后打印总览块。
+  逐模型逐场景一行（single 档位矩阵 × runs × thinking / multiturn sessions×turns 与上下文 ~起步→~末轮 /
+  concurrent levels × runs/worker 或每用户会话），末行总请求估算（不含预热与金丝雀）。
+- 展示口径 = 执行口径 ✅：档位复用 `ClampLadder`（含 max_prompt_tokens 截断→有效轮数）、输出档与 floor 复用
+  `MaxTokensList`、变体复用 `Variants`、模型差异复用 `ForModel`——估算与场景循环逐层同构（含 plan_test.go 三个单测）。
+  reach 按 4 字符/token + 1.07 模板开销，展示带 `~` 前缀；trace 模式按取样上限 16 会话估算并标注。
+- 报告侧 ✅：同一份 Plan 随每份场景 JSON 落盘（`Report.Plan`，`PartitionByModel` 带入分区），
+  `gen_html_report.py` 第 2 节渲染"战役画像"表（与 5.4 配置原文存档合并消费）。E2E（mock 两模型四场景）：
+  打印估算 36 请求 = 实际执行量，HTML 画像表正常渲染。
+- 连带修复：`gen_html_report.py` gen_conclusions 的 decode 吞吐对比在 TPS=0（mock/异常数据）时除零崩溃，加 >0 守卫。
+
 **批次建议**：先做 5.2 + 5.3 + 5.4（半天、零风险、不动 Go 主流程）→ 5.1（防方向性错误）→ 5.6（等场景）。
-（2026-09-08 更新：5.0–5.4 及 5.6 已全部实现；5.5 与 5.7 待做，5.5 恒为脚本不进 CLI，5.7 续跑项等 soak 需求。）
+（2026-09-08 更新：5.0–5.4 及 5.6 已全部实现；5.8 报告侧 + 5.9 配置联动 + 5.10 已实现——
+剩余：5.5（恒为脚本不进 CLI）、5.7 闭环错峰发车（续跑 P2 等 soak 需求）、5.8 `slo:` 配置段、
+5.9 AgentLens 取证（内网 + token，本机不可达）。）
 
 ---
 
@@ -175,5 +226,5 @@ thinking mode/levels 双轨（levels 优先已显式声明并告警）；api_key
 2. probe tool-call 检测 ← 不依赖数据集，fixture 单测 + 好端点即可交付
 3. trace 回放增强       ← 依赖真实 agent trace 验收
 4. 硬编码其余项（路径/超时/引擎识别）与回放改造合并一次提交
-5. 测量方法论 5.2/5.3/5.4 → 5.1 → 5.6 → 5.5 → 5.7
+5. 测量方法论 5.2/5.3/5.4 → 5.1 → 5.6 → 5.8（报告侧+配置段）→ 5.9（配置✅，取证待内网）→ 5.10 ✅；剩 5.5 / 5.7
 ```
