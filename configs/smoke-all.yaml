@@ -4,7 +4,7 @@ output_dir: "output-smoke-all"
 timeout_seconds: 30
 filler_lang: "en"
 stream: true
-server_metrics: true              # mock 无 /metrics → 应打印降级告警并继续
+server_metrics: true              # mock 已提供 /metrics → 观测层走真路径（counter 差值/gauge 有数可断言）
 warmup_requests: 2
 dataset:
   mode: "trace"

@@ -271,9 +271,9 @@ node scripts/validate_report.js <报告.html>   # JS 端校验（占位符/图�
 make build          # 本机二进制（-ldflags 注入 git describe 版本号到 JSON 的 tool 字段）
 make test
 scripts/smoke.sh    # 自动化冒烟：mock 服务 + 多组合运行 + 输出数据形状断言
-                    # （模型×变体分布/--thinking 过滤/--max-ctx 截断；含 CLI 优先级回归用例
-                    #  smoke-overrides.yaml——全局 off + 单模型 overrides both 的踩坑形状）
-scripts/mock_server.py   # 本地 mock OpenAI 兼容流式服务 + /metrics（smoke.sh 底层依赖）
+                    # （模型×变体分布/CLI 过滤回归/全能力 trace/开环/levels/-m/--max-ctx/
+                    #   错误路径/报告管线；mock 含 /models、/metrics 与 tool-call 好路径）
+scripts/mock_server.py   # 本地 mock OpenAI 兼容流式服务（smoke.sh 底层依赖）
 scripts/gen_html_report.py  # JSON → 自包含 HTML 分析报告（多文件合并 + 自动结论 + 内嵌 AI 摘要）
 scripts/validate_report.js  # 报告 JS 校验（占位符/图表可执行）
 deploy/             # 模型服务 docker-compose 存档（与 bench 配置对齐说明）

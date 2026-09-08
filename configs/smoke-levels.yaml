@@ -1,0 +1,38 @@
+# 思考档位（levels）机制冒烟：多档变体 E2E + CLI 按档位名过滤 + 错误路径，
+# 配 scripts/smoke.sh 自动跑。levels 配置后全局 mode/extra_body_on/off 失效（配置告警），
+# CLI --thinking on/off 在 levels 下应直接报错（用档位名过滤）。
+endpoint: "http://127.0.0.1:18099/router/v1"
+api_key_env: ""
+output_dir: "output-smoke-levels"
+timeout_seconds: 30
+filler_lang: "en"
+stream: true
+
+models: ["mock-model-a"]
+
+thinking:
+  levels:
+    - {name: off,  enabled: false, extra_body: {chat_template_kwargs: {enable_thinking: false}}}
+    - {name: low,  enabled: true,  extra_body: {chat_template_kwargs: {enable_thinking: true}}}
+    - {name: high, enabled: true,  extra_body: {chat_template_kwargs: {enable_thinking: true}}}
+
+single:
+  runs: 1
+  prompt_tokens: [500]
+  max_tokens: 64
+  fixed_seed: true
+
+multiturn:
+  sessions: 1
+  turns: 2
+  system_tokens: 100
+  tool_defs_tokens: 100
+  turn_tokens: 200
+  max_tokens: 32
+
+concurrent:
+  multiturn: false
+  levels: [2]
+  runs_per_worker: 1
+  prompt_tokens: 300
+  max_tokens: 32
