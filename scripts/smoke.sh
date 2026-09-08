@@ -110,6 +110,24 @@ expect_fail "非法变体名 --thinking badname" -c configs/smoke-overrides.yaml
 expect_fail "levels 配置下 --thinking on 应报错" -c configs/smoke-levels.yaml --thinking on
 expect_fail "多场景 -o 指到单 .json 应报错" -c configs/smoke.yaml --turns both --concurrency 1 -o "$TMP/bad.json"
 
+# 11) SIGHUP 优雅中断（2026-09-09 现场事故回归：SSH 断开发 SIGHUP，进程被杀丢整个场景）
+#     把多轮拉长到 8 轮，跑 2 秒后发 SIGHUP：应优雅退出（退出码 0，非强退 130）且部分数据落盘
+sed -e 's/^  turns: 2$/  turns: 8/' configs/smoke.yaml >"$TMP/hup.yaml"
+echo "==> bench(SIGHUP 中断): 优雅保存验证"
+"$BENCH" -c "$TMP/hup.yaml" --turns multi --concurrency 1 -o "$TMP/out-hup" >"$TMP/out-hup.log" 2>&1 &
+HUP_PID=$!
+sleep 2
+kill -HUP "$HUP_PID" 2>/dev/null || true
+HUP_RC=0
+wait "$HUP_PID" || HUP_RC=$?
+if [ "$HUP_RC" != 0 ]; then
+  echo "❌ SIGHUP 应优雅退出（退出码 $HUP_RC，130=强退）；日志:"; tail -20 "$TMP/out-hup.log"; exit 1
+fi
+if [ -z "$(find "$TMP/out-hup" -name '*.json' 2>/dev/null)" ]; then
+  echo "❌ SIGHUP 中断后没有任何 JSON 落盘；日志:"; tail -20 "$TMP/out-hup.log"; exit 1
+fi
+echo "  ✅ SIGHUP 优雅退出（rc=0）且已完成数据落盘"
+
 # ── 断言：校验输出 JSON 的模型×变体分布与指标完整性，不再靠目测 ──
 echo "==> 断言输出数据形状"
 python3 - "$TMP" <<'PYEOF'

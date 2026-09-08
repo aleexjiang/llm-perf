@@ -69,7 +69,8 @@ probe 选项:
 排查模式:
   配置里 debug: true 时，原始响应留存到 <output_dir>/raw/、日志同步写 <output_dir>/run.log；
   任何请求失败时即使不开 debug 也会自动留存转储（写到系统临时目录）。
-  Ctrl+C 优雅中断：已完成数据照常落盘；再按一次强制退出。
+  Ctrl+C / kill / SSH 断开（SIGHUP）优雅中断：停止发新请求，已完成数据照常落盘；
+  再按一次强制退出。长跑建议 nohup/tmux 挂后台，防连接抖动。
 
 按模型组织:
   model_overrides.<模型>.enabled: false 跳过该模型（分批重测时临时关掉，全部禁用报错）；
@@ -273,12 +274,14 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Ctrl+C 优雅中断：第一次停止新请求并保存已完成数据；再按一次强制退出
+	// Ctrl+C / kill / SSH 断开 优雅中断：第一次停止新请求并保存已完成数据；再按一次强制退出。
+	// SIGHUP 必须捕获：堡垒机上 SSH 连接断开时内核向前台进程组发 SIGHUP——2026-09-09 现场
+	// 整个 multiturn 场景因此丢失（场景级落盘，进程被杀时内存中的部分结果全丢、连优雅保存都没触发）。
 	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	go func() {
 		<-sigs
-		log.Printf("🛑 收到中断信号——停止发新请求，在飞请求将被取消，已完成数据照常保存（再按一次 Ctrl+C 强制退出）")
+		log.Printf("🛑 收到中断信号（Ctrl+C 或连接断开）——停止发新请求，在飞请求将被取消，已完成数据照常保存（再按一次强制退出）")
 		cancel()
 		<-sigs
 		fmt.Fprintln(os.Stderr, "强制退出，未保存的数据可能丢失")
