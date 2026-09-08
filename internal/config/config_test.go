@@ -314,6 +314,17 @@ single:
 		t.Error("max_tokens 列表含非正值应报错")
 	}
 
+	// 标量非正值与列表口径一致：显式写 0 应报错而非静默走默认
+	p2b := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+single:
+  max_tokens: 0
+`)
+	if _, err := Load(p2b); err == nil {
+		t.Error("max_tokens 标量非正值应报错（与列表口径一致）")
+	}
+
 	// 标量写法不变；thinking floor 告警逐档判断（列表中只有 <floor 的档位才提示）
 	p3 := writeTemp(t, `
 endpoint: "http://x:1/v1"

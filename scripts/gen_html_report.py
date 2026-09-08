@@ -231,7 +231,11 @@ def organize(data):
     max_tokens 是输出长度扫描维度（配置可为列表多档），同 (model, thinking) 下可有多组输出档。"""
     s_by, m_by = defaultdict(dict), defaultdict(list)
     for e in data["single"]:
-        s_by[(e["model"], e.get("thinking", "off"), e.get("max_tokens", 0))][e["prompt_tokens"]] = e
+        # trace 模式下 prompt_tokens 是 len(content)/4 的估算值，不同会话可能撞档位——
+        # 直接覆盖会丢会话数据，改为合并 runs（同估算档位视为同桶）
+        bucket = s_by[(e["model"], e.get("thinking", "off"), e.get("max_tokens", 0))].setdefault(
+            e["prompt_tokens"], {"runs": []})
+        bucket["runs"].extend(e.get("runs", []))
     for e in data["multiturn"]:
         m_by[(e["model"], e.get("thinking", "off"), e.get("max_tokens", 0))].append(e)
     c_lvls = list(data["concurrent"])
@@ -549,7 +553,8 @@ def build_charts(data, A):
                       and e["mt"] == mt and e["level"] == lv]
                 if es:
                     ys_tps.append(round(sum(x["tps"] or 0 for x in es) / len(es), 1))
-                    med = st.median([x["ttft"][0] for x in es if x["ttft"]] or [None])
+                    tts = [x["ttft"][0] for x in es if x["ttft"]]
+                    med = st.median(tts) if tts else None  # 全失败档位为空列表，不喂 None 进 median
                     ys_ttft.append(round(med, 2) if med is not None else None)
                 else:
                     ys_tps.append(None)
@@ -855,26 +860,39 @@ def gen_conclusions(A):
     # 5.6 混合负载：形状间尾延迟差异 + 混跑 vs 均匀吞吐对比
     for quad, qname in (("conc_single", "多发·单轮"), ("conc_multi", "多发·多轮")):
         mix_es = [e for e in A.get(quad, []) if e.get("shapes")]
+
+        def load_lbl(e):
+            if e["level"] > 0:
+                return "并发 {}".format(e["level"])
+            if e.get("request_rate"):
+                return "rate {}/s".format(e["request_rate"])
+            return "开环"
+
         for e in mix_es:
             shs = sorted((s for s in e["shapes"] if s["ttft_s"] > 0), key=lambda s: s["ttft_s"])
             if len(shs) >= 2:
                 lo, hi = shs[0], shs[-1]
-                cs.append("<b>{}（{}·thinking={}，并发 {}）</b>：混跑下 {}（{:,}tk）TTFT 中位 {:.2f}s vs "
+                cs.append("<b>{}（{}·thinking={}，{}）</b>：混跑下 {}（{:,}tk）TTFT 中位 {:.2f}s vs "
                           "{}（{:,}tk）{:.2f}s（{:.1f}×）——短请求被长请求排队拖住，均匀负载测不出该差异；"
                           "容量规划请按混跑口径评估。".format(
-                    esc(short(e["model"])), qname, e["thinking"], e["level"],
+                    esc(short(e["model"])), qname, e["thinking"], load_lbl(e),
                     esc(lo["label"]), lo["prompt_tokens"], lo["ttft_s"],
                     esc(hi["label"]), hi["prompt_tokens"], hi["ttft_s"],
                     hi["ttft_s"] / max(lo["ttft_s"], 1e-9)))
-        uni_by = {(e["model"], e["thinking"], e["level"]): e for e in A.get(quad, [])
+        # 对照项按 (model, thinking, level, request_rate) 匹配：开环轮次 level 全为 0，
+        # 只按 level 匹配会把不同 rate 的均匀轮混在一起（rate_sweep 下只剩最后一条），
+        # 混跑与均匀必须同 rate 才有可比性
+        uni_by = {(e["model"], e["thinking"], e["level"], e["request_rate"]): e
+                  for e in A.get(quad, [])
                   if not e.get("shapes") and e["tps"]}
+
         for e in mix_es:
-            u = uni_by.get((e["model"], e["thinking"], e["level"]))
+            u = uni_by.get((e["model"], e["thinking"], e["level"], e["request_rate"]))
             if u and e["tps"]:
                 ratio = e["tps"] / u["tps"]
-                cs.append("<b>{}（{}·thinking={}，并发 {}）</b>：混跑吞吐 {:.0f} tok/s 为均匀负载（{:,}tk）{:.0f} tok/s 的 "
+                cs.append("<b>{}（{}·thinking={}，{}）</b>：混跑吞吐 {:.0f} tok/s 为均匀负载（{:,}tk）{:.0f} tok/s 的 "
                           "{:.0f}%{}——长短混跑放大排队与抢占开销，容量规划请以混跑数为基准。".format(
-                    esc(short(e["model"])), qname, e["thinking"], e["level"],
+                    esc(short(e["model"])), qname, e["thinking"], load_lbl(e),
                     e["tps"], u["mt"], u["tps"], ratio * 100,
                     "（⚠️ 明显衰减）" if ratio < 0.85 else ""))
     # 6 agent 时延推算

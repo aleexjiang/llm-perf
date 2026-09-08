@@ -15,12 +15,6 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// fileExists 判断路径是否存在（文件或目录）。
-func fileExists(p string) bool {
-	_, err := os.Stat(p)
-	return err == nil
-}
-
 // IntList max_tokens 类字段：YAML 接受标量（max_tokens: 512）或列表（max_tokens: [128, 256, 512]）。
 // 列表 = 输出长度扫描：输出长度是 decode 指标的一级变量（同输入下输出 64→512 可使 TPOT
 // 变化 54–77%），多档对照才能把 prefill/decode 效应分开归因。
@@ -507,8 +501,9 @@ func Load(path string) (*Config, error) {
 		if isRel := !filepath.IsAbs(cfg.Dataset.Path) && cfg.Dataset.Path != ""; isRel {
 			cfg.Dataset.Path = filepath.Join(filepath.Dir(path), cfg.Dataset.Path)
 		}
-		if cfg.FillerCorpus != "" && !filepath.IsAbs(cfg.FillerCorpus) &&
-			fileExists(filepath.Join(filepath.Dir(path), cfg.FillerCorpus)) {
+		// 与 dataset.path 同口径：无条件 join（不判断目标文件是否存在）——
+		// 按存在与否分叉会导致写错路径时报错信息按 cwd 拼接，误导排查
+		if cfg.FillerCorpus != "" && !filepath.IsAbs(cfg.FillerCorpus) {
 			cfg.FillerCorpus = filepath.Join(filepath.Dir(path), cfg.FillerCorpus)
 		}
 	}
@@ -1022,9 +1017,10 @@ func Load(path string) (*Config, error) {
 }
 
 // normalizeMaxTokens 校验并规范化输出长度档位（max_tokens 标量或列表）：
-// 单值 ≤0 视为未配置（交默认值处理，与历史口径一致）；列表含非正值报错；排序去重。
+// 未配置（空）交默认值处理；显式非正值无论标量还是列表一律报错（口径一致）；
+// 排序去重。返回规范化后的档位与是否发生过修正。
 func normalizeMaxTokens(l IntList, where string) (IntList, bool, error) {
-	if len(l) == 0 || (len(l) == 1 && l[0] <= 0) {
+	if len(l) == 0 {
 		return nil, false, nil
 	}
 	for _, v := range l {
