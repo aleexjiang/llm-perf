@@ -36,11 +36,11 @@ func PlanSummary(cfg *config.Config, modelFilter string, items []PlanItem) *repo
 		return nil
 	}
 	p := &report.Plan{
-		Endpoint:    cfg.Endpoint,
-		Auth:        auth.Auth{Scheme: cfg.AuthScheme, Header: cfg.AuthHeader}.Describe(),
-		TimeoutS:    cfg.TimeoutSeconds,
-		NumModels:   len(models),
-		Warmup:      cfg.WarmupRequests,
+		Endpoint:  cfg.Endpoint,
+		Auth:      auth.Auth{Scheme: cfg.AuthScheme, Header: cfg.AuthHeader}.Describe(),
+		TimeoutS:  cfg.TimeoutSeconds,
+		NumModels: len(models),
+		Warmup:    cfg.WarmupRequests,
 	}
 	if cfg.Correctness != nil {
 		p.Correctness = cfg.Correctness.Samples

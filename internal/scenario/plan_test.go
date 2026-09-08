@@ -9,10 +9,10 @@ import (
 // PlanSummary 请求估算与场景循环同构：变体 × 输出档 × (档位×runs | sessions×turns | levels×每档请求)。
 func TestPlanSummary(t *testing.T) {
 	cfg := &config.Config{
-		Endpoint:  "http://x:1/v1",
-		Models:    []string{"m1", "m2"},
+		Endpoint:       "http://x:1/v1",
+		Models:         []string{"m1", "m2"},
 		TimeoutSeconds: 300,
-		Single:    config.Single{Runs: 2, PromptTokens: []int{4000, 10000}, MaxTokens: config.IntList{256}},
+		Single:         config.Single{Runs: 2, PromptTokens: []int{4000, 10000}, MaxTokens: config.IntList{256}},
 		Multiturn: config.Multiturn{Sessions: 2, Turns: 8, SystemTokens: 18000, ToolDefsTokens: 3000,
 			TurnTokens: 10000, MaxTokens: config.IntList{256}},
 		Concurrent: config.Concurrent{RunsPerWorker: 2, MaxTokens: config.IntList{256}}, // Load 后的默认形状
