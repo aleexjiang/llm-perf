@@ -390,8 +390,12 @@ func Single(ctx context.Context, cfg *config.Config, client *engine.Client, mode
 
 	for _, model := range filterModels(cfg.ActiveModels(), modelFilter) {
 		_, mc := forModel(e, cfg, model) // 该模型生效配置（model_overrides 差异覆盖）
-		warmup(ctx, e, model)
 		th := mc.Thinking
+		if len(th.Variants()) == 0 { // thinking 过滤后无匹配变体：整模型跳过（不发 warmup）
+			log.Printf("  %s: 无匹配的思考变体，跳过", model)
+			continue
+		}
+		warmup(ctx, e, model)
 		for _, v := range th.Variants() {
 			maxToks := th.MaxTokensList(mc.Single.MaxTokens, v) // 输出长度扫描维度（列表多档 / 标量单档）
 			if e.trace != nil {
@@ -535,9 +539,13 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 	for _, model := range filterModels(cfg.ActiveModels(), modelFilter) {
 		_, mc := forModel(e, cfg, model) // 该模型生效配置（model_overrides 差异覆盖）
 		mt := mc.Multiturn               // 遮蔽外层通用值（Note 仍描述通用基线；覆盖差异见 thinkingNoteSuffix）
+		th := mc.Thinking
+		if len(th.Variants()) == 0 { // thinking 过滤后无匹配变体：整模型跳过（不发 warmup）
+			log.Printf("  %s: 无匹配的思考变体，跳过", model)
+			continue
+		}
 		warmup(ctx, e, model)
 		e.warnTraceWrap(mt.Sessions)
-		th := mc.Thinking
 		for _, v := range th.Variants() {
 			ctxAborted := false // 触发模型上下文上限：剩余会话必然同样超限，全部跳过
 			for _, maxTok := range th.MaxTokensList(mt.MaxTokens, v) {
@@ -747,8 +755,12 @@ func Concurrent(ctx context.Context, cfg *config.Config, client *engine.Client, 
 		_, mc := forModel(e, cfg, model) // 该模型生效配置（model_overrides 差异覆盖）
 		cc := mc.Concurrent              // 遮蔽外层通用值：模型层可覆盖 levels/开环参数（Note 仍描述通用基线）
 		rates := openRates(cc)
-		warmup(ctx, e, model)
 		th := mc.Thinking
+		if len(th.Variants()) == 0 { // thinking 过滤后无匹配变体：整模型跳过（不发 warmup）
+			log.Printf("  %s: 无匹配的思考变体，跳过", model)
+			continue
+		}
+		warmup(ctx, e, model)
 		for _, v := range th.Variants() {
 			tiers := th.MaxTokensList(cc.MaxTokens, v)
 			if len(cc.Mix) > 0 {

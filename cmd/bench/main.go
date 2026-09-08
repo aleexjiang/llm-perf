@@ -46,7 +46,8 @@ func usage() {
   --turns single|multi|both    单轮 / 多轮会话 / 两者都跑（默认 both）
   --concurrency 1|1,2,4|cfg    并发=1 表示单发（串行）；逗号列表逐档爬坡；
                                cfg 用配置里 concurrent.levels（默认 1）
-  --thinking 变体名             只跑某个思考变体：on/off 或自定义档位名（如 low）
+  --thinking 变体名             只跑某个思考变体：on/off 或自定义档位名（如 low）；按变体名过滤，
+                                模型无该变体则整个模型跳过；both=全部（缺省不过滤）
   --seed-salt N                战役隔离：重跑/换变体必须换盐，否则命中服务端前缀缓存
   -o 路径                       输出 .json 或目录（默认配置 output_dir）
   -m 模型子串                   只测包含该子串的模型
@@ -123,6 +124,49 @@ func modelDirName(model string) string {
 	return name
 }
 
+// applyThinkingCLI 统一处理 --thinking：语义是"按变体名过滤"（合并各模型生效变体后筛选），
+// 优先级 CLI > model_overrides > 全局——不做全局 mode 覆写：那会被 overrides.thinking.mode
+// 反超（2026-09-08 客户现场踩坑：-thinking off 但 Qwen 的 overrides mode=both 仍跑了 on）。
+// both = 不过滤跑全部；on/off/自定义档位名 = SetFilter，模型无该变体则整个模型跳过。
+func applyThinkingCLI(cfg *config.Config, val string) error {
+	if val == "both" {
+		log.Printf("思考变体过滤（CLI）: both=不过滤，跑全部变体")
+		return nil
+	}
+	anyLevels := len(cfg.Thinking.Levels) > 0
+	for _, ov := range cfg.ModelOverrides {
+		if ov != nil && ov.Thinking != nil && len(ov.Thinking.Levels) > 0 {
+			anyLevels = true
+		}
+	}
+	if anyLevels && (val == "on" || val == "off") {
+		return fmt.Errorf("配置已使用 thinking.levels（含 model_overrides 覆盖），--thinking on/off 不适用——请用档位名过滤（如 --thinking low）")
+	}
+	nameSet := map[string]bool{}
+	var names []string
+	addVariantNames := func(t config.Thinking) {
+		for _, n := range t.VariantNames() {
+			key := strings.ToLower(n)
+			if !nameSet[key] {
+				nameSet[key] = true
+				names = append(names, n)
+			}
+		}
+	}
+	addVariantNames(cfg.Thinking)
+	for _, ov := range cfg.ModelOverrides {
+		if ov != nil && ov.Thinking != nil {
+			addVariantNames(*ov.Thinking)
+		}
+	}
+	if !nameSet[strings.ToLower(val)] {
+		return fmt.Errorf("--thinking %s 不匹配任何变体（可用: %s）", val, strings.Join(names, "/"))
+	}
+	cfg.Thinking.SetFilter(val)
+	log.Printf("思考变体过滤（CLI）: 只跑 %s", val)
+	return nil
+}
+
 func main() {
 	if len(os.Args) == 1 {
 		usage() // 裸调用不给参数：展示用法而不是拿默认配置开跑
@@ -149,7 +193,7 @@ func main() {
 	corpusFlag := fs.String("corpus", "", "填充语料：en/zh（内置公版书）或自定义文件路径（.txt/.txt.gz）；覆盖配置 filler_corpus")
 	maxCtxFlag := fs.Int("max-ctx", 0, "上下文截止（tokens）：>0 时所有请求 prompt 不超过该值；覆盖配置 max_prompt_tokens")
 	saltFlag := fs.Int("seed-salt", 0, "种子盐值：隔离测试战役（服务端 prefix cache 未清空时重测用）；覆盖配置 seed_salt")
-	thinkingFlag := fs.String("thinking", "", "只跑某个思考变体：on/off（开思考费 token，建议 off/on 分开两轮跑，互不连坐）；覆盖配置 thinking.mode")
+	thinkingFlag := fs.String("thinking", "", "只跑某个思考变体：on/off（开思考费 token，建议 off/on 分开两轮跑，互不连坐）；按变体名过滤，模型无该变体则跳过；both=全部")
 	noToolCallFlag := fs.Bool("no-toolcall", false, "probe: 关闭 tool-call 健康检查（默认开启，多 4 次请求秒级）")
 	captureFlag := fs.String("probe-capture", "", "probe: tool-call 检查原始响应落盘目录（排障证据/判据 fixture；含业务数据外发前脱敏）")
 	fs.Parse(args)
@@ -167,50 +211,22 @@ func main() {
 	}
 	if *maxCtxFlag > 0 {
 		cfg.MaxPromptTokens = *maxCtxFlag
+		// CLI 显式指定 > model_overrides：同步写进每个模型覆盖，防止 overrides 反超运行时意图
+		for _, ov := range cfg.ModelOverrides {
+			if ov != nil {
+				v := *maxCtxFlag
+				ov.MaxPromptTokens = &v
+			}
+		}
+		log.Printf("上下文截止（CLI 覆盖，含按模型覆盖）: %d", *maxCtxFlag)
 	}
 	if *saltFlag > 0 {
 		cfg.SeedSalt = *saltFlag
 	}
 	if *thinkingFlag != "" {
-		anyLevels := len(cfg.Thinking.Levels) > 0
-		for _, ov := range cfg.ModelOverrides {
-			if ov != nil && ov.Thinking != nil && len(ov.Thinking.Levels) > 0 {
-				anyLevels = true
-			}
-		}
-		switch {
-		case *thinkingFlag == "on" || *thinkingFlag == "off" || *thinkingFlag == "both":
-			if anyLevels {
-				fmt.Fprintln(os.Stderr, "配置已使用 thinking.levels（含 model_overrides 覆盖），--thinking on/off/both 不适用——请用档位名过滤（如 --thinking low）")
-				os.Exit(1)
-			}
-			cfg.Thinking.Mode = *thinkingFlag
-			log.Printf("思考模式（CLI 覆盖）: %s", *thinkingFlag)
-		default:
-			nameSet := map[string]bool{}
-			var names []string
-			addVariantNames := func(t config.Thinking) {
-				for _, n := range t.VariantNames() {
-					key := strings.ToLower(n)
-					if !nameSet[key] {
-						nameSet[key] = true
-						names = append(names, n)
-					}
-				}
-			}
-			addVariantNames(cfg.Thinking)
-			for _, ov := range cfg.ModelOverrides {
-				if ov != nil && ov.Thinking != nil {
-					addVariantNames(*ov.Thinking)
-				}
-			}
-			if !nameSet[strings.ToLower(*thinkingFlag)] {
-				fmt.Fprintf(os.Stderr, "--thinking %s 不匹配任何变体（可用档位: %s；基础配置可用 on/off/both）\n",
-					*thinkingFlag, strings.Join(names, "/"))
-				os.Exit(1)
-			}
-			cfg.Thinking.SetFilter(*thinkingFlag)
-			log.Printf("思考变体过滤（CLI）: 只跑 %s", *thinkingFlag)
+		if err := applyThinkingCLI(cfg, *thinkingFlag); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
 		}
 	}
 

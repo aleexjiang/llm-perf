@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/aleexjiang/llm-perf/internal/config"
 	"github.com/aleexjiang/llm-perf/internal/report"
 )
 
@@ -45,5 +46,52 @@ func TestModelDirName(t *testing.T) {
 		if got := modelDirName(c.in); got != c.want {
 			t.Fatalf("modelDirName(%q) = %q, want %q", c.in, got, c.want)
 		}
+	}
+}
+
+// applyThinkingCLI：-thinking off/on 是合并后的变体名过滤（优先级 CLI > overrides > 全局），
+// 不做全局 mode 覆写——回归 2026-09-08 现场 bug（overrides mode=both 反超 CLI off，on 照跑）
+func TestApplyThinkingCLIFilter(t *testing.T) {
+	newCfg := func() *config.Config {
+		return &config.Config{
+			Thinking: config.Thinking{Mode: "off"},
+			ModelOverrides: map[string]*config.ModelOverride{
+				"/models/Qwen3.8-27B": {Thinking: &config.Thinking{Mode: "both"}},
+			},
+		}
+	}
+	// off：DeepSeek [off]；Qwen 合并后 [off on] 被过滤成 [off]——overrides 不得反超 CLI
+	cfg := newCfg()
+	if err := applyThinkingCLI(cfg, "off"); err != nil {
+		t.Fatal(err)
+	}
+	if vs := cfg.ThinkingFor("/models/DeepSeek").Variants(); len(vs) != 1 || vs[0].Name != "off" {
+		t.Fatalf("DeepSeek 应只剩 off: %+v", vs)
+	}
+	if vs := cfg.ThinkingFor("/models/Qwen3.8-27B").Variants(); len(vs) != 1 || vs[0].Name != "off" {
+		t.Fatalf("Qwen 应被过滤成只剩 off: %+v", vs)
+	}
+	// on：DeepSeek 无 on 变体 → 空（整模型跳过）；Qwen 只剩 on
+	cfg = newCfg()
+	if err := applyThinkingCLI(cfg, "on"); err != nil {
+		t.Fatal(err)
+	}
+	if vs := cfg.ThinkingFor("/models/DeepSeek").Variants(); len(vs) != 0 {
+		t.Fatalf("DeepSeek 无 on 变体应为空: %+v", vs)
+	}
+	if vs := cfg.ThinkingFor("/models/Qwen3.8-27B").Variants(); len(vs) != 1 || vs[0].Name != "on" {
+		t.Fatalf("Qwen 应只剩 on: %+v", vs)
+	}
+	// both：不过滤
+	cfg = newCfg()
+	if err := applyThinkingCLI(cfg, "both"); err != nil {
+		t.Fatal(err)
+	}
+	if vs := cfg.ThinkingFor("/models/Qwen3.8-27B").Variants(); len(vs) != 2 {
+		t.Fatalf("both 应跑全部变体: %+v", vs)
+	}
+	// 未知名报错
+	if err := applyThinkingCLI(newCfg(), "low"); err == nil {
+		t.Fatal("不存在的变体名应报错")
 	}
 }
