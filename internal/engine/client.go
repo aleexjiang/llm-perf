@@ -153,7 +153,7 @@ type TurnMetrics struct {
 	// TPOT 每 output token 时间（GenAI-Perf 口径：(E2E−TTFT)/(completion−1)，含思考 token），
 	// 横评常用；与 ITL（仅 content chunk 间隔）互补
 	TPOTMS       float64 `json:"tpot_ms,omitempty"`
-	TokensPerSec float64 `json:"tokens_per_sec"`
+	TokensPerSec float64 `json:"tokens_per_sec"` // 流式 = completion/(E2E−TTFT)，与 TPOT 同窗（含思考段）；非流式 = completion/E2E
 
 	// SrvDelta 服务端 /metrics counter 增量（前缀缓存命中、preemptions、MTP 接受率）；
 	// server_metrics 开启时由 scenario 层在请求前后抓取差值填入
@@ -289,8 +289,12 @@ func (m *TurnMetrics) Finalize() {
 		m.TPOTMS = (m.E2EMS - m.TTFT) / float64(m.CompletionTokens-1)
 	}
 
-	if m.CompletionTokens > 0 && m.DecodeMS > 0 {
-		m.TokensPerSec = float64(m.CompletionTokens) / (m.DecodeMS / 1000)
+	// 吞吐（per 请求）：分母 = E2E−TTFT（首 token 后的全部生成时段，含思考段），
+	// 与 TPOT 同窗互逆（≈ 1000/TPOT）。不能用 DecodeMS：思考模型的 completion_tokens
+	// 含 reasoning token，而 DecodeMS 只覆盖 content 时段——思考 token 计入分子、
+	// 思考耗时不在分母，tok/s 会被显著虚高。非思考模型 E2E−TTFT == DecodeMS，数值不变。
+	if m.CompletionTokens > 0 && m.TTFT > 0 && m.E2EMS > m.TTFT {
+		m.TokensPerSec = float64(m.CompletionTokens) / ((m.E2EMS - m.TTFT) / 1000)
 	}
 }
 

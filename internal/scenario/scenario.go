@@ -596,8 +596,13 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 						}
 						m := runOne(ctx, e, model, msgs, maxTok, v)
 						if m.PromptTokens > 0 {
+							// tokenizer 对累积 history 重新切分等场景下 prompt 可能不增反减，
+							// 负增量会污染增量 prefill 斜率——钳 0（原始值在 prompt_tokens 可核查）
 							if lastPrompt > 0 {
 								m.NewTokens = m.PromptTokens - lastPrompt
+								if m.NewTokens < 0 {
+									m.NewTokens = 0
+								}
 							} else {
 								m.NewTokens = m.PromptTokens
 							}

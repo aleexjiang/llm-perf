@@ -159,10 +159,10 @@ func TestIngestSSE_MutatedEngine_Warnings(t *testing.T) {
 		t.Errorf("want usage_missing warning, got %v", m.Warnings)
 	}
 	// 垃圾行被跳过且不中断流（后续 content 仍被采集）
-	if m.ContentChars != len("答") {
+	if m.ContentChars != 1 { // "答" 1 字（rune 口径）
 		t.Errorf("ContentChars = %d, want 1", m.ContentChars)
 	}
-	if m.ReasoningChars != len("思考") {
+	if m.ReasoningChars != 2 { // "思考" 2 字
 		t.Errorf("ReasoningChars = %d", m.ReasoningChars)
 	}
 	// 垃圾行留下证据
@@ -214,7 +214,7 @@ func TestApplyWholeBody(t *testing.T) {
 	t.Run("legacy_reasoning_content", func(t *testing.T) {
 		m := &TurnMetrics{}
 		m.applyWholeBody([]byte(`{"choices":[{"message":{"content":"2","reasoning_content":"想了想"},"finish_reason":"stop"}]}`))
-		if m.ReasoningChars != len("想了想") || m.reasoningField != "reasoning_content" {
+		if m.ReasoningChars != 3 || m.reasoningField != "reasoning_content" { // "想了想" 3 字
 			t.Errorf("reasoning: chars=%d field=%q", m.ReasoningChars, m.reasoningField)
 		}
 	})
@@ -287,5 +287,44 @@ func TestTTFTContentOnlyFallback(t *testing.T) {
 	feed(t, m, raw, true)
 	if m.TTFT != m.TTFTContent {
 		t.Errorf("无 reasoning 时 TTFT 应等于 TTFTContent: %v vs %v", m.TTFT, m.TTFTContent)
+	}
+}
+
+// ── DeepSeek review 回归：思考模型 tok/s 分母必须含思考段（与 TPOT 同窗）──
+// 修复前：TokensPerSec = completion_tokens/DecodeMS，而 completion 含 reasoning
+// token、DecodeMS 只覆盖 content 时段——思考 token 计入分子、思考耗时不在分母，
+// DeepSeek-V4-Flash 这类长思考模型 tok/s 被显著虚高。
+
+func TestTokensPerSecThinkingWindow(t *testing.T) {
+	m := &TurnMetrics{Stream: true, Thinking: true}
+	feed(t, m, sseVLLM027, true)
+
+	want := float64(m.CompletionTokens) / ((m.E2EMS - m.TTFT) / 1000)
+	if m.TokensPerSec != want {
+		t.Errorf("TokensPerSec = %v, want %v（completion/(E2E−TTFT) 同窗口径）", m.TokensPerSec, want)
+	}
+	if old := float64(m.CompletionTokens) / (m.DecodeMS / 1000); m.TokensPerSec >= old {
+		t.Errorf("思考流新口径应低于旧口径（新=%v 旧=%v，旧口径虚高）", m.TokensPerSec, old)
+	}
+	// 与 TPOT 同窗互逆：tps×tpot_ms/1000 == n/(n−1)（同一时间窗，差一个 −1）
+	if m.TPOTMS > 0 {
+		want := float64(m.CompletionTokens) / float64(m.CompletionTokens-1)
+		if r := m.TokensPerSec * m.TPOTMS / 1000; r < want*0.999 || r > want*1.001 {
+			t.Errorf("tok/s 与 TPOT 应同窗互逆: r=%v want≈%v", r, want)
+		}
+	}
+}
+
+func TestTokensPerSecNonThinkingUnchanged(t *testing.T) {
+	// 非思考流：TTFT=content 首包 → E2E−TTFT == DecodeMS，数值与旧口径完全一致
+	raw := "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n" +
+		"data: {\"choices\":[{\"delta\":{\"content\":\"你好世界\"},\"finish_reason\":null}]}\n" +
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":8,\"total_tokens\":18}}\n" +
+		"data: [DONE]\n"
+	m := &TurnMetrics{Stream: true}
+	feed(t, m, raw, true)
+	want := float64(m.CompletionTokens) / (m.DecodeMS / 1000)
+	if m.TokensPerSec != want {
+		t.Errorf("非思考流 tok/s 应与旧口径一致: %v vs %v", m.TokensPerSec, want)
 	}
 }

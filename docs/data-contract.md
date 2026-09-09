@@ -58,7 +58,7 @@ Report
 
 以下口径来自全链路审查后的拍板，消费数据前先读：
 
-1. **tokens_per_sec 是双口径字段**：流式 = completion/decode_ms（纯 decode 速率）；非流式 = completion/e2e_ms（含 prefill+排队，天然偏低）。**两者不可横向比较**；非流式行的 ttft/think/itl 缺失即提示口径。
+1. **tokens_per_sec 是双口径字段**：流式 = completion/(E2E−TTFT)——首 token 后的全部生成时段，**含思考段**，与 TPOT 同窗互逆（≈1000/TPOT；2026-09 修正：此前分母是 decode_ms 仅覆盖 content 时段，而 completion 含 reasoning token，思考模型 tok/s 被显著虚高）；非流式 = completion/e2e_ms（含 prefill+排队，天然偏低）。**两者不可横向比较**；非流式行的 ttft/think/itl 缺失即提示口径。
 2. **失败判定唯一依据 `error` 字段**：断流（stream_broken）也写 error（"stream broken: …"）；`stream_broken` 只作补充标记。只看 stream_broken 会漏、只看 err 返回值会漏（attempt 返回 err=nil + 指标里的 Error）。
 3. **吞吐是物理口径**：ThroughputTPS = 全部请求（含失败）的 completion_tokens 之和 ÷ 墙钟。失败请求 0 产出但占墙钟——吞吐低可能是失败拖累而非 decode 慢，解读时先看失败数。Goodput ≤ Throughput 恒成立。
 4. **SLOTotal 含失败请求**：达标率分母 = 全部请求（失败=不达标）。非流式模式下 TPOT 不可测 → 配置 goodput 时非流式全不达标（设计如此，别用非流式测 goodput）。
@@ -69,6 +69,7 @@ Report
 9. **直方图多 label 合并近似**：同 family 多 label（如按模型拆分）的 bucket 会合并计数，多模型共署引擎的直方图分位是粗估。
 10. **TTFT 是"首个含 token chunk"口径**（2026-09 对齐主流）：role-only 空 content 首 chunk（OpenAI 兼容服务标配）不计入 TTFT，取 reasoning/content 首包较早者；原始首 chunk 时刻保留在 `first_chunk_at` 供核查。此版本前的落盘数据是"任意首 chunk"口径，数值略偏小（差 1 个空帧）。
 11. **goodput 只判定已配置的 SLO 子集**（vLLM 语义）：阈值为 0 的维度不参与判定；配置了 TTFT 阈值时要求 TTFT 可测（>0，非流式不白拿达标）。
+12. **content_chars/reasoning_chars 是字符数（rune）**：2026-09 起按字符计（此前是 UTF-8 字节数，中文单字被计为 3）；报告"思考字符"列、日志"N 字"同步。
 
 ## 主流口径对照（2026-09，对齐 GenAI-Perf/AIPerf、vLLM bench serve、LLMPerf、Inference-Perf）
 
@@ -78,7 +79,7 @@ Report
 | TPOT | (E2E−TTFT)/(completion−1)，含思考 token | GenAI-Perf/vLLM/AIPerf/Inference-Perf 同式；LLMPerf 原生含 TTFT（历史差异，AWS 也要打 patch 修掉） | ✅ 一致 |
 | ITL | 相邻 content chunk 间隔，per-request 分位，报告层对请求取中位 | vLLM 池化所有请求 gap 后取分位；GenAI-Perf 为 per-response 值再聚合 | ⚠️ 有意差异：本工具是"单用户体验"视角（median-of-p99），与 vLLM 池化数值不可直接互比 |
 | E2E | 发出 → 流读完（含 [DONE]/usage 尾帧到达） | GenAI-Perf 剔除末尾 [DONE] | ⚠️ 偏差 ≤1 个尾帧（毫秒级），本工具略偏保守，不改 |
-| tokens_per_sec（per 请求） | 流式 = completion/decode_ms（≈1/ITL 量级）；非流式 = completion/e2e | 行业 per-user TPS = output_tokens/e2e_latency（含 prefill） | ⚠️ 流式值系统性高于行业口径（分母少 prefill+排队）；与外部横评时换算：行业值 ≈ completion/e2e_ms×1000 |
+| tokens_per_sec（per 请求） | 流式 = completion/(E2E−TTFT)，含思考段、不含 prefill；非流式 = completion/e2e | 行业 per-user TPS = output_tokens/e2e_latency（含 prefill） | ✅ 口径已贴近（2026-09 修正思考模型虚高问题）；与行业差一段 prefill，横评时行业值 ≈ completion/e2e_ms×1000 |
 | 吞吐 ThroughputTPS | 全部请求 completion 之和 ÷ 墙钟（首请求发射前 → 全部完成；warmup 不计入） | vLLM/LLMPerf 同；GenAI-Perf 用 Ty−Tx（首请求→末响应，略窄）；Inference-Perf 滑窗剔除 warmup/cooldown | ✅ 一致（物理口径，失败请求占墙钟见细则 3） |
 | goodput | 达标请求数/墙钟 + 达标 token/墙钟 | vLLM：满足已配置 SLO 的成功请求/时长（req/s） | ✅ 对齐（子集语义见细则 11）；token 口径是本工具扩展 |
 | cached_tokens | usage.prompt_tokens_details.cached_tokens | OpenAI 口径，vLLM 同名透传 | ✅ 一致 |

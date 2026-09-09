@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // knownDeltaKeys 是流式 delta 的已知字段；出现其他字段说明引擎魔改或协议变体，记录进 warnings。
@@ -191,7 +192,7 @@ func (m *TurnMetrics) ingestEvent(ev *SSEEvent, now time.Time) {
 	}
 	if rt := d.reasoningText(); rt != "" {
 		m.ReasoningChunks++
-		m.ReasoningChars += len(rt)
+		m.ReasoningChars += utf8.RuneCountInString(rt) // 字符数（非字节），与日志" N字"及报告"思考字符"口径一致
 		if len(m.reasoningBuf) < 64*1024 {
 			m.reasoningBuf += rt
 		}
@@ -205,7 +206,7 @@ func (m *TurnMetrics) ingestEvent(ev *SSEEvent, now time.Time) {
 	}
 	if d.Content != "" {
 		m.ContentChunks++
-		m.ContentChars += len(d.Content)
+		m.ContentChars += utf8.RuneCountInString(d.Content)
 		if len(m.ReplyText) < 64*1024 {
 			m.ReplyText += d.Content
 		}
@@ -337,11 +338,11 @@ func (m *TurnMetrics) applyWholeBody(data []byte) {
 	}
 	if msg := out.Choices[0].Message; msg != nil {
 		if msg.Content != "" {
-			m.ContentChars = len(msg.Content)
+			m.ContentChars = utf8.RuneCountInString(msg.Content)
 			m.ReplyText = msg.Content
 		}
 		if rt := msg.reasoningText(); rt != "" {
-			m.ReasoningChars = len(rt)
+			m.ReasoningChars = utf8.RuneCountInString(rt)
 			m.reasoningBuf = rt
 			m.reasoningField = msg.reasoningFieldName()
 		}

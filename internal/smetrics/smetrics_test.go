@@ -233,3 +233,17 @@ func TestDiffCountersClampsNegative(t *testing.T) {
 		t.Fatalf("钳 0 后命中率应为 0, got %v", d.CacheHitRate())
 	}
 }
+
+// ── DeepSeek review 回归：/metrics 超限截断必须显式报错，不能静默丢指标 ──
+
+func TestScrapeTruncatedBodyRejected(t *testing.T) {
+	big := strings.Repeat("vllm:x_total 1\n", (16<<20)/15+2) // > 16MB
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(big))
+	}))
+	defer srv.Close()
+	sc := &Scraper{URL: srv.URL, Client: srv.Client()}
+	if _, err := sc.Scrape(context.Background()); err == nil || !strings.Contains(err.Error(), "截断") {
+		t.Fatalf("超限响应应报截断错误, got %v", err)
+	}
+}

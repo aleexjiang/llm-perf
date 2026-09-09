@@ -121,9 +121,13 @@ func (s *Scraper) scrapeOnce(ctx context.Context) (*Sample, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 16*1024*1024))
+	const maxBody = 16 << 20 // 16MB：超长响应截断会产生不完整半行，静默丢指标比失败更糟
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
 	if err != nil {
 		return nil, err
+	}
+	if len(body) > maxBody {
+		return nil, fmt.Errorf("metrics 响应超过 16MB 上限被截断（多 label 大集群请精简暴露指标）")
 	}
 	return Parse(string(body)), nil
 }
