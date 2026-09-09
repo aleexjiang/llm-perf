@@ -27,7 +27,9 @@ import sys
 from collections import OrderedDict, defaultdict
 
 SCENARIOS = ("single", "multiturn", "concurrent")
-PALETTE = ["#1652f0", "#0e9f6e", "#f0b429", "#e5484d", "#7c5cff", "#0ca678"]
+# 每模型占 2 色位（off/on 分色，见 color_of）——10 色支持 5 模型不撞色
+PALETTE = ["#1652f0", "#0e9f6e", "#f0b429", "#e5484d", "#7c5cff", "#0ca678",
+           "#d6409f", "#f97316", "#0891b2", "#65a30d"]
 
 GRID_JS = "const grid={ticks:{color:'#999'},grid:{color:'#f0f0f5'}};"
 
@@ -217,15 +219,18 @@ def filter_scenarios(data, sel):
     return out
 
 
-# 配置原文里的密钥形态：api_key: "sk-…" / Authorization: Bearer xxx / *token: xxx
+# 配置原文里的密钥形态：行级脱敏——匹配敏感键的整行值。
+# 不做值内匹配的原因：`authorization: Bearer sk-xxx` 的值是两个词（值级正则只会吃掉
+# "Bearer" 把 key 留下）、引号/冒号变体各异、auth_header 等自定义键名各有形态——
+# 行级 `键: 整行值` 一律 REDACT 才不漏。
 _SECRET_RE = re.compile(
-    r'(?i)\b(api_key|api[-_]?token|authorization|token|password)\b(\s*[:=]\s*)(["\']?)'
-    r'(?:sk-[\w-]+|[^\s"\']+)\3')
+    r'(?im)^(\s*-?\s*(?:api[_-]?key|api[_-]?token|authorization|auth[_-]?header|'
+    r'access[_-]?token|secret|password|token)\s*[:=]\s*).+$')
 
 
 def redact_secrets(text):
     """config_raw 原文可能内嵌客户 key，而报告是要外发的——落 HTML 前必须脱敏。"""
-    return _SECRET_RE.sub(r'\1\2\3***REDACTED***\3', text)
+    return _SECRET_RE.sub(r'\1***REDACTED***', text)
 
 
 def load_inputs(argv):
@@ -496,23 +501,26 @@ def analyze(data, meta):
             ladder = []  # 全部（输出档 × 输入档）组合，表格用
             for mt in mts:
                 for size in sorted(s_by[(m, th, mt)]):
-                    rs = s_by[(m, th, mt)][size]["runs"]
+                    rs_all = s_by[(m, th, mt)][size]["runs"]
+                    # 失败 run（如 HTTP 504）剔除后再统计——与并发侧口径一致，防 ttft=0 拉低中位数
+                    rs = [r for r in rs_all if not r.get("error")] or rs_all
                     ladder.append({
                         "size": size,
                         "mt": mt,
-                        "ttft": mmm([r.get("ttft_ms", 0) / 1000 for r in rs], 2),
-                        "ttft_content": mmm([r.get("ttft_content_ms", 0) / 1000 for r in rs], 2),
-                        "ttft_rea": mmm([r.get("ttft_reasoning_ms", 0) / 1000 for r in rs], 2),
+                        "fails": len(rs_all) - len([r for r in rs_all if not r.get("error")]),
+                        "ttft": mmm([r["ttft_ms"] / 1000 for r in rs if r.get("ttft_ms") is not None], 2),
+                        "ttft_content": mmm([r["ttft_content_ms"] / 1000 for r in rs if r.get("ttft_content_ms") is not None], 2),
+                        "ttft_rea": mmm([r["ttft_reasoning_ms"] / 1000 for r in rs if r.get("ttft_reasoning_ms") is not None], 2),
                         "think": mmm([(r.get("think_ms") or 0) / 1000 for r in rs], 1),
-                        "e2e": mmm([r.get("e2e_ms", 0) / 1000 for r in rs], 1),
-                        "decode": mmm([r.get("decode_ms", 0) / 1000 for r in rs], 1),
+                        "e2e": mmm([r["e2e_ms"] / 1000 for r in rs if r.get("e2e_ms") is not None], 1),
+                        "decode": mmm([r["decode_ms"] / 1000 for r in rs if r.get("decode_ms") is not None], 1),
                         "itl_p50": mmm([r.get("itl_p50_ms") for r in rs], 1),
                         "itl_p99": mmm([r.get("itl_p99_ms") for r in rs], 1),
                         "tokps": mmm([r.get("tokens_per_sec") for r in rs], 0),
                         "comp": mmm([r.get("completion_tokens") for r in rs], 0),
                         "rc": mmm([r.get("reasoning_chars", 0) for r in rs], 0),
                         "finish": sorted({r.get("finish_reason", "?") for r in rs}),
-                        "n": len(rs),
+                        "n": len(rs_all),
                     })
             P.setdefault(th, {})["ladder"] = ladder
             P[th]["mt_list"] = mts
@@ -523,27 +531,31 @@ def analyze(data, meta):
                 [(l["size"], l["ttft"][0]) for l in P[th]["ladder_top"] if l["ttft"]]) if len(P[th]["ladder_top"]) >= 2 else None
             P[th]["tokps"] = mmm([l["tokps"][0] for l in P[th]["ladder_top"] if l["tokps"]], 0)
             P[th]["finish_length"] = sum(1 for l in ladder if "length" in l["finish"])
-            P[th]["e2e_all"] = [r.get("e2e_ms", 0) / 1000 for mt in mts
+            P[th]["e2e_all"] = [r["e2e_ms"] / 1000 for mt in mts
                                 for size in sorted(s_by[(m, th, mt)])
-                                for r in s_by[(m, th, mt)][size]["runs"]]
+                                for r in s_by[(m, th, mt)][size]["runs"]
+                                if not r.get("error") and r.get("e2e_ms") is not None]
             P[th]["think_all"] = [(r.get("think_ms") or 0) / 1000 for mt in mts
                                   for size in sorted(s_by[(m, th, mt)])
-                                  for r in s_by[(m, th, mt)][size]["runs"]]
+                                  for r in s_by[(m, th, mt)][size]["runs"]
+                                  if not r.get("error")]
             P[th]["rc_all"] = [r.get("reasoning_chars", 0) for mt in mts
                                for size in sorted(s_by[(m, th, mt)])
-                               for r in s_by[(m, th, mt)][size]["runs"]]
+                               for r in s_by[(m, th, mt)][size]["runs"]
+                               if not r.get("error")]
             P[th]["no_content_runs"] = [r for mt in mts
                                         for size in sorted(s_by[(m, th, mt)])
                                         for r in s_by[(m, th, mt)][size]["runs"]
-                                        if r.get("content_chunks") == 0 or r.get("thinking_no_content")]
+                                        if not r.get("error") and
+                                        (r.get("content_chunks") == 0 or r.get("thinking_no_content"))]
             # run1 vs run2+ TTFT（缓存冷/热形态）
             firsts, rests = [], []
             for mt in mts:
                 for size in sorted(s_by[(m, th, mt)]):
-                    rs = s_by[(m, th, mt)][size]["runs"]
+                    rs = [r for r in s_by[(m, th, mt)][size]["runs"] if not r.get("error")]
                     if rs:
-                        firsts.append(rs[0].get("ttft_ms", 0))
-                        rests.extend(r.get("ttft_ms", 0) for r in rs[1:])
+                        firsts.append(rs[0].get("ttft_ms") or 0)
+                        rests.extend(r.get("ttft_ms") or 0 for r in rs[1:])
             if firsts and rests:
                 P[th]["cold_warm_ratio"] = (st.median(firsts) / max(st.median(rests), 1e-9))
         # 多轮（max_tokens 可为多档输出长度扫描，按输出档分组聚合）
@@ -557,17 +569,19 @@ def analyze(data, meta):
                 nturn = max(len(s["turns"]) for s in sess)
                 turns = []
                 for i in range(nturn):
-                    ts = [s["turns"][i] for s in sess if i < len(s["turns"])]
+                    ts_all = [s["turns"][i] for s in sess if i < len(s["turns"])]
+                    # 失败轮剔除后再统计（与并发/单发口径一致）
+                    ts = [t for t in ts_all if not t.get("error")] or ts_all
                     turns.append({
                         "i": i + 1,
                         "prompt": (min(t.get("prompt_tokens", 0) for t in ts),
                                    max(t.get("prompt_tokens", 0) for t in ts)),
                         "new": st.median([t.get("new_tokens", 0) for t in ts]),
-                        "ttft": mmm([t.get("ttft_ms", 0) / 1000 for t in ts], 2),
+                        "ttft": mmm([t["ttft_ms"] / 1000 for t in ts if t.get("ttft_ms") is not None], 2),
                         "think": mmm([(t.get("think_ms") or 0) / 1000 for t in ts], 1),
-                        "e2e": mmm([t.get("e2e_ms", 0) / 1000 for t in ts], 1),
-                        "sess_ttft": [t.get("ttft_ms", 0) / 1000 for t in ts],
-                        "sess_e2e": [t.get("e2e_ms", 0) / 1000 for t in ts],
+                        "e2e": mmm([t["e2e_ms"] / 1000 for t in ts if t.get("e2e_ms") is not None], 1),
+                        "sess_ttft": [t.get("ttft_ms") or 0 for t in ts],
+                        "sess_e2e": [t.get("e2e_ms") or 0 for t in ts],
                     })
                 turns_by_mt[mt] = turns
             P.setdefault(th, {})["turns_by_mt"] = turns_by_mt
@@ -639,7 +653,8 @@ def analyze(data, meta):
                     for size in sorted(s_by[(m, th, mt)]):
                         if bucket_of(size) != bkt:
                             continue
-                        rs = s_by[(m, th, mt)][size]["runs"]
+                        # 显式剔除失败 run（n=成功数；不依赖 mk_unit 内 if v 的隐式滤 0）
+                        rs = [r for r in s_by[(m, th, mt)][size]["runs"] if not r.get("error")]
                         if rs:
                             groups.append((mt, size, rs))
                 if not groups:
@@ -651,9 +666,9 @@ def analyze(data, meta):
                     "单发·单轮", m, th, bkt, prompt_lbl([size for _, size, _ in groups]),
                     ttfts, [r.get("itl_p99_ms") for r in top_rs],
                     [r.get("tokens_per_sec") for r in top_rs], len(ttfts)))
-            # 单发·多轮：逐轮按该轮 prompt 归档（会话越深输入越大）
+            # 单发·多轮：逐轮按该轮 prompt 归档（会话越深输入越大）；失败轮显式剔除
             top_mt = mts[-1]
-            turns = [t for sess in m_by[(m, th, top_mt)] for t in sess["turns"]]
+            turns = [t for sess in m_by[(m, th, top_mt)] for t in sess["turns"] if not t.get("error")]
             for bkt in ("short", "mid", "long"):
                 ts = [t for t in turns if bucket_of(t.get("prompt_tokens", 0)) == bkt]
                 if not ts:
@@ -678,6 +693,7 @@ def analyze(data, meta):
             continue
         turns = ([t for sess in lv.get("sessions", []) for t in sess.get("turns", [])] if is_mt
                  else lv.get("requests", []))
+        turns = [t for t in turns if not t.get("error")]  # 失败请求显式剔除（n=成功数）
         scene = "并发·{} {}".format(kind, load)
         for bkt in ("short", "mid", "long"):
             ts = [t for t in turns if bucket_of(t.get("prompt_tokens", 0)) == bkt]
@@ -875,7 +891,10 @@ def single_table(A, th):
             continue
         for l in P[th]["ladder"]:
             has_itl = l["itl_p50"] is not None
-            row = [esc(short(m)), str(l["mt"]), "{:,}".format(l["size"]), str(l["n"]),
+            fail_cell = str(l.get("fails") or 0)
+            if l.get("fails"):
+                fail_cell = '<span style="color:#e5484d;font-weight:600">{}</span>'.format(l["fails"])
+            row = [esc(short(m)), str(l["mt"]), "{:,}".format(l["size"]), str(l["n"]), fail_cell,
                    f3(l["ttft"]), f3(l["ttft_content"])]
             if th == "on":
                 # 思考占比 = 思考总时长 / E2E（思考与正文输出交错，占比为口径近似）
@@ -888,7 +907,7 @@ def single_table(A, th):
                     f0(l["rc"]) if th == "on" else "—",
                     " / ".join(l["finish"])]
             rows.append(row)
-    head = ["模型", "输出 tk", "档位 tk", "runs", "TTFT s", "首内容 s"] + \
+    head = ["模型", "输出 tk", "档位 tk", "runs", "失败", "TTFT s", "首内容 s"] + \
            (["思考 s", "思考占比"] if th == "on" else []) + \
            ["E2E s", "decode s", "ITL p50 ms", "ITL p99 ms", "tok/s", "输出 tok"] + \
            (["思考字符"] if th == "on" else []) + ["finish"]

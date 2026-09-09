@@ -54,6 +54,20 @@ Report
 
 口径提醒：TPOT = (E2E−TTFT)/(completion−1) **含思考 token**（GenAI-Perf 横评口径）；ITL 只算 content chunk 间隔；`new_tokens` 是本轮相对上一轮新增 prompt tokens，配合 TTFT 得增量 prefill 速率。
 
+## 指标口径细则（对抗式审查沉淀，2026-09）
+
+以下口径来自全链路审查后的拍板，消费数据前先读：
+
+1. **tokens_per_sec 是双口径字段**：流式 = completion/decode_ms（纯 decode 速率）；非流式 = completion/e2e_ms（含 prefill+排队，天然偏低）。**两者不可横向比较**；非流式行的 ttft/think/itl 缺失即提示口径。
+2. **失败判定唯一依据 `error` 字段**：断流（stream_broken）也写 error（"stream broken: …"）；`stream_broken` 只作补充标记。只看 stream_broken 会漏、只看 err 返回值会漏（attempt 返回 err=nil + 指标里的 Error）。
+3. **吞吐是物理口径**：ThroughputTPS = 全部请求（含失败）的 completion_tokens 之和 ÷ 墙钟。失败请求 0 产出但占墙钟——吞吐低可能是失败拖累而非 decode 慢，解读时先看失败数。Goodput ≤ Throughput 恒成立。
+4. **SLOTotal 含失败请求**：达标率分母 = 全部请求（失败=不达标）。非流式模式下 TPOT 不可测 → 配置 goodput 时非流式全不达标（设计如此，别用非流式测 goodput）。
+5. **分位两种口径并存**：ITL 分位（Go 侧）是最近秩 floor 取值；报告侧 TTFT/E2E 分位是线性插值（numpy 默认）。同一报告内两者都叫 p99 但数值口径不同，交叉核对时留意。
+6. **think_ms 保证 ≥ 0**：reasoning 首包晚于 content 首包（引擎时序异常）时钳 0 并记 `think_ms_negative` 告警，原始时序在 first_*_at 时间戳可核查。
+7. **usage 缺失的连锁**：服务端不回 usage 时 prompt/completion=0 + `usage_missing` 告警 → tokens_per_sec=0、TPOT 缺失、new_tokens 不更新（下轮会显示完整 prompt 而非增量）。有 usage_missing 告警的行，token 类指标全部不可信。
+8. **服务端 counter 差分保证 ≥ 0**：负增量（服务端重启归零）钳 0——该窗口的命中率等指标可信度下降，应结合 preemptions/重启时间解读。NaN/±Inf 指标行在解析层直接丢弃（防 JSON 序列化失败）。
+9. **直方图多 label 合并近似**：同 family 多 label（如按模型拆分）的 bucket 会合并计数，多模型共署引擎的直方图分位是粗估。
+
 ## 报告侧聚合口径（gen_html_report.py）
 
 | 口径 | 规则 | 位置 |

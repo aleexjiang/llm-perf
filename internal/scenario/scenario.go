@@ -879,7 +879,13 @@ func aggregateShapes(mp *mixPlan, reqs []*engine.TurnMetrics, idxs []int) []repo
 		med := func(get func(*engine.TurnMetrics) float64) float64 {
 			vals := make([]float64, 0, len(ms))
 			for _, m := range ms {
+				if m.Error != "" {
+					continue // 失败请求的 0/残值不进中位（与报告侧失败剔除口径一致）
+				}
 				vals = append(vals, get(m))
+			}
+			if len(vals) == 0 {
+				return 0 // 全失败形状：中位无意义，Count 仍反映请求总数
 			}
 			sort.Float64s(vals)
 			// 偶数样本取两中值平均（与报告侧 Python st.median 口径一致，

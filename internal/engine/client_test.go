@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -164,3 +165,74 @@ func TestPreviewHeadTail(t *testing.T) {
 		t.Fatalf("应含省略提示: %q", got)
 	}
 }
+
+// ── 断流必须进 Error：scenario 全链路只认 Error 区分成败，只标 StreamBroken 会让
+// 半截响应（部分 TTFT/usage）混进成功统计与 goodput ──
+
+type errMidStream struct{ n int }
+
+func (e *errMidStream) Read(p []byte) (int, error) {
+	if e.n == 0 {
+		e.n++
+		s := "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"
+		copy(p, s)
+		return len(s), nil
+	}
+	return 0, fmt.Errorf("connection reset by peer")
+}
+
+type brokenBodyRT struct{}
+
+func (brokenBodyRT) RoundTrip(*http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: 200,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(&errMidStream{}),
+	}, nil
+}
+
+func TestStreamBrokenSetsError(t *testing.T) {
+	c := NewClient("http://stub", "", 5*time.Second, false)
+	c.HTTP = &http.Client{Transport: brokenBodyRT{}}
+
+	m, err := c.Chat(context.Background(), retryOpts(true))
+	if err != nil {
+		t.Fatalf("无重试策略时断流应返回 (m, nil): %v", err)
+	}
+	if !m.StreamBroken {
+		t.Fatal("应标记 StreamBroken")
+	}
+	if m.Error == "" {
+		t.Fatal("断流必须写 Error——否则 scenario 层会把半截响应当成功数据统计")
+	}
+	if m.TTFT <= 0 {
+		t.Fatalf("断流前已收到 chunk，TTFT 应部分可用: %v", m.TTFT)
+	}
+}
+
+// ── ThinkMS 负值钳 0：reasoning 块晚于 content 首包（魔改引擎时序异常）不污染中位数 ──
+
+func TestThinkMSNegativeClamped(t *testing.T) {
+	base := time.Unix(1700000000, 0)
+	m := &TurnMetrics{
+		Stream:           true,
+		SentAt:           base,
+		FirstChunkAt:     ptrTime(base.Add(100 * time.Millisecond)),
+		FirstContentAt:   ptrTime(base.Add(200 * time.Millisecond)),
+		FirstReasoningAt: ptrTime(base.Add(300 * time.Millisecond)), // 异常：reasoning 晚于 content
+		EndAt:            base.Add(1000 * time.Millisecond),
+		CompletionTokens: 10,
+	}
+	m.Finalize()
+	if m.ThinkMS != 0 {
+		t.Fatalf("负 ThinkMS 应钳 0, got %v", m.ThinkMS)
+	}
+	if !hasWarningPrefix(m.Warnings, "think_ms_negative") {
+		t.Fatalf("应有 think_ms_negative 告警: %v", m.Warnings)
+	}
+	if m.DecodeMS <= 0 || m.E2EMS <= 0 {
+		t.Fatalf("正常指标不应受影响: decode=%v e2e=%v", m.DecodeMS, m.E2EMS)
+	}
+}
+
+func ptrTime(t time.Time) *time.Time { return &t }

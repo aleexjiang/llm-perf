@@ -370,3 +370,35 @@ func TestCtxLimitHit(t *testing.T) {
 		}
 	}
 }
+
+// ── 对抗式审查回归：形状中位剔除失败请求（与报告侧口径一致） ──
+
+func TestAggregateShapesExcludesFailed(t *testing.T) {
+	mp := &mixPlan{
+		shapes:  []config.MixShape{{Weight: 2, Label: "a", PromptTokens: 1000, MaxTokens: 32}},
+		maxToks: []int{32},
+		seq:     []int{0, 0},
+	}
+	reqs := []*engine.TurnMetrics{
+		{TTFT: 1000, E2EMS: 2000, TokensPerSec: 50, CompletionTokens: 100},
+		{TTFT: 0, E2EMS: 500, TokensPerSec: 0, CompletionTokens: 0, Error: "HTTP 504: gateway timeout"},
+	}
+	out := aggregateShapes(mp, reqs, []int{0, 0})
+	if len(out) != 1 {
+		t.Fatalf("应聚出 1 个形状, got %d", len(out))
+	}
+	sh := out[0]
+	if sh.Count != 2 {
+		t.Fatalf("Count 应反映请求总数 2, got %d", sh.Count)
+	}
+	if sh.TTFTS != 1.0 || sh.E2ES != 2.0 || sh.TokPS != 50 {
+		t.Fatalf("中位应只用成功请求: ttft=%v e2e=%v tokps=%v", sh.TTFTS, sh.E2ES, sh.TokPS)
+	}
+	// 全失败形状：中位为 0（无意义），Count 仍如实
+	allFailed := aggregateShapes(mp, []*engine.TurnMetrics{
+		{Error: "x"}, {Error: "y"},
+	}, []int{0, 0})
+	if allFailed[0].Count != 2 || allFailed[0].TTFTS != 0 {
+		t.Fatalf("全失败形状应 Count=2 且中位 0: %+v", allFailed[0])
+	}
+}

@@ -199,3 +199,37 @@ func TestScraperApplyAuth(t *testing.T) {
 		t.Fatal("无 key 不应带认证头")
 	}
 }
+
+// ── 对抗式审查回归：NaN/Inf 丢弃 + counter 负增量钳 0 ──
+
+func TestParseSkipsNonFinite(t *testing.T) {
+	s := Parse("vllm:good_total 5\n" +
+		"vllm:nan_total NaN\n" +
+		"vllm:pinf_total +Inf\n" +
+		"vllm:ninf_total -Inf\n")
+	if _, ok := s.Counters["vllm:nan"]; ok {
+		t.Fatal("NaN 指标应被丢弃（json 序列化会失败）")
+	}
+	if _, ok := s.Counters["vllm:pinf"]; ok {
+		t.Fatal("+Inf 指标应被丢弃")
+	}
+	if _, ok := s.Counters["vllm:ninf"]; ok {
+		t.Fatal("-Inf 指标应被丢弃")
+	}
+	if s.Counters["vllm:good"] != 5 {
+		t.Fatalf("正常指标不受影响: %v", s.Counters["vllm:good"])
+	}
+}
+
+func TestDiffCountersClampsNegative(t *testing.T) {
+	before := Parse("vllm:prefix_cache_hits_total 100\nvllm:prefix_cache_queries_total 200\n")
+	// after < before：服务端重启 counter 归零
+	after := Parse("vllm:prefix_cache_hits_total 3\nvllm:prefix_cache_queries_total 4\n")
+	d := DiffCounters(before, after, VLLM())
+	if d.PrefixCacheHitTokens != 0 || d.PrefixCacheQueryTokens != 0 {
+		t.Fatalf("负增量应钳 0, got hits=%v queries=%v", d.PrefixCacheHitTokens, d.PrefixCacheQueryTokens)
+	}
+	if d.CacheHitRate() != 0 {
+		t.Fatalf("钳 0 后命中率应为 0, got %v", d.CacheHitRate())
+	}
+}

@@ -142,7 +142,9 @@ func Parse(text string) *Sample {
 		}
 		name, labels, rest := splitMetricLine(line)
 		val, err := strconv.ParseFloat(rest, 64)
-		if err != nil || name == "" {
+		// NaN/±Inf（坏 exporter/采样窗口）会随 counter 差分扩散，最终让整份报告 JSON
+		// 序列化失败（Go json 拒绝 NaN）——解析层直接丢弃
+		if err != nil || name == "" || math.IsNaN(val) || math.IsInf(val, 0) {
 			continue
 		}
 		switch {
@@ -399,7 +401,13 @@ func DiffCounters(before, after *Sample, p MetricsProvider) *CounterDelta {
 		"spec_drafts":          &d.SpecDrafts,
 		"spec_accepted":        &d.SpecAcceptedTokens,
 	} {
-		*dst = get(after, key) - get(before, key)
+		delta := get(after, key) - get(before, key)
+		if delta < 0 {
+			// counter 单调递增；负增量只会来自服务端重启归零/进程替换——钳 0，
+			// 防止负命中率/负 preemptions 出现在报告里（该窗口的其他指标同样不可信）
+			delta = 0
+		}
+		*dst = delta
 	}
 	return d
 }

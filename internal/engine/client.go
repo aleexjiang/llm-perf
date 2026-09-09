@@ -241,6 +241,13 @@ func (m *TurnMetrics) Finalize() {
 		m.TTFTContent = ms(m.SentAt, *m.FirstContentAt)
 		if m.FirstReasoningAt != nil {
 			m.ThinkMS = ms(*m.FirstReasoningAt, *m.FirstContentAt)
+			if m.ThinkMS < 0 {
+				// reasoning 块出现在 content 之后（魔改引擎时序异常）——负值会污染下游
+				// 中位数统计，钳 0 并告警；原始时序证据保留在 first_*_at 时间戳里
+				neg := m.ThinkMS
+				m.ThinkMS = 0
+				m.warn("think_ms_negative: reasoning 首包晚于 content 首包 %.0fms，已钳 0", -neg)
+			}
 		}
 		m.DecodeMS = ms(*m.FirstContentAt, m.EndAt)
 	} else if m.FirstChunkAt != nil {
@@ -423,6 +430,9 @@ func (c *Client) attempt(ctx context.Context, o ChatOptions) (m *TurnMetrics, er
 func (c *Client) readStream(resp *http.Response, m *TurnMetrics) {
 	if err := ingestSSEBody(m, resp.Body, time.Now, c.IncludeUsage); err != nil {
 		m.StreamBroken = true // 读取中断：连接层瞬时失败，可重试
+		// 断流必须同时进 Error：scenario 层全链路只认 Error 区分成败——只标 StreamBroken
+		// 会让半截响应（部分 TTFT/usage）以 Error=="" 混进成功统计与 goodput
+		m.Error = fmt.Sprintf("stream broken: %v", err)
 		return
 	}
 	m.closeOutWarnings(c.IncludeUsage)
