@@ -1497,7 +1497,6 @@ def main():
         cov.append("并发·单轮（独立单轮请求）")
     if A["coverage"]["has_conc_multi"]:
         cov.append("并发·多轮（每用户独立多轮会话）")
-    notes_html = "".join("<p><b>{}</b>：{}</p>".format(esc(f), esc(n)) for f, n in meta["notes"][-4:])
     sec2_body = table_kv([("端点", meta["endpoint"]), ("工具版本", meta["tool"]),
                           ("场景覆盖", "；".join(cov)),
                           ("请求总数", str(n_req))])
@@ -1513,9 +1512,7 @@ def main():
         sec2_body += "<h3>引擎环境（压测时自动探测）</h3>" + table(["项目", "值"], env_rows)
     else:
         sec2_body += '<div class="note">本份数据未包含引擎环境存档（旧版本工具产出）。</div>'
-    sec.append(("<h2>2 · 测试配置与方法</h2>",
-                sec2_body +
-                (('<div class="note">' + notes_html + "</div>") if notes_html else "")))
+    sec.append(("<h2>2 · 测试配置与方法</h2>", sec2_body))
     sec.append(("<h2>3 · 指标口径</h2>", table(
         ["指标", "定义"],
         [["TTFT", "请求发出 → 首个流式 chunk（空首包不计）；本报告单位秒"],
