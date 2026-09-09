@@ -302,27 +302,27 @@ func main() {
 		}
 		th := cfg.ThinkingFor(model) // probe 也按模型解析思考配置（model_overrides.thinking 覆盖生效）
 		res := engine.Probe(ctx, engine.ProbeOptions{
-			Endpoint:       cfg.Endpoint,
-			APIKey:         cfg.APIKey,
-			Auth:           auth.Auth{Scheme: cfg.AuthScheme, Header: cfg.AuthHeader},
-			ChatPath:       cfg.ChatPath,
-			MetricsPath:    cfg.MetricsPath,
-			ModelsPath:     cfg.ModelsPath,
-			Model:          model,
-			ThinkingOn:     th.ExtraBodyOn,
-			ThinkingOff:    th.ExtraBodyOff,
-			IncludeUsage:   *cfg.IncludeUsage,
-			MaxContext:     cfg.LargestPromptTokens(),
-			Timeout:        cfg.Timeout(),
-			ToolCall:       !*noToolCallFlag,
-			CaptureDir:     *captureFlag,
-		XVPromptTokens: cfg.Concurrent.PromptTokens,
-		XVMaxTokens:    cfg.Concurrent.MaxTokens.Max(), // probe 上下文探测按最大输出预算（prompt+output 最坏组合）
-		ThinkingBudget: th.MaxTokensFloor,
-		CacheCheck:     *cacheFlag,
-		CacheSizeTokens: *cacheSizeFlag,
-		FillerLang:     cfg.FillerLang,
-	})
+			Endpoint:        cfg.Endpoint,
+			APIKey:          cfg.APIKey,
+			Auth:            auth.Auth{Scheme: cfg.AuthScheme, Header: cfg.AuthHeader},
+			ChatPath:        cfg.ChatPath,
+			MetricsPath:     cfg.MetricsPath,
+			ModelsPath:      cfg.ModelsPath,
+			Model:           model,
+			ThinkingOn:      th.ExtraBodyOn,
+			ThinkingOff:     th.ExtraBodyOff,
+			IncludeUsage:    *cfg.IncludeUsage,
+			MaxContext:      cfg.LargestPromptTokens(),
+			Timeout:         cfg.Timeout(),
+			ToolCall:        !*noToolCallFlag,
+			CaptureDir:      *captureFlag,
+			XVPromptTokens:  cfg.Concurrent.PromptTokens,
+			XVMaxTokens:     cfg.Concurrent.MaxTokens.Max(), // probe 上下文探测按最大输出预算（prompt+output 最坏组合）
+			ThinkingBudget:  th.MaxTokensFloor,
+			CacheCheck:      *cacheFlag,
+			CacheSizeTokens: *cacheSizeFlag,
+			FillerLang:      cfg.FillerLang,
+		})
 		outPath := resolveOutPath(*outFlag, cfg.OutputDir, "probe")
 		if !strings.HasSuffix(*outFlag, ".json") {
 			// 按模型分区落盘：probe 结果归到模型子目录（显式 -o xxx.json 尊重用户路径）
