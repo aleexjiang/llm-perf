@@ -13,3 +13,7 @@ bench-windows-*.exe
 bench-darwin-*
 
 /bench
+
+# 前缀缓存探针临时产物（能力已并入 bench probe --cache，不入库）
+/testdata/
+cache-probe-testdata.zip

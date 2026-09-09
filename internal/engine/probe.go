@@ -51,6 +51,9 @@ type ProbeResult struct {
 	// ThinkingLevel 探测到的思考等级控制参数（空 = 未探测到可控参数）
 	ThinkingLevelParam string `json:"thinking_level_param,omitempty"`
 	ThinkingLevelNote  string `json:"thinking_level_note,omitempty"`
+
+	// CacheProbe 前缀缓存定性探针结果（probe --cache 开启时非空）
+	CacheProbe *CacheProbeResult `json:"cache_probe,omitempty"`
 }
 
 // ProbeOptions 探测参数。
@@ -87,6 +90,15 @@ type ProbeOptions struct {
 	// 探测 prompt 极短，但思考长的模型（如 Qwen3 对填充文本思考 1500+ token）
 	// 在 512 预算下会吃光预算导致误报"开关未生效"
 	ThinkingBudget int
+
+	// CacheCheck 前缀缓存定性探针（--cache 开启，默认关闭：默认 4 次长上下文请求，成本不低）
+	CacheCheck bool
+
+	// CacheSizeTokens 缓存探针的上下文大小（tokens），默认 40000（agent 真实档位）
+	CacheSizeTokens int
+
+	// FillerLang 缓存探针的填充语料语言（继承配置 filler_lang）
+	FillerLang string
 }
 
 type probeModelsResp struct {
@@ -367,6 +379,28 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 	// ── 7. tool-call 健康检查（默认开；--no-toolcall 关闭）──
 	if o.ToolCall {
 		runToolCallCheck(ctx, res, check, o, base, chatPath, timeout, model, streamAnalyze)
+	}
+
+	// ── 7.5 前缀缓存定性探针（--cache 开启，默认关）──
+	// 上下文大小对齐模型上限：超出会被服务端拒绝，自动收到 max_model_len-1024 以内
+	if o.CacheCheck {
+		size := o.CacheSizeTokens
+		if size <= 0 {
+			size = 40000
+		}
+		if res.ModelMaxLen > 0 && size > res.ModelMaxLen-1024 {
+			size = res.ModelMaxLen - 1024
+			res.Verdicts = append(res.Verdicts, fmt.Sprintf("缓存探针上下文已收到模型上限以内: %dtk（原配置 %dtk + 输出预算会超 max_model_len=%d）", size, o.CacheSizeTokens, res.ModelMaxLen))
+		}
+		pc := NewClient(o.Endpoint, o.APIKey, timeout, o.IncludeUsage)
+		pc.Auth = o.Auth
+		pc.ChatPath = o.ChatPath
+		cacheProbeInto(ctx, res, pc, CacheProbeOptions{
+			Model:       model,
+			SizeTokens:  size,
+			ThinkingOff: o.ThinkingOff,
+			FillerLang:  o.FillerLang,
+		})
 	}
 
 	// ── 8. 交叉验证建议：引擎 → 原生 perf 工具 ──

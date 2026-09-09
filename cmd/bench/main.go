@@ -58,6 +58,8 @@ probe 选项:
                                失败时给可行动结论；多 4 次请求、秒级、不进压测路径）
   --probe-capture 目录          tool-call 检查的原始响应落盘（厂商排障证据/判据回归 fixture；
                                含业务数据，外发前按需脱敏）
+  --cache                      开启前缀缓存定性检查（默认关：多 4 次长上下文请求，40k 档约多花 1-2 分钟）
+  --cache-size N               缓存检查的上下文大小（tokens，默认 40000，自动收到模型上限以内）
 
 组合语义:
   --concurrency 1 --turns single            单发单轮档位矩阵（ladder × runs，缓存对照）
@@ -197,6 +199,8 @@ func main() {
 	thinkingFlag := fs.String("thinking", "", "只跑某个思考变体：on/off（开思考费 token，建议 off/on 分开两轮跑，互不连坐）；按变体名过滤，模型无该变体则跳过；both=全部")
 	noToolCallFlag := fs.Bool("no-toolcall", false, "probe: 关闭 tool-call 健康检查（默认开启，多 4 次请求秒级）")
 	captureFlag := fs.String("probe-capture", "", "probe: tool-call 检查原始响应落盘目录（排障证据/判据 fixture；含业务数据外发前脱敏）")
+	cacheFlag := fs.Bool("cache", false, "probe: 开启前缀缓存定性检查（默认关；同 prompt 连发 3 次 + 乱序冷基线各 1 次，长上下文请求）")
+	cacheSizeFlag := fs.Int("cache-size", 40000, "probe --cache 的上下文大小（tokens，默认 40000；自动收到模型上限以内）")
 	fs.Parse(args)
 
 	cfg, err := config.Load(*cfgPath)
@@ -312,10 +316,13 @@ func main() {
 			Timeout:        cfg.Timeout(),
 			ToolCall:       !*noToolCallFlag,
 			CaptureDir:     *captureFlag,
-			XVPromptTokens: cfg.Concurrent.PromptTokens,
-			XVMaxTokens:    cfg.Concurrent.MaxTokens.Max(), // probe 上下文探测按最大输出预算（prompt+output 最坏组合）
-			ThinkingBudget: th.MaxTokensFloor,
-		})
+		XVPromptTokens: cfg.Concurrent.PromptTokens,
+		XVMaxTokens:    cfg.Concurrent.MaxTokens.Max(), // probe 上下文探测按最大输出预算（prompt+output 最坏组合）
+		ThinkingBudget: th.MaxTokensFloor,
+		CacheCheck:     *cacheFlag,
+		CacheSizeTokens: *cacheSizeFlag,
+		FillerLang:     cfg.FillerLang,
+	})
 		outPath := resolveOutPath(*outFlag, cfg.OutputDir, "probe")
 		if !strings.HasSuffix(*outFlag, ".json") {
 			// 按模型分区落盘：probe 结果归到模型子目录（显式 -o xxx.json 尊重用户路径）
@@ -335,6 +342,32 @@ func main() {
 				mark = "❌"
 			}
 			fmt.Printf("%s %s: %s\n", mark, c.Name, c.Detail)
+		}
+		if cp := res.CacheProbe; cp != nil {
+			fmt.Printf("\n前缀缓存定性检查（上下文 %dtk，max_tokens=64 隔离 prefill）:\n", cp.SizeTokens)
+			fmt.Printf("  %-8s %10s %10s %12s %14s\n", "轮次", "TTFT", "总耗时", "prompt_tk", "cached_tk")
+			row := func(r engine.CacheRun) {
+				if r.Error != "" {
+					errStr := r.Error
+					if len(errStr) > 80 {
+						errStr = errStr[:80] + "..."
+					}
+					fmt.Printf("  %-8s %10s %10s %12s %14s  err=%s\n", r.Label, "-", "-", "-", "-", errStr)
+					return
+				}
+				fmt.Printf("  %-8s %9.0fms %9.0fms %12d %14d\n", r.Label, r.TTFTMS, r.E2EMS, r.PromptTokens, r.CachedTokens)
+			}
+			for _, r := range cp.Warm {
+				row(r)
+			}
+			for _, r := range cp.Cold {
+				row(r)
+			}
+			mark := "❌"
+			if cp.Hit {
+				mark = "✅"
+			}
+			fmt.Printf("%s 判读: %s\n", mark, cp.Verdict)
 		}
 		for _, v := range res.Verdicts {
 			fmt.Printf("💡 %s\n", v)
