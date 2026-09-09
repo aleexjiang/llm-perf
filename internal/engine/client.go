@@ -1,7 +1,8 @@
 // Package engine 实现 OpenAI 兼容 API 的流式客户端与逐 chunk 计时。
 //
 // 核心设计：对每个流式请求分别记录
-//   - 首个任意 chunk          -> TTFT（含排队 + prefill）
+//   - 首个任意 chunk          -> first_chunk_at（原始证据，空 chunk 也算）
+//   - 首个含 token 的 chunk   -> TTFT（主流口径，GenAI-Perf/LLMPerf：忽略空首响应）
 //   - 首个 reasoning chunk    -> prefill 完成时刻（思考模型）
 //   - 首个 content chunk      -> 可见输出开始（= prefill + 思考）
 //   - 最后一个 chunk          -> 请求结束
@@ -138,7 +139,7 @@ type TurnMetrics struct {
 
 	// 派生指标（Finalize 后填充），单位 ms；非流式时 TTFT/思考/ITL 为 0（N/A）
 	E2EMS         float64 `json:"e2e_ms"`                      // 请求发出 -> 结束（两种模式都有）
-	TTFT          float64 `json:"ttft_ms,omitempty"`           // 首个任意 chunk（含排队 + prefill）
+	TTFT          float64 `json:"ttft_ms,omitempty"`           // 首个含 token 的 chunk（主流口径，空首 chunk 不算；原始首 chunk 在 first_chunk_at）
 	TTFTReasoning float64 `json:"ttft_reasoning_ms,omitempty"` // 首个 reasoning chunk ≈ prefill 完成
 	TTFTContent   float64 `json:"ttft_content_ms,omitempty"`   // 首个 content chunk = prefill + 思考
 	ThinkMS       float64 `json:"think_ms,omitempty"`          // reasoning 首包 -> content 首包
@@ -232,7 +233,18 @@ func (m *TurnMetrics) Finalize() {
 		return
 	}
 	if m.FirstChunkAt != nil {
-		m.TTFT = ms(m.SentAt, *m.FirstChunkAt)
+		// 主流口径（GenAI-Perf / LLMPerf / AIPerf：disregard initial responses with
+		// no content）：TTFT 取首个含 token 的 chunk（reasoning/content 首包较早者）。
+		// role-only 空首 chunk（OpenAI 兼容服务标配）不算 token；原始首 chunk 时刻
+		// 保留在 first_chunk_at 供口径核查。全程无 token 的流退回首 chunk 时刻。
+		switch {
+		case m.FirstReasoningAt != nil:
+			m.TTFT = ms(m.SentAt, *m.FirstReasoningAt)
+		case m.FirstContentAt != nil:
+			m.TTFT = ms(m.SentAt, *m.FirstContentAt)
+		default:
+			m.TTFT = ms(m.SentAt, *m.FirstChunkAt)
+		}
 	}
 	if m.FirstReasoningAt != nil {
 		m.TTFTReasoning = ms(m.SentAt, *m.FirstReasoningAt)

@@ -67,6 +67,24 @@ Report
 7. **usage 缺失的连锁**：服务端不回 usage 时 prompt/completion=0 + `usage_missing` 告警 → tokens_per_sec=0、TPOT 缺失、new_tokens 不更新（下轮会显示完整 prompt 而非增量）。有 usage_missing 告警的行，token 类指标全部不可信。
 8. **服务端 counter 差分保证 ≥ 0**：负增量（服务端重启归零）钳 0——该窗口的命中率等指标可信度下降，应结合 preemptions/重启时间解读。NaN/±Inf 指标行在解析层直接丢弃（防 JSON 序列化失败）。
 9. **直方图多 label 合并近似**：同 family 多 label（如按模型拆分）的 bucket 会合并计数，多模型共署引擎的直方图分位是粗估。
+10. **TTFT 是"首个含 token chunk"口径**（2026-09 对齐主流）：role-only 空 content 首 chunk（OpenAI 兼容服务标配）不计入 TTFT，取 reasoning/content 首包较早者；原始首 chunk 时刻保留在 `first_chunk_at` 供核查。此版本前的落盘数据是"任意首 chunk"口径，数值略偏小（差 1 个空帧）。
+11. **goodput 只判定已配置的 SLO 子集**（vLLM 语义）：阈值为 0 的维度不参与判定；配置了 TTFT 阈值时要求 TTFT 可测（>0，非流式不白拿达标）。
+
+## 主流口径对照（2026-09，对齐 GenAI-Perf/AIPerf、vLLM bench serve、LLMPerf、Inference-Perf）
+
+| 指标 | 本工具 | 主流口径 | 结论 |
+|---|---|---|---|
+| TTFT | 首个含 token chunk（首 reasoning/content 较早者） | GenAI-Perf/LLMPerf/AIPerf/Inference-Perf 均"忽略空首响应"；vLLM 为首个流式输出 | ✅ 已对齐（空首 chunk 不算）；`first_chunk_at` 保留任意首帧 |
+| TPOT | (E2E−TTFT)/(completion−1)，含思考 token | GenAI-Perf/vLLM/AIPerf/Inference-Perf 同式；LLMPerf 原生含 TTFT（历史差异，AWS 也要打 patch 修掉） | ✅ 一致 |
+| ITL | 相邻 content chunk 间隔，per-request 分位，报告层对请求取中位 | vLLM 池化所有请求 gap 后取分位；GenAI-Perf 为 per-response 值再聚合 | ⚠️ 有意差异：本工具是"单用户体验"视角（median-of-p99），与 vLLM 池化数值不可直接互比 |
+| E2E | 发出 → 流读完（含 [DONE]/usage 尾帧到达） | GenAI-Perf 剔除末尾 [DONE] | ⚠️ 偏差 ≤1 个尾帧（毫秒级），本工具略偏保守，不改 |
+| tokens_per_sec（per 请求） | 流式 = completion/decode_ms（≈1/ITL 量级）；非流式 = completion/e2e | 行业 per-user TPS = output_tokens/e2e_latency（含 prefill） | ⚠️ 流式值系统性高于行业口径（分母少 prefill+排队）；与外部横评时换算：行业值 ≈ completion/e2e_ms×1000 |
+| 吞吐 ThroughputTPS | 全部请求 completion 之和 ÷ 墙钟（首请求发射前 → 全部完成；warmup 不计入） | vLLM/LLMPerf 同；GenAI-Perf 用 Ty−Tx（首请求→末响应，略窄）；Inference-Perf 滑窗剔除 warmup/cooldown | ✅ 一致（物理口径，失败请求占墙钟见细则 3） |
+| goodput | 达标请求数/墙钟 + 达标 token/墙钟 | vLLM：满足已配置 SLO 的成功请求/时长（req/s） | ✅ 对齐（子集语义见细则 11）；token 口径是本工具扩展 |
+| cached_tokens | usage.prompt_tokens_details.cached_tokens | OpenAI 口径，vLLM 同名透传 | ✅ 一致 |
+| 思考模型 TTFT | 首 reasoning chunk（= TTFTReasoning） | Neuron 的 llmperf_reasoning.patch 同口径 | ✅ 一致 |
+
+参考：NVIDIA NIM Metrics / GenAI-Perf docs、vLLM `bench serve` 文档（"Metric terminology is not standardized across benchmarking tools…use the measurement points and formulas rather than the metric names alone"）、ray-project/llmperf、awslabs Inference-Perf 关键指标页。
 
 ## 报告侧聚合口径（gen_html_report.py）
 

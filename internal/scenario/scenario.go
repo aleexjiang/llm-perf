@@ -299,15 +299,17 @@ func applySLO(e *env, rep *report.Report) {
 	}
 }
 
-// goodputOf 请求是否同时满足 SLO（TTFT 与 TPOT 双约束；非流式 TPOT 不可测视为不达标）。
+// goodputOf 请求是否满足 SLO。对齐 vLLM goodput 语义：只判定"已配置的"SLO 子集
+// （阈值为 0 的维度不参与）；配置了 TTFT 阈值时要求 TTFT 可测（>0）——非流式
+// TTFT 不可测（N/A），不应凭 0 值白拿达标。非流式在配置了 TPOT 阈值时天然不达标。
 func goodputOf(e *env, m *engine.TurnMetrics) bool {
 	if e.cfg.Goodput == nil || m == nil || m.Error != "" {
 		return false
 	}
-	if m.TTFT > e.cfg.Goodput.TTFTMS {
+	if e.cfg.Goodput.TTFTMS > 0 && (m.TTFT <= 0 || m.TTFT > e.cfg.Goodput.TTFTMS) {
 		return false
 	}
-	if m.TPOTMS <= 0 || m.TPOTMS > e.cfg.Goodput.TPOTMS {
+	if e.cfg.Goodput.TPOTMS > 0 && (m.TPOTMS <= 0 || m.TPOTMS > e.cfg.Goodput.TPOTMS) {
 		return false
 	}
 	return true

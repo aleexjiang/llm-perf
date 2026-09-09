@@ -402,3 +402,36 @@ func TestAggregateShapesExcludesFailed(t *testing.T) {
 		t.Fatalf("全失败形状应 Count=2 且中位 0: %+v", allFailed[0])
 	}
 }
+
+// ── 主流口径对齐回归：goodput 只判定"已配置的"SLO 子集（vLLM 语义）──
+// 修复前：goodputOf 无条件检查 TPOT>0 与 TTFT>阈值，只配 ttft_ms（或只配 tpot_ms）
+// 时所有请求都被判不达标——配置校验只拦两项均为 0，单配一项是合法用法。
+
+func TestGoodputSLOSubset(t *testing.T) {
+	// 只配 TTFT：TPOT 缺失（如非流式/短输出）不应拖累判定
+	eTTFT := &env{cfg: &config.Config{Goodput: &config.GoodputCfg{TTFTMS: 2000}}}
+	if !goodputOf(eTTFT, &engine.TurnMetrics{Stream: true, TTFT: 1500}) {
+		t.Error("只配 TTFT 阈值时，TTFT 达标即应判达标（TPOT 未配置不参与）")
+	}
+	if goodputOf(eTTFT, &engine.TurnMetrics{Stream: true, TTFT: 3000}) {
+		t.Error("TTFT 超标应不达标")
+	}
+	if goodputOf(eTTFT, &engine.TurnMetrics{TTFT: 0}) { // 非流式 TTFT 不可测（N/A）
+		t.Error("非流式 TTFT 不可测，不应凭 0 值白拿达标")
+	}
+
+	// 只配 TPOT：TTFT 不参与判定
+	eTPOT := &env{cfg: &config.Config{Goodput: &config.GoodputCfg{TPOTMS: 200}}}
+	if !goodputOf(eTPOT, &engine.TurnMetrics{Stream: true, TPOTMS: 150}) {
+		t.Error("只配 TPOT 阈值时，TPOT 达标即应判达标")
+	}
+	if goodputOf(eTPOT, &engine.TurnMetrics{Stream: true, TPOTMS: 0}) {
+		t.Error("TPOT 不可测（0 值）应不达标")
+	}
+
+	// 双约束：任一超标即不达标（原有语义保持）
+	eBoth := &env{cfg: &config.Config{Goodput: &config.GoodputCfg{TTFTMS: 2000, TPOTMS: 200}}}
+	if goodputOf(eBoth, &engine.TurnMetrics{Stream: true, TTFT: 1000, TPOTMS: 500}) {
+		t.Error("TPOT 超标应不达标")
+	}
+}

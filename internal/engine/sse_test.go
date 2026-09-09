@@ -105,9 +105,13 @@ func TestIngestSSE_VLLM027_ReasoningField(t *testing.T) {
 	if len(m.Warnings) != 0 {
 		t.Errorf("unexpected warnings: %v", m.Warnings)
 	}
-	// 计时：首 chunk 在 t0+100ms，reasoning 首包 t0+110ms，content 首包 t0+130ms
-	if m.TTFT != 100 {
-		t.Errorf("TTFT = %v, want 100", m.TTFT)
+	// 计时：首 chunk（空 role-only）t0+100ms，reasoning 首包 t0+110ms，content 首包 t0+130ms
+	// TTFT 主流口径：空首 chunk 不算 token，取首个含 token 的 chunk（此处 reasoning 首包）
+	if m.TTFT != 110 {
+		t.Errorf("TTFT = %v, want 110（首个含 token chunk 口径）", m.TTFT)
+	}
+	if m.FirstChunkAt == nil || ms(m.SentAt, *m.FirstChunkAt) != 100 {
+		t.Errorf("first_chunk_at 应保留原始首 chunk 时刻（+100ms）: %v", m.FirstChunkAt)
 	}
 	if m.TTFTReasoning != 110 {
 		t.Errorf("TTFTReasoning = %v, want 110", m.TTFTReasoning)
@@ -246,5 +250,42 @@ func BenchmarkParseSSEData(b *testing.B) {
 		if _, err := parseSSEData(line); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// ── 主流口径对齐回归：TTFT 忽略空首 chunk（GenAI-Perf/LLMPerf disregard empty
+// initial responses），首个含 token 的 chunk 才是 TTFT ──
+
+func TestTTFTSkipsEmptyFirstChunk(t *testing.T) {
+	// 非思考模型：首 chunk 为 role-only 空 content，第二个 chunk 才有正文
+	raw := "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n" +
+		"data: {\"choices\":[{\"delta\":{\"content\":\"你好\"},\"finish_reason\":null}]}\n" +
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n" +
+		"data: [DONE]\n"
+	m := &TurnMetrics{Stream: true}
+	feed(t, m, raw, true)
+
+	// 空首 chunk t0+100ms，正文首包 t0+110ms → TTFT=110 而非 100
+	if m.TTFT != 110 {
+		t.Errorf("TTFT = %v, want 110（空首 chunk 不算 token）", m.TTFT)
+	}
+	if m.TTFTContent != 110 {
+		t.Errorf("TTFTContent = %v, want 110", m.TTFTContent)
+	}
+	// TPOT 用同一口径：(E2E−TTFT)/(completion−1)
+	if m.TPOTMS <= 0 {
+		t.Errorf("TPOT 应可测: %v", m.TPOTMS)
+	}
+}
+
+func TestTTFTContentOnlyFallback(t *testing.T) {
+	// 全程无 reasoning：TTFT 取首个 content chunk
+	raw := "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n" +
+		"data: {\"choices\":[{\"delta\":{\"content\":\"答\"},\"finish_reason\":\"stop\"}]}\n" +
+		"data: [DONE]\n"
+	m := &TurnMetrics{Stream: true}
+	feed(t, m, raw, true)
+	if m.TTFT != m.TTFTContent {
+		t.Errorf("无 reasoning 时 TTFT 应等于 TTFTContent: %v vs %v", m.TTFT, m.TTFTContent)
 	}
 }
