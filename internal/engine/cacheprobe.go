@@ -126,6 +126,9 @@ func cacheVerdict(warm, cold []CacheRun) (bool, string) {
 		return false, "warm 请求不足 2 次有效完成，无法判读（先解决端点连通性/认证）"
 	}
 	first, last := warm[0], warm[len(warm)-1]
+	if first.Error != "" {
+		return false, "首次 warm 请求失败: " + first.Error
+	}
 	if last.Error != "" {
 		return false, "末次 warm 请求失败: " + last.Error
 	}

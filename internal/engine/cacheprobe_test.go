@@ -77,4 +77,13 @@ func TestCacheVerdict(t *testing.T) {
 			t.Fatal("warm 不足应给出说明")
 		}
 	})
+
+	t.Run("首次warm失败应报失败而非TTFT缺失", func(t *testing.T) {
+		bad := cr("warm#1", 0, 0, 0)
+		bad.Error = "Post \"http://gw/v1/chat/completions\": context deadline exceeded"
+		_, v := cacheVerdict([]CacheRun{bad, cr("warm#2", 2000, 40000, 0)}, nil)
+		if !containsSubs(v, "失败") {
+			t.Fatalf("首请求失败应明确报失败原因: %s", v)
+		}
+	})
 }
