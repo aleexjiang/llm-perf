@@ -48,7 +48,7 @@ func usage() {
                                cfg 用配置里 concurrent.levels（默认 1）
   --thinking 变体名             只跑某个思考变体：on/off 或自定义档位名（如 low）；按变体名过滤，
                                 模型无该变体则整个模型跳过；both=全部（缺省不过滤）
-  --seed-salt N                战役隔离：重跑/换变体必须换盐，否则命中服务端前缀缓存
+  --seed-salt N                测试隔离：重跑/换变体必须换盐，否则命中服务端前缀缓存
   -o 路径                       输出 .json 或目录（默认配置 output_dir）
   -m 模型子串                   只测包含该子串的模型
   --corpus en|zh|路径           填充语料；--max-ctx N 上下文截止
@@ -75,7 +75,7 @@ probe 选项:
 按模型组织:
   model_overrides.<模型>.enabled: false 跳过该模型（分批重测时临时关掉，全部禁用报错）；
   多模型数据按模型分区落 <output_dir>/<模型>/<场景>-<ts>.json（单模型仍直接落 output_dir）；
-  run.log 与 raw/ 仍在 output_dir 顶层（战役级共享）。
+  run.log 与 raw/ 仍在 output_dir 顶层（测试级共享）。
 
 示例:
   bench probe -c configs/customer.yaml
@@ -193,7 +193,7 @@ func main() {
 	outFlag := fs.String("o", "", "输出路径：.json 文件或目录（默认用配置 output_dir）")
 	corpusFlag := fs.String("corpus", "", "填充语料：en/zh（内置公版书）或自定义文件路径（.txt/.txt.gz）；覆盖配置 filler_corpus")
 	maxCtxFlag := fs.Int("max-ctx", 0, "上下文截止（tokens）：>0 时所有请求 prompt 不超过该值；覆盖配置 max_prompt_tokens")
-	saltFlag := fs.Int("seed-salt", 0, "种子盐值：隔离测试战役（服务端 prefix cache 未清空时重测用）；覆盖配置 seed_salt")
+	saltFlag := fs.Int("seed-salt", 0, "种子盐值：隔离测试（服务端 prefix cache 未清空时重测用）；覆盖配置 seed_salt")
 	thinkingFlag := fs.String("thinking", "", "只跑某个思考变体：on/off（开思考费 token，建议 off/on 分开两轮跑，互不连坐）；按变体名过滤，模型无该变体则跳过；both=全部")
 	noToolCallFlag := fs.Bool("no-toolcall", false, "probe: 关闭 tool-call 健康检查（默认开启，多 4 次请求秒级）")
 	captureFlag := fs.String("probe-capture", "", "probe: tool-call 检查原始响应落盘目录（排障证据/判据 fixture；含业务数据外发前脱敏）")
@@ -248,7 +248,7 @@ func main() {
 	// run.log 追加而非覆盖：同目录多轮测试的日志都要留得住（两轮对照时踩过覆盖坑）
 	if err := os.MkdirAll(cfg.OutputDir, 0o755); err == nil {
 		if lf, err := os.OpenFile(filepath.Join(cfg.OutputDir, "run.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
-			fmt.Fprintf(lf, "\n===== campaign %s（tool %s）=====\n", time.Now().Format(time.RFC3339), report.Version)
+			fmt.Fprintf(lf, "\n===== test run %s（tool %s）=====\n", time.Now().Format(time.RFC3339), report.Version)
 			log.SetOutput(io.MultiWriter(os.Stderr, lf))
 			defer lf.Close()
 		}
@@ -462,14 +462,14 @@ func main() {
 	}
 	log.Printf("执行计划: turns=%s concurrency=%v → %s（并发=1 即单发串行）", *turnsFlag, vals, strings.Join(names, " → "))
 
-	// 战役画像（5.10）：开跑前打印"这次要跑什么形状"总览；同一份数据随每份 JSON 落盘
+	// 测试画像（5.10）：开跑前打印"这次要跑什么形状"总览；同一份数据随每份 JSON 落盘
 	planItems := make([]scenario.PlanItem, len(items))
 	for i, it := range items {
 		planItems[i] = scenario.PlanItem{Name: it.name, Highs: it.highs, MT: it.mt}
 	}
-	campaignPlan := scenario.PlanSummary(cfg, *modelFilter, planItems)
-	if campaignPlan != nil {
-		for _, l := range campaignPlan.Render() {
+	planSum := scenario.PlanSummary(cfg, *modelFilter, planItems)
+	if planSum != nil {
+		for _, l := range planSum.Render() {
 			log.Print(l)
 		}
 	}
@@ -487,11 +487,11 @@ func main() {
 			os.Exit(1)
 		}
 		outPath := resolveOutPath(*outFlag, cfg.OutputDir, name)
-		// 环境存档随每份分区落盘（引擎识别 + 配置原文）；战役画像同附（回溯"当时的计划"）
+		// 环境存档随每份分区落盘（引擎识别 + 配置原文）；测试画像同附（回溯"当时的计划"）
 		rep.Environment = envInfo
 		rep.ConfigRaw = cfg.Raw
-		rep.Plan = campaignPlan
-		// 按模型分区落盘：多模型战役各落 <output_dir>/<模型>/，重测/作废单模型不纠缠；
+		rep.Plan = planSum
+		// 按模型分区落盘：多模型测试各落 <output_dir>/<模型>/，重测/作废单模型不纠缠；
 		// 单模型（或 -m 过滤后只剩一个）保持原布局直接落 output_dir，报告工具兼容两种布局
 		parts := rep.PartitionByModel()
 		if len(parts) == 0 {

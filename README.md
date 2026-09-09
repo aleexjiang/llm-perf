@@ -186,8 +186,8 @@ gauge 轮询自带健康度：从未成功或连续失败 ≥5 时 JSON 标记 `
 
 ## 其他
 
-- **战役盐值**：`seed_salt: N`（CLI `--seed-salt`）给所有 prompt 种子叠加盐值——服务端 prefix cache
-  是内存态且不会被挤出，同一配置重跑时"冷缓存"测量会被上次战役污染；**每次测试战役递增盐值**，
+- **测试盐值**：`seed_salt: N`（CLI `--seed-salt`）给所有 prompt 种子叠加盐值——服务端 prefix cache
+  是内存态且不会被挤出，同一配置重跑时"冷缓存"测量会被上次测试污染；**每次测试递增盐值**，
   或重启服务端清缓存（二选一）
 - **预热**：`warmup_requests: N` 每场景开始前发 N 条小请求暖连接（不计入统计，唯一内容不污染缓存对照）
 - **连接层重试**：`retry: {max_attempts: 2, backoff_ms: 300}` 对瞬时失败（reset/5xx/429）重试，默认关闭；重试留痕 warnings/retry_count
@@ -221,7 +221,7 @@ mv bench-linux-amd64 bench && chmod +x bench
 
 **按模型分区**：配置了多个模型时，数据按模型分区落 `<output_dir>/<模型>/<场景>-<ts>.json`
 （模型名取 `/` 后末段），重测/作废单模型数据不纠缠；`run.log` 与 `raw/` 仍在 output_dir
-顶层（战役级共享）。单模型配置（或 `-m` 过滤后只剩一个）保持原布局直接落 output_dir：
+顶层（测试级共享）。单模型配置（或 `-m` 过滤后只剩一个）保持原布局直接落 output_dir：
 
 ```bash
 output/
@@ -240,7 +240,7 @@ JSON 结构见 `internal/report/report.go`：`single` / `multiturn` / `concurren
 元素分别为档位 / 会话 / 并发档位，每条请求是 `engine.TurnMetrics`；观测层开启时附
 `server_metrics` 汇总（缓存命中率/排队/prefill-decode 分解）与逐请求 `server_counter_delta`。
 
-JSON → HTML 分析报告（自包含、Chart.js 内嵌离线可用）。自动合并多份 JSON（含 thinking off/on 分离的战役）、
+JSON → HTML 分析报告（自包含、Chart.js 内嵌离线可用）。自动合并多份 JSON（含 thinking off/on 分离的测试）、
 数据驱动生成结论与建议（prefill 斜率、前缀缓存判定、decode 吞吐、思考行为分类），报告末尾内嵌
 `perf-summary` JSON 数据块——把整份 HTML 交给 AI 即可让它追加通俗解读备注：
 

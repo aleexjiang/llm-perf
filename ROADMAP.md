@@ -155,8 +155,8 @@ thinking mode/levels 双轨（levels 优先已显式声明并告警）；api_key
 - 闭环 multiturn 指数爬坡发车（内置机制，默认开，`concurrent.ramp: false` 可关）：首批发 1 个会话，
   等该批**全部完成首轮**后放下一批 `min(上批×factor, 剩余)`，`concurrent.ramp_factor` 默认 2（可设 3）；
   最后一批放剩余量。批次节奏由服务端首轮实际耗时决定（自适应，无需按端点调参），在途会话深度混合自然涌现。
-- 失败语义：**任一批次首轮失败 → 终止战役**（fail-fast，首轮挂大概率模型服务有问题）；
-  中间轮失败会话继续，止损双保险——会话内连续失败 3 轮提前终止该会话，全局连续失败 ≥ 2×level 终止战役
+- 失败语义：**任一批次首轮失败 → 终止测试**（fail-fast，首轮挂大概率模型服务有问题）；
+  中间轮失败会话继续，止损双保险——会话内连续失败 3 轮提前终止该会话，全局连续失败 ≥ 2×level 终止测试
   （默认常量，必要时再配置化）。
 - `MultiturnRun` 落盘启动偏移与批次号，报告侧可标爬坡窗口。
 - 会话续跑（P2，等真实 soak 需求再做）：`renew: true` + `duration_seconds`（闭环从次数语义扩展出时长语义），
@@ -196,7 +196,7 @@ thinking mode/levels 双轨（levels 优先已显式声明并告警）；api_key
 - 连带：`config.go:851` 深上下文告警（base + turns×turn_tokens ≥ 100k）改后必触发，属预期 ✅；
   probe `LargestPromptTokens`（`config.go:1134`）随配置自动跟上，无需改动 ✅。
 
-**5.10 启动时打印战役画像（campaign profile）**【已实现，2026-09-08】
+**5.10 启动时打印测试画像（plan profile）**【已实现，2026-09-08】
 
 - 问题：`sessions` / `turns` / 上下文爬升 / 请求数只在逐请求日志或结果 JSON 里间接可见，
   开跑前没有"这次要跑什么形状"的总览，核对配置只能翻 YAML。
@@ -208,7 +208,7 @@ thinking mode/levels 双轨（levels 优先已显式声明并告警）；api_key
   `MaxTokensList`、变体复用 `Variants`、模型差异复用 `ForModel`——估算与场景循环逐层同构（含 plan_test.go 三个单测）。
   reach 按 4 字符/token + 1.07 模板开销，展示带 `~` 前缀；trace 模式按取样上限 16 会话估算并标注。
 - 报告侧 ✅：同一份 Plan 随每份场景 JSON 落盘（`Report.Plan`，`PartitionByModel` 带入分区），
-  `gen_html_report.py` 第 2 节渲染"战役画像"表（与 5.4 配置原文存档合并消费）。E2E（mock 两模型四场景）：
+  `gen_html_report.py` 第 2 节渲染"测试画像"表（与 5.4 配置原文存档合并消费）。E2E（mock 两模型四场景）：
   打印估算 36 请求 = 实际执行量，HTML 画像表正常渲染。
 - 连带修复：`gen_html_report.py` gen_conclusions 的 decode 吞吐对比在 TPS=0（mock/异常数据）时除零崩溃，加 >0 守卫。
 

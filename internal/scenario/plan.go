@@ -1,4 +1,4 @@
-// 战役画像（5.10）：配置校验通过后、发首个请求前估算"这次要跑什么形状"。
+// 测试画像（5.10）：配置校验通过后、发首个请求前估算"这次要跑什么形状"。
 //
 // 设计约束：展示口径 = 执行口径。估算不新造逻辑——档位列表复用 ClampLadder（含
 // max_prompt_tokens 截断）、输出档与思考 floor 复用 MaxTokensList、变体展开复用
@@ -28,7 +28,7 @@ const planTemplateOverhead = 1.07
 // traceSingleSampleLimit 与场景层同名常量同口径：trace 单发档位最多取样会话数。
 const planTraceSampleLimit = 16
 
-// PlanSummary 生成战役画像。cfg 须已过 Load（默认值与告警已就位）；
+// PlanSummary 生成测试画像。cfg 须已过 Load（默认值与告警已就位）；
 // modelFilter 与 main 的 -m 语义一致；items 为本次实际要跑的场景序列。
 func PlanSummary(cfg *config.Config, modelFilter string, items []PlanItem) *report.Plan {
 	models := filterModels(cfg.ActiveModels(), modelFilter)

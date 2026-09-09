@@ -4,12 +4,13 @@
 
 用法:
   python3 gen_html_report.py output/                      # 目录模式：合并目录下全部 single-/multiturn-/concurrent-*.json
+  python3 gen_html_report.py output/<模型子目录>/          # 按模型出报告：只合并该模型目录下的 JSON（推荐对外交付口径）
   python3 gen_html_report.py a.json b.json [标题]          # 文件模式：显式指定一份或多份报告 JSON
 
 输出: <输入目录>/llm-perf-报告.html（Chart.js 内嵌，离线可用）
 
 特性:
-  - 自动合并同场景多份 JSON（例如 thinking=off / on 分开的战役），不丢变体
+  - 自动合并同场景多份 JSON（例如 thinking=off / on 分开的测试），不丢变体
   - 数据驱动的分析章节：prefill 斜率（ms/token）、前缀缓存判定（多轮/单发斜率比）、
     decode 吞吐、思考行为分类（无思考输出 / 正常 / 思考独占输出预算）
   - 结论与建议由数据条件生成，不写死模型名
@@ -29,6 +30,149 @@ SCENARIOS = ("single", "multiturn", "concurrent")
 PALETTE = ["#1652f0", "#0e9f6e", "#f0b429", "#e5484d", "#7c5cff", "#0ca678"]
 
 GRID_JS = "const grid={ticks:{color:'#999'},grid:{color:'#f0f0f5'}};"
+
+# 多模型落地页 + 视图切换器：一进来只显示两张模型卡片与指标口径；点卡片进入该模型专属视图
+# （表格行/列过滤、Chart.js 数据集过滤、空小节隐藏）；"← 返回首页"链接回落地页。
+SWITCHER_JS = """(function(){
+var MODELS=__MODELS__;
+if(!document.getElementById('cards'))return;
+function modelOf(text){for(var i=0;i<MODELS.length;i++){if(text.indexOf(MODELS[i])>=0)return MODELS[i];}return '';}
+var tables=[];
+document.querySelectorAll('table').forEach(function(tb){
+  var head=tb.rows[0];if(!head)return;
+  var cols=[],hits=0,single='',seen={},distinct=0;
+  for(var c=0;c<head.cells.length;c++){var m=modelOf(head.cells[c].textContent);if(m){hits++;if(!seen[m]){seen[m]=1;distinct++;single=m;}}cols.push(m);}
+  var info={tb:tb,colMap:distinct>=2?cols:null,rows:[],tag:distinct===1?single:''};
+  if(!info.colMap){
+    var prev=info.tag;
+    for(var r=0;r<tb.rows.length;r++){
+      var hit=modelOf(tb.rows[r].textContent);
+      if(hit)prev=hit;
+      info.rows.push({tr:tb.rows[r],m:hit||prev});
+    }
+  }
+  tables.push(info);
+});
+var caps=[];
+document.querySelectorAll('p.cap').forEach(function(p){
+  caps.push({p:p,m:modelOf(p.textContent),next:p.nextElementSibling});
+});
+var kcards=[];
+document.querySelectorAll('.kpi').forEach(function(k){
+  kcards.push({el:k,m:modelOf(k.textContent)});
+});
+var lis=[];
+document.querySelectorAll('li').forEach(function(li){
+  var txt=li.textContent,m=modelOf(txt),multi=false;
+  if(m){for(var i=0;i<MODELS.length;i++){if(MODELS[i]!==m&&txt.indexOf(MODELS[i])>=0)multi=true;}}
+  lis.push({el:li,m:m,multi:multi});
+});
+var charts=[];
+if(window.Chart&&Chart.instances){Object.keys(Chart.instances).forEach(function(k){
+  var ch=Chart.instances[k];
+  var labels=(ch.data.labels||[]).map(String);
+  var byIndex=labels.some(function(l){return MODELS.indexOf(l)>=0;});
+  var dsMap=ch.data.datasets.map(function(ds){return modelOf(ds.label||'');});
+  charts.push({ch:ch,labels:labels,byIndex:byIndex,dsMap:dsMap,
+    datasets:ch.data.datasets.map(function(ds){return{ds:ds,data:(ds.data||[]).slice()};})});
+});}
+function tidy(){
+  document.querySelectorAll('h2,h3').forEach(function(h){
+    var lvl=+h.tagName[1],node=h.nextElementSibling,empty=true,guard=0;
+    while(node&&guard++<300){
+      var t=node.tagName;
+      if(t==='H2'||(t==='H3'&&+t[1]<=lvl))break;
+      var vis=node.style.display!=='none';
+      var skip=(lvl===3&&t==='DIV'&&node.className==='note');
+      if(vis&&!skip){empty=false;break;}
+      node=node.nextElementSibling;
+    }
+    h.style.display=empty?'none':'';
+  });
+}
+var h1=document.querySelector('h1');
+var baseTitle=h1.textContent;
+var cards=document.getElementById('cards');
+var kpis=document.querySelector('.kpis');
+var foot=document.querySelector('.foot');
+var secs=[];
+document.querySelectorAll('h2').forEach(function(h){
+  var els=[],node=h.nextElementSibling,guard=0;
+  while(node&&guard++<500){if(node.tagName==='H2')break;els.push(node);node=node.nextElementSibling;}
+  secs.push({h:h,els:els,metric:h.textContent.indexOf('指标口径')>=0});
+});
+function setTitle(sel){
+  var t=sel?sel+'测试报告':baseTitle;
+  h1.textContent=t;document.title=t;
+}
+var backlink=document.getElementById('backhome');
+function apply(sel){
+  var home=!sel;
+  if(backlink)backlink.style.display=home?'none':'block';
+  var home=!sel;
+  secs.forEach(function(s){
+    var show=home?s.metric:true;
+    s.h.style.display=show?'':'none';
+    s.els.forEach(function(el){if(el.tagName!=='SCRIPT')el.style.display=show?'':'none';});
+  });
+  if(kpis)kpis.style.display=home?'none':'';
+  if(cards)cards.style.display=home?'':'none';
+  if(foot)foot.style.display=home?'none':'';
+  if(home){
+    charts.forEach(function(rec){rec.ch.canvas.parentNode.style.display='none';});
+    setTitle(sel);
+    return;
+  }
+  tables.forEach(function(info){
+    if(info.colMap){
+      for(var r=0;r<info.tb.rows.length;r++){
+        var tr=info.tb.rows[r];
+        for(var c=0;c<tr.cells.length;c++){
+          var cm=info.colMap[c];
+          tr.cells[c].style.display=(sel&&cm&&cm!==sel)?'none':'';
+        }
+      }
+    }else{
+      info.rows.forEach(function(ro){ro.tr.style.display=(sel&&ro.m&&ro.m!==sel)?'none':'';});
+    }
+    var any=false;
+    for(var r2=0;r2<info.tb.rows.length;r2++){if(info.tb.rows[r2].style.display!=='none'){any=true;break;}}
+    var hideTable=(sel&&info.tag&&info.tag!==sel)||!any;
+    info.tb.style.display=hideTable?'none':'';
+  });
+  caps.forEach(function(cp){
+    var hide=!!sel&&!!cp.m&&cp.m!==sel;
+    cp.p.style.display=hide?'none':'';
+    if(cp.next&&(cp.next.tagName==='TABLE'||cp.next.tagName==='DETAILS')&&hide)cp.next.style.display='none';
+  });
+  kcards.forEach(function(k){k.el.style.display=(sel&&k.m&&k.m!==sel)?'none':'';});
+  lis.forEach(function(r){r.el.style.display=(sel&&r.m&&(r.m!==sel||r.multi))?'none':'';});
+  charts.forEach(function(rec){
+    var ch=rec.ch;
+    if(rec.byIndex){
+      var idx=[];
+      for(var i=0;i<rec.labels.length;i++){if(!sel||MODELS.indexOf(rec.labels[i])<0||rec.labels[i]===sel)idx.push(i);}
+      ch.data.labels=idx.map(function(i){return rec.labels[i];});
+      rec.datasets.forEach(function(r){r.ds.data=idx.map(function(i){return r.data[i];});});
+      ch.update();ch.resize();
+      ch.canvas.parentNode.style.display=idx.length?'':'none';
+    }else{
+      var keep=[];
+      rec.datasets.forEach(function(r,i){if(!sel||!rec.dsMap[i]||rec.dsMap[i]===sel)keep.push(r.ds);});
+      ch.data.datasets=keep;
+      ch.update();ch.resize();
+      ch.canvas.parentNode.style.display=keep.length?'':'none';
+    }
+  });
+  setTitle(sel);
+  tidy();
+}
+if(backlink)backlink.addEventListener('click',function(ev){ev.preventDefault();apply('');});
+if(cards)document.querySelectorAll('.mcard').forEach(function(c){
+  c.addEventListener('click',function(){apply(c.getAttribute('data-mv'));});
+});
+apply('');
+})();"""
 
 
 # ────────────────────────── 输入加载 ──────────────────────────
@@ -71,6 +215,17 @@ def filter_scenarios(data, sel):
         if lv_quad(lv) in sel:
             out["concurrent"].append(lv)
     return out
+
+
+# 配置原文里的密钥形态：api_key: "sk-…" / Authorization: Bearer xxx / *token: xxx
+_SECRET_RE = re.compile(
+    r'(?i)\b(api_key|api[-_]?token|authorization|token|password)\b(\s*[:=]\s*)(["\']?)'
+    r'(?:sk-[\w-]+|[^\s"\']+)\3')
+
+
+def redact_secrets(text):
+    """config_raw 原文可能内嵌客户 key，而报告是要外发的——落 HTML 前必须脱敏。"""
+    return _SECRET_RE.sub(r'\1\2\3***REDACTED***\3', text)
 
 
 def load_inputs(argv):
@@ -126,7 +281,7 @@ def merge(reports):
         if d.get("environment"):
             meta["environment"] = d["environment"]
         if d.get("config_raw"):
-            meta["config_raw"] = d["config_raw"]
+            meta["config_raw"] = redact_secrets(d["config_raw"])
         if d.get("plan"):
             meta["plan"] = d["plan"]
     return data, meta
@@ -305,6 +460,11 @@ def analyze(data, meta):
             n_units = len(turns)
         if not turns:
             continue
+        # 失败请求（error 字段，如网关 504）：无 ttft/有效计时，混进统计会把中位数
+        # 拉向 0（幸存者偏差的反向污染）——一律剔除，只报失败数。
+        ok_turns = [t for t in turns if not t.get("error")]
+        n_fails = len(turns) - len(ok_turns)
+        src = ok_turns or turns
         A[quad].append({
             "model": lv["model"],
             "thinking": lv.get("thinking", "off"),
@@ -312,15 +472,16 @@ def analyze(data, meta):
             "level": lv.get("level", 0),
             "n_units": n_units,
             "n_turns": len(turns),
+            "fails": n_fails,
             "wall": lv.get("wall_seconds"),
             "tps": lv.get("throughput_tps"),
-            "ttft": mmm([t.get("ttft_ms", 0) / 1000 for t in turns], 2),
-            "e2e": mmm([t.get("e2e_ms", 0) / 1000 for t in turns], 1),
-            "ttft_p": pct9599([t.get("ttft_ms", 0) / 1000 for t in turns], 2),
-            "e2e_p": pct9599([t.get("e2e_ms", 0) / 1000 for t in turns], 1),
-            "think": mmm([(t.get("think_ms") or 0) / 1000 for t in turns], 1),
-            "tokps": mmm([t.get("tokens_per_sec") for t in turns], 0),
-            "finish": sorted({t.get("finish_reason", "?") for t in turns}),
+            "ttft": mmm([t["ttft_ms"] / 1000 for t in src if t.get("ttft_ms") is not None], 2),
+            "e2e": mmm([t["e2e_ms"] / 1000 for t in src if t.get("e2e_ms") is not None], 1),
+            "ttft_p": pct9599([t["ttft_ms"] / 1000 for t in src if t.get("ttft_ms") is not None], 2),
+            "e2e_p": pct9599([t["e2e_ms"] / 1000 for t in src if t.get("e2e_ms") is not None], 1),
+            "think": mmm([(t.get("think_ms") or 0) / 1000 for t in src], 1),
+            "tokps": mmm([t.get("tokens_per_sec") for t in src], 0),
+            "finish": sorted({t.get("finish_reason", "?") for t in src}),
             "shapes": lv.get("shapes") or [],  # 5.6 混合负载：形状分解（非空 = 混跑轮）
             "request_rate": lv.get("request_rate", 0),
         })
@@ -564,8 +725,10 @@ def line_ds(label, data, color, dash=None):
     return d
 
 
-def color_of(models, m):
-    return PALETTE[models.index(m) % len(PALETTE)]
+def color_of(models, m, variant=0):
+    # 每模型占 2 个色位：variant=0（thinking=off/主线）、1（thinking=on/副线），
+    # 同一图表内同模型多条线不再撞色
+    return PALETTE[(models.index(m) * 2 + variant) % len(PALETTE)]
 
 
 def build_charts(data, A):
@@ -607,6 +770,7 @@ def build_charts(data, A):
         nturn = max(len(s["turns"]) for k in keys for s in m_by[k])
         labels = ["T{}".format(i + 1) for i in range(nturn)]
         ds = []
+        cnt_m = {}
         for (m, t, mt) in keys:
             if t != th:
                 continue
@@ -616,7 +780,9 @@ def build_charts(data, A):
                         and s["turns"][i].get("ttft_ms")]
                 ys.append(round(st.median(vals)) if vals else None)
             lbl = short(m) + (" out={}".format(mt) if multi_mt else "")
-            ds.append(line_ds(lbl, ys, color_of(models, m)))
+            pi = cnt_m.get(m, 0)
+            cnt_m[m] = pi + 1
+            ds.append(line_ds(lbl, ys, color_of(models, m), dash=[5, 4] if pi > 0 else None))
         scales = {"x": spread({"title": {"display": True, "text": "多轮会话轮次"}}),
                   "y": spread({"title": {"display": True, "text": "TTFT ms"}})}
         stmts.append(chart_js("c_m_ttft_" + th, "line", labels, ds,
@@ -656,6 +822,7 @@ def build_charts(data, A):
             continue
         groups = sorted({(e["model"], e["thinking"], e["mt"]) for e in items})
         multi_mt = len({g[2] for g in groups}) > 1
+        pair_i = {}
         ds_tps, ds_ttft = [], []
         for m, th, mt in groups:
             ys_tps, ys_ttft = [], []
@@ -674,8 +841,11 @@ def build_charts(data, A):
                 lbl = "{} (thinking={})".format(short(m), th)
                 if multi_mt:
                     lbl += " out={}".format(mt)
-                ds_tps.append(line_ds(lbl, ys_tps, color_of(models, m)))
-                ds_ttft.append(line_ds(lbl, ys_ttft, color_of(models, m)))
+                pi = pair_i.get((m, th), 0)
+                pair_i[(m, th)] = pi + 1
+                col = color_of(models, m, 1 if th == "on" else 0)
+                ds_tps.append(line_ds(lbl, ys_tps, col, dash=[5, 4] if pi > 0 else None))
+                ds_ttft.append(line_ds(lbl, ys_ttft, col, dash=[5, 4] if pi > 0 else None))
         if ds_tps:
             scales = {"x": spread({"title": {"display": True, "text": "并发数"}}),
                       "y": spread({"title": {"display": True, "text": "吞吐 tok/s"}})}
@@ -728,14 +898,17 @@ def single_table(A, th):
 def concurrent_table(A, quad):
     qname = "多发·多轮" if quad == "conc_multi" else "多发·单轮"
     has_think = any(e["thinking"] != "off" or (e["think"] and e["think"][0] > 0) for e in A[quad])
-    head = ["模型", "thinking", "输出 tk", "并发", "单元数", "请求总数", "墙钟 s", "吞吐 tok/s",
+    head = ["模型", "thinking", "输出 tk", "并发", "单元数", "请求总数", "失败", "墙钟 s", "吞吐 tok/s",
             "TTFT s", "TTFT p95/p99 s", "E2E s", "E2E p95/p99 s"] + (["思考 s"] if quad == "conc_multi" else []) + \
            ["单请求 tok/s", "finish"]
     rows = []
     for e in sorted(A[quad], key=lambda x: (x["model"], x["thinking"], x["mt"], x["level"])):
         mt_cell = "mix({})".format("/".join(s["label"] for s in e["shapes"])) if e["shapes"] else str(e["mt"])
+        fail_cell = str(e.get("fails") or 0)
+        if e.get("fails"):
+            fail_cell = '<span style="color:#e5484d;font-weight:600">{}</span>'.format(e["fails"])
         row = [esc(short(e["model"])), e["thinking"], mt_cell, str(e["level"]),
-               "{:,}".format(e["n_units"]), "{:,}".format(e["n_turns"]),
+               "{:,}".format(e["n_units"]), "{:,}".format(e["n_turns"]), fail_cell,
                "{:.1f}".format(e["wall"]) if e["wall"] else "—",
                "{:.0f}".format(e["tps"]) if e["tps"] else "—",
                f3(e["ttft"]), fpct(e["ttft_p"], 2), f1(e["e2e"]), fpct(e["e2e_p"], 1)]
@@ -743,10 +916,13 @@ def concurrent_table(A, quad):
             row.append(f1(e["think"]))
         row += [f0(e["tokps"]), " / ".join(e["finish"])]
         rows.append(row)
-    note = '<div class="note">单元数：{}。TTFT/E2E 为该并发等级下全部请求的中位数（min–max）；' \
-           'p95/p99 仅在请求总数 ≥ {} 时计算——长短混跑时中位数可能几乎不动而 p99 数倍膨胀，' \
+    note = '<div class="note">单元数：{}。TTFT/E2E 为该并发等级下成功请求的中位数（min–max）；' \
+           'p95/p99 仅在成功请求数 ≥ {} 时计算——长短混跑时中位数可能几乎不动而 p99 数倍膨胀，' \
            '请对照 p95/p99 列判断尾部时延风险。</div>'.format(
         "独立多轮会话（每用户各自跑完整会话）" if quad == "conc_multi" else "独立单轮请求", MIN_PCT_SAMPLE)
+    if any(e.get("fails") for e in A[quad]):
+        note += '<div class="note" style="color:#b45309;font-weight:600">⚠️ 该象限存在失败请求（已从延迟统计剔除）——' \
+                '对应档位的中位数/分位数仅基于幸存请求，真实体验比表中更差；失败明细见数据质量章。</div>'
     return table(head, rows) + note if rows else "<p>无数据</p>"
 
 
@@ -1200,6 +1376,12 @@ def quality_block(data):
         p = "<p>{}：{} 条请求，{} 条带兼容性告警".format(k, len(runs), n_warn)
         if kinds:
             p += "（" + "、".join(esc(x) for x in kinds) + "）"
+        n_fail = sum(1 for r in runs if r.get("error"))
+        if n_fail:
+            ekinds = sorted({(r.get("error") or "").split(":")[0].strip() for r in runs if r.get("error")})
+            p += "；<span style=\"color:#e5484d;font-weight:600\">⚠️ {} 条失败（{}）</span>" \
+                 "——失败请求未计入延迟统计，相关档位中位数为幸存者口径，并按网关侧超时上限截断" \
+                 "（见 E2E 是否钉在整 300s 附近）".format(n_fail, "、".join(esc(x) for x in ekinds))
         parts.append(p + "。</p>")
         # 服务端 metrics
     for k in SCENARIOS:
@@ -1335,7 +1517,7 @@ def main():
         sec2_body += ('<details><summary>配置原文（YAML 存档）</summary>'
                       '<pre style="white-space:pre-wrap;font-size:12px">{}</pre></details>').format(
             esc(meta["config_raw"]))
-    # 战役画像（5.10）：开跑前估算的计划，随数据落盘——核对"当时的计划"与实际产出是否一致
+    # 测试画像（5.10）：开跑前估算的计划，随数据落盘——核对"当时的计划"与实际产出是否一致
     plan = meta.get("plan")
     if plan and (plan.get("models") or []):
         rows = []
@@ -1344,7 +1526,7 @@ def main():
                 rows.append([s.get("name"), m.get("model"), s.get("detail"),
                              "{:,}".format(s.get("requests") or 0)])
         if rows:
-            sec2_body += ('<h3>战役画像（开跑前估算；展示口径 = 执行口径）</h3>'
+            sec2_body += ('<h3>测试画像（开跑前估算；展示口径 = 执行口径）</h3>'
                           + table(["场景", "模型", "形状明细", "请求估算"], rows)
                           + '<div class="note">总请求估算 ≈ {:,}（不含预热与金丝雀）。'
                             'token 数字为估算值（~4 字符/token + 1.07 模板开销），带 ~ 前缀。</div>'.format(
@@ -1460,7 +1642,7 @@ h3{font-size:15.5px;margin:20px 0 6px}
 .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin:18px 0}
 .kpi{background:#fff;border:1px solid var(--line);border-radius:10px;padding:12px 14px}
 .kpi-v{font-size:20px;font-weight:700;color:#1652f0}.kpi-l{font-size:12px;color:#777;margin-top:2px}
-table{border-collapse:collapse;width:100%;font-size:12.5px;background:#fff;margin:10px 0}
+table{border-collapse:collapse;width:100%;font-size:12.5px;background:#fff;margin:10px 0;display:block;overflow-x:auto}
 th,td{border:1px solid var(--line);padding:5px 9px;text-align:left;white-space:nowrap}
 th{background:#f1f5f9}
 .rng{color:#6b7280;font-size:11px;white-space:nowrap}
@@ -1474,27 +1656,49 @@ summary{cursor:pointer;font-size:13.5px;color:#374151}
 .cap{font-size:13px;font-weight:600;margin:10px 0 0}
 .tight li{margin:3px 0}
 .foot{color:#6b7280;font-size:12px;margin-top:44px;border-top:1px solid var(--line);padding-top:12px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px;margin:26px 0}
+.backhome{display:none;margin:2px 0 0}
+.backhome a{color:#1652f0;font-size:13px;text-decoration:none;cursor:pointer}
+.mcard{background:#fff;border:1px solid var(--line);border-radius:12px;padding:18px 20px;cursor:pointer;transition:box-shadow .15s,transform .15s,border-color .15s}
+.mcard:hover{box-shadow:0 4px 18px rgba(22,82,240,.14);transform:translateY(-2px);border-color:#1652f0}
+.mcard .mname{font-size:16.5px;font-weight:700;color:#111827}
+.mcard .msub{font-size:12px;color:#6b7280;margin-top:2px}
+.mcard .mstats{margin-top:12px;font-size:12.8px;color:#374151;line-height:2.0}
+.mcard .mstats b{color:#1652f0}
+.mcard .menter{margin-top:12px;color:#1652f0;font-size:13px;font-weight:600}
 </style></head><body>
 <h1>__TITLE__</h1>
 <p class="sub">__SUB__</p>
 <div class="kpis">__KPI__</div>
+__CARDS__
+<p class="backhome" id="backhome"><a href="#">← 返回首页（选择模型）</a></p>
 __BODY__
 <div class="foot">全部数字来自服务端 usage 与客户端逐 chunk 计时，原始 JSON 原始留存可复查。
 本报告内嵌 <code>&lt;script id="perf-summary"&gt;</code> 数据块（聚合指标 + 自动观察）——将整份 HTML 交给 AI，
 即可让它基于该数据块为报告追加通俗解读备注。</div>
 __SUMMARY__
 __CHARTS__
+<script>__SWITCHER__</script>
 </body></html>"""
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor", "chart.umd.min.js"),
               encoding="utf-8") as f:
         lib = f.read().replace("</script>", "<\\/script>")
+    model_names = list(A["per_model"].keys())
+    cards_html, switcher = "", ""
+    if len(model_names) > 1:
+        switcher = SWITCHER_JS.replace(
+            "__MODELS__", json.dumps([short(m) for m in model_names], ensure_ascii=False))
+        cards_html = landing_cards(data, model_names)
+        sub = sub + '　·　点击模型卡片进入该模型的报告'
     page = (page.replace("__LIB__", lib)
                 .replace("__TITLE__", esc(title))
                 .replace("__SUB__", sub)
                 .replace("__KPI__", kpi_html)
+                .replace("__CARDS__", cards_html)
                 .replace("__BODY__", body)
                 .replace("__SUMMARY__", summary_block)
-                .replace("__CHARTS__", chart_block))
+                .replace("__CHARTS__", chart_block)
+                .replace("__SWITCHER__", switcher))
     suffix = ""
     if scenarios != set(QUADS):
         suffix = "-" + "+".join(QUADS[q] for q in sorted(scenarios, key=list(QUADS).index))
@@ -1505,6 +1709,63 @@ __CHARTS__
 
 def table_kv(rows):
     return "".join('<tr><th>{}</th><td>{}</td></tr>'.format(esc(k), esc(v)) for k, v in rows)
+
+
+def landing_cards(data, models):
+    """落地页模型卡片：每模型 3 条头条指标（单发 TTFT / 多轮末端 TTFT / 并发最高档 TTFT+失败数）。"""
+    def med(vals, nd=2):
+        vals = [v for v in vals if v is not None]
+        return round(st.median(vals), nd) if vals else None
+
+    def fmt(ms, nd=2):
+        return "{:.{}f} s".format(ms / 1000, nd) if ms is not None else "—"
+
+    cards = []
+    for m_full in models:
+        m = short(m_full)  # 展示名与 data-mv 用短名；源数据匹配用完整名
+        # 单发 TTFT（thinking=off，取最大输入档）
+        single_ttft = None
+        s_entries = [e for e in data["single"]
+                     if e["model"] == m_full and e.get("thinking", "off") == "off" and e.get("runs")]
+        if s_entries:
+            e = max(s_entries, key=lambda x: x["prompt_tokens"])
+            single_ttft = med([r.get("ttft_ms") for r in e["runs"]])
+            pin = "{:,}".format(e["prompt_tokens"])
+        else:
+            pin = "—"
+        # 多轮末端 TTFT（off，各 session 最后一轮）
+        mt_ttft = None
+        mt_sessions = [e for e in data["multiturn"]
+                       if e["model"] == m_full and e.get("thinking", "off") == "off" and e.get("turns")]
+        if mt_sessions:
+            mt_ttft = med([e["turns"][-1].get("ttft_ms") for e in mt_sessions])
+        # 并发最高档 TTFT 中位（off 优先）+ 该模型总失败数
+        conc_ttft = None
+        lvls = [lv for lv in data["concurrent"] if lv["model"] == m_full]
+        fails = 0
+        for lv in lvls:
+            turns = ([t for s in lv.get("sessions", []) for t in s["turns"]]
+                     if (lv.get("sessions") or lv.get("multiturn")) else lv.get("requests", []))
+            fails += sum(1 for t in turns if t.get("error"))
+        top = max((lv for lv in lvls if lv.get("thinking", "off") == "off"),
+                  key=lambda x: x.get("level", 0), default=None)
+        if top:
+            turns = ([t for s in top.get("sessions", []) for t in s["turns"]]
+                     if (top.get("sessions") or top.get("multiturn")) else top.get("requests", []))
+            conc_ttft = med([t.get("ttft_ms") for t in turns if not t.get("error")])
+        cards.append(
+            '<div class="mcard" data-mv="{m}">'
+            '<div class="mname">{m}</div>'
+            '<div class="msub">单发 / 多轮 / 并发 头条指标（thinking=off）</div>'
+            '<div class="mstats">'
+            '单发 {pin} TTFT 中位　<b>{s1}</b><br>'
+            '多轮末端 TTFT 中位　<b>{s2}</b><br>'
+            '并发最高档 TTFT 中位　<b>{s3}</b>　·　总失败 <b>{f}</b>'
+            '</div>'
+            '<div class="menter">查看该模型报告 →</div>'
+            '</div>'.format(m=esc(m), pin=esc(pin), s1=fmt(single_ttft), s2=fmt(mt_ttft),
+                            s3=fmt(conc_ttft), f="{:,}".format(fails) if fails else "0"))
+    return '<div class="cards" id="cards">' + "".join(cards) + "</div>"
 
 
 if __name__ == "__main__":

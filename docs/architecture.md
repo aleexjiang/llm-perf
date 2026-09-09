@@ -37,7 +37,7 @@ scripts/gen_html_report.py ── 读多份 JSON → merge/analyze → 自包含
 | `internal/corpus` | corpus.go | 填充语料加载（en/zh/自定义路径），供 filler 构造 token 精确文本 | |
 | `internal/auth` | auth.go | 认证方案抽象：bearer / 裸 key / 自定义 header / none，chat 与 /metrics 共用 | 替代了早期 3 处硬编码 `Bearer ` |
 | `internal/engine` | client.go / sse.go / filler.go / trace.go / probe.go / toolprobe.go / corpus_filler.go | OpenAI 兼容客户端与逐 chunk 计时；SSE 解析；负载生成；兼容性探针 | 见下"engine 内部" |
-| `internal/scenario` | scenario.go（1111 行）、plan.go（战役画像） | 三场景编排：Single(374) / Multiturn(505) / Concurrent(700)；闭环(885)/开环(946)；混跑形状计划(803)/聚合(839)；正确性金丝雀(317)；goodput(296-316)；plan.go：PlanSummary 开跑前估算请求量（复用 ClampLadder/MaxTokensList/Variants，展示口径=执行口径） | 场景经 Register 注册表派发（main 不直接 import 各场景实现） |
+| `internal/scenario` | scenario.go（1111 行）、plan.go（测试画像） | 三场景编排：Single(374) / Multiturn(505) / Concurrent(700)；闭环(885)/开环(946)；混跑形状计划(803)/聚合(839)；正确性金丝雀(317)；goodput(296-316)；plan.go：PlanSummary 开跑前估算请求量（复用 ClampLadder/MaxTokensList/Variants，展示口径=执行口径） | 场景经 Register 注册表派发（main 不直接 import 各场景实现） |
 | `internal/smetrics` | smetrics.go | 服务端 /metrics 观测层：counter 差值 / gauge 轮询 / histogram 分位估计；指标名归一化（去 `_total`） | 引擎指标名表(249-298)硬编码，未知引擎回落 vLLM(302-307) 无告警（ROADMAP 附录 C） |
 | `internal/report` | report.go | JSON 输出结构定义与落盘：Report / SingleRow / MultiturnRun / ConcurrentLevel / PartitionByModel | 只定义结构不做聚合 |
 
@@ -72,7 +72,7 @@ scripts/gen_html_report.py ── 读多份 JSON → merge/analyze → 自包含
 ## 已知坑位（改代码前先看）
 
 1. **`--concurrency cfg` 是字面量**：main.go 据此读 `config.Concurrent.Levels`，与逗号数字列表两条解析路径。
-2. **seed 规则**（scenario.go:1067-1082）：`fixed_seed` / 会话 / worker 三套确定性 seed 公式 + `--seed-salt` 战役隔离——重跑对照必须换盐，否则命中服务端前缀缓存。
+2. **seed 规则**（scenario.go:1067-1082）：`fixed_seed` / 会话 / worker 三套确定性 seed 公式 + `--seed-salt` 测试隔离——重跑对照必须换盐，否则命中服务端前缀缓存。
 3. **截断必须按 rune**：`TruncateRunes`（client.go:207）是唯一正确姿势，按字节切中文出半个 UTF-8 字符（历史 bug）。
 4. **多模型分区**：`PartitionByModel`（report.go:166）+ main.go `modelDirName`（保留 Unicode，中文模型名不清洗成同形碰撞）；run.log 与 raw/ 留在 output_dir 顶层共享。
 5. **run.log 追加不覆盖**（main.go:233）：同目录多轮测试日志都要留得住。

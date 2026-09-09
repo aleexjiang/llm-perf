@@ -376,7 +376,7 @@ func (c *Config) ForModel(model string) *Config {
 // 段内覆盖语义与 ThinkingFor 一致——零值/缺省 = 继承；因此布尔与"合法零值"字段
 // （fixed_seed、keep_assistant、concurrent.multiturn 等）无法在模型层显式改回 false，
 // 这类全局形状请保持各模型一致或拆分配置。端点级配置（endpoint/认证/timeout_seconds/
-// server_metrics）不在此覆盖——一个战役一个端点，超时由 client 统一持有。
+// server_metrics）不在此覆盖——一个测试一个端点，超时由 client 统一持有。
 type ModelOverride struct {
 	Thinking   *Thinking   `yaml:"thinking"` // 覆盖全局 thinking（字段级，未写的继承）
 	Single     *Single     `yaml:"single"`
@@ -446,8 +446,8 @@ type Config struct {
 	WarmupRequests int `yaml:"warmup_requests"`
 
 	// SeedSalt 种子盐值：所有场景的 prompt 种子都叠加该值。服务端 prefix cache 是内存态、
-	// 跨请求存活——同一配置重跑时 prompt 与上次完全相同，"冷缓存"测量会被上次战役污染。
-	// 每次测试战役（改代码/改配置后的重测）递增盐值即可隔离；不改服务端也能拿到干净的冷缓存。
+	// 跨请求存活——同一配置重跑时 prompt 与上次完全相同，"冷缓存"测量会被上次测试污染。
+	// 每次测试（改代码/改配置后的重测）递增盐值即可隔离；不改服务端也能拿到干净的冷缓存。
 	SeedSalt int `yaml:"seed_salt"`
 
 	// Warnings 配置诊断提示（Load 时生成，非序列化字段）：不阻止运行，

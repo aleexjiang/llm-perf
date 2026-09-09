@@ -9,7 +9,7 @@
 bench -c config.yaml --turns X --concurrency Y
   └─ <output_dir>/<场景>-<时间戳>.json          # 单模型：直接落顶层
      <output_dir>/<模型>/<场景>-<时间戳>.json   # 多模型：PartitionByModel 按模型分区
-     <output_dir>/run.log                       # 战役级追加日志（跨场景共享）
+     <output_dir>/run.log                       # 测试级追加日志（跨场景共享）
      <output_dir>/raw/*.log                     # debug:true 时的原始请求/响应转储
   ▼
 gen_html_report.py f1.json f2.json ... [标题]

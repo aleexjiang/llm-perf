@@ -74,7 +74,7 @@ type SLO struct {
 	TPOTMS float64 `json:"tpot_ms"`
 }
 
-// Plan 战役画像（5.10）：配置校验通过后、发首个请求前估算的"这次要跑什么形状"总览。
+// Plan 测试画像（5.10）：配置校验通过后、发首个请求前估算的"这次要跑什么形状"总览。
 // 估算口径 = 执行口径（复用 ClampLadder / MaxTokensList / Variants / ForModel），
 // 开跑前打印 + 随每份场景 JSON 落盘（与 Environment/ConfigRaw 合并消费，回溯"当时的计划"）。
 type Plan struct {
@@ -88,7 +88,7 @@ type Plan struct {
 	TotalRequests int         `json:"total_requests"` // 所有模型所有场景之和；不含预热与金丝雀
 }
 
-// PlanModel 单模型的战役计划（model_overrides 覆盖后各模型请求量可能不同）。
+// PlanModel 单模型的测试计划（model_overrides 覆盖后各模型请求量可能不同）。
 type PlanModel struct {
 	Model     string         `json:"model"`
 	Scenarios []PlanScenario `json:"scenarios"`
@@ -105,7 +105,7 @@ type PlanScenario struct {
 // Render 输出人读总览行（bench 启动时逐行打印；HTML 报告另按结构渲染）。
 func (p *Plan) Render() []string {
 	lines := []string{fmt.Sprintf(
-		"战役画像：端点 %s ｜ 模型 %d 个 ｜ 认证 %s ｜ 超时 %ds ｜ 预热 %d/场景 ｜ 金丝雀 %d/模型",
+		"测试画像：端点 %s ｜ 模型 %d 个 ｜ 认证 %s ｜ 超时 %ds ｜ 预热 %d/场景 ｜ 金丝雀 %d/模型",
 		p.Endpoint, p.NumModels, p.Auth, p.TimeoutS, p.Warmup, p.Correctness)}
 	for _, m := range p.Models {
 		for _, s := range m.Scenarios {

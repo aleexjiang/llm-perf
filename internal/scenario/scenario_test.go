@@ -16,7 +16,7 @@ import (
 	"github.com/aleexjiang/llm-perf/internal/report"
 )
 
-// ── 种子派生语义（表驱动锁定：战役盐值隔离、fixed_seed 档内复用/档间独立、worker 互异） ──
+// ── 种子派生语义（表驱动锁定：测试盐值隔离、fixed_seed 档内复用/档间独立、worker 互异） ──
 
 func TestSingleSeed(t *testing.T) {
 	cases := []struct {
@@ -43,9 +43,9 @@ func TestSingleSeed(t *testing.T) {
 	if singleSeed(true, 4096, 0, 0) == singleSeed(true, 20480, 0, 0) {
 		t.Fatal("不同档位的 fixed_seed 种子相同——嵌套前缀缺陷回归")
 	}
-	// 关键不变量：盐值隔离战役——任意组合下 salt=0 与 salt=1 种子不同
+	// 关键不变量：盐值隔离测试——任意组合下 salt=0 与 salt=1 种子不同
 	if singleSeed(true, 4096, 1, 0) == singleSeed(true, 4096, 1, 1) {
-		t.Fatal("盐值未生效——战役隔离失效")
+		t.Fatal("盐值未生效——测试隔离失效")
 	}
 }
 

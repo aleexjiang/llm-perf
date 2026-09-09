@@ -1083,7 +1083,7 @@ func finalizeLevel(e *env, lv *report.ConcurrentLevel, wall float64) {
 	lv.SLOMeet = meet
 }
 
-// ── 种子派生（表驱动测试锁定语义：盐值隔离战役、fixed_seed 档内复用/档间独立、worker 间互异） ──
+// ── 种子派生（表驱动测试锁定语义：盐值隔离测试、fixed_seed 档内复用/档间独立、worker 间互异） ──
 
 // singleSeed 单发场景：fixed_seed 时每档独立种子（档位内各 run 复用同一 prompt 测缓存对照）。
 // 不要让不同档位共享种子——语料窗口同起点会使档位间 prompt 互为嵌套前缀，
