@@ -177,10 +177,10 @@ apply('');
 
 # ────────────────────────── 输入加载 ──────────────────────────
 
-# 四象限场景：single=单发·单轮 multiturn=单发·多轮 conc-single=多发·单轮 conc-multi=多发·多轮
-QUADS = {"single": "单发单轮", "multiturn": "单发多轮", "conc-single": "多发单轮", "conc-multi": "多发多轮"}
-SCEN_ALIASES = {"单发单轮": "single", "单发多轮": "multiturn", "多发单轮": "conc-single",
-                "多发多轮": "conc-multi", "全部": "all", "合并": "all", "all": "all"}
+# 四象限场景：single=单发·单轮 multiturn=单发·多轮 conc-single=并发·单轮 conc-multi=并发·多轮
+QUADS = {"single": "单发单轮", "multiturn": "单发多轮", "conc-single": "并发单轮", "conc-multi": "并发多轮"}
+SCEN_ALIASES = {"单发单轮": "single", "单发多轮": "multiturn", "并发单轮": "conc-single",
+                "并发多轮": "conc-multi", "全部": "all", "合并": "all", "all": "all"}
 
 
 def parse_scenarios(spec):
@@ -193,7 +193,7 @@ def parse_scenarios(spec):
             return set(QUADS)
         if t not in QUADS:
             sys.exit("--scenarios 无效值 {!r}（可选：single=单发单轮 multiturn=单发多轮 "
-                     "conc-single=多发单轮 conc-multi=多发多轮 all=合并；支持中文别名）".format(t))
+                     "conc-single=并发单轮 conc-multi=并发多轮 all=合并；支持中文别名）".format(t))
         out.add(t)
     return out or set(QUADS)
 
@@ -812,8 +812,8 @@ def build_charts(data, A):
 
     # 并发四象限：吞吐 & TTFT vs 并发（每象限一张图，每模型×thinking 一条线）
     for quad, cid_tps, cid_ttft, qname in (
-            ("conc_single", "c_cs_tps", "c_cs_ttft", "多发·单轮"),
-            ("conc_multi", "c_cm_tps", "c_cm_ttft", "多发·多轮")):
+            ("conc_single", "c_cs_tps", "c_cs_ttft", "并发·单轮"),
+            ("conc_multi", "c_cm_tps", "c_cm_ttft", "并发·多轮")):
         items = A.get(quad) or []
         if not items:
             continue
@@ -896,7 +896,7 @@ def single_table(A, th):
 
 
 def concurrent_table(A, quad):
-    qname = "多发·多轮" if quad == "conc_multi" else "多发·单轮"
+    qname = "并发·多轮" if quad == "conc_multi" else "并发·单轮"
     has_think = any(e["thinking"] != "off" or (e["think"] and e["think"][0] > 0) for e in A[quad])
     head = ["模型", "thinking", "输出 tk", "并发", "单元数", "请求总数", "失败", "墙钟 s", "吞吐 tok/s",
             "TTFT s", "TTFT p95/p99 s", "E2E s", "E2E p95/p99 s"] + (["思考 s"] if quad == "conc_multi" else []) + \
@@ -1212,8 +1212,8 @@ def gen_conclusions(A):
                       "长草稿显著放大单次时延{}。".format(
                 esc(short(m)), min(rc), max(rc), "{:.0f}".format(min(e2)), "{:.0f}".format(max(e2)), st.median(e2),
                 "；其中 {} 次思考独占输出预算（正文 0 token）".format(n_exh) if n_exh else ""))
-    # 5 并发扩展性（四象限中的两个"多发"）
-    for quad, qname in (("conc_single", "多发·单轮"), ("conc_multi", "多发·多轮")):
+    # 5 并发扩展性（并发两象限）
+    for quad, qname in (("conc_single", "并发·单轮"), ("conc_multi", "并发·多轮")):
         bymt = defaultdict(list)
         for e in A.get(quad, []):
             bymt[(e["model"], e["thinking"], e["mt"])].append(e)
@@ -1248,7 +1248,7 @@ def gen_conclusions(A):
                     esc(short(m)), qname, th_lbl, es[0]["level"], es[-1]["level"], scale, lv_ratio,
                     es[0]["ttft"][0], es[-1]["ttft"][0]))
     # 5.6 混合负载：形状间尾延迟差异 + 混跑 vs 均匀吞吐对比
-    for quad, qname in (("conc_single", "多发·单轮"), ("conc_multi", "多发·多轮")):
+    for quad, qname in (("conc_single", "并发·单轮"), ("conc_multi", "并发·多轮")):
         mix_es = [e for e in A.get(quad, []) if e.get("shapes")]
 
         def load_lbl(e):
@@ -1335,8 +1335,8 @@ def gen_limits(data, A):
         n_len = sum(1 for r in off_runs if r.get("finish_reason") == "length")
         if n_len > len(off_runs) * 0.5:
             cap = max(r.get("completion_tokens", 0) for r in off_runs)
-            lim.append("off 场景 {}% 的 run finish=length（输出上限 ≈{:,} tok）——<b>E2E / decode 列在 off 场景不可跨"
-                       "模型或跨思考变体比较</b>（输出长度被钳制）；TTFT / ITL / tok/s 不受影响。".format(
+            lim.append("off 场景 {}% 的 run finish=length（输出上限 ≈{:,} tok，输出长度被钳制）——E2E / decode 列在 off 场景不可跨"
+                       "模型或跨思考变体比较；TTFT / ITL / tok/s 不受影响。".format(
                            round(n_len / len(off_runs) * 100), cap))
     ev = A["events"]
     if ev["no_content"]:
@@ -1470,7 +1470,7 @@ def main():
         if "on" in P and P["on"].get("e2e_all"):
             kpis.append(("思考 E2E 中位·单发 ({})".format(short(m)),
                          "{:.0f} s".format(st.median(P["on"]["e2e_all"]))))
-    for quad, qname in (("conc_single", "多发单轮"), ("conc_multi", "多发多轮")):
+    for quad, qname in (("conc_single", "并发单轮"), ("conc_multi", "并发多轮")):
         bym = defaultdict(list)
         for e in A.get(quad, []):
             bym[(e["model"], e["thinking"], e["mt"])].append(e)
@@ -1494,9 +1494,9 @@ def main():
     if A["coverage"]["has_multiturn"]:
         cov.append("单发·多轮（history 逐轮滚动）")
     if A["coverage"]["has_conc_single"]:
-        cov.append("多发·单轮（并发 × 独立单轮请求）")
+        cov.append("并发·单轮（独立单轮请求）")
     if A["coverage"]["has_conc_multi"]:
-        cov.append("多发·多轮（并发 × 每用户独立多轮会话）")
+        cov.append("并发·多轮（每用户独立多轮会话）")
     notes_html = "".join("<p><b>{}</b>：{}</p>".format(esc(f), esc(n)) for f, n in meta["notes"][-4:])
     sec2_body = table_kv([("端点", meta["endpoint"]), ("工具版本", meta["tool"]),
                           ("场景覆盖", "；".join(cov)),
@@ -1513,24 +1513,6 @@ def main():
         sec2_body += "<h3>引擎环境（压测时自动探测）</h3>" + table(["项目", "值"], env_rows)
     else:
         sec2_body += '<div class="note">本份数据未包含引擎环境存档（旧版本工具产出）。</div>'
-    if meta.get("config_raw"):
-        sec2_body += ('<details><summary>配置原文（YAML 存档）</summary>'
-                      '<pre style="white-space:pre-wrap;font-size:12px">{}</pre></details>').format(
-            esc(meta["config_raw"]))
-    # 测试画像（5.10）：开跑前估算的计划，随数据落盘——核对"当时的计划"与实际产出是否一致
-    plan = meta.get("plan")
-    if plan and (plan.get("models") or []):
-        rows = []
-        for m in plan.get("models") or []:
-            for s in m.get("scenarios") or []:
-                rows.append([s.get("name"), m.get("model"), s.get("detail"),
-                             "{:,}".format(s.get("requests") or 0)])
-        if rows:
-            sec2_body += ('<h3>测试画像（开跑前估算；展示口径 = 执行口径）</h3>'
-                          + table(["场景", "模型", "形状明细", "请求估算"], rows)
-                          + '<div class="note">总请求估算 ≈ {:,}（不含预热与金丝雀）。'
-                            'token 数字为估算值（~4 字符/token + 1.07 模板开销），带 ~ 前缀。</div>'.format(
-                              plan.get("total_requests") or 0))
     sec.append(("<h2>2 · 测试配置与方法</h2>",
                 sec2_body +
                 (('<div class="note">' + notes_html + "</div>") if notes_html else "")))
@@ -1568,11 +1550,11 @@ def main():
         if any(c == "c_on_e2e" for c, _ in canvases):
             body += '<div class="chart"><canvas id="c_on_e2e" height="110"></canvas></div>'
         sec.append(("<h2>5 · 单发·多轮结果</h2>", body))
-    # 并发（多发·单轮 / 多发·多轮）
+    # 并发（并发·单轮 / 并发·多轮）
     if A["coverage"]["has_concurrent"]:
         body = ""
-        for quad, qname, cids in (("conc_single", "6.1 多发·单轮（并发 × 独立单轮请求）", ("c_cs_tps", "c_cs_ttft")),
-                                  ("conc_multi", "6.2 多发·多轮（并发 × 每用户独立多轮会话）", ("c_cm_tps", "c_cm_ttft"))):
+        for quad, qname, cids in (("conc_single", "6.1 并发·单轮（独立单轮请求）", ("c_cs_tps", "c_cs_ttft")),
+                                  ("conc_multi", "6.2 并发·多轮（每用户独立多轮会话）", ("c_cm_tps", "c_cm_ttft"))):
             if not A.get(quad):
                 continue
             body += "<h3>{}</h3>".format(qname)
@@ -1621,8 +1603,8 @@ def main():
     if A["coverage"]["has_concurrent"]:
         sec.append(("<h2>附录 C · 并发逐等级明细</h2>",
                     "<details><summary>展开</summary>{}{}</details>".format(
-                        ("<h3>多发·单轮</h3>" + concurrent_table(A, "conc_single") + shapes_table(A, "conc_single")) if A.get("conc_single") else "",
-                        ("<h3>多发·多轮</h3>" + concurrent_table(A, "conc_multi") + shapes_table(A, "conc_multi")) if A.get("conc_multi") else "")))
+                        ("<h3>并发·单轮</h3>" + concurrent_table(A, "conc_single") + shapes_table(A, "conc_single")) if A.get("conc_single") else "",
+                        ("<h3>并发·多轮</h3>" + concurrent_table(A, "conc_multi") + shapes_table(A, "conc_multi")) if A.get("conc_multi") else "")))
 
     body = "".join(h + '\n' + b + "\n" for h, b in sec)
     chart_block = ("<script>\n" + GRID_JS + "\n" + "\n".join(stmts) + "\n</script>") if stmts else ""
@@ -1635,17 +1617,17 @@ def main():
 <script>__LIB__</script>
 <style>
 :root{--ink:#111827;--line:#e5e7eb}
-body{font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;max-width:960px;margin:24px auto;padding:0 18px 80px;color:var(--ink);background:#f8fafc;line-height:1.7}
+body{font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;max-width:1720px;margin:24px auto;padding:0 18px 80px;color:var(--ink);background:#f8fafc;line-height:1.7}
 h1{font-size:25px;margin-bottom:4px} h2{font-size:19px;margin-top:44px;border-bottom:1px solid var(--line);padding-bottom:8px}
 h3{font-size:15.5px;margin:20px 0 6px}
 .sub{color:#6b7280;font-size:13px;margin-bottom:24px}
 .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin:18px 0}
 .kpi{background:#fff;border:1px solid var(--line);border-radius:10px;padding:12px 14px}
 .kpi-v{font-size:20px;font-weight:700;color:#1652f0}.kpi-l{font-size:12px;color:#777;margin-top:2px}
-table{border-collapse:collapse;width:100%;font-size:12.5px;background:#fff;margin:10px 0;display:block;overflow-x:auto}
-th,td{border:1px solid var(--line);padding:5px 9px;text-align:left;white-space:nowrap}
+table{border-collapse:collapse;width:100%;font-size:12.5px;background:#fff;margin:10px 0;table-layout:auto}
+th,td{border:1px solid var(--line);padding:5px 9px;text-align:left;overflow-wrap:anywhere;word-break:break-word}
 th{background:#f1f5f9}
-.rng{color:#6b7280;font-size:11px;white-space:nowrap}
+.rng{color:#6b7280;font-size:11px;overflow-wrap:anywhere}
 .note{background:#fff8e6;border-left:4px solid #f0b429;padding:10px 14px;border-radius:4px;font-size:13.5px;margin:10px 0}
 .finding{background:#eff6ff;border-left:4px solid #1652f0;padding:12px 16px;border-radius:4px;margin:10px 0}
 .good{background:#ecfdf5;border-left:4px solid #0e9f6e;padding:12px 16px;border-radius:4px;margin:10px 0}
