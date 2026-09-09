@@ -706,11 +706,15 @@ func collectSessionTurns(ctx context.Context, e *env, cfg *config.Config,
 		m := runOne(ctx, e, model, msgs, maxTok, v)
 		if m.PromptTokens > 0 {
 			if lastPrompt > 0 {
+				// 与 Multiturn 同语义：失败轮不推进基准；tokenizer 重切分致 prompt
+				// 不增反减时钳 0，避免负增量污染增量 prefill 斜率（原始值在 prompt_tokens 可核查）
 				m.NewTokens = m.PromptTokens - lastPrompt
+				if m.NewTokens < 0 {
+					m.NewTokens = 0
+				}
 			} else {
 				m.NewTokens = m.PromptTokens
 			}
-			// 与 Multiturn 同语义：失败轮不推进基准
 			lastPrompt = m.PromptTokens
 		}
 		out = append(out, m)

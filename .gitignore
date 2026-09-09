@@ -1,4 +1,9 @@
-bin/
+# 构建产物统一落 bin/，命名 bench-<os>-<arch>（见 Makefile）。
+# 正式产物 allowlist 入库——默认忽略全部 bin，只放行明确要跟踪的平台。
+bin/bench
+bin/bench-*
+!bin/bench-linux-amd64
+
 output/
 output-*/
 .env
@@ -7,12 +12,6 @@ output-*/
 configs/customer.yaml
 configs/customer-*.md
 scripts/__pycache__/
-bench-linux-amd64
-bench-linux-arm64
-bench-windows-*.exe
-bench-darwin-*
-
-/bench
 
 # 前缀缓存探针临时产物（能力已并入 bench probe --cache，不入库）
 /testdata/

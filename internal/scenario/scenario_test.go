@@ -145,6 +145,7 @@ type stubState struct {
 	mu       sync.Mutex
 	count    int
 	failReq  map[int]bool // 第 N 个请求（1-based）强制断连
+	promptOv map[int]int  // 第 N 个请求（1-based）强制返回指定 prompt_tokens（模拟 tokenizer 重切分回退）
 	bodies   []int        // 每个请求的 messages 数量
 	contents []string     // 每个请求的最后一条 user 消息前 80 字符
 }
@@ -202,6 +203,11 @@ func sseStub(t *testing.T, state *stubState) *httptest.Server {
 		if prompt < 1 {
 			prompt = 1
 		}
+		state.mu.Lock()
+		if ov, ok := state.promptOv[idx]; ok {
+			prompt = ov
+		}
+		state.mu.Unlock()
 		usage := map[string]any{
 			"prompt_tokens": prompt, "completion_tokens": 4, "total_tokens": prompt + 4,
 		}
@@ -284,6 +290,43 @@ func TestMultiturnFailureResume(t *testing.T) {
 	}
 	if state.bodies[1] != 3 || state.bodies[2] != 4 {
 		t.Fatalf("keep_assistant 拼装错误: 各请求消息数 %v", state.bodies)
+	}
+}
+
+// TestConcurrentMultiturnNewTokensClamp 集成：并发多轮（collectSessionTurns）路径
+// 下 tokenizer 重切分致服务端 prompt_tokens 回退（turn2 300 < turn1 1000）时，
+// NewTokens 必须钳 0 且不污染后续轮基准——与单场景 Multiturn 修复同语义（scenario.go 602/709 两路径对称）。
+func TestConcurrentMultiturnNewTokensClamp(t *testing.T) {
+	state := &stubState{
+		promptOv: map[int]int{1: 1000, 2: 300, 3: 1500}, // turn2 刻意回退：模拟 tokenizer 对累积 history 重切分
+	}
+	srv := sseStub(t, state)
+
+	cfg := testCfg(t, srv.URL)
+	cfg.Multiturn = config.Multiturn{Sessions: 1, Turns: 3, TurnTokens: 100, MaxTokens: config.IntList{16}, KeepAssistant: true}
+	cfg.Concurrent = config.Concurrent{Levels: []int{1}, Multiturn: true, RunsPerWorker: 1, MaxTokens: config.IntList{16}}
+
+	rep, err := Concurrent(context.Background(), cfg, engine.NewClient(srv.URL, "", 10*time.Second, true), "")
+	if err != nil {
+		t.Fatalf("Concurrent: %v", err)
+	}
+	sess := rep.Concurrent[0].Sessions
+	if len(sess) != 1 || len(sess[0].Turns) != 3 {
+		t.Fatalf("应有 1 会话 × 3 轮，得到 %d 会话 × %d 轮", len(sess), len(sess[0].Turns))
+	}
+	t1, t2, t3 := sess[0].Turns[0], sess[0].Turns[1], sess[0].Turns[2]
+	if t1.NewTokens != 1000 {
+		t.Fatalf("turn1.NewTokens = %d, want 1000（首轮=全量）", t1.NewTokens)
+	}
+	if t2.NewTokens != 0 {
+		t.Fatalf("turn2.NewTokens = %d, want 0（prompt 回退 1000→300 必须钳 0，否则负值污染增量 prefill 斜率）", t2.NewTokens)
+	}
+	// turn3 相对 turn2 的实际值（300）计增量，而不是被回退清成整个 ctx
+	if want := t3.PromptTokens - t2.PromptTokens; t3.NewTokens != want {
+		t.Fatalf("turn3.NewTokens = %d, want %d（基准应推进到回退后的 300，而非清零）", t3.NewTokens, want)
+	}
+	if t3.NewTokens <= 0 {
+		t.Fatalf("turn3 正常增长不应被误钳: %d", t3.NewTokens)
 	}
 }
 
