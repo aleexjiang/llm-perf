@@ -95,11 +95,14 @@ func newEnv(ctx context.Context, cfg *config.Config, client *engine.Client) (*en
 		// 否则观测层会带着空指标集白跑，报告里出现假"可用"
 		ok, detail := s.Available(ctx)
 		if !ok {
-			log.Printf("⚠️ server_metrics=true 但 /metrics 不可用（%v）——降级为纯客户端计时", detail)
+			// /metrics 是引擎实现细节，不是标准端点（网关照不到、代理剥掉都属常见形态）。
+			// 客户端实测是本工具唯一的基线口径，服务端观测只是可选增强——
+			// 因此这里既不是错误，也不是"降级"：缺它不影响任何结论。
+			log.Printf("ℹ️ 未提供 %s（%v）——全部结论按客户端实测口径给出", cfg.MetricsPath, detail)
 		} else {
 			sample, err := s.Scrape(ctx)
 			if err != nil {
-				log.Printf("⚠️ server_metrics=true 但 /metrics 抓取失败（%v）——降级为纯客户端计时", err)
+				log.Printf("ℹ️ %s 抓取失败（%v）——本次按客户端实测口径给出结论", cfg.MetricsPath, err)
 			} else {
 				name := smetrics.DetectProviderName(sample)
 				if name == "" {
@@ -110,7 +113,7 @@ func newEnv(ctx context.Context, cfg *config.Config, client *engine.Client) (*en
 				e.srv = s
 				e.provider = smetrics.DetectProvider(sample)
 				n := len(sample.Counters) + len(sample.Gauges) + len(sample.Hists)
-				log.Printf("服务端观测层: %s 可用（%d 项指标，%s 命名）", cfg.MetricsPath, n, name)
+				log.Printf("ℹ️ 服务端观测 %s 可用（%d 项指标，%s 命名）——额外采集一份作辅助，结论基线仍是客户端实测", cfg.MetricsPath, n, name)
 			}
 		}
 	}
@@ -266,6 +269,12 @@ func startWindow(ctx context.Context, e *env) (*smetrics.Sample, *smetrics.Gauge
 	return before, poller
 }
 
+// finishWindow 汇总场景窗口的服务端观测。
+//
+// Available 的语义严格限定为「**窗口差值**（counter/hist）是否取到」：结束快照失败时窗口差值
+// 无从计算，此时 Available=false 并保留 Note 说明原因——已轮询到的 gauges 仍然有效，照常挂回。
+// 这样报告侧能如实区分「已采集 / 已启用但未取到 / 未提供」，不会把一次失败渲染成全零面板
+// （历史 bug：中断场景下 available=true 且计数器全空，报告输出一句「服务端观测（single）：。」）。
 func finishWindow(ctx context.Context, e *env, before *smetrics.Sample, poller *smetrics.GaugePoller) *report.ServerMetricsSummary {
 	if e.srv == nil || before == nil {
 		if poller != nil {
@@ -273,7 +282,7 @@ func finishWindow(ctx context.Context, e *env, before *smetrics.Sample, poller *
 		}
 		return nil
 	}
-	summary := &report.ServerMetricsSummary{Available: true}
+	summary := &report.ServerMetricsSummary{}
 	if poller != nil {
 		summary.Gauges = poller.Summary() // Summary 内部会 Stop
 		if h := poller.Health(); h.Degraded() {
@@ -284,9 +293,10 @@ func finishWindow(ctx context.Context, e *env, before *smetrics.Sample, poller *
 	}
 	after, err := e.srv.Scrape(ctx)
 	if err != nil {
-		summary.Note = "结束快照抓取失败: " + err.Error()
+		summary.Note = "结束快照抓取失败（本场景无窗口差值）: " + err.Error()
 		return summary
 	}
+	summary.Available = true
 	d := smetrics.DiffCounters(before, after, e.provider)
 	summary.CacheHitTokens = d.PrefixCacheHitTokens
 	summary.CacheQueryTokens = d.PrefixCacheQueryTokens

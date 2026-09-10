@@ -14,6 +14,7 @@ import (
 	"github.com/aleexjiang/llm-perf/internal/config"
 	"github.com/aleexjiang/llm-perf/internal/engine"
 	"github.com/aleexjiang/llm-perf/internal/report"
+	"github.com/aleexjiang/llm-perf/internal/smetrics"
 )
 
 // ── 种子派生语义（表驱动锁定：测试盐值隔离、fixed_seed 档内复用/档间独立、worker 互异） ──
@@ -517,5 +518,80 @@ func TestGoodputSLOSubset(t *testing.T) {
 	eBoth := &env{cfg: &config.Config{Goodput: &config.GoodputCfg{TTFTMS: 2000, TPOTMS: 200}}}
 	if goodputOf(eBoth, &engine.TurnMetrics{Stream: true, TTFT: 1000, TPOTMS: 500}) {
 		t.Error("TPOT 超标应不达标")
+	}
+}
+
+// ── 服务端观测（/metrics）语义：可选第二数据源，缺失或失败一律不得影响结论 ──
+
+const metricsFixture = `# HELP vllm:prefix_cache_hits_total prefix cache hits
+# TYPE vllm:prefix_cache_hits_total counter
+vllm:prefix_cache_hits_total{engine="0"} 11708800
+vllm:prefix_cache_queries_total{engine="0"} 16188982
+vllm:num_preemptions_total{engine="0"} 3
+vllm:num_requests_running{engine="0"} 2
+`
+
+// metricsStub 只提供 /metrics 的最小服务端（chat 侧不参与本组用例）。
+func metricsStub(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/metrics" {
+			http.NotFound(w, r)
+			return
+		}
+		fmt.Fprint(w, metricsFixture)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// 观测层关闭（server_metrics=false，或端点探不到）时窗口汇总必须是 nil——
+// 报告据此走「未提供 /metrics」分支，而不是渲染一个全零面板。
+func TestFinishWindowNilWhenObservationOff(t *testing.T) {
+	e := &env{cfg: testCfg(t, "http://127.0.0.1:1"), perReqSrv: true} // srv == nil = 观测关闭
+	if got := finishWindow(context.Background(), e, nil, nil); got != nil {
+		t.Fatalf("观测层关闭时应返回 nil，实际: %+v", got)
+	}
+}
+
+// 结束快照失败（用取消 ctx 模拟 SIGINT）时：Available 必须为 false 且保留原因。
+// 回归背景：旧实现写 available=true + 全零计数器，报告渲染出一句「服务端观测（single）：。」。
+// 窗口内已轮询到的 gauges 独立于结束快照，应照常挂回。
+func TestFinishWindowNoWindowDeltaOnFailedSnapshot(t *testing.T) {
+	stub := metricsStub(t)
+	e := &env{cfg: testCfg(t, stub.URL), perReqSrv: true}
+	e.srv = smetrics.NewScraperAt(stub.URL, "/metrics")
+	e.cfg.MetricsPath = "/metrics"
+
+	live, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	before, err := e.srv.Scrape(live)
+	if err != nil || before == nil {
+		t.Fatalf("前置快照应抓取成功: %v", err)
+	}
+	e.provider = smetrics.DetectProvider(before)
+
+	pctx, pcancel := context.WithCancel(context.Background())
+	poller := smetrics.StartGaugePoller(pctx, e.srv, 5*time.Millisecond, e.provider)
+	deadline := time.Now().Add(3 * time.Second)
+	for poller.Health().Samples == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	gotSamples := poller.Health().Samples > 0
+	pcancel()
+	cancel() // 结束快照必然失败
+
+	sum := finishWindow(live, e, before, poller)
+	if sum == nil {
+		t.Fatal("应返回带失败原因的汇总而不是 nil——nil 会被报告误判成「未启用 /metrics」")
+	}
+	if sum.Available {
+		t.Error("结束快照失败时 Available 必须为 false；否则报告会把全零计数器当成已采集数据")
+	}
+	if sum.Note == "" {
+		t.Error("必须保留失败原因（note），供报告如实说明「已启用但未取到窗口差值」")
+	}
+	if gotSamples && len(sum.Gauges) == 0 {
+		t.Error("窗口内已轮询到的 gauges 与结束快照无关，应照常挂回")
 	}
 }

@@ -114,9 +114,43 @@
 ./bench probe -c example.yaml <模型ID>  # 指定模型
 ```
 
-输出：引擎猜测（Server 头 + 响应特征）、模型列表、逐项检查（非流式/流式/usage/[DONE]/思考开关有效性）、
-**tool-call 健康检查**（默认开启，`--no-toolcall` 关闭）、结论提示（哪些配置要改、哪些魔改需要适配），
-落盘 `probe-<时间戳>.json`。
+输出：引擎猜测（Server 头 + 响应特征）、模型列表、逐项检查（非流式/流式/usage/[DONE]/**部署默认思考状态**、
+思考开关有效性、思考等级可控性）、**tool-call 健康检查**（默认开启，`--no-toolcall` 关闭）、
+结论提示（哪些配置要改、哪些魔改需要适配）、**可粘贴回配置文件的 YAML 片段**，落盘 `probe-<时间戳>.json`。
+
+### 证据分级：标准面才是配置基线
+
+检查项分两级，**只有标准面（`/chat/completions`）的结论才用来定配置**：
+
+| 分级 | 来源 | 缺失时 | 记号 |
+|---|---|---|---|
+| **标准面** `core` | OpenAI 兼容契约内的 `chat` 接口 | 是缺陷，必须处理 | ✅ / ❌ |
+| **扩展面** `ext` | 引擎扩展：`/metrics`、`/models` 的 `max_model_len`、`Server` 头 | **只记 NA，不判失败、不计入通过率** | ✅ / ➖ |
+
+这条分级是本工具的一等原则：很多推理服务、尤其经网关代理之后，`/metrics` 根本不转发、
+`/models` 只返回 `id/object/created/owned_by`（`max_model_len` 是 vLLM/SGLang 扩展字段，会被剥掉）。
+把这些缺失当故障，会让探针在正常服务上到处误报 ❌。扩展面探到了是白捡的增强（可用它优化采集与报告），
+探不到只记 `➖ … [扩展面未提供，不计入结论]`。跑完会打一行汇总，例如
+`📊 标准面 12/12 通过；扩展面 2 项可用、1 项服务端未提供（非标准端点，不影响结论）`。
+
+### 自举：认证格式与挂载路径不用再猜
+
+`bench probe` 先用一个 `max_tokens=1` 的最小请求确认 chat 面，命中以下情况自动试探并给出可用值：
+
+- **认证被拒（401/403）** → 依次试 `Bearer/Authorization`、裸 key/`Authorization`、裸 key/`X-API-Key`、
+  `Bearer/X-API-Key`，命中即写进结论与配置片段。当前方案可用时**不会**额外发送 key，不把密钥撒到更多 header。
+- **挂载点落空（404/405）** → chat、models、metrics 各自扫常见候选
+  （如 `/v1/chat/completions`、`/openai/v1/chat/completions`、`/actuator/prometheus`），命中即提示改配置。
+- **端点不可达** → 直接 `❌ chat_endpoint` 并停止：其余探测项无从谈起，避免每项各超时一次。
+
+配置片段里**只有标准面确认过的值写成生效项**；由扩展面推导来的（如 `max_prompt_tokens` 由
+`max_model_len` 换算、`server_metrics: true`）一律注释掉并标明来源——换个端点就可能失效。
+
+`thinking_default` 是**无参数基线**，独立于配置：部署侧可能已经把思考关掉了（模板硬编码
+`enable_thinking=false`、没挂 `--reasoning-parser`、启动参数就是非思考模式），此时"本次压测跑的是
+思考态"是错误前提，整份性能结论会整体错位。探针把默认态显式打出来，默认关思考时给 ⚠️ 提示；
+若配置声明了开启参数却拿不到思考增量，会进一步指出"优先怀疑部署侧关思考，而非参数名写错"。
+配置用 `thinking.levels` 时（`extra_body_on/off` 为空），探针自动从 levels 里取开启态/关闭态兜底。
 
 tool-call 健康检查是**前置门禁**：检出引擎能否正常调工具（parser 是否启用、流式调用是否丢失、
 内容是否泄漏 `<tool_call>` 标记），失败时给出可行动结论（可直接贴给客户/厂商）；
@@ -125,9 +159,9 @@ tool-call 健康检查是**前置门禁**：检出引擎能否正常调工具（
 `--probe-capture <目录>` 把检查的原始响应落盘（厂商排障证据 + 判据回归 fixture；含业务数据，外发前脱敏）。
 
 **认证格式**：默认 `Authorization: Bearer <key>`；客户网关用裸 key 时配 `auth_scheme: raw`，
-免认证端点配 `auth_scheme: none`，自定义 header 名配 `auth_header`（如 `X-API-Key`）。
-接口路径与指标路径也可配：`chat_path`（默认 `/chat/completions`）、`metrics_path`（默认 `/metrics`）、
-`models_path`（默认 `/models`，probe 拉模型列表用）；
+免认证端点配 `auth_scheme: none`，自定义 header 名配 `auth_header`（如 `X-API-Key`）——配错也不怕，
+probe 会自举出可用值。接口路径与指标路径同样可配：`chat_path`（默认 `/chat/completions`）、
+`metrics_path`（默认 `/metrics`）、`models_path`（默认 `/models`）；
 probe 的请求超时直接读 `timeout_seconds`（此前硬编码 120s 不受配置影响）。
 
 **2. 请求级兼容性告警（自动）**
@@ -161,17 +195,25 @@ debug: true   # 原始响应 → <output_dir>/raw/*.log；日志同步 → <outp
 注意：交叉验证是**对数量级与分位趋势**（数据集/计时口径不同），不是逐数对齐。
 结果对不上时的排查顺序：数据集差异 → 网络路径 → 客户端计时方法。
 
-## 服务端观测层（/metrics）
+## 服务端观测层（/metrics）——可选第二数据源
+
+**定位先说清楚**：`/metrics` 是引擎实现细节，不是标准端点（网关、反向代理、SaaS 托管普遍不提供）。
+**客户端实测是本工具唯一的标准口径**；服务端观测是**可选的第二数据源**——有就多采一份做交叉验证
+与归因，没有就只跑客户端口径，**结论一条都不少、口径一处不改**。这与 `probe` 的证据分级
+（`core` / `ext`）是同一条原则在压测链路上的落地。
 
 ```yaml
-server_metrics: true   # 抓推理服务原生 /metrics（vLLM 默认暴露）；不可达自动降级纯客户端计时
+server_metrics: true   # 有 /metrics 就多采一份（vLLM 默认暴露）；不可达不影响结论
 ```
+
+不可达或抓取失败时只打一行说明（`ℹ️ 未提供 /metrics …… 全部结论按客户端实测口径给出`），
+不中断、不降级措辞：报告里「数据来源」会如实写成「客户端实测（基线）；未启用或端点未提供 /metrics」。
 
 指标命名经 `MetricsProvider` 抽象，**按抓取样本的指标名前缀自动识别引擎**（`vllm:` → vLLM、
 `sglang:` → SGLang；无法识别时日志显式告警"按 vLLM 命名尝试，服务端指标大概率拿不到数"，
 不静默套错——自研网关属预期）；SGLang 的缓存 counter 命名待真机校准。
 **/metrics 抓取带认证头**（`auth_scheme`/`auth_header` 对探测、场景快照与 gauge 轮询同样生效）——
-网关把 metrics 端点与业务接口用同一套认证保护时，观测层不再静默降级。
+网关把 metrics 端点与业务接口用同一套认证保护时不会误判不可用。
 gauge 轮询自带健康度：从未成功或连续失败 ≥5 时 JSON 标记 `observation_degraded`，报告出红色警示。
 
 对标 NVIDIA AIPerf / inference-perf 的 server metrics 层，给客户端计时补上服务端视角：

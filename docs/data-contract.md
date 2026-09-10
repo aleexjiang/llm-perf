@@ -33,8 +33,13 @@ Report
 │                  #   wall_seconds, throughput_tps, slo_meet/slo_total/goodput_rps/goodput_tps,
 │                  #   shapes[]→ShapeStat（concurrent.mix 形状分解，中位数）
 ├── correctness[]  # 金丝雀：{model, number, reply, match, e2e_ms, error}
-├── server_metrics # 窗口差值/轮询聚合：cache_hit/query, preemptions, spec_drafts/accepted,
-│                  #   gauges{}, histograms{}, observation_degraded（观测失效须醒目标注）
+├── server_metrics # 可选第二数据源（客户端实测才是基线）。窗口差值/轮询聚合：
+│                  #   available（**仅指窗口差值 counter/hist 是否取到**）,
+│                  #   note（取不到时的原因；全仓只有"结束快照失败"会写它）,
+│                  #   cache_hit/query, preemptions, spec_drafts/accepted,
+│                  #   gauges{}（轮询独立于结束快照，available=false 时仍可能有效）,
+│                  #   histograms{}, observation_degraded（观测失效须醒目标注）
+│                  #   缺失/取不到不得导致少结论、漏档位或改变判定
 ├── environment    # 引擎识别存档（ProbeResult 轻量版）
 └── config_raw     # 配置原文
 ```

@@ -267,9 +267,14 @@ def load_inputs(argv):
 
 
 def merge(reports):
-    """合并多份同场景报告 → {scenario: [entries...]}，并收集元信息。"""
+    """合并多份同场景报告 → {scenario: [entries...]}，并收集元信息。
+
+    注意：Report 的 `server_metrics` 是**顶层字段**（每个场景一份窗口汇总），不在场景数组里。
+    历史上这里只 extend 了场景数组，导致服务端观测被采集、写进 JSON，却在出报告时静默丢弃，
+    报告里那两段「服务端观测」代码成了死代码。现在按场景归集到 meta["server"]。
+    """
     data = {k: [] for k in SCENARIOS}
-    meta = {"endpoint": "?", "tool": "?", "notes": [], "generated": [], "slo": None}
+    meta = {"endpoint": "?", "tool": "?", "notes": [], "generated": [], "slo": None, "server": {}}
     for p, d in reports:
         scen = d.get("scenario")
         if scen not in data:
@@ -289,6 +294,13 @@ def merge(reports):
             meta["config_raw"] = redact_secrets(d["config_raw"])
         if d.get("plan"):
             meta["plan"] = d["plan"]
+        sm = d.get("server_metrics")
+        if isinstance(sm, dict):  # probe 的 server_metrics 是字符串，别混进来
+            cur = meta["server"].get(scen)
+            # 同场景可能有多份产物（按模型/思考变体分区）：优先保留窗口差值取到的那份；
+            # 全都没取到则留首份（带 note），报告据此如实说明「已启用但未取到」。
+            if cur is None or (sm.get("available") and not cur.get("available")):
+                meta["server"][scen] = sm
     return data, meta
 
 
@@ -901,7 +913,10 @@ def single_table(A, th):
                    f3(l["ttft"]), f3(l["ttft_content"])]
             if th == "on":
                 # 思考占比 = 思考总时长 / E2E（思考与正文输出交错，占比为口径近似）
-                pct = "{:.0%}".format(l["think"][0] / l["e2e"][0]) if l["e2e"][0] else "—"
+                # 整档全失败时 mmm() 返回 None（中位数不存在）——不能直接下标，否则中断产物无法出报告
+                e2e0 = (l["e2e"] or [None])[0]
+                think0 = (l["think"] or [None])[0]
+                pct = "{:.0%}".format(think0 / e2e0) if e2e0 and think0 is not None else "—"
                 row += [f1(l["think"]), pct]
             row += [f1(l["e2e"]), f1(l["decode"]),
                     f1(l["itl_p50"], "ms") if has_itl else "—",
@@ -1370,15 +1385,48 @@ def gen_limits(data, A):
         lim.append("兼容性告警 {} 条，明细见附录（含网关伪响应/字段缺失类告警需人工复核）。".format(ev["warnings"]))
     lim.append("单发同档位 runs 复用固定 prompt（缓存对照设计）：单发 TTFT 代表「重复请求」分布；"
                "独立冷请求请参考多轮 T1 与单发各档 run1。")
-    for k in SCENARIOS:
-        if data[k]:
-            lim.append("服务端观测（/metrics）{}。".format(
-                "已随报告输出（见数据质量章）" if data[k][0].get("server_metrics") else "未开启，缓存判定基于客户端行为证据"))
-            break
+    collected, no_data, _ = metrics_provenance(A.get("server") or {})
+    if collected:
+        lim.append("服务端观测（/metrics）已随报告输出（见数据质量章），仅作<b>辅助与交叉验证</b>"
+                   "——全部结论仍以客户端实测为准，两者口径不同不可逐数对齐。")
+    else:
+        extra = "；本次已启用但未取到窗口数据" if no_data else ""
+        lim.append("未使用服务端 /metrics（非标准端点，网关/代理部署普遍不提供{}）"
+                   "——<b>不影响任何结论</b>：延迟、吞吐、缓存判定均基于客户端实测。".format(extra))
     return lim
 
 
-def quality_block(data):
+# ── 服务端观测（/metrics）：可选的第二数据源 ──
+# 原则：/metrics 是引擎实现细节、非标准端点。客户端实测是本工具唯一的标准口径，
+# 服务端观测只做增强与交叉验证。本函数只负责「如实描述来源」，任何分支都不削弱结论。
+def _window_ok(s):
+    """窗口差值（counter/hist）是否真的可用。
+
+    新口径直接看 available；同时兼容旧产物——旧版本在结束快照失败时仍写 available=true，
+    只把原因放进 note。全仓只有「结束快照抓取失败」会设置 note，故 note 非空即视为没取到。
+    """
+    return bool(s.get("available")) and not s.get("note")
+
+
+def metrics_provenance(server):
+    """按场景归集服务端观测状态，返回 (collected, no_data, absent)。
+
+    入参是 merge() 产出的 `meta["server"]`（{场景: 窗口汇总}）。
+    collected / no_data 为 [(场景, 摘要)]；absent 为没有任何服务端观测数据的场景。
+    判定依据是**窗口差值是否真取到**而非「字段是否存在」：结束快照失败时会留下 note，
+    报告必须如实说「未取到」，而不是把全零计数器渲染成一个空面板。
+    """
+    collected, no_data, absent = [], [], []
+    for k in SCENARIOS:
+        sm = (server or {}).get(k)
+        if not sm:
+            absent.append(k)
+            continue
+        (collected if _window_ok(sm) else no_data).append((k, sm))
+    return collected, no_data, absent
+
+
+def quality_block(data, A):
     parts = []
     for k in SCENARIOS:
         if not data[k]:
@@ -1405,20 +1453,37 @@ def quality_block(data):
                  "——失败请求未计入延迟统计，相关档位中位数为幸存者口径，并按网关侧超时上限截断" \
                  "（见 E2E 是否钉在整 300s 附近）".format(n_fail, "、".join(esc(x) for x in ekinds))
         parts.append(p + "。</p>")
-        # 服务端 metrics
-    for k in SCENARIOS:
-        if data[k] and data[k][0].get("server_metrics"):
-            s = data[k][0]["server_metrics"]
-            hit_q = s.get("cache_query_tokens") or 0
-            hit = (s.get("cache_hit_tokens") or 0) / hit_q if hit_q > 0 else None
-            row = ["preemptions", "{:,.0f}".format(s.get("preemptions") or 0)]
-            parts.append("<p>服务端观测（{}）：{}{}{}。</p>".format(
-                k,
-                "前缀缓存命中率 {:.1%}。".format(hit) if hit is not None else "",
-                "preemptions {:,.0f}。".format(s.get("preemptions") or 0) if s.get("preemptions") else "",
-                "MTP 接受率 {:.0%}。".format((s.get("spec_accepted_tokens") or 0) / s["spec_drafts"])
-                if s.get("spec_drafts") else ""))
-            break
+
+    # 服务端观测（可选数据源）：有则展示，失败/缺失则如实说明——绝不留空面板
+    collected, no_data, _ = metrics_provenance(A.get("server") or {})
+    if collected or no_data:
+        parts.append("<p><b>数据源</b>：本报告全部指标为客户端实测口径（基线）；"
+                     "下列服务端 /metrics 观测为<b>可选增强</b>，采集失败或端点不存在均不影响任何结论。</p>")
+    for k, s in collected:
+        bits = []
+        hit_q = s.get("cache_query_tokens") or 0
+        if hit_q > 0:
+            bits.append("前缀缓存命中率 {:.1%}".format((s.get("cache_hit_tokens") or 0) / hit_q))
+        if s.get("preemptions"):
+            bits.append("preemptions {:,.0f}".format(s["preemptions"]))
+        if s.get("spec_drafts"):
+            bits.append("MTP 接受率 {:.0%}".format((s.get("spec_accepted_tokens") or 0) / s["spec_drafts"]))
+        for gname, gv in sorted((s.get("gauges") or {}).items()):
+            mx = (gv or {}).get("max") or 0
+            if not mx:
+                continue
+            bits.append("{} 峰值 {:.1%}".format(gname, mx) if gname == "kv_usage"
+                        else "{} 峰值 {:.0f}".format(gname, mx))
+        if s.get("observation_degraded"):
+            bits.append("⚠️ " + esc(s.get("observation_note") or "gauge 轮询降级"))
+        parts.append("<p>服务端观测（{}）：{}。</p>".format(
+            k, "；".join(bits) if bits else "已采集，但本场景该项无有效数据"))
+    for k, s in no_data:
+        note = "（{}）".format(esc(s["note"])) if s.get("note") else ""
+        g = sorted((s.get("gauges") or {}).keys())
+        gtxt = "；窗口内已轮询到 {}".format("、".join(g)) if g else ""
+        parts.append("<p>服务端观测（{}）：已启用但<b>未取到窗口差值</b>{}{}"
+                     "——该场景全部结论仍按客户端实测口径给出。</p>".format(k, note, gtxt))
     # 正确性抽查
     for k in SCENARIOS:
         if data[k] and (data[k][0].get("correctness") or []):
@@ -1468,6 +1533,7 @@ def main():
     if not any(data[k] for k in SCENARIOS):
         sys.exit("输入中没有可用场景数据（过滤条件 --scenarios={}）".format("+".join(sorted(scenarios))))
     A = analyze(data, meta)
+    A["server"] = meta["server"]  # 服务端观测（可选数据源）按场景挂到分析结果，供各章节如实标注
     conclusions = gen_conclusions(A)
     recommendations = gen_recommendations(A)
     limits = gen_limits(data, A)
@@ -1519,9 +1585,17 @@ def main():
         cov.append("并发·单轮（独立单轮请求）")
     if A["coverage"]["has_conc_multi"]:
         cov.append("并发·多轮（每用户独立多轮会话）")
+    _collected, _no_data, _ = metrics_provenance(meta["server"])
+    if _collected:
+        src = "客户端实测（基线）＋ 服务端 /metrics 辅助（{}）".format("、".join(k for k, _ in _collected))
+    elif _no_data:
+        src = "客户端实测（基线）；服务端 /metrics 已启用但未取到窗口数据（见数据质量章）"
+    else:
+        src = "客户端实测（基线）；未启用或端点未提供 /metrics（非标准端点，不影响结论）"
     sec2_body = table_kv([("端点", meta["endpoint"]), ("工具版本", meta["tool"]),
                           ("场景覆盖", "；".join(cov)),
-                          ("请求总数", str(n_req))])
+                          ("请求总数", str(n_req)),
+                          ("数据来源", src)])
     # 环境存档：压测时自动探测的引擎信息 + 配置原文（复现"当时是什么配置跑的"）
     env = meta.get("environment")
     if env:
@@ -1535,7 +1609,9 @@ def main():
     else:
         sec2_body += '<div class="note">本份数据未包含引擎环境存档（旧版本工具产出）。</div>'
     sec.append(("<h2>2 · 测试配置与方法</h2>", sec2_body))
-    sec.append(("<h2>3 · 指标口径</h2>", table(
+    sec.append(("<h2>3 · 指标口径</h2>",
+                '<p class="note">下表全部为<b>客户端实测</b>口径（基线）——与服务端是否存在 /metrics 无关。</p>'
+                + table(
         ["指标", "定义"],
         [["TTFT", "请求发出 → 首个流式 chunk（空首包不计）；本报告单位秒"],
          ["首内容", "请求发出 → 首个 content chunk（TTFT_content）"],
@@ -1612,7 +1688,7 @@ def main():
     sec.append(("<h2>9 · 结论与建议</h2>", '<div class="good">{}</div>'.format(rec_html)))
     sec.append(("<h2>10 · 局限与备注</h2>", "<ul class='tight'>{}</ul>".format(
         "".join("<li>{}</li>".format(esc(l)) for l in limits))))
-    sec.append(("<h2>11 · 数据质量</h2>", quality_block(data)))
+    sec.append(("<h2>11 · 数据质量</h2>", quality_block(data, A)))
     sec.append(("<h2>附录 A · 单发逐 run 明细</h2>",
                 "<details><summary>展开</summary>{}</details>".format(appendix_single(data))
                 if data["single"] else ""))

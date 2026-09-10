@@ -128,6 +128,13 @@ type CorrectnessRow struct {
 
 // GaugeSummary / HistSummary / ServerMetricsSummary：服务端 /metrics 观测汇总。
 // 挂在每个场景 Report 上，覆盖该场景执行窗口。
+//
+// 【定位】服务端 /metrics 是**可选的第二数据源**：有就多采一份做交叉验证与归因，
+// 没有就用客户端实测——后者是本工具唯一的标准口径。任何消费方都不得因为本字段缺失
+// 而少给结论、漏掉档位或改变判定。
+//
+// Available 的语义严格限定为「**窗口差值**（counter/hist）是否取到」：
+// 结束快照失败时为 false（Note 说明原因），此时 Gauges 若存在仍为有效数据（轮询独立于快照）。
 type ServerMetricsSummary struct {
 	Available bool   `json:"available"`
 	Note      string `json:"note,omitempty"`

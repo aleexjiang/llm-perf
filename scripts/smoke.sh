@@ -231,6 +231,14 @@ check("models_list" in {c["name"] for c in probe.get("checks", [])} and not bad,
 tc = [c for c in probe.get("checks", []) if c["name"].startswith("toolcall")]
 check(tc and all(c.get("ok") for c in tc), "probe tool-call 检查通过（mock 结构化 tool_calls 好路径）")
 
+# probe 证据分级：扩展面（/metrics、max_model_len 等）服务端未提供时记 na，绝不判失败；
+# 汇总行必须区分标准面与扩展面，避免可选端点的缺失拉低通过率
+bad_na = [c["name"] for c in probe.get("checks", []) if c.get("na") and not c.get("ok")]
+check(not bad_na, f"probe 扩展面 NA 项不得同时标记为失败（{bad_na or '无'}）")
+check(bool(probe.get("summary")) and "标准面" in probe.get("summary", ""),
+      f"probe 分级汇总已落盘（实际: {probe.get('summary')!r}）")
+check(bool(probe.get("suggested_config")), "probe 已输出可粘贴的配置片段")
+
 # 7) 非流式：有数据、全 on、E2E 计时在（TTFT 允许缺失）
 ns, ns_m = rows("out-nostream")
 check(len(ns) > 0 and thinks(ns) == {"on"}, f"非流式有数据且全 on（{len(ns)} 行）")
@@ -268,6 +276,14 @@ python3 scripts/gen_html_report.py "$TMP/flat" >"$TMP/report.log" 2>&1 \
 HTML="$TMP/flat/llm-perf-报告.html"
 [ -f "$HTML" ] || { echo "❌ 报告 HTML 未生成"; exit 1; }
 echo "  ✅ 报告 HTML 已生成（$(wc -c <"$HTML" | tr -d ' ') bytes）"
+python3 - "$HTML" <<'PYEOF'
+import sys, re, html
+t = html.unescape(re.sub(r"<[^>]+>", "", open(sys.argv[1], encoding="utf-8").read()))
+assert "数据来源" in t, "报告缺少『数据来源』声明（/metrics 是可选数据源，口径必须在报告里标注）"
+bad = re.findall(r"服务端观测（\w+）：。", t)
+assert not bad, "报告出现空的服务端观测面板: {}".format(bad)
+print("  ✅ 数据来源已标注；无空的服务端观测面板")
+PYEOF
 if command -v node >/dev/null 2>&1; then
   node scripts/validate_report.js "$HTML" >"$TMP/validate.log" 2>&1 \
     || { echo "❌ validate_report 校验失败（日志: $TMP/validate.log）"; tail -20 "$TMP/validate.log"; exit 1; }

@@ -38,7 +38,7 @@ scripts/gen_html_report.py ── 读多份 JSON → merge/analyze → 自包含
 | `internal/auth` | auth.go | 认证方案抽象：bearer / 裸 key / 自定义 header / none，chat 与 /metrics 共用 | 替代了早期 3 处硬编码 `Bearer ` |
 | `internal/engine` | client.go / sse.go / filler.go / trace.go / probe.go / toolprobe.go / corpus_filler.go | OpenAI 兼容客户端与逐 chunk 计时；SSE 解析；负载生成；兼容性探针 | 见下"engine 内部" |
 | `internal/scenario` | scenario.go（1111 行）、plan.go（测试画像） | 三场景编排：Single(374) / Multiturn(505) / Concurrent(700)；闭环(885)/开环(946)；混跑形状计划(803)/聚合(839)；正确性金丝雀(317)；goodput(296-316)；plan.go：PlanSummary 开跑前估算请求量（复用 ClampLadder/MaxTokensList/Variants，展示口径=执行口径） | 场景经 Register 注册表派发（main 不直接 import 各场景实现） |
-| `internal/smetrics` | smetrics.go | 服务端 /metrics 观测层：counter 差值 / gauge 轮询 / histogram 分位估计；指标名归一化（去 `_total`） | 引擎指标名表(249-298)硬编码，未知引擎回落 vLLM(302-307) 无告警（ROADMAP 附录 C） |
+| `internal/smetrics` | smetrics.go | 服务端 /metrics 采集（**可选的第二数据源**，客户端实测才是基线）：counter 差值 / gauge 轮询 / histogram 分位估计；指标名归一化（去 `_total`）。缺失或抓取失败一律不产生错误语义（`finishWindow` 返回 `Available=false`+`Note`，观测关闭返回 nil） | 引擎指标名表(249-298)硬编码，未知引擎回落 vLLM(302-307) 无告警（ROADMAP 附录 C） |
 | `internal/report` | report.go | JSON 输出结构定义与落盘：Report / SingleRow / MultiturnRun / ConcurrentLevel / PartitionByModel | 只定义结构不做聚合 |
 
 ## engine 内部
@@ -47,7 +47,7 @@ scripts/gen_html_report.py ── 读多份 JSON → merge/analyze → 自包含
 - **sse.go**：`ingestSSEBody` 是流解析唯一入口（时钟注入，生产 time.Now / 测试合成时钟）；`deltaPayload`(35) 自定义 UnmarshalJSON 一次解析同时拿值和键名清单，`knownDeltaKeys`(19) 白名单之外的键记 warnings（魔改引擎探测）；`tool_calls` 分片按 index 分桶聚合。
 - **filler.go**：token 精确的合成填充。注意 `SystemMsg`(74) 把工具定义当纯文本塞 system 消息——只模拟体积，不发真实 `tools` 字段（定位见 AGENTS.md tool-call 一节）。
 - **trace.go**：`LoadTrace`(61) 加载 ShareGPT / sessions 格式；`replay_mode: full` 按原序注入全部 role，user_only 只回放 user 轮。
-- **probe.go**：`Probe`(101) 兼容性探针——引擎识别（Server 头猜测）、上下文探测、usage 检查等 ProbeCheck 列表。
+- **probe.go**：`Probe`(180) 兼容性探针。核心是 **`ProbeCheck` 的证据分级**：`TierCore`（标准 OpenAI 兼容面，`/chat/completions`）才是配置基线；`TierExt`（`/metrics`、`/models` 的 `max_model_len`、`Server` 头）只作增强，服务端未提供时记 `NA`（`OK=true`），不判失败也不进通过率——很多服务经网关代理后没有这些端点，把缺失当故障会到处误报。`Tally`/`Summarize` 按分级出统计。另有 `buildSuggestedConfig` 把结论收敛成可粘回的 YAML（扩展面推导项一律注释掉）；认证自举（`auth_scheme`）与挂载点扫描（`chat_path`/`models_path`/`metrics_path`）只在明确被拒（401/403）或落空（404/405）时触发。URL 统一按 `origin + 绝对路径` 拼装（`splitOrigin`/`resolvePath`），候选挂载点因此能整体替换。
 - **toolprobe.go**：tool-call 健康检查，verdict 分级 PASS/FAIL/WARN/INCOMPLETE（检查自身失败不计 ❌），带 `toolCallSelfCheckNotice`(37) 自检提示常量。
 
 ## 关键数据结构
@@ -63,11 +63,13 @@ scripts/gen_html_report.py ── 读多份 JSON → merge/analyze → 自包含
 | 要加什么 | 改哪里 |
 |---|---|
 | 新的请求级指标 | `TurnMetrics` 加字段 + `Finalize` 计算（注意 json:"-/omitempty 语义）→ 报告侧 gen_html_report.py 的 `analyze()` 消费 |
-| 新的 probe 检查项 | `engine.ProbeOptions` + `probe.go` 的 ProbeCheck 列表（或 toolprobe.go 模式：独立文件 + verdict 分级） |
+| 新的 probe 检查项 | `engine.ProbeOptions` + `probe.go` 的 ProbeCheck 列表（或 toolprobe.go 模式：独立文件 + verdict 分级）。**先判定证据来源**：只用标准面就选 `check`（核心），沾了引擎扩展面就选 `checkExt`/`checkExtNA`——别让可选端点拖累通过率 |
 | 新场景/新负载模式 | scenario.go 注册新 Scenario 或扩展 Concurrent（闭环 runClosedRound / 开环 runOpenRound 已是两条成熟路径） |
 | 配置新字段 | config.go 对应子结构 + Load 默认值；**不做向后兼容双轨** |
 | 报告新章节 | gen_html_report.py：analyze() 出数据 → 新 render 函数 → main() 组装；判级常量收敛到 SLO_TIERS(150) |
 | 服务端新指标 | smetrics.go 指标名表加归一化名；未知引擎命名差异优先考虑告警而不是静默回落 |
+| 报告要用 Report 的**顶层字段** | 先改 `merge()`：它只 extend 三个场景数组，顶层字段（如 `server_metrics`）不显式取就会**静默丢弃**——历史上服务端观测就这么被扔掉的。按场景收进 `meta["server"]` → `main()` 挂到 `A["server"]` → render 函数读 `A["server"]` |
+| 任何依赖 /metrics 的新渲染 | `/metrics` 是**可选**第二数据源，只能增强不能成为前提：判定用 `metrics_provenance()`（它按"窗口差值是否真取到"分拣，而且兼容旧产物的 `available=true`+`note`），三种状态都必须能出完整报告 |
 
 ## 已知坑位（改代码前先看）
 

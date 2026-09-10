@@ -11,6 +11,8 @@ output-*/
 *.test
 .DS_Store
 configs/customer.yaml
+# 客户环境实测配置（含真实端点/密钥），只留本机
+configs/customer-*.yaml
 configs/customer-*.md
 # 客户环境实测手册（含客户端点/key），放在 docs/ 也不入库
 docs/customer-*.md
