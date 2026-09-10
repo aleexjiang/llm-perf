@@ -30,6 +30,9 @@ dataset:
   mode: "filler"
   # mode: "trace"
   # path: "ShareGPT_V3_unfiltered_cleaned_split.json"   # .json / .json.gz
+  # path: "fixtures/trace-real-16.json.gz"   # 仓库内置真实 agent 会话样本（路径相对配置目录解析）：
+                                             # 16 条脱敏 trace，会话峰值 prompt 20k-480k 四档，
+                                             # 含 assistant/tool 消息，full 回放真正生效；逐条清单见 fixtures/trace-real-16.md
   # format: "sharegpt"       # sharegpt | sessions（自定义 [{"turns":[...]}]；留空自动识别）
   # min_turns: 2             # 会话最少 user 轮数
   # max_sessions: 64         # 最多加载多少会话（0=不限）
@@ -96,7 +99,8 @@ single:
 # 场景二：单发多轮（模拟 agent：system + tool defs + 逐轮滚大的 history）
 # 形状对齐现代 agent 产品（5.9）：首调上下文 ~35k（system+tool defs 基座 21k × 1.07 模板开销 + 首轮 10k），
 # 8 轮滚到末轮 ~108k（128k 模型留 ~12k + 输出预算余量）。
-# 起步由 system_tokens + tool_defs_tokens 控制（35k 基线为推导值，AgentLens 取证待做）；
+# 起步由 system_tokens + tool_defs_tokens 控制（AgentLens 首调实测中位 ~44k，n=4 偏高但样本不足，
+# 暂维持 35k，补样后再定，见 ROADMAP 5.9）；
 # probe 确认各模型上限后再微调 turn_tokens / turns。
 multiturn:
   sessions: 2                     # 跑几个独立会话

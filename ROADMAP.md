@@ -46,7 +46,7 @@
   `full` 按原序注入全部 role；`multiturn.max_reply_chars` 可配（默认 2000）。
 - **注意**：`role: tool` 消息须带 `tool_call_id`，缺失跳过并计 warning，不静默丢弃；
   `reply[:2000]` 现在按字节切，一并改为按 rune 截（中文切半个字符）。
-- **验收**：真实 agent trace 上 full vs user_only 对比 context 深度与 TTFT（数据来源见第 4 节）。
+- **验收**：真实 agent trace 上 full vs user_only 对比 context 深度与 TTFT——物料已就绪（第 4 节 trace-real-16）。
 
 ---
 
@@ -68,12 +68,25 @@
 
 ---
 
-## 4. 数据来源（支撑第 2 节验收，做的时候再说）
+## 4. 数据来源（支撑第 2 节验收）【已完成，2026-09-10】
 
-真实 agent 会话从 AgentLens OpenAPI 导出（`openapi.agentlens.woa.com`，`X-Agentlens-Token` 鉴权，
-调用链 space/list → traceList → traceDetail → spanDetail），转成 trace 格式。
-两个已知坑：完整 messages 要走 spanDetail（traceList 的 IO 摘要会截断）；
-同一 session 各次调用 prompt 是包含关系，取最后一次或做差分，不能拼接。
+**物料已入库**：`configs/fixtures/trace-real-16.json.gz`（+ 同名 `.md` 清单）——16 条真实 agent 会话（脱敏），
+单会话峰值 prompt 20k–480k 四档，含 assistant/tool 消息与工具定义；`LoadTrace` 实跑
+`FullReplay=true`、缺 `tool_call_id`=0，`replay_mode: full` 真正生效不退化。逐条清单与脱敏规则见 `trace-real-16.md`。
+
+**导出协议备忘**（AgentLens OpenAPI，全 POST + JSON）：
+- 地址必须 **http://**（https 走内网代理会 502）；Header `X-Agentlens-Token: <明文>`，非 Bearer。
+- 调用链 `space/list → scenario/list → traceList → traceDetail → spanDetail`；
+  traceList/spanDetail 默认只查最近 1h/24h，**必传 start_time/end_time**（东八区）。
+- **口径坑**：traceList 一条 = 一次用户交互（trace），其 `inputTokens` 是链路内多次 LLM 调用的**累加**；
+  单次调用的真实 prompt 只在 spanDetail 的 attributes（`gen_ai.usage.input_tokens`）。
+  `attr_type=attr`（≈23KB，仅元信息）供批量扫描；`raw-attr`（≈200KB）才含完整 prompts + 工具定义。
+- 同一 session 内第 N 次调用的 prompt 包含前 N-1 次全部 history，**不可拼接**——
+  取首调（起步基线）、末调（完整上下文）或相邻差分（每轮增量）。
+- 取样注意：session 内 seq 靠前的 trace 往往只有 1 个 user 轮（会被 `min_turns=2` 过滤），挑 seq≥3；
+  候选池可能混入当前会话自身（含明文 token），必须排除。
+- 脱敏重点：**工具定义**（skill 清单带绝对路径与内网域名）是残留风险最高处，须与 messages 一并过脱敏；
+  原始未脱敏数据不入库，脱敏完成后即删。
 
 ---
 
@@ -177,14 +190,17 @@ thinking mode/levels 双轨（levels 优先已显式声明并告警）；api_key
 - 档位归组：≤4K 打档1/2 徽章，≥24K 打档3 徽章，4K–24K 只报数值（prefill 斜率见第 7 节分析表）；
   agent 场景 TTFT 判据以档3 为准（现代 agent 产品基线上下文即 ~35K）
 
-**5.9 负载保真度：multiturn 起步上下文对齐 agent 真实形状**（配置联动已实现，2026-09-08；AgentLens 取证待做）
+**5.9 负载保真度：multiturn 起步上下文对齐 agent 真实形状**（配置联动已实现 2026-09-08；首轮取证完成 2026-09-10，暂维持 35k）
 
 - 问题：filler 模式 turn1 ≈ 15.5k（system 基座 `system_tokens 1000` + `tool_defs_tokens 2000`，×1.07 模板开销），
   远低于真实 agent 产品的首调上下文规模 → multiturn turn1 测不出"大 prefill 冷启动"，而首字延迟恰是 agent 产品的真实痛点。
-- 目标：turn1 起步 ≈ **35k**。**假设值，待取证**：与 5.8 档3"现代 agent 产品基线上下文 ~35K"同一来源，均为推导值。
-- 取证（待做）：AgentLens `codebuddy-model-request-prod` 空间按 `session_id` 聚合，取每个 session **第一次** LLM 调用的
-  `inputTokens` 分布（P50/P90）回填基线。session 内 prompt 是包含关系 → 只取首调，不差分、不拼接（第 4 节坑 2）。
-  需内网环境 + `X-Agentlens-Token`，本机不可达，取证后如 P50 偏离 35k 再回填调整。
+- 目标：turn1 起步 ≈ **35k**。原始为推导值（与 5.8 档3 同源）；取证协议与坑见第 4 节。
+- 取证结果（2026-09-10，n=4，办公/轻开发场景各 2 session）：session **首调** prompt 31.7k / 43.0k / 45.0k / 67.4k，
+  **中位 ~44k**；首调缓存命中 0–16%、TTFT 4.3–5.8s，第二次调用起 90–99%、TTFT 1.3–2.6s
+  （TTFT 由缓存主导，与大 prompt 关系弱——真实会话几乎不测冷 prefill）。
+  结论：35k 假设偏低约 25%，但 n=4 不足以定基线——**暂维持 35k 起步、配置不动**；
+  补样至 n≥20（覆盖 CLI/WorkBuddy/app_cloud 等入口与更多场景）出 P50/P90 后再定，
+  上调路径：`system_tokens + tool_defs_tokens` 基座 21k → ~44k 档。
 - 配置联动 ✅（无需改代码，按预期）：`example.yaml` 与 `customer.yaml` multiturn 已改为
   `system_tokens: 18000` + `tool_defs_tokens: 3000` + `turn_tokens: 10000`、`turns: 8`（turn1 ≈ 32.5k，末轮 ≈108k）。
   qwen3.8-27b.yaml（256k 模型自算预算）与 smoke 系列保持不变。
@@ -213,9 +229,10 @@ thinking mode/levels 双轨（levels 优先已显式声明并告警）；api_key
 - 连带修复：`gen_html_report.py` gen_conclusions 的 decode 吞吐对比在 TPS=0（mock/异常数据）时除零崩溃，加 >0 守卫。
 
 **批次建议**：先做 5.2 + 5.3 + 5.4（半天、零风险、不动 Go 主流程）→ 5.1（防方向性错误）→ 5.6（等场景）。
-（2026-09-08 更新：5.0–5.4 及 5.6 已全部实现；5.8 报告侧 + 5.9 配置联动 + 5.10 已实现——
+（2026-09-08 更新：5.0–5.4 及 5.6 已全部实现；5.8 报告侧 + 5.9 配置联动 + 5.10 已实现。
+2026-09-10 更新：5.9 首轮取证完成（首调中位 ~44k，n=4，暂维持 35k）+ 真实 trace 物料入库（第 4 节）——
 剩余：5.5（恒为脚本不进 CLI）、5.7 闭环错峰发车（续跑 P2 等 soak 需求）、5.8 `slo:` 配置段、
-5.9 AgentLens 取证（内网 + token，本机不可达）。）
+5.9 补样至 n≥20 后定起步值。）
 
 ---
 
@@ -226,5 +243,5 @@ thinking mode/levels 双轨（levels 优先已显式声明并告警）；api_key
 2. probe tool-call 检测 ← 不依赖数据集，fixture 单测 + 好端点即可交付
 3. trace 回放增强       ← 依赖真实 agent trace 验收
 4. 硬编码其余项（路径/超时/引擎识别）与回放改造合并一次提交
-5. 测量方法论 5.2/5.3/5.4 → 5.1 → 5.6 → 5.8（报告侧+配置段）→ 5.9（配置✅，取证待内网）→ 5.10 ✅；剩 5.5 / 5.7
+5. 测量方法论 5.2/5.3/5.4 → 5.1 → 5.6 → 5.8（报告侧+配置段）→ 5.9（配置✅ 取证✅ 待补样）→ 5.10 ✅；剩 5.5 / 5.7
 ```
