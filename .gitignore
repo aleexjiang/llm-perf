@@ -1,8 +1,7 @@
 # 构建产物统一落 bin/，命名 bench-<os>-<arch>（见 Makefile）。
-# 正式产物 allowlist 入库——默认忽略全部 bin，只放行明确要跟踪的平台。
+# 产物不入库（13M 二进制拖慢拉取），用 make 重建或向维护者索取。
 bin/bench
 bin/bench-*
-!bin/bench-linux-amd64
 
 output/
 output-*/
