@@ -36,7 +36,9 @@ Report
 ├── server_metrics # 可选第二数据源（客户端实测才是基线）。窗口差值/轮询聚合：
 │                  #   available（**仅指窗口差值 counter/hist 是否取到**）,
 │                  #   note（取不到时的原因；全仓只有"结束快照失败"会写它）,
-│                  #   cache_hit/query, preemptions, spec_drafts/accepted,
+│                  #   cache_hit/query, spec_drafts/accepted,
+│                  #   preemptions（**恒出现，刻意不带 omitempty**：0 = 窗口内没有发生抢占，
+│                  #     这本身是有意义的好结果；键一消失就会被读成"这项没采到"）,
 │                  #   gauges{}（轮询独立于结束快照，available=false 时仍可能有效）,
 │                  #   histograms{}, observation_degraded（观测失效须醒目标注）
 │                  #   缺失/取不到不得导致少结论、漏档位或改变判定
@@ -57,7 +59,7 @@ Report
 | 不进 JSON（json:"-"） | ToolCalls（probe 专用） | 报告侧永远看不到，别指望 |
 | 质量标记 | thinking_no_content（思考吃光预算，剔除或调 max_tokens）、stream_broken（响应不完整）、retry_count、warnings[] | 分析前先过滤 |
 
-口径提醒：TPOT = (E2E−TTFT)/(completion−1) **含思考 token**（GenAI-Perf 横评口径）；ITL 只算 content chunk 间隔；`new_tokens` 是本轮相对上一轮新增 prompt tokens，配合 TTFT 得增量 prefill 速率。
+口径提醒：TPOT = (E2E−TTFT)/(completion−1) **含思考 token**（GenAI-Perf 横评口径）；ITL 只算 content chunk 间隔——**ITL 是 chunk 间隔、不是 token 间隔**：投机解码（MTP）会把多个 token 合进同一个 SSE chunk，此时 chunk 间隔 ≈ N × token 间隔（vLLM+MTP 实测约 2.66×），拿 ITL 分位当 TPOT 会把延迟判高约 2.6 倍、把并发各档成片判成"未达标"。**判级一律用 `tpot_ms`，不用 ITL 分位**；`new_tokens` 是本轮相对上一轮新增 prompt tokens，配合 TTFT 得增量 prefill 速率。
 
 ## 指标口径细则（对抗式审查沉淀，2026-09）
 
@@ -75,6 +77,7 @@ Report
 10. **TTFT 是"首个含 token chunk"口径**（2026-09 对齐主流）：role-only 空 content 首 chunk（OpenAI 兼容服务标配）不计入 TTFT，取 reasoning/content 首包较早者；原始首 chunk 时刻保留在 `first_chunk_at` 供核查。此版本前的落盘数据是"任意首 chunk"口径，数值略偏小（差 1 个空帧）。
 11. **goodput 只判定已配置的 SLO 子集**（vLLM 语义）：阈值为 0 的维度不参与判定；配置了 TTFT 阈值时要求 TTFT 可测（>0，非流式不白拿达标）。
 12. **content_chars/reasoning_chars 是字符数（rune）**：2026-09 起按字符计（此前是 UTF-8 字节数，中文单字被计为 3）；报告"思考字符"列、日志"N 字"同步。
+13. **think_ms 缺失 ≠ 思考 0 秒**（2026-09-10 起）：`think_ms` 带 omitempty，`thinking=off` 时缺失代表真实的 0（该保留）；但 `thinking=on` 且 `thinking_no_content=true`（思考吃光输出预算、正文 0 字符）时思考段终点无从界定，缺失是**"测不出"而不是 0**。消费方不得把后者当 0 参与中位数——报告侧 `think_sec()` 统一返回 None 并整体剔除。否则一个档位里只要有部分 run 测不出，中位数就塌成 0：实测曾把 100k 档渲染成"思考 0.0s / 占比 0%"，而该档真实思考为 142s。
 
 ## 主流口径对照（2026-09，对齐 GenAI-Perf/AIPerf、vLLM bench serve、LLMPerf、Inference-Perf）
 

@@ -314,6 +314,27 @@ def mmm(vals, nd=2):
     return (round(st.median(vals), nd), round(min(vals), nd), round(max(vals), nd))
 
 
+def think_sec(r):
+    """单 run 的思考时长（秒）；无法界定返回 None。
+
+    为什么不能写 `(r.get("think_ms") or 0)`：think_ms 的 JSON tag 带 omitempty，
+    值为 0 时**整个键会消失**。若把「键缺失」当 0 塞进统计，一个档位里只要有
+    部分 run 无法界定思考段，中位数就会被拉塌到 0——实测 R2 报告 pt=102400 行
+    因此渲染成「思考 0.0s / 占比 0%」，而该行 E2E 154s、思考字符 15,687–35,994。
+
+    判定规则（区分「真的没思考」与「思考了但测不出时长」）：
+      - think_ms 存在            → 用它
+      - 缺失 + reasoning_chars>0 → None（思考吃光预算、正文 0 字符，终点不可界定）
+      - 缺失 + 无思考字符        → 0.0（thinking=off 的 0 是真实的 0，必须保留）
+    """
+    v = r.get("think_ms")
+    if v is not None:
+        return v / 1000.0
+    if r.get("thinking_no_content") or (r.get("reasoning_chars") or 0) > 0:
+        return None
+    return 0.0
+
+
 # p95/p99 最小样本量：低于它的分位数是纯噪音（n=3 时 p99 甚至超过 max），
 # 宁可留空也不硬算。并发场景 level × runs_per_worker 通常 ≥ 20 才出分位。
 MIN_PCT_SAMPLE = 20
@@ -328,7 +349,7 @@ SLO_TIERS = {
     "short_pass_ttft": 2.0,     # s，MLPerf Server p99（锚定 ~240 wpm 阅读速度）
     "long_good_ttft": 3.0,      # s，推导值：particula 10K 实测 0.75–1.6s 线性外推
     "long_pass_ttft": 6.0,      # s，推导值：MLPerf 405B 档 6s @9.4K 作宽松上限佐证
-    "good_tpot": 40.0,          # ms，ITL p99（MLPerf Interactive）
+    "good_tpot": 40.0,          # ms，per-token TPOT（MLPerf Interactive）
     "pass_tpot": 200.0,         # ms（MLPerf Server）
     "good_tps": 25.0,           # 单请求输出速度 tok/s（>30–50 超过所有读者感知，再快无感）
     "pass_tps": 10.0,           # 阅读速度 ~5–6 tok/s × 2 安全系数
@@ -498,7 +519,7 @@ def analyze(data, meta):
             "e2e": mmm([t["e2e_ms"] / 1000 for t in src if t.get("e2e_ms") is not None], 1),
             "ttft_p": pct9599([t["ttft_ms"] / 1000 for t in src if t.get("ttft_ms") is not None], 2),
             "e2e_p": pct9599([t["e2e_ms"] / 1000 for t in src if t.get("e2e_ms") is not None], 1),
-            "think": mmm([(t.get("think_ms") or 0) / 1000 for t in src], 1),
+            "think": mmm([think_sec(t) for t in src], 1),
             "tokps": mmm([t.get("tokens_per_sec") for t in src], 0),
             "finish": sorted({t.get("finish_reason", "?") for t in src}),
             "shapes": lv.get("shapes") or [],  # 5.6 混合负载：形状分解（非空 = 混跑轮）
@@ -526,7 +547,7 @@ def analyze(data, meta):
                         "ttft": mmm([r["ttft_ms"] / 1000 for r in rs if r.get("ttft_ms") is not None], 2),
                         "ttft_content": mmm([r["ttft_content_ms"] / 1000 for r in rs if r.get("ttft_content_ms") is not None], 2),
                         "ttft_rea": mmm([r["ttft_reasoning_ms"] / 1000 for r in rs if r.get("ttft_reasoning_ms") is not None], 2),
-                        "think": mmm([(r.get("think_ms") or 0) / 1000 for r in rs], 1),
+                        "think": mmm([think_sec(r) for r in rs], 1),
                         "e2e": mmm([r["e2e_ms"] / 1000 for r in rs if r.get("e2e_ms") is not None], 1),
                         "decode": mmm([r["decode_ms"] / 1000 for r in rs if r.get("decode_ms") is not None], 1),
                         "itl_p50": mmm([r.get("itl_p50_ms") for r in rs], 1),
@@ -550,10 +571,13 @@ def analyze(data, meta):
                                 for size in sorted(s_by[(m, th, mt)])
                                 for r in s_by[(m, th, mt)][size]["runs"]
                                 if not r.get("error") and r.get("e2e_ms") is not None]
-            P[th]["think_all"] = [(r.get("think_ms") or 0) / 1000 for mt in mts
-                                  for size in sorted(s_by[(m, th, mt)])
-                                  for r in s_by[(m, th, mt)][size]["runs"]
-                                  if not r.get("error")]
+            # 思考时长汇总：先算再滤 None（think_sec 把「测不出」标成 None，
+            # 若直接当 0 进统计会让「思考时长中位」这条曲线整体塌到 0）
+            _think_all = [think_sec(r) for mt in mts
+                          for size in sorted(s_by[(m, th, mt)])
+                          for r in s_by[(m, th, mt)][size]["runs"]
+                          if not r.get("error")]
+            P[th]["think_all"] = [v for v in _think_all if v is not None]
             P[th]["rc_all"] = [r.get("reasoning_chars", 0) for mt in mts
                                for size in sorted(s_by[(m, th, mt)])
                                for r in s_by[(m, th, mt)][size]["runs"]
@@ -641,9 +665,9 @@ def analyze(data, meta):
         lo, hi = min(ps), max(ps)
         return "{:,}".format(lo) if lo == hi else "{:,}–{:,}".format(lo, hi)
 
-    def mk_unit(scene, model, th, bkt, lbl, ttfts, itls, tpss, n):
+    def mk_unit(scene, model, th, bkt, lbl, ttfts, tpots, tpss, n):
         ttfts = [v for v in ttfts if v]
-        itls = [v for v in itls if v]
+        tpots = [v for v in tpots if v]
         tpss = [v for v in tpss if v]
         pp = pct9599(ttfts)
         return {
@@ -651,7 +675,11 @@ def analyze(data, meta):
             "prompt": lbl, "n": n,
             "ttft_med": round(st.median(ttfts), 2) if ttfts else None,
             "ttft_p99": pp[1] if pp else None,  # 样本 < MIN_PCT_SAMPLE 时退回中位数判级
-            "itl_p99": round(st.median(itls), 1) if itls else None,
+            # TPOT 取真实 per-token 解码间隔（tpot_ms = (E2E-TTFT)/(tokens-1)）。
+            # ⚠️ 不要用 ITL 分位替代：ITL 按 **chunk** 计，投机解码（MTP）把多个 token
+            # 合进一个 SSE chunk，于是 chunk 间隔 ≈ N × token 间隔（本实例实测 N≈2.66），
+            # TPOT 会被系统性高估约 2.6 倍，使并发各档整片误判「未达标」。
+            "tpot_med": round(st.median(tpots), 1) if tpots else None,
             "tps": round(st.median(tpss), 0) if tpss else None,
         }
 
@@ -679,7 +707,7 @@ def analyze(data, meta):
                 top_rs = [r for mt, _, rs in groups if mt == top_mt for r in rs]
                 base.append(mk_unit(
                     "单发·单轮", m, th, bkt, prompt_lbl([size for _, size, _ in groups]),
-                    ttfts, [r.get("itl_p99_ms") for r in top_rs],
+                    ttfts, [r.get("tpot_ms") for r in top_rs],
                     [r.get("tokens_per_sec") for r in top_rs], len(ttfts)))
             # 单发·多轮：逐轮按该轮 prompt 归档（会话越深输入越大）；失败轮显式剔除
             top_mt = mts[-1]
@@ -691,7 +719,7 @@ def analyze(data, meta):
                 base.append(mk_unit(
                     "单发·多轮", m, th, bkt, prompt_lbl([t.get("prompt_tokens", 0) for t in ts]),
                     [t.get("ttft_ms", 0) / 1000 for t in ts],
-                    [t.get("itl_p99_ms") for t in ts],
+                    [t.get("tpot_ms") for t in ts],
                     [t.get("tokens_per_sec") for t in ts], len(ts)))
     # 并发：均匀轮按请求 prompt 归档；混跑轮逐形状评估（形状即输入档，只有中位数）
     for lv in c_lvls:
@@ -717,7 +745,7 @@ def analyze(data, meta):
             base.append(mk_unit(scene, lv["model"], lv.get("thinking", "off"), bkt,
                                 prompt_lbl([t.get("prompt_tokens", 0) for t in ts]),
                                 [t.get("ttft_ms", 0) / 1000 for t in ts],
-                                [t.get("itl_p99_ms") for t in ts],
+                                [t.get("tpot_ms") for t in ts],
                                 [t.get("tokens_per_sec") for t in ts], len(ts)))
     A["baseline"] = base
 
@@ -1125,7 +1153,7 @@ def baseline_section(A):
             g = SLO_TIERS["short_good_ttft"] if bkt == "short" else SLO_TIERS["long_good_ttft"]
             p = SLO_TIERS["short_pass_ttft"] if bkt == "short" else SLO_TIERS["long_pass_ttft"]
             t_b = badge(t_v, g, p)
-        tp_b = badge(u["itl_p99"], SLO_TIERS["good_tpot"], SLO_TIERS["pass_tpot"])
+        tp_b = badge(u["tpot_med"], SLO_TIERS["good_tpot"], SLO_TIERS["pass_tpot"])
         if u["thinking"] == "on" and u["tps"] is not None:
             note_html.append(note_once(
                 "tok/s 为整响应吞吐（thinking=on 时含思考 token），速度判级仅供参考。"))
@@ -1143,7 +1171,7 @@ def baseline_section(A):
             summary[bkt].append(verdict)
         rows.append([u["scene"], esc(short(u["model"])), u["thinking"], BUCKET_LABEL[bkt],
                      u["prompt"], "{:,}".format(u["n"]), t_txt, t_b,
-                     "{:.0f}ms".format(u["itl_p99"]) if u["itl_p99"] is not None else "—", tp_b,
+                     "{:.0f}ms".format(u["tpot_med"]) if u["tpot_med"] is not None else "—", tp_b,
                      "{:.0f}".format(u["tps"]) if u["tps"] is not None else "—", ts_b, verdict])
 
     ps = []
@@ -1159,7 +1187,11 @@ def baseline_section(A):
         ps.append("暖路径提示：prefix cache 命中时大输入的 TTFT 只由新增 token 决定，会显著好于档位数字——"
                   "≥24K 档判的是冷 prefill 最坏角落；命中率的实测见第 7 节缓存判定。")
     note_html.append("<li>判级口径：TTFT 优先 p99，样本不足 {} 时退回中位数（括号内标注）；"
-                     "TPOT 以每请求 ITL p99 的中位数为代理。基线不进退出码、不影响原始数据。</li>"
+                     "TPOT 取<b>真实 per-token 解码间隔</b>（<code>tpot_ms</code>，即 (E2E−TTFT)/(输出 token−1)）"
+                     "的中位数，<b>不用 ITL 分位</b>——ITL 按 chunk 计，投机解码（MTP）会把多个 token 合进"
+                     "同一个 SSE chunk，chunk 间隔约为 token 间隔的 N 倍（本实例实测 N≈2.66），"
+                     "拿它当 TPOT 会高估约 2.6 倍并把并发各档成片误判为未达标。"
+                     "基线不进退出码、不影响原始数据。</li>"
                      .format(MIN_PCT_SAMPLE))
     note_html.append("<li>判据出处：<code>docs/latency-baselines.md</code> §7 —— "
                      "MLPerf Server（TTFT p99 ≤2s / TPOT ≤200ms，锚定 ~240 wpm 阅读速度）、"
@@ -1167,7 +1199,7 @@ def baseline_section(A):
                      "≥24K 档为推导值（particula 10K 实测 0.75–1.6s 线性外推 + MLPerf 405B 档 6s 上限佐证）。</li>")
 
     head = ["场景", "模型", "thinking", "输入档", "prompt tk", "样本", "TTFT", "TTFT 判级",
-            "ITL p99", "TPOT 判级", "tok/s", "速度判级", "综合"]
+            "TPOT ms", "TPOT 判级", "tok/s", "速度判级", "综合"]
     html_tbl = table(head, rows)
     concl = '<div class="finding">{}</div>'.format("".join("<p>{}</p>".format(x) for x in ps)) if ps else ""
     notes = '<ul class="tight">{}</ul>'.format("".join(note_html))
@@ -1464,10 +1496,16 @@ def quality_block(data, A):
         hit_q = s.get("cache_query_tokens") or 0
         if hit_q > 0:
             bits.append("前缀缓存命中率 {:.1%}".format((s.get("cache_hit_tokens") or 0) / hit_q))
-        if s.get("preemptions"):
+        # 0 要显式渲染出来：省略会让「窗口内没有抢占」看起来像「没采到这一项」。
+        # 旧产物没有该键（is None）时自然不显示，兼容不变。
+        if s.get("preemptions") is not None:
             bits.append("preemptions {:,.0f}".format(s["preemptions"]))
         if s.get("spec_drafts"):
-            bits.append("MTP 接受率 {:.0%}".format((s.get("spec_accepted_tokens") or 0) / s["spec_drafts"]))
+            # 语义是「每个 draft 平均被接受多少 token」（0–N 之间的数，N = 每步投机 token 数，
+            # 本实例 3），**不是百分比**。按 % 渲染会给出 148% 这种不可能值，读者会当成接受率超高。
+            bits.append("MTP 平均每 draft 接受 {:.2f} token（{:.0f}/{:.0f}）".format(
+                (s.get("spec_accepted_tokens") or 0) / s["spec_drafts"],
+                s.get("spec_accepted_tokens") or 0, s["spec_drafts"]))
         for gname, gv in sorted((s.get("gauges") or {}).items()):
             mx = (gv or {}).get("max") or 0
             if not mx:

@@ -100,3 +100,16 @@ func TestPartitionByModel(t *testing.T) {
 		}
 	}
 }
+
+// preemptions 的 JSON tag 刻意不带 omitempty：0 表示「窗口内没有发生抢占」这一
+// 有意义的结果（健康态），键一旦消失，读数据的人会把「实测 0」误读成「没采到这一项」。
+// 真机上 vllm:num_preemptions_total 存在且为 0，旧产物里却查无此键，正是这个坑。
+func TestServerMetricsPreemptionsZeroKept(t *testing.T) {
+	b, err := json.Marshal(ServerMetricsSummary{Available: true})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(b), `"preemptions":0`) {
+		t.Errorf("preemptions=0 必须显式出现在 JSON 中（否则与「未采集」不可区分）: %s", b)
+	}
+}

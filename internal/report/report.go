@@ -142,7 +142,10 @@ type ServerMetricsSummary struct {
 	// counter 窗口差值（并发窗口内为混合贡献；命中率 = hit/query）
 	CacheHitTokens     float64 `json:"cache_hit_tokens,omitempty"`
 	CacheQueryTokens   float64 `json:"cache_query_tokens,omitempty"`
-	Preemptions        float64 `json:"preemptions,omitempty"`
+	// 刻意不加 omitempty：0 表示「窗口内没有发生抢占」这一**有意义的好结果**。
+	// 加上 omitempty 后该键会整个消失，读数据的人会把「实测 0」误读成「没采集到」。
+	// 是否可采信看同级的 Available（窗口差值没取到时它才是 false）。
+	Preemptions        float64 `json:"preemptions"`
 	SpecDrafts         float64 `json:"spec_drafts,omitempty"`
 	SpecAcceptedTokens float64 `json:"spec_accepted_tokens,omitempty"`
 
