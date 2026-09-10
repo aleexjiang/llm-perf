@@ -184,10 +184,14 @@ func TestIngestSSE_ThinkingNoContent(t *testing.T) {
 	feed(t, m, raw, true)
 
 	if !m.ThinkingNoContent {
-		t.Error("ThinkingNoContent should be true")
+		t.Fatal("ThinkingNoContent should be true")
 	}
-	if m.ThinkMS != 0 || m.TTFTContent != 0 {
-		t.Errorf("ThinkMS/TTFTContent should be 0, got %v/%v", m.ThinkMS, m.TTFTContent)
+	// 全程无 content 时 DecodeMS 会被填成 first_chunk→end（那其实是整段 reasoning 的
+	// 生成时长）。留在 JSON 里报告 decode 列照常出数，与「思考段不可界定」的结论相反，
+	// 也和日志侧打的「—」矛盾——必须与 ThinkMS 一起清 0，让键消失。
+	if m.ThinkMS != 0 || m.DecodeMS != 0 || m.TTFTContent != 0 {
+		t.Errorf("ThinkMS/DecodeMS/TTFTContent should be 0, got %v/%v/%v",
+			m.ThinkMS, m.DecodeMS, m.TTFTContent)
 	}
 }
 

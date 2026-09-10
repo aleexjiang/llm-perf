@@ -617,7 +617,10 @@ def analyze(data, meta):
                                    max(t.get("prompt_tokens", 0) for t in ts)),
                         "new": st.median([t.get("new_tokens", 0) for t in ts]),
                         "ttft": mmm([t["ttft_ms"] / 1000 for t in ts if t.get("ttft_ms") is not None], 2),
-                        "think": mmm([(t.get("think_ms") or 0) / 1000 for t in ts], 1),
+                        # 与单发/并发同一口径（think_sec）：think_ms 缺失且有思考字符 ⇒ 不可界定，
+                        # 整体剔除不计。此前这里是 ((think_ms) or 0)，多轮又恰是思考最容易被
+                        # 截断的场景（长上下文 + thinking on），该轮「思考」列会塌成 0.0s。
+                        "think": mmm([think_sec(t) for t in ts], 1),
                         "e2e": mmm([t["e2e_ms"] / 1000 for t in ts if t.get("e2e_ms") is not None], 1),
                         "sess_ttft": [t.get("ttft_ms") or 0 for t in ts],
                         "sess_e2e": [t.get("e2e_ms") or 0 for t in ts],
@@ -1656,9 +1659,11 @@ def main():
          ["思考时长", "模型思考输出的总时长（think_ms）；TTFT 在 thinking=on 时即思考首包"],
          ["思考占比", "思考时长 ÷ E2E（思考与正文输出可能交错，口径近似）"],
          ["E2E", "请求发出 → 流结束（含思考全程）"],
-         ["decode", "首 chunk → 流结束"],
-         ["ITL p50/p99", "chunk 间间隔分位（不含 TTFT）"],
-         ["tok/s", "completion_tokens ÷ decode 时长"],
+         ["decode", "content 首包 → 流结束；全程无正文（思考吃光预算）时不可测，记「—」"],
+         ["ITL p50/p99", "chunk 间间隔分位（不含 TTFT）。注意是 chunk 间隔、不是 token 间隔，"
+                         "投机解码会把多个 token 合进一个 chunk"],
+         ["tok/s", "completion_tokens ÷（E2E−TTFT），含思考段——不用 decode 时长（decode 只覆盖正文段，"
+                   "思考 token 计入分子而思考耗时不在分母，会显著虚高）"],
          ["思考字符", "reasoning_content 累积字符数"],
          ["finish", "stop=自然结束；length=触达 max_tokens 截断"]])))
     # 单发

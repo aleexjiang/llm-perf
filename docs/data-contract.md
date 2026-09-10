@@ -77,7 +77,8 @@ Report
 10. **TTFT 是"首个含 token chunk"口径**（2026-09 对齐主流）：role-only 空 content 首 chunk（OpenAI 兼容服务标配）不计入 TTFT，取 reasoning/content 首包较早者；原始首 chunk 时刻保留在 `first_chunk_at` 供核查。此版本前的落盘数据是"任意首 chunk"口径，数值略偏小（差 1 个空帧）。
 11. **goodput 只判定已配置的 SLO 子集**（vLLM 语义）：阈值为 0 的维度不参与判定；配置了 TTFT 阈值时要求 TTFT 可测（>0，非流式不白拿达标）。
 12. **content_chars/reasoning_chars 是字符数（rune）**：2026-09 起按字符计（此前是 UTF-8 字节数，中文单字被计为 3）；报告"思考字符"列、日志"N 字"同步。
-13. **think_ms 缺失 ≠ 思考 0 秒**（2026-09-10 起）：`think_ms` 带 omitempty，`thinking=off` 时缺失代表真实的 0（该保留）；但 `thinking=on` 且 `thinking_no_content=true`（思考吃光输出预算、正文 0 字符）时思考段终点无从界定，缺失是**"测不出"而不是 0**。消费方不得把后者当 0 参与中位数——报告侧 `think_sec()` 统一返回 None 并整体剔除。否则一个档位里只要有部分 run 测不出，中位数就塌成 0：实测曾把 100k 档渲染成"思考 0.0s / 占比 0%"，而该档真实思考为 142s。
+13. **think_ms / decode_ms 缺失 ≠ 0 秒**（2026-09-10 起）：两者都带 omitempty，`thinking=off` 时 `think_ms` 缺失代表真实的 0（该保留）；但 `thinking=on` 且 `thinking_no_content=true`（思考吃光输出预算、正文 0 字符）时思考段终点无从界定，缺失是**"测不出"而不是 0**。消费方不得把后者当 0 参与中位数——报告侧 `think_sec()` 统一返回 None 并整体剔除（单发阶梯、并发、多轮逐轮、think_all 四处同一口径）。否则一个档位里只要有部分 run 测不出，中位数就塌成 0：实测曾把 100k 档渲染成"思考 0.0s / 占比 0%"，而该档真实思考为 142s。
+    **`decode_ms` 同理且已由采集端清 0**：全程无 content 时它本会被填成 `first_chunk→end`，那是整段 reasoning 的生成时长、不是 content 解码时长——留着会让报告 decode 列出一个像样的错数。故 `thinking_no_content=true` 时采集端直接清 0，键随 omitempty 消失，与日志侧打的「—」一致。
 
 ## 主流口径对照（2026-09，对齐 GenAI-Perf/AIPerf、vLLM bench serve、LLMPerf、Inference-Perf）
 

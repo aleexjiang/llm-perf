@@ -144,7 +144,7 @@ type TurnMetrics struct {
 	TTFTReasoning float64 `json:"ttft_reasoning_ms,omitempty"` // 首个 reasoning chunk ≈ prefill 完成
 	TTFTContent   float64 `json:"ttft_content_ms,omitempty"`   // 首个 content chunk = prefill + 思考
 	ThinkMS       float64 `json:"think_ms,omitempty"`          // reasoning 首包 -> content 首包
-	DecodeMS      float64 `json:"decode_ms,omitempty"`         // content 首包 -> 结束
+	DecodeMS      float64 `json:"decode_ms,omitempty"`         // content 首包 -> 结束；无 content（思考吃光预算）时清 0，键消失 = 不可测
 	ITLAvg        float64 `json:"itl_avg_ms,omitempty"`
 	ITLP50        float64 `json:"itl_p50_ms,omitempty"`
 	ITLP90        float64 `json:"itl_p90_ms,omitempty"`
@@ -274,6 +274,11 @@ func (m *TurnMetrics) Finalize() {
 	}
 	if m.Stream && m.Thinking && m.FirstContentAt == nil && m.FinishReason == "length" {
 		m.ThinkingNoContent = true
+		// 与 ThinkMS 同处理：全程无 content 时 DecodeMS 会被填成 first_chunk→end，
+		// 那是整段 reasoning 的生成时长，不是 content 解码时长。留在 JSON 里报告 decode 列
+		// 会照常出数（消费方只会看见一个像样的数字），而日志侧已按「不可测」打「—」——
+		// 同一份数据两处口径相反。清 0 让键消失，「测不出」与「真的是这个数」才可区分。
+		m.DecodeMS = 0
 	}
 
 	// ITL：相邻 content chunk 间隔（GenAI-Perf 口径，不含 TTFT）
