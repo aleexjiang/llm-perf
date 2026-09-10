@@ -573,6 +573,7 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 						}
 					}
 					lastPrompt := 0 // 上一轮服务端实测 prompt_tokens（截止计算与新增 tokens 计算）
+					estPrompt := 0  // usage 缺失时的生成侧估算：filler 每轮累加本轮 turn tokens，usage 恢复即对齐实测
 					for turn := 0; turn < mt.Turns; turn++ {
 						if e.fullReplay() {
 							if turn >= len(fullPrefixes) {
@@ -587,12 +588,13 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 							}
 							msgs = append(msgs, engine.Message{Role: "user", Content: userTurns[turn]})
 						} else {
-							tt := nextTurnTokens(mc, mt.TurnTokens, lastPrompt)
+							tt := nextTurnTokens(mc, mt.TurnTokens, effPromptOf(lastPrompt, estPrompt))
 							if tt <= 0 {
 								log.Printf("    已达 max_prompt_tokens=%d 截止，提前结束会话（%d/%d 轮）", mc.MaxPromptTokens, turn, mt.Turns)
 								break
 							}
 							msgs = append(msgs, engine.UserMsg(tt, baseSeed+int64(turn), mc.FillerLang))
+							estPrompt += tt // usage 缺失时的估算基线：本轮已追加进 history，下一轮的 prompt 必然包含它
 						}
 						m := runOne(ctx, e, model, msgs, maxTok, v)
 						if m.PromptTokens > 0 {
@@ -609,6 +611,7 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 							// 只有成功的轮次才推进基准：失败的轮次（ctx=0）不能把 lastPrompt 清零，
 							// 否则下一轮会把整条 history 都算成"新增"，增量 prefill 指标错乱
 							lastPrompt = m.PromptTokens
+							estPrompt = m.PromptTokens // usage 恢复：估算基线对齐实测
 						}
 						log.Printf("    turn%d (ctx≈%dtk +%dtk)", turn+1, m.PromptTokens, m.NewTokens)
 						if mt.KeepAssistant && m.ReplyText != "" && !e.fullReplay() {
@@ -684,6 +687,7 @@ func collectSessionTurns(ctx context.Context, e *env, cfg *config.Config,
 	}
 	var out []*engine.TurnMetrics
 	lastPrompt := 0
+	estPrompt := 0 // usage 缺失时的生成侧估算（与 Multiturn 同语义）
 	for turn := 0; turn < turns; turn++ {
 		if e.fullReplay() {
 			if turn >= len(fullPrefixes) {
@@ -696,12 +700,13 @@ func collectSessionTurns(ctx context.Context, e *env, cfg *config.Config,
 			}
 			msgs = append(msgs, engine.Message{Role: "user", Content: userTurns[turn]})
 		} else {
-			tt := nextTurnTokens(cfg, mt.TurnTokens, lastPrompt)
+			tt := nextTurnTokens(cfg, mt.TurnTokens, effPromptOf(lastPrompt, estPrompt))
 			if tt <= 0 {
 				log.Printf("    worker 会话已达 max_prompt_tokens=%d 截止，提前结束（%d/%d 轮）", cfg.MaxPromptTokens, turn, turns)
 				break
 			}
 			msgs = append(msgs, engine.UserMsg(tt, baseSeed+int64(turn), cfg.FillerLang))
+			estPrompt += tt // 本轮已追加进 history，下一轮的 prompt 必然包含它
 		}
 		m := runOne(ctx, e, model, msgs, maxTok, v)
 		if m.PromptTokens > 0 {
@@ -716,6 +721,7 @@ func collectSessionTurns(ctx context.Context, e *env, cfg *config.Config,
 				m.NewTokens = m.PromptTokens
 			}
 			lastPrompt = m.PromptTokens
+			estPrompt = m.PromptTokens // usage 恢复：估算基线对齐实测
 		}
 		out = append(out, m)
 		if mt.KeepAssistant && m.ReplyText != "" && !e.fullReplay() {
@@ -1136,6 +1142,16 @@ func nextTurnTokens(cfg *config.Config, turnTokens, lastPrompt int) int {
 		return remaining
 	}
 	return turnTokens
+}
+
+// effPromptOf 截止计算用的有效上下文基线：优先服务端实测 prompt_tokens；
+// 引擎不回 usage 时（恒为 0）回退到生成侧估算——否则 remaining 恒等于
+// MaxPromptTokens，max_prompt_tokens 截止形同虚设，上下文无界增长撞模型上限。
+func effPromptOf(server, est int) int {
+	if server > 0 {
+		return server
+	}
+	return est
 }
 
 func filterModels(models []string, filter string) []string {

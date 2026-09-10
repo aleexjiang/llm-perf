@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -233,17 +234,23 @@ func (m *TurnMetrics) Finalize() {
 		return
 	}
 	if m.FirstChunkAt != nil {
-		// 主流口径（GenAI-Perf / LLMPerf / AIPerf：disregard initial responses with
-		// no content）：TTFT 取首个含 token 的 chunk（reasoning/content 首包较早者）。
-		// role-only 空首 chunk（OpenAI 兼容服务标配）不算 token；原始首 chunk 时刻
-		// 保留在 first_chunk_at 供口径核查。全程无 token 的流退回首 chunk 时刻。
-		switch {
-		case m.FirstReasoningAt != nil:
-			m.TTFT = ms(m.SentAt, *m.FirstReasoningAt)
-		case m.FirstContentAt != nil:
-			m.TTFT = ms(m.SentAt, *m.FirstContentAt)
-		default:
-			m.TTFT = ms(m.SentAt, *m.FirstChunkAt)
+		// 先取 reasoning/content 两个含 token 首包中**较早者**——魔改引擎可能把
+		// content 排在 reasoning 之前（think_ms_negative 兜底同样预料到这种时序），
+		// 固定取 reasoning 会偏大并与 ttft_content_ms 矛盾。
+		// FirstChunkAt 是 role-only 空首 chunk（OpenAI 兼容服务标配，不算 token），
+		// 仅在全程无 token 时兜底；原始首 chunk 时刻保留在 first_chunk_at 供口径核查。
+		var first *time.Time
+		if m.FirstReasoningAt != nil {
+			first = m.FirstReasoningAt
+		}
+		if m.FirstContentAt != nil && (first == nil || m.FirstContentAt.Before(*first)) {
+			first = m.FirstContentAt
+		}
+		if first == nil {
+			first = m.FirstChunkAt
+		}
+		if first != nil {
+			m.TTFT = ms(m.SentAt, *first)
 		}
 	}
 	if m.FirstReasoningAt != nil {
@@ -308,11 +315,23 @@ func avg(xs []float64) float64 {
 	return s / float64(len(xs))
 }
 
+// percentile 线性插值分位（偶数样本的 P50 自动等于两中值平均）。
+// 与报告侧 Python st.median、scenario 层 aggregateShapes 的中位口径一致——
+// 之前的 floor 取整口径在偶数样本时系统性偏低半步。
 func percentile(xs []float64, p float64) float64 {
 	s := append([]float64(nil), xs...)
 	sort.Float64s(s)
-	idx := int(p / 100 * float64(len(s)-1))
-	return s[idx]
+	n := len(s)
+	if n == 0 {
+		return 0
+	}
+	idx := p / 100 * float64(n-1)
+	lo := int(math.Floor(idx))
+	hi := int(math.Ceil(idx))
+	if lo == hi {
+		return s[lo]
+	}
+	return s[lo] + (s[hi]-s[lo])*(idx-float64(lo))
 }
 
 // ChatOptions 一次请求的全部参数。

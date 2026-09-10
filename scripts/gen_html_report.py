@@ -467,9 +467,11 @@ def analyze(data, meta):
             continue
         # 失败请求（error 字段，如网关 504）：无 ttft/有效计时，混进统计会把中位数
         # 拉向 0（幸存者偏差的反向污染）——一律剔除，只报失败数。
+        # 整档全失败时 stats 留空（渲染为 "—"，fails 表达失败数），
+        # 不回退到含失败的全集——否则一整行 0 值进中位 = 0，看起来像"极快"。
         ok_turns = [t for t in turns if not t.get("error")]
         n_fails = len(turns) - len(ok_turns)
-        src = ok_turns or turns
+        src = ok_turns
         A[quad].append({
             "model": lv["model"],
             "thinking": lv.get("thinking", "off"),
@@ -502,8 +504,9 @@ def analyze(data, meta):
             for mt in mts:
                 for size in sorted(s_by[(m, th, mt)]):
                     rs_all = s_by[(m, th, mt)][size]["runs"]
-                    # 失败 run（如 HTTP 504）剔除后再统计——与并发侧口径一致，防 ttft=0 拉低中位数
-                    rs = [r for r in rs_all if not r.get("error")] or rs_all
+                    # 失败 run（如 HTTP 504）剔除后再统计——与并发侧口径一致，防 ttft=0 拉低中位数；
+                    # 整档全失败不回退全集（stats 为空渲染 "—"，fails/n 表达失败规模）
+                    rs = [r for r in rs_all if not r.get("error")]
                     ladder.append({
                         "size": size,
                         "mt": mt,

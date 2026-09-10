@@ -160,7 +160,10 @@ func Parse(text string) *Sample {
 				s.Hists[family] = h
 			}
 			le := parseLE(labels["le"])
-			h.Buckets = append(h.Buckets, Bucket{LE: le, Count: val})
+			// 带 label 的直方图（vLLM/SGLang：model_name、finished_reason 等）同一 le
+			// 会出现多条——必须按 (family, le) 累加，否则 histQuantile 的 map 覆盖
+			// 会让分位估算失真（与 _count/_sum 的跨系列求和口径一致）
+			h.addBucket(le, val)
 		case strings.HasSuffix(name, "_sum"):
 			family := strings.TrimSuffix(name, "_sum")
 			h := s.Hists[family]
@@ -456,6 +459,17 @@ func HistDeltas(before, after *Sample, p MetricsProvider) map[string]HistDelta {
 		out[name] = d
 	}
 	return out
+}
+
+// addBucket 按 le 累加桶计数（同一 le 命中就 +=，否则新增）。Parse 末尾会统一排序。
+func (h *Hist) addBucket(le, count float64) {
+	for i := range h.Buckets {
+		if h.Buckets[i].LE == le {
+			h.Buckets[i].Count += count
+			return
+		}
+	}
+	h.Buckets = append(h.Buckets, Bucket{LE: le, Count: count})
 }
 
 // histQuantile 从桶边界估算分位。Prometheus histogram 的桶为累计计数：

@@ -72,6 +72,36 @@ func TestWorkerSeed(t *testing.T) {
 
 // ── 纯函数：上下文截止 / 开环到达率 ──
 
+// 回归点：引擎不回 usage 时 lastPrompt 恒 0，曾导致 max_prompt_tokens 截止永不触发、
+// 上下文无界增长。生成侧估算（estPrompt）必须参与截止判断。
+func TestUsageMissingPromptCutoff(t *testing.T) {
+	cfg := &config.Config{MaxPromptTokens: 20000}
+	last, est := 0, 0
+	// 模拟 usage 缺失：每轮追加 10000 tokens，第 3 轮应因估算基线达到上限而停轮
+	tt := nextTurnTokens(cfg, 10000, effPromptOf(last, est))
+	est += tt
+	if tt != 10000 {
+		t.Fatalf("第 1 轮应全额 10000，实际 %d", tt)
+	}
+	tt = nextTurnTokens(cfg, 10000, effPromptOf(last, est))
+	est += tt
+	if tt != 10000 { // 剩余 15000，截断为 10000
+		t.Fatalf("第 2 轮应仍为 10000，实际 %d", tt)
+	}
+	tt = nextTurnTokens(cfg, 10000, effPromptOf(last, est))
+	if tt != 0 {
+		t.Fatalf("估算基线 %d 已达上限，第 3 轮应停轮（=0），实际 %d", est, tt)
+	}
+	// usage 中途恢复：估算基线对齐实测（实测可能因模板开销大于生成侧估算）
+	last, est = 30000, 22000
+	if got := effPromptOf(last, est); got != 30000 {
+		t.Fatalf("usage 恢复后应优先实测值，实际 %d", got)
+	}
+	if got := effPromptOf(0, 22000); got != 22000 {
+		t.Fatalf("usage 缺失时应回退估算值，实际 %d", got)
+	}
+}
+
 func TestNextTurnTokens(t *testing.T) {
 	cases := []struct {
 		name                string

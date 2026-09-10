@@ -47,6 +47,37 @@ func TestParse(t *testing.T) {
 	}
 }
 
+func TestParseLabeledBucketsMerged(t *testing.T) {
+	// 同一 family 同一 le 出现两个 label 系列（vLLM 真实形态）——
+	// 回归点：Parse 曾逐行 append 不合并，histQuantile 的 map 覆盖导致分位估算失真
+	text := `vllm:time_to_first_token_seconds_bucket{model_name="a",le="0.1"} 3
+vllm:time_to_first_token_seconds_bucket{model_name="b",le="0.1"} 5
+vllm:time_to_first_token_seconds_bucket{model_name="a",le="1.0"} 9
+vllm:time_to_first_token_seconds_bucket{model_name="b",le="1.0"} 10
+vllm:time_to_first_token_seconds_bucket{model_name="a",le="+Inf"} 10
+vllm:time_to_first_token_seconds_bucket{model_name="b",le="+Inf"} 10
+vllm:time_to_first_token_seconds_count 20
+`
+	s := Parse(text)
+	h := s.Hists["vllm:time_to_first_token_seconds"]
+	if h == nil {
+		t.Fatal("直方图未解析")
+	}
+	if len(h.Buckets) != 3 {
+		t.Fatalf("同 le 桶应合并为一条，实际 %d 条: %+v", len(h.Buckets), h.Buckets)
+	}
+	if h.Buckets[0].LE != 0.1 || h.Buckets[0].Count != 8 {
+		t.Fatalf("le=0.1 桶应累加 3+5=8，实际 %+v", h.Buckets[0])
+	}
+	if h.Buckets[1].LE != 1.0 || h.Buckets[1].Count != 19 {
+		t.Fatalf("le=1.0 桶应累加 9+10=19，实际 %+v", h.Buckets[1])
+	}
+	// 分位可估算：total=20（+Inf 差），累计到 10 落在 le=1.0 桶
+	if got := histQuantile(nil, h, 0.50); got != 1.0 {
+		t.Fatalf("P50 应落在 le=1.0 桶，实际 %v", got)
+	}
+}
+
 func TestCounterDelta(t *testing.T) {
 	before := Parse(sampleText)
 	afterText := strings.NewReplacer(

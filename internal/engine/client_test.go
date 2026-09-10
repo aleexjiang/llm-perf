@@ -227,6 +227,11 @@ func TestThinkMSNegativeClamped(t *testing.T) {
 	if m.ThinkMS != 0 {
 		t.Fatalf("负 ThinkMS 应钳 0, got %v", m.ThinkMS)
 	}
+	// TTFT 必须取较早的 content 首包（200ms）而非 reasoning（300ms）——
+	// 回归点：Finalize 曾固定"reasoning 优先"，content 先到时 TTFT 偏大
+	if got := m.TTFT; got != 200 {
+		t.Fatalf("TTFT 应取较早的 content 首包=200ms，实际 %.0f", got)
+	}
 	if !hasWarningPrefix(m.Warnings, "think_ms_negative") {
 		t.Fatalf("应有 think_ms_negative 告警: %v", m.Warnings)
 	}
@@ -236,3 +241,20 @@ func TestThinkMSNegativeClamped(t *testing.T) {
 }
 
 func ptrTime(t time.Time) *time.Time { return &t }
+
+// 回归点：percentile 曾用 floor 索引，偶数样本 P50 系统性偏低半步，
+// 与报告侧 st.median / scenario 层 aggregateShapes 口径不一致
+func TestPercentileMedianParity(t *testing.T) {
+	if got := percentile([]float64{1, 2}, 50); got != 1.5 {
+		t.Fatalf("偶数样本 P50 应取两中值平均=1.5，实际 %v", got)
+	}
+	if got := percentile([]float64{3, 1, 2}, 50); got != 2 {
+		t.Fatalf("奇数样本 P50 应为中位=2，实际 %v", got)
+	}
+	if got := percentile([]float64{10, 20, 30, 40}, 50); got != 25 {
+		t.Fatalf("四样本 P50 应=25，实际 %v", got)
+	}
+	if got := percentile([]float64{1, 2, 3, 4}, 100); got != 4 {
+		t.Fatalf("P100 应取最大=4，实际 %v", got)
+	}
+}
