@@ -169,6 +169,38 @@ func TestProbe_ChatPathScan(t *testing.T) {
 	}
 }
 
+// 中止路径也要给配置片段：端点全 404 时 chat 路径扫描全落空，probe 提前返回。
+// 此时片段只能列已确证的事实——绝不能复用正常路径的生成器，那会写出
+// 「未探测到 /metrics」这类断言，而 /metrics 根本没探过。
+func TestProbe_AbortPathStillSuggestsConfig(t *testing.T) {
+	srv := newProbeServer(t, nil) // 一切 404
+
+	res := Probe(context.Background(), ProbeOptions{
+		Endpoint: srv.URL,
+		Model:    "qwen3.8-27b",
+		Timeout:  5 * time.Second,
+	})
+
+	if c := findCheck(res, "chat_path"); c == nil || c.OK {
+		t.Fatalf("chat 路径全落空时应有 chat_path 失败项，实际 %+v，checks=%s", c, dumpChecks(res))
+	}
+	if res.Suggested == "" {
+		t.Fatalf("中止路径也必须给出配置片段（最需要照抄就能改的恰是这些场景）")
+	}
+	if !strings.Contains(res.Suggested, "endpoint: "+srv.URL) {
+		t.Errorf("片段应含已确证的 endpoint，实际:\n%s", res.Suggested)
+	}
+	if !strings.Contains(res.Suggested, "model: qwen3.8-27b") {
+		t.Errorf("已指定的 model 应写成生效项，实际:\n%s", res.Suggested)
+	}
+	// 未探测的扩展面一项都不许出现（中止时它们压根没被探过）
+	for _, bad := range []string{"server_metrics", "max_prompt_tokens", "models_path"} {
+		if strings.Contains(res.Suggested, bad) {
+			t.Errorf("中止片段不得断言未探测项 %s：\n%s", bad, res.Suggested)
+		}
+	}
+}
+
 // URL 拼装：endpoint 带 /v1 前缀与不带前缀两种写法都要算对。
 func TestSplitOriginResolvePath(t *testing.T) {
 	cases := []struct {

@@ -260,6 +260,7 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 	if model == "" {
 		if len(res.Models) == 0 {
 			res.Verdicts = append(res.Verdicts, "拿不到模型列表，且配置里未显式指定 model——无法继续，在配置里写 model 后重试")
+			res.Suggested = buildAbortConfig(origin, chatPath, "", "模型列表不可用且未指定 model——填好 model 后重跑")
 			res.Summary = res.Summarize()
 			return res
 		}
@@ -347,11 +348,13 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 	case chatSt == 0:
 		check("chat_endpoint", false, "请求失败: "+strings.TrimSpace(string(chatRaw)))
 		res.Verdicts = append(res.Verdicts, "chat 端点不可达——先解决网络（VPN/代理/端口/证书），其余探测项无从谈起")
+		res.Suggested = buildAbortConfig(origin, chatPath, model, "chat 端点不可达——先解决网络（VPN/代理/端口/证书）")
 		res.Summary = res.Summarize()
 		return res
 	case chatSt == http.StatusNotFound || chatSt == http.StatusMethodNotAllowed:
 		check("chat_path", false, fmt.Sprintf("%s 及 %d 个常见挂载点全落空（404/405）——确认服务端路由前缀", chatPath, len(chatPathCandidates)))
 		res.Verdicts = append(res.Verdicts, "chat 路径全部落空——把正确的 chat_path 写进配置后重跑")
+		res.Suggested = buildAbortConfig(origin, chatPath, model, "chat 路径全部落空（含常见挂载点扫描）——把正确的 chat_path 写进配置后重跑")
 		res.Summary = res.Summarize()
 		return res
 	case chatSt == http.StatusOK:
@@ -602,10 +605,14 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 					}
 					highRejected = append(highRejected, fmt.Sprintf("%s 被拒（%s）", h.val, note))
 				}
-				if len(highRejected) > 0 {
+				// 分隔符不能无条件前置：全部候选都被拒时 highNote 还是空串，
+				// "+=" 会拼出以「；」开头的片段（真机上打印成「…（基线=…），；被拒候选: …」）。
+				switch {
+				case highNote != "" && len(highRejected) > 0:
 					highNote += "；被拒候选: " + strings.Join(highRejected, " / ")
-				}
-				if highNote == "" {
+				case len(highRejected) > 0:
+					highNote = "拉高方向未被接受；被拒候选: " + strings.Join(highRejected, " / ")
+				default:
 					highNote = "拉高方向未确认"
 				}
 				working = c.name
@@ -706,6 +713,30 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 	res.Summary = res.Summarize()
 
 	return res
+}
+
+// buildAbortConfig 探针**提前中止**时给出的最小配置片段。
+//
+// 中止路径（拿不到模型列表 / 端点不可达 / chat 路径全落空）原先干脆不给片段，偏偏这几条
+// 最需要「照抄就能改」。这里也不能复用 buildSuggestedConfig：它会写出「未探测到 /metrics」
+// 之类断言，而中止时那些面根本没探过——按本探针的纪律，不替用户断言没探过的事。
+//
+// 因此只列三件确证的事：端点地址、用了哪个 chat_path（中止路径上它恰恰可疑，写成注释）、
+// 以及缺口是什么。model 未定时给一行占位。
+func buildAbortConfig(origin, chatPath, model, gap string) string {
+	var sb strings.Builder
+	sb.WriteString("# 由 bench probe 生成（探测提前中止：只列已确证项，未探测的面一律不写）\n")
+	fmt.Fprintf(&sb, "endpoint: %s\n", origin)
+	if chatPath != "" {
+		fmt.Fprintf(&sb, "# chat_path: %s   # 本次用的是这个值，但未确认可达——确认后取消注释\n", chatPath)
+	}
+	if model != "" {
+		fmt.Fprintf(&sb, "model: %s\n", model)
+	} else {
+		sb.WriteString("# model: <在此填模型名>   # 中止路径上未拿到模型列表，必须显式指定\n")
+	}
+	fmt.Fprintf(&sb, "# ❗ 待补齐：%s\n", gap)
+	return sb.String()
 }
 
 // buildSuggestedConfig 把探测结论收敛成可直接粘回配置文件的 YAML 片段。
