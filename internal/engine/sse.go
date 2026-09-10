@@ -256,7 +256,9 @@ func ingestSSEBody(m *TurnMetrics, body io.Reader, clock func() time.Time, inclu
 		m.unknownKeys = map[string]bool{}
 	}
 	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	// 单行上限 8MB：1MB 曾把含超大 tool_calls arguments 的 SSE 行误判为
+	// stream_read_error（流断裂），整个请求被当失败
+	scanner.Buffer(make([]byte, 1024*1024), 8*1024*1024)
 	badLines := 0
 	var lastBad string
 	for scanner.Scan() {

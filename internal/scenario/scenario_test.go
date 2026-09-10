@@ -68,6 +68,17 @@ func TestWorkerSeed(t *testing.T) {
 	if openWorkerSeed(0, 0) == openWorkerSeed(1, 0) {
 		t.Fatal("开环 worker 种子相同")
 	}
+	// 回归点：stride 曾为 100，runs_per_worker ≥ 100 时相邻 worker 撞种子（相同 prompt）
+	seen := map[int64]bool{}
+	for w := 0; w < 8; w++ {
+		for r := 0; r < 200; r++ {
+			s := workerSeed(w, r, 0)
+			if seen[s] {
+				t.Fatalf("worker%d run%d 种子 %d 与先前组合碰撞", w, r, s)
+			}
+			seen[s] = true
+		}
+	}
 }
 
 // ── 纯函数：上下文截止 / 开环到达率 ──

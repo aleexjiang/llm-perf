@@ -77,7 +77,7 @@ func NewClient(baseURL, apiKey string, timeout time.Duration, includeUsage bool)
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		MaxIdleConns:          256,
-		MaxIdleConnsPerHost:   128,
+		MaxIdleConnsPerHost:   0, // 不限：并发档超过上限时空闲连接被回收重建，握手耗时进 TTFT（P3-11）
 		MaxConnsPerHost:       0, // 不限：并发度由场景层控制
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,

@@ -37,7 +37,7 @@ if [ -n "${BENCH:-}" ]; then
   echo "==> 使用指定二进制: $BENCH"
 else
   GO_BIN="${GO_BIN:-go}"
-  echo "==> go build 临时二进制（GO_BIN=$GO_BIN）"
+  echo "==> go build 临时二进制（GO_BIN=${GO_BIN}）"
   "$GO_BIN" build -o "$TMP/bench" ./cmd/bench
   BENCH="$TMP/bench"
 fi
@@ -58,7 +58,7 @@ run() { # run <label> <outdir> [bench 参数...] —— 期望成功
   shift 2
   echo "==> bench: $label"
   "$BENCH" -o "$TMP/$out" "$@" >"$TMP/$out.log" 2>&1 \
-    || { echo "❌ bench 失败: $label（日志: $TMP/$out.log）"; tail -30 "$TMP/$out.log"; exit 1; }
+    || { echo "❌ bench 失败: ${label}（日志: $TMP/$out.log）"; tail -30 "$TMP/$out.log"; exit 1; }
 }
 
 expect_fail() { # expect_fail <label> [bench 参数...] —— 期望非零退出（参数校验/错误路径）
@@ -121,7 +121,7 @@ kill -HUP "$HUP_PID" 2>/dev/null || true
 HUP_RC=0
 wait "$HUP_PID" || HUP_RC=$?
 if [ "$HUP_RC" != 0 ]; then
-  echo "❌ SIGHUP 应优雅退出（退出码 $HUP_RC，130=强退）；日志:"; tail -20 "$TMP/out-hup.log"; exit 1
+  echo "❌ SIGHUP 应优雅退出（退出码 ${HUP_RC}，130=强退）；日志:"; tail -20 "$TMP/out-hup.log"; exit 1
 fi
 if [ -z "$(find "$TMP/out-hup" -name '*.json' 2>/dev/null)" ]; then
   echo "❌ SIGHUP 中断后没有任何 JSON 落盘；日志:"; tail -20 "$TMP/out-hup.log"; exit 1

@@ -77,10 +77,15 @@ type env struct {
 	srv      *smetrics.Scraper        // nil = 观测层关闭/不可用
 	provider smetrics.MetricsProvider // 观测层指标命名（按服务端指标前缀自动识别）
 	trace    *engine.TraceSet         // nil = filler 模式
+	// perReqSrv 逐请求 /metrics 前后抓取（SrvDelta）开关：仅单发/串行多轮启用。
+	// 并发/开环下每请求抓取落在计时窗口内（压低 wall_seconds 口径的吞吐）、
+	// 各请求差值窗口互相重叠无归因意义，且给服务端叠加可观测负载——
+	// 并发路径只保留场景窗口级差分（startWindow/finishWindow），口径更干净。
+	perReqSrv bool
 }
 
 func newEnv(ctx context.Context, cfg *config.Config, client *engine.Client) (*env, error) {
-	e := &env{cfg: cfg, client: client}
+	e := &env{cfg: cfg, client: client, perReqSrv: true}
 	if cfg.ServerMetrics {
 		s := smetrics.NewScraperAt(cfg.Endpoint, cfg.MetricsPath)
 		// /metrics 常与业务接口同一套认证保护——认证格式与 chat 请求保持一致
@@ -161,7 +166,7 @@ func runOne(ctx context.Context, e *env, model string,
 	msgs []engine.Message, maxTokens int, v config.ThinkingVariant) *engine.TurnMetrics {
 
 	var before *smetrics.Sample
-	if e.srv != nil {
+	if e.srv != nil && e.perReqSrv {
 		before, _ = e.srv.Scrape(ctx)
 	}
 	m, err := e.client.Chat(ctx, engine.ChatOptions{
@@ -200,7 +205,7 @@ func runOne(ctx context.Context, e *env, model string,
 			log.Printf("    E2E=%.0fms tok/s=%.0f（非流式，TTFT/思考拆分 N/A）", m.E2EMS, m.TokensPerSec)
 		}
 	}
-	if e.srv != nil && before != nil {
+	if e.srv != nil && e.perReqSrv && before != nil {
 		if after, err := e.srv.Scrape(ctx); err == nil {
 			m.SrvDelta = smetrics.DiffCounters(before, after, e.provider)
 		}
@@ -736,6 +741,9 @@ func Concurrent(ctx context.Context, cfg *config.Config, client *engine.Client, 
 	if err != nil {
 		return nil, err
 	}
+	// 并发/开环关闭逐请求 /metrics 抓取：抓取耗时曾落在计时窗口内压低吞吐口径，
+	// 且并发下各请求差值窗口互相重叠无归因意义——只保留场景窗口级差分（P3-6）
+	e.perReqSrv = false
 	cc := cfg.Concurrent
 	rates := openRates(cc)
 	mode := "单轮"
@@ -1122,7 +1130,11 @@ func singleSeed(fixed bool, tokens, run, salt int) int64 {
 func sessionSeed(sessionIdx, salt int) int64 { return int64(5000 + sessionIdx*10000 + salt) }
 
 // workerSeed 闭环并发单轮：不同 worker / 不同 run 内容互异。
-func workerSeed(workerIdx, run, salt int) int64 { return int64(90000 + workerIdx*100 + run + salt) }
+// stride 取 1_000_000（≥ runs_per_worker 实际可达上限）：曾用 100，
+// runs_per_worker ≥ 100 时相邻 worker 撞种子（相同 prompt 破坏缓存对照）。
+func workerSeed(workerIdx, run, salt int) int64 {
+	return int64(90000 + workerIdx*1_000_000 + run + salt)
+}
 
 // openWorkerSeed 开环并发单轮。
 func openWorkerSeed(i, salt int) int64 { return int64(90000 + i + salt) }
