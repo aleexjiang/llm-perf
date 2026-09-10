@@ -12,6 +12,8 @@ output-*/
 .DS_Store
 configs/customer.yaml
 configs/customer-*.md
+# 客户环境实测手册（含客户端点/key），放在 docs/ 也不入库
+docs/customer-*.md
 scripts/__pycache__/
 
 # 前缀缓存探针临时产物（能力已并入 bench probe --cache，不入库）
