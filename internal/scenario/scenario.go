@@ -202,8 +202,15 @@ func runOne(ctx context.Context, e *env, model string,
 			log.Printf("    ⚠️ 兼容性告警: %s", w)
 		}
 		if e.cfg.StreamEnabled() {
-			log.Printf("    TTFT=%.0fms think=%.0fms decode=%.0fms tok/s=%.0f finish=%s",
-				m.TTFT, m.ThinkMS, m.DecodeMS, m.TokensPerSec, m.FinishReason)
+			// 不可测的时长打印 "—" 而不是 "0ms"：思考吃光输出预算时 m.ThinkMS 是零值
+			// （JSON 里因 omitempty 连键都不存在），打成 0ms 会被读成「这个请求没思考」，
+			// 而真实情况恰好相反。上面那条 ⚠️ 说得对，但日志行才是被扫读的那一行。
+			think, decode := fmt.Sprintf("%.0fms", m.ThinkMS), fmt.Sprintf("%.0fms", m.DecodeMS)
+			if m.ThinkingNoContent {
+				think, decode = "—", "—"
+			}
+			log.Printf("    TTFT=%.0fms think=%s decode=%s tok/s=%.0f finish=%s",
+				m.TTFT, think, decode, m.TokensPerSec, m.FinishReason)
 		} else {
 			log.Printf("    E2E=%.0fms tok/s=%.0f（非流式，TTFT/思考拆分 N/A）", m.E2EMS, m.TokensPerSec)
 		}
@@ -635,7 +642,23 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 						}
 						run.Turns = append(run.Turns, m)
 						if interrupted(ctx) {
-							log.Printf("    🛑 收到中断信号——提前结束会话（已完成 %d/%d 轮保留）", len(run.Turns), mt.Turns)
+							// 被 ctx 取消的这一轮是作废样本（error 非空、prompt_tokens=0），
+							// 不能算进「已完成」——否则日志报「3/8」而落盘数据里只有 2 轮能用，
+							// 读数的人会高估有效样本量。
+							done, dropped := 0, 0
+							for _, t := range run.Turns {
+								if t.Error == "" {
+									done++
+								} else {
+									dropped++
+								}
+							}
+							extra := ""
+							if dropped > 0 {
+								extra = fmt.Sprintf("，另 %d 轮被中断作废（error 非空，未计入）", dropped)
+							}
+							log.Printf("    🛑 收到中断信号——提前结束会话（有效 %d/%d 轮保留%s）",
+								done, mt.Turns, extra)
 							break
 						}
 						if limit := ctxLimitHit(m); limit != "" {
