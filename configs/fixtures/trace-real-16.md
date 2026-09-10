@@ -45,7 +45,10 @@
 ```yaml
 dataset:
   mode: trace
-  path: configs/fixtures/trace-real-16.json.gz   # 相对配置目录解析；支持 .json / .json.gz
+  path: configs/fixtures/trace-real-16.json.gz   # 支持 .json / .json.gz。外部文件同样可用：绝对路径直通
+                                                  # （如 /data/traces/xx.json.gz）；相对路径以【配置文件
+                                                  # 所在目录】为基准——配置放 configs/ 下时应写
+                                                  # fixtures/trace-real-16.json.gz，放仓库根才写 configs/...
   format: sharegpt        # 可省略（自动识别）
   replay_mode: full       # 注入 system/user/assistant/tool 原序；user_only 只回灌 user 轮
   min_turns: 2            # 默认 2；本样本全部 >=2 轮，不会被过滤

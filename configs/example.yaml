@@ -33,6 +33,9 @@ dataset:
   # path: "fixtures/trace-real-16.json.gz"   # 仓库内置真实 agent 会话样本（路径相对配置目录解析）：
                                              # 16 条脱敏 trace，会话峰值 prompt 20k-480k 四档，
                                              # 含 assistant/tool 消息，full 回放真正生效；逐条清单见 fixtures/trace-real-16.md
+  # path: "/data/traces/customer-sessions.json.gz"   # 外部文件同样支持：绝对路径直通（客户环境导入的
+                                             # trace 放哪都行）；相对路径以配置文件所在目录为基准，
+                                             # 与启动时的工作目录解耦
   # format: "sharegpt"       # sharegpt | sessions（自定义 [{"turns":[...]}]；留空自动识别）
   # min_turns: 2             # 会话最少 user 轮数
   # max_sessions: 64         # 最多加载多少会话（0=不限）
