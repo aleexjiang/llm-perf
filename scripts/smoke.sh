@@ -239,6 +239,16 @@ check(bool(probe.get("summary")) and "标准面" in probe.get("summary", ""),
       f"probe 分级汇总已落盘（实际: {probe.get('summary')!r}）")
 check(bool(probe.get("suggested_config")), "probe 已输出可粘贴的配置片段")
 
+# 配置片段约定：凡由**扩展面**推导来的项（/models 的 max_model_len、/metrics 可达性）
+# 一律以注释态给出，让人显式确认后再启用。扩展面不是标准 OpenAI 兼容面、网关代理后
+# 普遍缺失，默认替用户打开等于替他做了个没依据的决定。
+# （回归：此前 server_metrics 被写成生效态，与 README 自述直接矛盾。）
+sug_lines = (probe.get("suggested_config") or "").splitlines()
+eff_on = [l for l in sug_lines
+          if not l.lstrip().startswith("#")
+          and (l.startswith("server_metrics:") or l.startswith("max_prompt_tokens:"))]
+check(not eff_on, f"probe 配置片段的扩展面推导项须为注释态（实际生效: {eff_on}）")
+
 # 7) 非流式：有数据、全 on、E2E 计时在（TTFT 允许缺失）
 ns, ns_m = rows("out-nostream")
 check(len(ns) > 0 and thinks(ns) == {"on"}, f"非流式有数据且全 on（{len(ns)} 行）")

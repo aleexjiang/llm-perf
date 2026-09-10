@@ -585,7 +585,11 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 				if nLow == 0 || nLow*2 >= nBase {
 					continue // 压低不显著，参数不可控
 				}
-				// 拉高方向：确认双向可控。枚举值不被接受时如实标注，不把 400 当成"思考量为 0"
+				// 拉高方向：确认双向可控。枚举值不被接受时如实标注，不把 400 当成"思考量为 0"。
+				// 被拒的候选必须留痕——客户最需要知道的恰是「这个部署没有 high 档」。
+				// 早先的写法一遇到成功候选就 break，把此前被拒的候选全丢了：只在 detail 里
+				// 留下成功的那个档位，读者无从得知其余档位是被拒还是压根没试。
+				var highRejected []string
 				highNote := ""
 				for _, h := range c.highs {
 					n, ok, note := tryThinking(h.body)
@@ -593,9 +597,16 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 						highNote = fmt.Sprintf("拉高=%s（%d字）", h.val, n)
 						break
 					}
-					if highNote == "" {
-						highNote = "拉高方向未确认（" + h.val + "：" + note + "）"
+					if r := []rune(note); len(r) > 90 {
+						note = string(r[:90]) + "…"
 					}
+					highRejected = append(highRejected, fmt.Sprintf("%s 被拒（%s）", h.val, note))
+				}
+				if len(highRejected) > 0 {
+					highNote += "；被拒候选: " + strings.Join(highRejected, " / ")
+				}
+				if highNote == "" {
+					highNote = "拉高方向未确认"
 				}
 				working = c.name
 				check("thinking_levels", true,
@@ -734,7 +745,10 @@ func buildSuggestedConfig(res *ProbeResult, o ProbeOptions, effAuth auth.Auth, o
 		sb.WriteString("# max_prompt_tokens: 32000   # 未探测到模型上限（/models 未提供 max_model_len），先用保守值试探\n")
 	}
 	if metricsOK {
-		fmt.Fprintf(&sb, "server_metrics: true   # %s 可达（引擎扩展面，用于增强采集；不可达自动降级）\n", metricsPath)
+		// 与 max_prompt_tokens 一致：凡由扩展面推导来的项一律注释掉，让人显式确认后再启用。
+		// 此前这里写成生效态，与 README「扩展面推导项一律注释」的自述直接矛盾——
+		// 而它开的不过是「多采一份服务端观测」，与任何结论都无关，更没理由默认打开。
+		fmt.Fprintf(&sb, "# server_metrics: true   # %s 可达——扩展面推导项，按约定注释；需要增强观测时取消注释（不开不影响任何结论）\n", metricsPath)
 	} else {
 		sb.WriteString("# server_metrics: false   # 未探测到 /metrics（非标准端点，属常见形态）\n")
 	}
