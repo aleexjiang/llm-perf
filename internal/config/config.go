@@ -158,6 +158,23 @@ type LevelVariant struct {
 // SetFilter CLI 指定变体名过滤（大小写不敏感；不匹配任何变体时 Variants 返回空）。
 func (t *Thinking) SetFilter(name string) { t.filter = name }
 
+// ProbeExtraBodies 供 probe 取「思考开启态 / 关闭态」两份 extra_body。
+// levels 模式下 extra_body_on/off 通常为空（参数写在 levels 里），若直接读取会让 probe
+// 整块思考探测被跳过——部署侧关思考这类问题就查不出来。这里从 levels 兜底：
+// 取第一个 enabled=true 的变体当开启态、第一个 enabled=false 的当关闭态。
+func (t Thinking) ProbeExtraBodies() (on, off map[string]any) {
+	on, off = t.ExtraBodyOn, t.ExtraBodyOff
+	for _, v := range t.Levels {
+		if v.Enabled && on == nil {
+			on = v.ExtraBody
+		}
+		if !v.Enabled && off == nil {
+			off = v.ExtraBody
+		}
+	}
+	return on, off
+}
+
 // VariantNames 返回全部变体名（忽略 CLI 过滤）——CLI --thinking 校验用。
 func (t Thinking) VariantNames() []string {
 	saved := t.filter
@@ -475,6 +492,13 @@ type Config struct {
 	APIKey string `yaml:"-"`
 }
 
+// isBuiltinCorpus 判断 filler_corpus 是否为内置语料哨兵（en/zh）。
+// 哨兵不是路径，必须原样透传给 corpus.Load，不能参与相对路径拼接。
+// 取值集合与 internal/corpus.Load 的 switch 保持一致，新增内置语料时两处同步。
+func isBuiltinCorpus(spec string) bool {
+	return spec == "en" || spec == "zh"
+}
+
 // Load 读取配置文件，应用默认值，再用环境变量覆盖。
 // 环境变量优先级最高：LLM_PERF_ENDPOINT、LLM_PERF_API_KEY。
 func Load(path string) (*Config, error) {
@@ -502,8 +526,9 @@ func Load(path string) (*Config, error) {
 			cfg.Dataset.Path = filepath.Join(filepath.Dir(path), cfg.Dataset.Path)
 		}
 		// 与 dataset.path 同口径：无条件 join（不判断目标文件是否存在）——
-		// 按存在与否分叉会导致写错路径时报错信息按 cwd 拼接，误导排查
-		if cfg.FillerCorpus != "" && !filepath.IsAbs(cfg.FillerCorpus) {
+		// 按存在与否分叉会导致写错路径时报错信息按 cwd 拼接，误导排查。
+		// 例外：en/zh 是内置语料哨兵（见 isBuiltinCorpus），不是路径
+		if cfg.FillerCorpus != "" && !isBuiltinCorpus(cfg.FillerCorpus) && !filepath.IsAbs(cfg.FillerCorpus) {
 			cfg.FillerCorpus = filepath.Join(filepath.Dir(path), cfg.FillerCorpus)
 		}
 	}

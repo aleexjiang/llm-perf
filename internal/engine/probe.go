@@ -21,10 +21,76 @@ import (
 )
 
 // ProbeCheck 一项探测结果。
+//
+// Tier 决定这条结论能不能当「配置基线」用，是本探针的一等原则：
+//   - TierCore：证据来自标准 OpenAI 兼容面（/chat/completions）。任何号称兼容的
+//     推理服务都必须具备这个面，测出的问题就是真问题，配置以它为准。
+//   - TierExt：证据来自引擎扩展面（vLLM/SGLang 的 /metrics、/models 的 max_model_len、
+//     Server 头……）。大量推理服务、尤其经网关代理之后并不提供这些端点，
+//     或者网关会把扩展字段剥掉——缺失属正常形态而非缺陷。
+//     探到了就用它优化采集与报告，探不到记 NA，不判失败、不计入通过率。
+//
+// NA 表示「该探测面在本服务上不存在」，与 OK=false（存在但结论不达标）严格区分。
 type ProbeCheck struct {
 	Name   string `json:"name"`
 	OK     bool   `json:"ok"`
 	Detail string `json:"detail,omitempty"`
+	Tier   string `json:"tier,omitempty"` // core(默认,省略) | ext
+	NA     bool   `json:"na,omitempty"`   // 仅 ext：服务端未提供该扩展面
+}
+
+// 证据分级取值。
+const (
+	TierCore = "core" // 标准 OpenAI 兼容面——配置基线的唯一来源
+	TierExt  = "ext"  // 引擎扩展面——可选增强，缺失不算失败
+)
+
+// Tally 检查项分级统计。
+type Tally struct {
+	CorePass int // 标准面通过
+	CoreFail int // 标准面失败（真问题，必须处理）
+	ExtPass  int // 扩展面可用（白捡的增强）
+	ExtFail  int // 扩展面存在但异常
+	ExtNA    int // 扩展面服务端未提供（非标准端点，属预期）
+}
+
+// Tally 按证据分级统计全部检查项。
+func (r *ProbeResult) Tally() Tally {
+	var t Tally
+	for _, c := range r.Checks {
+		if c.Tier == TierExt {
+			switch {
+			case c.NA:
+				t.ExtNA++
+			case c.OK:
+				t.ExtPass++
+			default:
+				t.ExtFail++
+			}
+			continue
+		}
+		if c.OK {
+			t.CorePass++
+		} else {
+			t.CoreFail++
+		}
+	}
+	return t
+}
+
+// Summarize 一句话结论。标准面是基线，扩展面只报「可用/未提供」，
+// 措辞上刻意不让扩展面的缺失听起来像故障。
+func (r *ProbeResult) Summarize() string {
+	t := r.Tally()
+	s := fmt.Sprintf("标准面 %d/%d 通过", t.CorePass, t.CorePass+t.CoreFail)
+	ext := fmt.Sprintf("扩展面 %d 项可用", t.ExtPass)
+	if t.ExtNA > 0 {
+		ext += fmt.Sprintf("、%d 项服务端未提供（非标准端点，不影响结论）", t.ExtNA)
+	}
+	if t.ExtFail > 0 {
+		ext += fmt.Sprintf("、%d 项异常", t.ExtFail)
+	}
+	return s + "；" + ext
 }
 
 // CrossCheck 交叉验证建议：识别出引擎后给出对应的原生 perf 工具与等价命令。
@@ -45,8 +111,10 @@ type ProbeResult struct {
 	ModelMaxLen   int          `json:"model_max_len,omitempty"` // 服务端报告的模型上下文上限（vLLM 等提供）
 	Checks        []ProbeCheck `json:"checks"`
 	Verdicts      []string     `json:"verdicts,omitempty"`
-	CrossChecks   []CrossCheck `json:"cross_checks,omitempty"`   // 交叉验证建议（引擎→原生 perf 工具）
-	ServerMetrics string       `json:"server_metrics,omitempty"` // /metrics 可用性（观测层前置条件）
+	Summary       string       `json:"summary,omitempty"`          // 分级统计的一句话结论
+	Suggested     string       `json:"suggested_config,omitempty"` // 可直接粘回配置文件的 YAML 片段
+	CrossChecks   []CrossCheck `json:"cross_checks,omitempty"`     // 交叉验证建议（引擎→原生 perf 工具）
+	ServerMetrics string       `json:"server_metrics,omitempty"`   // /metrics 可用性（观测层前置条件，扩展面）
 
 	// ThinkingLevel 探测到的思考等级控制参数（空 = 未探测到可控参数）
 	ThinkingLevelParam string `json:"thinking_level_param,omitempty"`
@@ -111,51 +179,88 @@ type probeModelsResp struct {
 
 // Probe 对目标端点执行全套兼容性探测。
 func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
-	base := strings.TrimRight(o.Endpoint, "/")
-	chatPath := o.ChatPath
-	if chatPath == "" {
-		chatPath = "/chat/completions"
-	}
 	timeout := o.Timeout
 	if timeout <= 0 {
 		timeout = 120 * time.Second
 	}
 	res := &ProbeResult{GeneratedAt: time.Now(), Endpoint: o.Endpoint}
+	// 三种登记口径：标准面 / 扩展面 / 扩展面未提供。分级不是装饰——它决定这条结论
+	// 能不能当配置基线用，见 ProbeCheck 注释。
 	check := func(name string, ok bool, detail string) {
-		res.Checks = append(res.Checks, ProbeCheck{Name: name, OK: ok, Detail: detail})
+		res.Checks = append(res.Checks, ProbeCheck{Name: name, OK: ok, Detail: detail, Tier: TierCore})
+	}
+	checkExt := func(name string, ok bool, detail string) {
+		res.Checks = append(res.Checks, ProbeCheck{Name: name, OK: ok, Detail: detail, Tier: TierExt})
+	}
+	checkExtNA := func(name, detail string) {
+		res.Checks = append(res.Checks, ProbeCheck{Name: name, OK: true, Detail: detail, Tier: TierExt, NA: true})
 	}
 
-	// ── 1. 模型列表 + Server 头 ──
-	modelsPath := o.ModelsPath
-	if modelsPath == "" {
-		modelsPath = "/models"
+	// URL 统一按「origin + 绝对路径」拼装：endpoint 自带的前缀（如 /v1）折叠进路径，
+	// 候选挂载点因此可以直接整体替换，不必猜「挂前缀 / 挂根」两种拼法。
+	origin, basePath := splitOrigin(o.Endpoint)
+	chatPath := resolvePath(basePath, o.ChatPath, "/chat/completions")
+
+	// effAuth：后续请求实际使用的认证方案。认证自举命中备选后替换它，
+	// 避免一个认证配置错误把整份报告的结论带偏。
+	effAuth := o.Auth
+
+	httpGet := func(u string) (int, []byte, http.Header, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		if err != nil {
+			return 0, nil, nil, err
+		}
+		effAuth.Apply(req, o.APIKey)
+		resp, err := (&http.Client{Timeout: timeout}).Do(req)
+		if err != nil {
+			return 0, nil, nil, err
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+		return resp.StatusCode, b, resp.Header, nil
 	}
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, base+modelsPath, nil)
-	o.Auth.Apply(req, o.APIKey)
-	resp, err := (&http.Client{Timeout: timeout}).Do(req)
-	if err != nil {
-		res.Checks = append(res.Checks, ProbeCheck{Name: "models_list", OK: false, Detail: err.Error()})
-		res.Verdicts = append(res.Verdicts, "端点不可达，先解决网络/认证再继续")
-		return res
+
+	// ── 1. 模型列表 + Server 头（扩展面）──
+	// /models 在 OpenAI 契约里有，但相当多网关只转发 /chat/completions，
+	// 所以这里探不到只记 NA —— 连通性与能力基线一律以 chat 面为准。
+	modelsPath := resolvePath(basePath, o.ModelsPath, "/models")
+	mStatus, mBody, mHdr, mErr := httpGet(origin + modelsPath)
+	if mErr == nil && (mStatus == http.StatusNotFound || mStatus == http.StatusMethodNotAllowed) {
+		for _, p := range pathCandidates(modelsPath, modelsPathCandidates) {
+			if st, b, h, e := httpGet(origin + p); e == nil && st == http.StatusOK {
+				modelsPath, mStatus, mBody, mHdr, mErr = p, st, b, h, e
+				res.Verdicts = append(res.Verdicts, "模型列表实际挂在 "+p+"（models_path 建议改成该值）")
+				break
+			}
+		}
 	}
-	defer resp.Body.Close()
-	res.Server = resp.Header.Get("Server")
-	if v := resp.Header.Get("X-Request-Id"); v != "" {
+	res.Server = mHdr.Get("Server")
+	if v := mHdr.Get("X-Request-Id"); v != "" {
 		res.Server += " | x-request-id: " + v
 	}
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
 	var ml probeModelsResp
-	modelsOK := resp.StatusCode == 200 && json.Unmarshal(body, &ml) == nil && len(ml.Data) > 0
-	check("models_list", modelsOK, fmt.Sprintf("HTTP %d, %d 个模型", resp.StatusCode, len(ml.Data)))
-	if modelsOK {
+	modelsOK := mErr == nil && mStatus == http.StatusOK && json.Unmarshal(mBody, &ml) == nil && len(ml.Data) > 0
+	switch {
+	case modelsOK:
 		for _, m := range ml.Data {
 			res.Models = append(res.Models, m.ID)
 		}
+		checkExt("models_list", true, fmt.Sprintf("%s HTTP 200，%d 个模型", modelsPath, len(ml.Data)))
+	case mErr != nil:
+		checkExtNA("models_list", "未提供（"+modelsPath+" 请求失败: "+mErr.Error()+"）——该端点非必需，连通性以 chat 为准")
+	case mStatus == http.StatusUnauthorized || mStatus == http.StatusForbidden:
+		checkExtNA("models_list", fmt.Sprintf("HTTP %d（认证被拒，见下方 auth_scheme）", mStatus))
+	case mStatus == http.StatusNotFound || mStatus == http.StatusMethodNotAllowed:
+		checkExtNA("models_list", fmt.Sprintf("未提供（%s 及 %d 个常见挂载点均 404/405）——网关常见形态，不影响压测，只要配置里显式写 model",
+			modelsPath, len(modelsPathCandidates)))
+	default:
+		checkExt("models_list", false, fmt.Sprintf("%s HTTP %d（可达但不可用）%.160s", modelsPath, mStatus, strings.TrimSpace(string(mBody))))
 	}
 	model := o.Model
 	if model == "" {
 		if len(res.Models) == 0 {
-			res.Verdicts = append(res.Verdicts, "拿不到模型列表，请在配置里显式指定 model 后重试")
+			res.Verdicts = append(res.Verdicts, "拿不到模型列表，且配置里未显式指定 model——无法继续，在配置里写 model 后重试")
+			res.Summary = res.Summarize()
 			return res
 		}
 		model = res.Models[0]
@@ -173,17 +278,19 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 			}
 		}
 	}
+	// max_model_len 是引擎扩展字段（标准 OpenAI /models 只返回 id/object/created/owned_by），
+	// 网关剥掉它很常见——探不到记 NA，别让它看起来像端点故障。
 	if res.ModelMaxLen > 0 {
-		check("context_limit", true, fmt.Sprintf("模型 %s max_model_len=%d", model, res.ModelMaxLen))
+		checkExt("context_limit", true, fmt.Sprintf("模型 %s max_model_len=%d（引擎扩展字段）", model, res.ModelMaxLen))
 		if o.MaxContext > res.ModelMaxLen {
 			res.Verdicts = append(res.Verdicts, fmt.Sprintf("⚠️ 计划压测的最大上下文 %dtk 超过模型上限 %dtk——超限请求会被服务端拒绝，请用 --max-ctx 或 max_prompt_tokens 截止到 %d 以内", o.MaxContext, res.ModelMaxLen, res.ModelMaxLen))
 		} else if o.MaxContext > 0 {
 			res.Verdicts = append(res.Verdicts, fmt.Sprintf("上下文规划 OK：计划最大 %dtk ≤ 模型上限 %dtk（注意预留 max_tokens 输出空间）", o.MaxContext, res.ModelMaxLen))
 		}
 	} else {
-		check("context_limit", false, "服务端未报告 max_model_len（网关可能剥离）——长上下文压测前先用小档位试探")
+		checkExtNA("context_limit", "服务端未报告 max_model_len（标准 /models 无此字段，网关也常剥掉）——长上下文压测前先用小档位试探")
 	}
-	res.EngineGuess = guessEngine(res.Server, body)
+	res.EngineGuess = guessEngine(res.Server, mBody)
 
 	doChat := func(extra map[string]any, maxTokens int, stream bool) (status int, raw []byte, hdr http.Header, err error) {
 		payload := map[string]any{
@@ -199,9 +306,9 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 			payload["stream_options"] = map[string]any{"include_usage": true}
 		}
 		pj, _ := json.Marshal(payload)
-		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, base+chatPath, bytes.NewReader(pj))
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, origin+chatPath, bytes.NewReader(pj))
 		req.Header.Set("Content-Type", "application/json")
-		o.Auth.Apply(req, o.APIKey)
+		effAuth.Apply(req, o.APIKey)
 		resp, err := (&http.Client{Timeout: timeout}).Do(req)
 		if err != nil {
 			return 0, nil, nil, err
@@ -209,6 +316,87 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 		defer resp.Body.Close()
 		raw, _ = io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
 		return resp.StatusCode, raw, resp.Header, nil
+	}
+
+	// ── 1.5 chat 面自举：连通性 → 挂载路径 → 认证方案 ──
+	//
+	// 这三件事决定后面每个探测项能否成立，值得先用一个 max_tokens=1 的最小请求串起来定夺。
+	// 之所以不依赖 /models 来判断，是因为网关常常压根没开这个端点；
+	// chat 面才是所有 OpenAI 兼容服务都必须提供的标准面。
+	//
+	// 认证只在「已被拒」时才试备选：当前方案可用就不额外发送 key，不把密钥撒到更多 header 上。
+	minChat := func() (int, []byte) {
+		st, raw, _, err := doChat(nil, 1, false)
+		if err != nil {
+			return 0, []byte(err.Error())
+		}
+		return st, raw
+	}
+	chatSt, chatRaw := minChat()
+	if chatSt == http.StatusNotFound || chatSt == http.StatusMethodNotAllowed {
+		for _, p := range pathCandidates(chatPath, chatPathCandidates) {
+			chatPath = p
+			if st, raw, _, err := doChat(nil, 1, false); err == nil && st != http.StatusNotFound && st != http.StatusMethodNotAllowed {
+				chatSt, chatRaw = st, raw
+				res.Verdicts = append(res.Verdicts, "chat 实际挂在 "+p+"——把配置的 chat_path 改成该值")
+				break
+			}
+		}
+	}
+	switch {
+	case chatSt == 0:
+		check("chat_endpoint", false, "请求失败: "+strings.TrimSpace(string(chatRaw)))
+		res.Verdicts = append(res.Verdicts, "chat 端点不可达——先解决网络（VPN/代理/端口/证书），其余探测项无从谈起")
+		res.Summary = res.Summarize()
+		return res
+	case chatSt == http.StatusNotFound || chatSt == http.StatusMethodNotAllowed:
+		check("chat_path", false, fmt.Sprintf("%s 及 %d 个常见挂载点全落空（404/405）——确认服务端路由前缀", chatPath, len(chatPathCandidates)))
+		res.Verdicts = append(res.Verdicts, "chat 路径全部落空——把正确的 chat_path 写进配置后重跑")
+		res.Summary = res.Summarize()
+		return res
+	case chatSt == http.StatusOK:
+		check("chat_endpoint", true, fmt.Sprintf("%s HTTP 200——chat 标准面可达，能力基线成立", chatPath))
+	default:
+		check("chat_endpoint", true, fmt.Sprintf("%s HTTP %d（可达，非 200；具体判定见下方各项）", chatPath, chatSt))
+	}
+	if chatSt == http.StatusUnauthorized || chatSt == http.StatusForbidden {
+		// 认证自举：候选含当前配置（/models 的 401 未必代表业务面也拒），命中即替换 effAuth
+		cands := []auth.Auth{
+			o.Auth,
+			{Scheme: "raw", Header: "Authorization"}, // Authorization: <key>（网关裸 key）
+			{Scheme: "raw", Header: "X-API-Key"},
+			{Scheme: "bearer", Header: "X-API-Key"},
+		}
+		if o.APIKey == "" {
+			check("auth_scheme", false, fmt.Sprintf("HTTP %d 但配置里没有 API key——补 api_key，或服务端本就免认证时设 auth_scheme: none", chatSt))
+		} else {
+			var tried []string
+			hit := false
+			for _, c := range cands {
+				effAuth = c
+				st, raw := minChat()
+				switch {
+				case st == 0:
+					tried = append(tried, c.Describe()+" → 请求失败: "+strings.TrimSpace(string(raw)))
+				case st == http.StatusUnauthorized || st == http.StatusForbidden:
+					tried = append(tried, fmt.Sprintf("%s → HTTP %d", c.Describe(), st))
+				default:
+					hit = true
+					check("auth_scheme", true, fmt.Sprintf("自举命中：%s（HTTP %d）——按此改配置即可，不必再猜", c.Describe(), st))
+					res.Verdicts = append(res.Verdicts, "认证方案已自举出可用值——写进配置的 auth_scheme / auth_header")
+				}
+				if hit {
+					break
+				}
+			}
+			if !hit {
+				effAuth = o.Auth
+				check("auth_scheme", false, "4 种认证方案均被拒："+strings.Join(tried, "；"))
+				res.Verdicts = append(res.Verdicts, "认证自举失败——确认 key 是否正确/过期，或向服务方索取正确的 header 名")
+			}
+		}
+	} else {
+		check("auth_scheme", true, "当前方案可用："+o.Auth.Describe())
 	}
 
 	// ── 2. 非流式基础对话（带思考关闭参数，防思考吃光 max_tokens 导致误报）──
@@ -274,12 +462,50 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 	}
 	testThinking := func(extra map[string]any, label string) (reasoningField string, reasoningLen int) {
 		st, raw, _, err := doChat(extra, budget, true)
-		if err != nil || st != 200 {
-			check("thinking_"+label, false, fmt.Sprintf("HTTP %d err=%v", st, err))
+		if err != nil {
+			check("thinking_"+label, false, "请求失败: "+err.Error())
+			return "none", 0
+		}
+		if st != 200 {
+			// HTTP 400 时 err 为 nil，只打 "HTTP 400 err=<nil>" 等于没有证据——带上服务端错误体
+			check("thinking_"+label, false, fmt.Sprintf("HTTP %d %.200s", st, strings.TrimSpace(string(raw))))
 			return "none", 0
 		}
 		pm := streamAnalyze(raw)
 		return pm.reasoningField, pm.ReasoningChars
+	}
+
+	// tryThinking 与 testThinking 同源，但不产出 check 行：等级候选需要逐个试（含枚举值试探），
+	// 每个失败都写一行会让同名 check 重复，也无法区分"参数被拒"与"思考量真的是 0"。
+	tryThinking := func(extra map[string]any) (reasoningLen int, ok bool, note string) {
+		st, raw, _, err := doChat(extra, budget, true)
+		if err != nil {
+			return 0, false, "请求失败: " + err.Error()
+		}
+		if st != 200 {
+			return 0, false, fmt.Sprintf("HTTP %d %.160s", st, strings.TrimSpace(string(raw)))
+		}
+		return streamAnalyze(raw).ReasoningChars, true, ""
+	}
+
+	// ── 4. 部署侧默认思考状态（无思考参数基线）──
+	// 独立于配置，必须显式探测：有些部署在服务端就把思考关掉了（模板硬编码
+	// enable_thinking=false、没挂 --reasoning-parser、或启动参数指定了非思考模式），
+	// 此时"本次压测跑的是思考态"是错误前提，整份性能结论会整体错位。
+	// 无参数请求反映的正是客户默认拿到的行为，是判断这件事的唯一直接证据。
+	nDef, okDef, noteDef := tryThinking(nil)
+	switch {
+	case !okDef:
+		check("thinking_default", false, "无参数基线请求失败: "+noteDef)
+	case nDef > 0:
+		check("thinking_default", true,
+			fmt.Sprintf("无参数基线：思考增量 %d 字符 → 部署默认【开】思考（不带参数发的请求就是思考态）", nDef))
+	default:
+		check("thinking_default", true,
+			"无参数基线：思考增量 0 字符 → 部署默认【关】思考（客户默认拿到的是非思考响应）")
+		res.Verdicts = append(res.Verdicts,
+			"⚠️ 服务端默认不思考：不带思考参数的压测衡量的是非思考性能。若本次要测思考态，"+
+				"必须显式传开启参数，并以 thinking_on 的结果为准（参数无效时下面会报 ❌）")
 	}
 
 	if len(o.ThinkingOn) > 0 {
@@ -293,7 +519,12 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 			}
 		} else {
 			check("thinking_on", false, "extra_body 透传后没有产生任何思考增量——参数名可能不对，或该模型/模板不支持")
-			res.Verdicts = append(res.Verdicts, "⚠️ 思考开启参数未生效：确认参数名（chat_template_kwargs/enable_thinking/thinking...）与模型模板")
+			msg := "思考开启参数未生效：确认参数名（chat_template_kwargs/enable_thinking/thinking...）与模型模板"
+			if okDef && nDef == 0 {
+				msg = "思考开启参数未生效，且无参数基线同样没有思考增量——优先怀疑部署侧关掉了思考" +
+					"（模板硬编码 enable_thinking=false / 未挂 --reasoning-parser / 启动参数就是非思考模式），而非参数名写错"
+			}
+			res.Verdicts = append(res.Verdicts, "⚠️ "+msg)
 		}
 	}
 	if len(o.ThinkingOff) > 0 {
@@ -314,42 +545,69 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 		if nBase == 0 {
 			check("thinking_levels", false, "思考开启参数下思考增量=0，等级探测无意义（先解决思考开启）")
 		} else {
+			type levelHigh struct {
+				val  string // 枚举值/参数值的人读标签，写进结论——避免把兜底成功的值冒充成首次尝试的值
+				body map[string]any
+			}
 			type levelCand struct {
-				name string
-				low  map[string]any
-				high map[string]any
+				name  string
+				low   map[string]any
+				highs []levelHigh // 拉高方向候选：枚举值跨引擎不同（vLLM 认 xhigh/medium/low，OpenAI 认 high），逐个试到第一个被接受
 			}
 			cands := []levelCand{
 				{"reasoning_effort(顶层,OpenAI口径)",
 					map[string]any{"reasoning_effort": "low"},
-					map[string]any{"reasoning_effort": "high"}},
+					[]levelHigh{
+						{"high", map[string]any{"reasoning_effort": "high"}},
+						{"xhigh", map[string]any{"reasoning_effort": "xhigh"}}}},
 				{"reasoning_effort(chat_template_kwargs)",
 					map[string]any{"chat_template_kwargs": map[string]any{"reasoning_effort": "low"}},
-					map[string]any{"chat_template_kwargs": map[string]any{"reasoning_effort": "high"}}},
+					[]levelHigh{
+						{"high", map[string]any{"chat_template_kwargs": map[string]any{"reasoning_effort": "high"}}},
+						{"xhigh", map[string]any{"chat_template_kwargs": map[string]any{"reasoning_effort": "xhigh"}}}}},
 				{"thinking_budget(chat_template_kwargs,Qwen系)",
 					map[string]any{"chat_template_kwargs": map[string]any{"thinking_budget": 16}},
-					map[string]any{"chat_template_kwargs": map[string]any{"thinking_budget": budget}}},
+					[]levelHigh{{fmt.Sprintf("budget=%d", budget), map[string]any{"chat_template_kwargs": map[string]any{"thinking_budget": budget}}}}},
 				{"thinking_budget(顶层)",
 					map[string]any{"thinking_budget": 16},
-					map[string]any{"thinking_budget": budget}},
+					[]levelHigh{{fmt.Sprintf("budget=%d", budget), map[string]any{"thinking_budget": budget}}}},
 				{"thinking.type+budget(GLM系)",
 					map[string]any{"thinking": map[string]any{"type": "disabled"}},
-					map[string]any{"thinking": map[string]any{"type": "enabled", "budget_tokens": budget}}},
+					[]levelHigh{{"enabled", map[string]any{"thinking": map[string]any{"type": "enabled", "budget_tokens": budget}}}}},
 			}
+			var rejected []string
 			for _, c := range cands {
-				_, nLow := testThinking(c.low, "levels_low")
+				nLow, okLow, noteLow := tryThinking(c.low)
+				if !okLow {
+					rejected = append(rejected, fmt.Sprintf("%s 压低请求被拒（%s）", c.name, noteLow))
+					continue
+				}
 				if nLow == 0 || nLow*2 >= nBase {
 					continue // 压低不显著，参数不可控
 				}
-				_, nHigh := testThinking(c.high, "levels_high")
+				// 拉高方向：确认双向可控。枚举值不被接受时如实标注，不把 400 当成"思考量为 0"
+				highNote := ""
+				for _, h := range c.highs {
+					n, ok, note := tryThinking(h.body)
+					if ok {
+						highNote = fmt.Sprintf("拉高=%s（%d字）", h.val, n)
+						break
+					}
+					if highNote == "" {
+						highNote = "拉高方向未确认（" + h.val + "：" + note + "）"
+					}
+				}
 				working = c.name
 				check("thinking_levels", true,
-					fmt.Sprintf("参数[%s]可控：low=%d字（基线=%d字），high=%d字", c.name, nLow, nBase, nHigh))
+					fmt.Sprintf("参数[%s]可控：low=%d字（基线=%d字），%s", c.name, nLow, nBase, highNote))
 				break
 			}
 			if working == "" {
-				check("thinking_levels", false,
-					fmt.Sprintf("5 组候选等级参数均未能显著压低思考量（基线=%d字）——按开/关两态压测，或查部署框架文档补充参数", nBase))
+				msg := fmt.Sprintf("5 组候选等级参数均未能显著压低思考量（基线=%d字）——按开/关两态压测，或查部署框架文档补充参数", nBase)
+				if len(rejected) > 0 {
+					msg += "；被服务端拒绝的候选取证: " + strings.Join(rejected, " / ")
+				}
+				check("thinking_levels", false, msg)
 			}
 		}
 		res.ThinkingLevelParam = working
@@ -360,25 +618,47 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 		}
 	}
 
-	// ── 6. /metrics 可用性（服务端观测层的前置条件；vLLM 默认暴露） ──
-	metricsPath := o.MetricsPath
+	// ── 6. /metrics 可用性（扩展面）──
+	// 最容易踩「过度依赖」的一处：很多推理服务、尤其经网关代理之后根本不转发 /metrics，
+	// 或者直接 404。缺失只记 NA——压测侧本来就会自动降级为纯客户端计时。
+	// 注意：/metrics 按 Prometheus 惯例挂在 origin 根上，不继承 endpoint 的 /v1 前缀
+	// （smetrics.NewScraperAt 自身会剥掉尾部的 /v1，与此一致）。
+	metricsPath := strings.TrimRight(o.MetricsPath, "/")
 	if metricsPath == "" {
 		metricsPath = "/metrics"
 	}
-	s := smetrics.NewScraperAt(o.Endpoint, metricsPath)
-	s.Auth = o.Auth // /metrics 与业务接口同一套认证（网关保护 metrics 端点时探测不至误报不可用）
-	s.APIKey = o.APIKey
-	if ok, detail := s.Available(ctx); ok {
-		res.ServerMetrics = "available: " + detail
-		check("server_metrics", true, metricsPath+" 可用（"+detail+"）→ 配置 server_metrics: true 可开启观测层（缓存命中率/排队/prefill-decode 分解）")
-	} else {
-		res.ServerMetrics = "unavailable: " + detail
-		check("server_metrics", false, metricsPath+" 不可达（"+detail+"）→ 观测层不可用，压测时自动降级为纯客户端计时")
+	metricsOK := false
+	{
+		s := smetrics.NewScraperAt(origin, metricsPath)
+		s.Auth = effAuth // 与业务接口同一套认证（网关保护 metrics 端点时不至误报不可用）
+		s.APIKey = o.APIKey
+		ok, detail := s.Available(ctx)
+		if !ok {
+			for _, p := range pathCandidates(metricsPath, metricsPathCandidates) {
+				cand := smetrics.NewScraperAt(origin, p)
+				cand.Auth = effAuth
+				cand.APIKey = o.APIKey
+				if ok2, d2 := cand.Available(ctx); ok2 {
+					ok, detail, metricsPath = true, d2, p
+					res.Verdicts = append(res.Verdicts, "/metrics 实际挂在 "+p+"——该端点非标准面，只用于增强采集")
+					break
+				}
+			}
+		}
+		metricsOK = ok
+		if ok {
+			res.ServerMetrics = "available: " + detail
+			checkExt("server_metrics", true, metricsPath+" 可用（"+detail+"）→ 配置 server_metrics: true 可开启观测层（缓存命中率/排队/prefill-decode 分解）")
+		} else {
+			res.ServerMetrics = "unavailable: " + detail
+			checkExtNA("server_metrics", fmt.Sprintf("未提供（%s 及 %d 个常见挂载点均不可用：%s）——非标准端点，压测自动降级为纯客户端计时，结论不受影响",
+				metricsPath, len(metricsPathCandidates), detail))
+		}
 	}
 
 	// ── 7. tool-call 健康检查（默认开；--no-toolcall 关闭）──
 	if o.ToolCall {
-		runToolCallCheck(ctx, res, check, o, base, chatPath, timeout, model, streamAnalyze)
+		runToolCallCheck(ctx, res, check, o, origin, chatPath, timeout, model, streamAnalyze)
 	}
 
 	// ── 7.5 前缀缓存定性探针（--cache 开启，默认关）──
@@ -392,9 +672,9 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 			size = res.ModelMaxLen - 1024
 			res.Verdicts = append(res.Verdicts, fmt.Sprintf("缓存探针上下文已收到模型上限以内: %dtk（原配置 %dtk + 输出预算会超 max_model_len=%d）", size, o.CacheSizeTokens, res.ModelMaxLen))
 		}
-		pc := NewClient(o.Endpoint, o.APIKey, timeout, o.IncludeUsage)
-		pc.Auth = o.Auth
-		pc.ChatPath = o.ChatPath
+		pc := NewClient(origin, o.APIKey, timeout, o.IncludeUsage)
+		pc.Auth = effAuth
+		pc.ChatPath = chatPath
 		cacheProbeInto(ctx, res, pc, CacheProbeOptions{
 			Model:       model,
 			SizeTokens:  size,
@@ -410,7 +690,60 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 			"无法识别引擎（Server 头不吐特征）——交叉验证命令不可用，自研网关/魔改版属预期；其余探测项不受影响")
 	}
 
+	// ── 9. 配置片段 + 分级汇总 ──
+	res.Suggested = buildSuggestedConfig(res, o, effAuth, origin, chatPath, modelsPath, metricsPath, modelsOK, metricsOK, model)
+	res.Summary = res.Summarize()
+
 	return res
+}
+
+// buildSuggestedConfig 把探测结论收敛成可直接粘回配置文件的 YAML 片段。
+//
+// 证据分级在这里同样是硬约束：只有标准面确认过的值才写成「生效项」；
+// 由引擎扩展面（/models 的 max_model_len、/metrics）推导出来的一律注释掉并标明来源——
+// 那些不是所有服务都有，当成配置基线用会在换个端点后立刻失效。
+func buildSuggestedConfig(res *ProbeResult, o ProbeOptions, effAuth auth.Auth, origin, chatPath, modelsPath, metricsPath string,
+	modelsOK, metricsOK bool, model string) string {
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "# 由 bench probe 生成（%s），可直接粘回配置文件\n", res.GeneratedAt.Format("2006-01-02 15:04"))
+	sb.WriteString("# 生效项 = 标准面已确认；被注释的项 = 引擎扩展面推导，仅供增强，换端点后需重新探测\n")
+	fmt.Fprintf(&sb, "endpoint: %s\n", origin)
+	fmt.Fprintf(&sb, "chat_path: %s          # 标准面已确认\n", chatPath)
+	if modelsOK {
+		fmt.Fprintf(&sb, "models_path: %s\n", modelsPath)
+	} else {
+		fmt.Fprintf(&sb, "# models_path: %s        # 未探测到，该端点非必需\n", modelsPath)
+	}
+	na := effAuth.Normalize()
+	authNote := "沿用配置"
+	if na != o.Auth.Normalize() {
+		authNote = "认证自举命中"
+	}
+	fmt.Fprintf(&sb, "auth_scheme: %s        # %s\n", na.Scheme, authNote)
+	if na.Header != "" && na.Header != "Authorization" {
+		fmt.Fprintf(&sb, "auth_header: %s\n", na.Header)
+	}
+	if model != "" {
+		fmt.Fprintf(&sb, "model: %s\n", model)
+	}
+	if res.ModelMaxLen > 2048 {
+		fmt.Fprintf(&sb, "# max_prompt_tokens: %d   # 由 /models 的 max_model_len=%d 减输出预算推得（引擎扩展字段）\n",
+			res.ModelMaxLen-2048, res.ModelMaxLen)
+	} else {
+		sb.WriteString("# max_prompt_tokens: 32000   # 未探测到模型上限（/models 未提供 max_model_len），先用保守值试探\n")
+	}
+	if metricsOK {
+		fmt.Fprintf(&sb, "server_metrics: true   # %s 可达（引擎扩展面，用于增强采集；不可达自动降级）\n", metricsPath)
+	} else {
+		sb.WriteString("# server_metrics: false   # 未探测到 /metrics（非标准端点，属常见形态）\n")
+	}
+	if res.ThinkingLevelParam != "" {
+		fmt.Fprintf(&sb, "# thinking:  # 思考等级可控（参数=%s），按需定义 levels 变体做多档对比\n", res.ThinkingLevelParam)
+	} else {
+		sb.WriteString("# thinking:  # 未探测到可控的思考等级参数，建议按 thinking.on/off 两态压测\n")
+	}
+	return sb.String()
 }
 
 // nativeTools 引擎 → 原生 perf 工具对照（命令映射只对 OpenAI 兼容客户端型工具能给全；其余给指引）。
@@ -478,6 +811,55 @@ func splitHostPort(base string) (host, port string) {
 	}
 	return s, "80"
 }
+
+// splitOrigin 把 endpoint 拆成 origin 与路径前缀（如 http://h:8849/v1 → http://h:8849 + /v1）。
+// 统一按「origin + 绝对路径」拼装 URL 之后，候选挂载点可以直接整体替换，
+// 不必再猜「挂在前缀之后 / 挂在根上」两种拼法。
+func splitOrigin(endpoint string) (origin, basePath string) {
+	rest := endpoint
+	scheme := ""
+	if i := strings.Index(rest, "://"); i >= 0 {
+		scheme, rest = rest[:i+3], rest[i+3:]
+	}
+	if i := strings.Index(rest, "/"); i >= 0 {
+		return scheme + rest[:i], strings.TrimRight(rest[i:], "/")
+	}
+	return scheme + rest, ""
+}
+
+// resolvePath 把配置里的路径解析为相对 origin 的绝对路径。
+// 配置可能写全前缀（/v1/chat/completions），也可能只写 /chat/completions，两种都要能算对。
+func resolvePath(basePath, p, def string) string {
+	if p == "" {
+		p = def
+	}
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	if basePath == "" || p == basePath || strings.HasPrefix(p, basePath+"/") {
+		return p
+	}
+	return basePath + p
+}
+
+// pathCandidates 返回候选挂载点（剔除与当前值重复的项，保持声明顺序）。
+// 只在默认路径明确落空（404/405）时才用——这些是各框架/网关的既有惯例，不是瞎猜。
+func pathCandidates(cur string, cands []string) []string {
+	out := make([]string, 0, len(cands))
+	for _, p := range cands {
+		if p != cur {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// 常见挂载点候选。命中即写进结论，让用户改配置而不是靠猜。
+var (
+	chatPathCandidates    = []string{"/v1/chat/completions", "/chat/completions", "/openai/v1/chat/completions", "/api/v1/chat/completions"}
+	modelsPathCandidates  = []string{"/v1/models", "/models", "/api/v1/models"}
+	metricsPathCandidates = []string{"/metrics", "/actuator/prometheus", "/api/v1/metrics", "/v1/metrics"}
+)
 
 // guessEngine 从 Server 头与响应体特征猜引擎类型。
 func guessEngine(server string, modelsBody []byte) string {

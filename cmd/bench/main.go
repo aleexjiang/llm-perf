@@ -301,6 +301,7 @@ func main() {
 			model = active[0] // enabled=false 的模型不作为默认探测对象
 		}
 		th := cfg.ThinkingFor(model) // probe 也按模型解析思考配置（model_overrides.thinking 覆盖生效）
+		probeOn, probeOff := th.ProbeExtraBodies()
 		res := engine.Probe(ctx, engine.ProbeOptions{
 			Endpoint:        cfg.Endpoint,
 			APIKey:          cfg.APIKey,
@@ -309,8 +310,8 @@ func main() {
 			MetricsPath:     cfg.MetricsPath,
 			ModelsPath:      cfg.ModelsPath,
 			Model:           model,
-			ThinkingOn:      th.ExtraBodyOn,
-			ThinkingOff:     th.ExtraBodyOff,
+			ThinkingOn:      probeOn,
+			ThinkingOff:     probeOff,
 			IncludeUsage:    *cfg.IncludeUsage,
 			MaxContext:      cfg.LargestPromptTokens(),
 			Timeout:         cfg.Timeout(),
@@ -337,11 +338,22 @@ func main() {
 			fmt.Printf("  模型: %s\n", m)
 		}
 		for _, c := range res.Checks {
-			mark := "✅"
-			if !c.OK {
+			// 扩展面未提供（NA）用 ➖ 而不是 ❌：没有 /metrics、没有 max_model_len
+			// 是经网关代理后的常见形态，不是端点缺陷，更不该拉低通过率
+			mark, suffix := "✅", ""
+			switch {
+			case c.NA:
+				mark, suffix = "➖", "  [扩展面未提供，不计入结论]"
+			case !c.OK:
 				mark = "❌"
 			}
-			fmt.Printf("%s %s: %s\n", mark, c.Name, c.Detail)
+			if c.Tier == engine.TierExt {
+				suffix = "  [扩展面]" + suffix
+			}
+			fmt.Printf("%s %s: %s%s\n", mark, c.Name, c.Detail, suffix)
+		}
+		if res.Summary != "" {
+			fmt.Printf("\n📊 %s\n", res.Summary)
 		}
 		if cp := res.CacheProbe; cp != nil {
 			fmt.Printf("\n前缀缓存定性检查（上下文 %dtk，max_tokens=64 隔离 prefill）:\n", cp.SizeTokens)
@@ -381,6 +393,12 @@ func main() {
 				fmt.Printf("   说明: %s\n", x.Note)
 			}
 		}
+		if res.Suggested != "" {
+			fmt.Printf("\n📝 可粘贴回配置文件的片段（注释项来自引擎扩展面，换端点后需重新探测）:\n")
+			for _, line := range strings.Split(strings.TrimRight(res.Suggested, "\n"), "\n") {
+				fmt.Printf("    %s\n", line)
+			}
+		}
 		fmt.Printf("探针完成，输出: %s\n", outPath)
 		return
 	}
@@ -391,6 +409,7 @@ func main() {
 	if active := cfg.ActiveModels(); len(active) > 0 {
 		m := active[0]
 		th := cfg.ThinkingFor(m)
+		probeOn, probeOff := th.ProbeExtraBodies()
 		res := engine.Probe(ctx, engine.ProbeOptions{
 			Endpoint:     cfg.Endpoint,
 			APIKey:       cfg.APIKey,
@@ -399,8 +418,8 @@ func main() {
 			MetricsPath:  cfg.MetricsPath,
 			ModelsPath:   cfg.ModelsPath,
 			Model:        m,
-			ThinkingOn:   th.ExtraBodyOn,
-			ThinkingOff:  th.ExtraBodyOff,
+			ThinkingOn:   probeOn,
+			ThinkingOff:  probeOff,
 			IncludeUsage: *cfg.IncludeUsage,
 			Timeout:      30 * time.Second,
 			ToolCall:     false, // 存档用轻量探针：识别引擎即可，不做 tool-call 检查

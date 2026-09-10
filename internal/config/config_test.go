@@ -93,6 +93,63 @@ func TestShippedConfigsParse(t *testing.T) {
 	}
 }
 
+// filler_corpus 的「按配置目录解析相对路径」只对文件路径生效；
+// en/zh 是内置语料哨兵，必须原样透传给 corpus.Load。
+// 回归：曾无条件 join，把 en 变成 configs/en，语料加载直接失败。
+func TestFillerCorpusBuiltinNotJoined(t *testing.T) {
+	p := filepath.Join("..", "..", "configs", "example.yaml")
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.FillerCorpus != "en" {
+		t.Errorf("内置语料哨兵被当成路径拼接了: %q", cfg.FillerCorpus)
+	}
+
+	// 文件路径仍以配置文件所在目录为基准
+	p2 := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+filler_corpus: "my.txt.gz"
+`)
+	cfg2, err := Load(p2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(filepath.Dir(p2), "my.txt.gz"); cfg2.FillerCorpus != want {
+		t.Errorf("文件路径应按配置目录解析: got %q want %q", cfg2.FillerCorpus, want)
+	}
+}
+
+// levels 模式下 extra_body_on/off 为空；probe 靠 ProbeExtraBodies 从 levels 兜底取开关两态。
+// 不兜底会让整块思考探测被静默跳过——部署侧关思考这类问题就查不出来。
+func TestProbeExtraBodiesFromLevels(t *testing.T) {
+	th := Thinking{
+		Levels: []LevelVariant{
+			{Name: "off", Enabled: false, ExtraBody: map[string]any{"k": "off"}},
+			{Name: "on", Enabled: true, ExtraBody: map[string]any{"k": "on"}},
+		},
+	}
+	on, off := th.ProbeExtraBodies()
+	if on == nil || off == nil {
+		t.Fatalf("levels 兜底失败: on=%v off=%v", on, off)
+	}
+	if on["k"] != "on" || off["k"] != "off" {
+		t.Errorf("应从 levels 取到开启态/关闭态: on=%v off=%v", on, off)
+	}
+
+	// 显式 extra_body_on/off 优先于 levels 兜底
+	th2 := Thinking{
+		ExtraBodyOn:  map[string]any{"k": "explicit-on"},
+		ExtraBodyOff: map[string]any{"k": "explicit-off"},
+		Levels:       []LevelVariant{{Name: "low", Enabled: true, ExtraBody: map[string]any{"k": "level"}}},
+	}
+	on2, off2 := th2.ProbeExtraBodies()
+	if on2["k"] != "explicit-on" || off2["k"] != "explicit-off" {
+		t.Errorf("显式 extra_body_on/off 应优先: %v %v", on2, off2)
+	}
+}
+
 // thinking.levels 自定义变体：取代 mode 展开 + CLI 按档位名过滤
 func TestThinkingLevelsVariants(t *testing.T) {
 	th := Thinking{
