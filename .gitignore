@@ -5,6 +5,7 @@ bin/bench-*
 
 output/
 output-*/
+.workbuddy/          # WorkBuddy 项目数据（记忆/日志/技能），不入库
 .env
 *.test
 .DS_Store
