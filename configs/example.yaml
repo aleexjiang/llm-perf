@@ -29,7 +29,7 @@ warmup_requests: 0                # 每场景开始前的预热请求数（不�
 # 速率标定（实测 16.6 tok/s 的实例用默认 20 会在正常运行时误触发）。
 # stall_guard:
 #   enabled: true
-#   min_tps: 20                    # 阈值（tok/s，聚合输出速度），默认 20
+#   min_tps: 10                    # 阈值（tok/s，聚合输出速度），默认 10（熔断兜底非 UX 评级；部署建议值由 bench probe 输出）
 #   window_seconds: 600            # 持续低于阈值多久触发，默认 600（10 分钟）
 #   cooldown_seconds: 300          # 熔断后到下一场景的冷却，默认 300；只给恢复留时间窗
 #   sample_seconds: 2              # 采样周期（秒），默认 2；支持亚秒（回归用 0.5）

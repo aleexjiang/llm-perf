@@ -233,7 +233,7 @@ gauge 轮询自带健康度：从未成功或连续失败 ≥5 时 JSON 标记 `
   或重启服务端清缓存（二选一）
 - **预热**：`warmup_requests: N` 每场景开始前发 N 条小请求暖连接（不计入统计，唯一内容不污染缓存对照）
 - **连接层重试**：`retry: {max_attempts: 2, backoff_ms: 300}` 对瞬时失败（reset/5xx/429）重试，默认关闭；重试留痕 warnings/retry_count
-- **降速熔断**：`stall_guard: {min_tps: 20, window_seconds: 600, cooldown_seconds: 300}` 按**聚合输出速度**
+- **降速熔断**：`stall_guard: {min_tps: 10, window_seconds: 600, cooldown_seconds: 300}` 按**聚合输出速度**
   （窗口内在飞请求输出 token 之和 / 时长）判定服务端退化，持续低于阈值即中止**当前场景**（不是整轮），
   冷却后继续下一个场景；已完成数据照常落盘，报告 note 标注熔断原因与现场速度。空闲与纯 prefill 不参与
   判定。CLI `--stall-tps/--stall-window/--stall-cooldown`、`--no-stall-guard`

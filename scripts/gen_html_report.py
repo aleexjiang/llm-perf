@@ -351,8 +351,8 @@ SLO_TIERS = {
     "long_pass_ttft": 6.0,      # s，推导值：MLPerf 405B 档 6s @9.4K 作宽松上限佐证
     "good_tpot": 40.0,          # ms，per-token TPOT（MLPerf Interactive）
     "pass_tpot": 200.0,         # ms（MLPerf Server）
-    "good_tps": 25.0,           # 单请求输出速度 tok/s（>30–50 超过所有读者感知，再快无感）
-    "pass_tps": 10.0,           # 阅读速度 ~5–6 tok/s × 2 安全系数
+    "good_tps": 25.0,           # 单请求输出速度 tok/s（comfortable 区上沿；依据 docs/latency-baselines.md §8）
+    "pass_tps": 10.0,           # 阅读速度 ~4 tok/s × 2 安全系数（勉强区上沿；依据 §8）
 }
 BUCKET_LABEL = {"short": "≤4K", "mid": "4–24K", "long": "≥24K"}
 

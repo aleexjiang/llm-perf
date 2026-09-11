@@ -555,8 +555,8 @@ stall_guard:
 	if !sg.StallEnabled() {
 		t.Fatal("enabled: true 应生效")
 	}
-	if sg.MinTPS != 20 {
-		t.Errorf("min_tps default = %v, want 20", sg.MinTPS)
+	if sg.MinTPS != 10 {
+		t.Errorf("min_tps default = %v, want 10", sg.MinTPS)
 	}
 	if sg.WindowSeconds != 600 {
 		t.Errorf("window_seconds default = %v, want 600", sg.WindowSeconds)

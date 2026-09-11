@@ -198,7 +198,7 @@ func main() {
 	corpusFlag := fs.String("corpus", "", "填充语料：en/zh（内置公版书）或自定义文件路径（.txt/.txt.gz）；覆盖配置 filler_corpus")
 	maxCtxFlag := fs.Int("max-ctx", 0, "上下文截止（tokens）：>0 时所有请求 prompt 不超过该值；覆盖配置 max_prompt_tokens")
 	saltFlag := fs.Int("seed-salt", 0, "种子盐值：隔离测试（服务端 prefix cache 未清空时重测用）；覆盖配置 seed_salt")
-	stallTPSFlag := fs.Float64("stall-tps", 0, "降速熔断阈值（tok/s，聚合输出速度）：>0 时开启并覆盖 stall_guard.min_tps（默认 20）")
+	stallTPSFlag := fs.Float64("stall-tps", 0, "降速熔断阈值（tok/s，聚合输出速度）：>0 时开启并覆盖 stall_guard.min_tps（默认 10）")
 	stallWindowFlag := fs.Int("stall-window", 0, "降速熔断判定窗口（秒）：覆盖 stall_guard.window_seconds（默认 600）")
 	stallCooldownFlag := fs.Int("stall-cooldown", 0, "熔断后到下一个场景的冷却（秒）：覆盖 stall_guard.cooldown_seconds（默认 300；0 表示用配置值）")
 	stallProbeFlag := fs.Float64("stall-probe-factor", 0, "熔断冷却后的恢复探针倍数：探针实测 tok/s ≥ 倍数×min_tps 才继续下一场景，否则停止整轮；>0 覆盖 stall_guard.probe_factor（默认 2，0=关闭退回纯计时；关闭只能走配置）")
@@ -262,7 +262,7 @@ func main() {
 			sg.ProbeFactor = &pf
 		}
 		if sg.MinTPS <= 0 {
-			sg.MinTPS = 20
+			sg.MinTPS = 10
 		}
 		if sg.WindowSeconds <= 0 {
 			sg.WindowSeconds = 600

@@ -156,7 +156,7 @@ type RetryCfg struct {
 // 已完成的数据照常落盘，报告 note 与 run.log 里标注熔断原因与现场速度。
 type StallGuardCfg struct {
 	Enabled         *bool   `yaml:"enabled"`          // 默认 true（写了该段即生效）；false = 保留配置但不启用
-	MinTPS          float64 `yaml:"min_tps"`          // 阈值（tok/s），默认 20
+	MinTPS          float64 `yaml:"min_tps"`          // 阈值（tok/s），默认 10——熔断兜底（防接近死机白烧长跑），不是 UX 评级；评级线见 docs/latency-baselines.md §8
 	WindowSeconds   int     `yaml:"window_seconds"`   // 连续低于阈值多久触发，默认 600（10 分钟）
 	CooldownSeconds int     `yaml:"cooldown_seconds"` // 触发后到下一个场景的冷却，默认 300（5 分钟）；0 = 不等
 	SampleSeconds   float64 `yaml:"sample_seconds"`   // 采样周期（秒），默认 2；支持亚秒（熔断回归用 0.5）
@@ -1093,7 +1093,7 @@ func Load(path string) (*Config, error) {
 		}
 		if sg.StallEnabled() {
 			if sg.MinTPS == 0 {
-				sg.MinTPS = 20 // 默认阈值 20 tok/s
+				sg.MinTPS = 10 // 默认阈值 10 tok/s（跨机器安全下限；部署级建议值由 bench probe 实测输出）
 			}
 			if sg.WindowSeconds == 0 {
 				sg.WindowSeconds = 600 // 默认持续 10 分钟
