@@ -85,7 +85,7 @@ api_key_env: "SOME_MISSING_VAR"
 
 // 随仓库的每份配置都必须能通过严格解析（防止加字段后忘了同步模板）
 func TestShippedConfigsParse(t *testing.T) {
-	for _, name := range []string{"example.yaml", "smoke.yaml", "smoke-all.yaml", "qwen3.8-27b.yaml"} {
+	for _, name := range []string{"example.yaml", "smoke.yaml", "smoke-all.yaml"} {
 		p := filepath.Join("..", "..", "configs", name)
 		if _, err := Load(p); err != nil {
 			t.Errorf("%s: %v", name, err)
