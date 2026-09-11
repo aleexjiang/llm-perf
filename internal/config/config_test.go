@@ -455,3 +455,265 @@ concurrent:
 		t.Errorf("应提示单值维度失效，got: %v", cfg.Warnings)
 	}
 }
+
+// 降速熔断（stall_guard）：默认值填充、显式覆盖、关闭语义、非法值报错。
+func TestLoad_StallGuard(t *testing.T) {
+	// 只写 enabled 与阈值：窗口/冷却/采样周期应补默认值（600/300/2）
+	p := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+stall_guard:
+  min_tps: 35
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sg := cfg.StallGuard
+	if sg == nil || !sg.StallEnabled() {
+		t.Fatal("配置了 stall_guard 段应默认启用")
+	}
+	if sg.MinTPS != 35 || sg.WindowSeconds != 600 || sg.CooldownSeconds != 300 || sg.SampleSeconds != 2 {
+		t.Errorf("默认值填充不符：%+v", sg)
+	}
+	if !strings.Contains(strings.Join(cfg.Warnings, "\n"), "降速熔断已启用") {
+		t.Errorf("应打印启用提示，got: %v", cfg.Warnings)
+	}
+
+	// 未配置该段 = 不启用
+	p2 := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+`)
+	cfg2, err := Load(p2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg2.StallGuard.StallEnabled() {
+		t.Error("未配置 stall_guard 时不应启用")
+	}
+
+	// enabled: false = 保留配置但不启用（也不填默认值、不告警）
+	p3 := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+stall_guard:
+  enabled: false
+  min_tps: 20
+  window_seconds: 600
+`)
+	cfg3, err := Load(p3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg3.StallGuard.StallEnabled() {
+		t.Error("enabled:false 应不启用")
+	}
+
+	// 采样间隔比判定窗口还长：永远判不出持续降速，直接报错
+	p4 := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+stall_guard:
+  min_tps: 20
+  window_seconds: 5
+  sample_seconds: 30
+`)
+	if _, err := Load(p4); err == nil {
+		t.Error("sample_seconds 大于 window_seconds 应报错")
+	}
+
+	// 负值报错
+	p5 := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+stall_guard:
+  min_tps: -1
+`)
+	if _, err := Load(p5); err == nil {
+		t.Error("min_tps 为负应报错")
+	}
+}
+
+// ── stall_guard（降速熔断）：默认值、校验、探针三态 ──
+
+func TestLoad_StallGuardDefaults(t *testing.T) {
+	p := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+stall_guard:
+  enabled: true
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sg := cfg.StallGuard
+	if sg == nil {
+		t.Fatal("stall_guard 段应被解析")
+	}
+	if !sg.StallEnabled() {
+		t.Fatal("enabled: true 应生效")
+	}
+	if sg.MinTPS != 20 {
+		t.Errorf("min_tps default = %v, want 20", sg.MinTPS)
+	}
+	if sg.WindowSeconds != 600 {
+		t.Errorf("window_seconds default = %v, want 600", sg.WindowSeconds)
+	}
+	if sg.SampleSeconds != 2 {
+		t.Errorf("sample_seconds default = %v, want 2", sg.SampleSeconds)
+	}
+	if sg.CooldownSeconds != 300 {
+		t.Errorf("cooldown_seconds default = %v, want 300", sg.CooldownSeconds)
+	}
+	if len(cfg.Warnings) == 0 || !strings.Contains(strings.Join(cfg.Warnings, ";"), "降速熔断已启用") {
+		t.Errorf("启用熔断应有 Warnings 提示: %v", cfg.Warnings)
+	}
+}
+
+func TestLoad_StallGuardDisabledKeepsZeros(t *testing.T) {
+	p := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+stall_guard:
+  enabled: false
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sg := cfg.StallGuard
+	if sg.StallEnabled() {
+		t.Fatal("enabled: false 应不生效")
+	}
+	if sg.MinTPS != 0 || sg.WindowSeconds != 0 {
+		t.Errorf("禁用时不应填默认值（保留配置原样）: %+v", sg)
+	}
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "降速熔断已启用") {
+			t.Errorf("禁用时不应有熔断启用提示: %v", cfg.Warnings)
+		}
+	}
+}
+
+func TestLoad_StallGuardAbsentByDefault(t *testing.T) {
+	p := writeTemp(t, "endpoint: \"http://x:1/v1\"\nmodels: [\"m1\"]\n")
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.StallGuard != nil {
+		t.Fatalf("未配置段应为 nil: %+v", cfg.StallGuard)
+	}
+}
+
+func TestLoad_StallGuardNegativeRejected(t *testing.T) {
+	cases := map[string]string{
+		"min_tps":          "stall_guard:\n  min_tps: -1\n  enabled: false\n",
+		"window_seconds":   "stall_guard:\n  window_seconds: -5\n  enabled: false\n",
+		"cooldown_seconds": "stall_guard:\n  cooldown_seconds: -3\n  enabled: false\n",
+		"sample_seconds":   "stall_guard:\n  sample_seconds: -0.5\n  enabled: false\n",
+	}
+	for name, y := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(writeTemp(t, "endpoint: \"http://x:1/v1\"\nmodels: [\"m1\"]\n"+y)); err == nil {
+				t.Fatalf("%s 为负应报错", name)
+			}
+		})
+	}
+}
+
+func TestLoad_StallGuardProbeFactorNegativeRejected(t *testing.T) {
+	p := writeTemp(t, "endpoint: \"http://x:1/v1\"\nmodels: [\"m1\"]\nstall_guard:\n  enabled: false\n  probe_factor: -0.1\n")
+	if _, err := Load(p); err == nil {
+		t.Fatal("probe_factor 为负应报错（0 = 关闭探针，是合法值）")
+	}
+}
+
+func TestLoad_StallGuardSampleLargerThanWindow(t *testing.T) {
+	p := writeTemp(t, "endpoint: \"http://x:1/v1\"\nmodels: [\"m1\"]\nstall_guard:\n  window_seconds: 600\n  sample_seconds: 700\n")
+	if _, err := Load(p); err == nil {
+		t.Fatal("sample_seconds > window_seconds 应报错（永远判不出持续降速）")
+	}
+}
+
+func TestStallEnabledAndProbeFactorMethods(t *testing.T) {
+	var nilCfg *StallGuardCfg
+	if nilCfg.StallEnabled() {
+		t.Fatal("nil 配置应视为未启用（StallEnabled 需 nil 安全）")
+	}
+	disabled := false
+	if (&StallGuardCfg{Enabled: &disabled}).StallEnabled() {
+		t.Fatal("enabled: false 应视为未启用")
+	}
+	if !(&StallGuardCfg{}).StallEnabled() {
+		t.Fatal("Enabled 未配置应默认启用")
+	}
+	// EffProbeFactor 三态：nil → 默认 2；显式 0 → 关闭；负数 → 防御性归 0
+	if got := (&StallGuardCfg{}).EffProbeFactor(); got != 2 {
+		t.Errorf("EffProbeFactor 默认 = %v, want 2", got)
+	}
+	zero := 0.0
+	if got := (&StallGuardCfg{ProbeFactor: &zero}).EffProbeFactor(); got != 0 {
+		t.Errorf("EffProbeFactor 显式 0 = %v, want 0", got)
+	}
+	neg := -1.0
+	if got := (&StallGuardCfg{ProbeFactor: &neg}).EffProbeFactor(); got != 0 {
+		t.Errorf("EffProbeFactor 负数防御 = %v, want 0", got)
+	}
+	pf := 1.5
+	if got := (&StallGuardCfg{ProbeFactor: &pf}).EffProbeFactor(); got != 1.5 {
+		t.Errorf("EffProbeFactor 显式 1.5 = %v", got)
+	}
+}
+
+// ── 5.7 ramp：默认开 / 显式关 / factor 校验与回落 ──
+
+func TestLoad_RampDefaults(t *testing.T) {
+	p := writeTemp(t, "endpoint: \"http://x:1/v1\"\nmodels: [\"m1\"]\n")
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Concurrent.RampEnabled() {
+		t.Fatal("ramp 未配置应默认开启（nil = true）")
+	}
+	if cfg.Concurrent.EffRampFactor() != 2 {
+		t.Fatalf("ramp_factor 默认 = %d, want 2", cfg.Concurrent.EffRampFactor())
+	}
+}
+
+func TestLoad_RampNegativeRejected(t *testing.T) {
+	p := writeTemp(t, "endpoint: \"http://x:1/v1\"\nmodels: [\"m1\"]\nconcurrent:\n  ramp_factor: -1\n")
+	if _, err := Load(p); err == nil {
+		t.Fatal("ramp_factor 为负应报错")
+	}
+}
+
+func TestLoad_RampFactorOneWarns(t *testing.T) {
+	p := writeTemp(t, "endpoint: \"http://x:1/v1\"\nmodels: [\"m1\"]\nconcurrent:\n  ramp_factor: 1\n")
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(cfg.Warnings, ";"), "串行发车") {
+		t.Errorf("ramp_factor=1 应有串行发车 Warnings: %v", cfg.Warnings)
+	}
+	if cfg.Concurrent.EffRampFactor() != 2 {
+		t.Fatalf("factor=1 应回落 2（EffRampFactor），得到 %d", cfg.Concurrent.EffRampFactor())
+	}
+}
+
+func TestRampEnabledExplicitFalse(t *testing.T) {
+	off := false
+	if (&Concurrent{Ramp: &off}).RampEnabled() {
+		t.Fatal("ramp: false 应关闭爬坡（退回齐射）")
+	}
+	if !(Concurrent{}).RampEnabled() {
+		t.Fatal("Ramp nil 应默认开")
+	}
+	if got := (Concurrent{RampFactor: 3}).EffRampFactor(); got != 3 {
+		t.Fatalf("显式 3 应保持 3，得到 %d", got)
+	}
+}

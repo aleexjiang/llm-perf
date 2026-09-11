@@ -16,8 +16,13 @@ configs/customer-*.yaml
 configs/customer-*.md
 # 客户环境实测手册（含客户端点/key），放在 docs/ 也不入库
 docs/customer-*.md
-scripts/__pycache__/
 
 # 前缀缓存探针临时产物（能力已并入 bench probe --cache，不入库）
 /testdata/
 cache-probe-testdata.zip
+
+# 降速熔断回归 harness 的运行日志（scripts/stall-e2e）
+scripts/stall-e2e/reqs.log
+
+# Python 字节码缓存（mock/桩脚本运行产物）
+__pycache__/
