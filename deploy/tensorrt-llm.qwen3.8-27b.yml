@@ -1,0 +1,59 @@
+# Qwen3.8-27B TensorRT-LLM 推理服务（对照 vLLM 基线 docker-compose.qwen3.8-27b.yml）
+#
+# 镜像：nvcr.io/nvidia/tensorrt-llm/release:1.2.1（NGC 稳定版，2026-04 发布，基于 CUDA 13.1，需驱动 590+）。
+#   1.x 起 trtllm-serve 默认走 PyTorch backend，直接读 HF safetensors 权重，无需预编译 engine。
+#
+# 与 vLLM 基线的参数对照：
+#   --tensor-parallel-size 2         → --tp_size 2
+#   --max-num-seqs 4                 → --max_batch_size 4
+#   --max-model-len 262144           → --max_seq_len 262144
+#   --dtype float16                  → 权重按模型 config 的 float16 原样加载（--dtype 可显式指定，按 serve --help 校准）
+#   --kv-cache-dtype fp8             → --kv_cache_dtype fp8（默认未开，与 FP16 环境保持一致先不开）
+#   --enable-prefix-caching          → PyTorch backend 内置前缀复用；对照实验结论以 bench 实测为准
+#   --reasoning-parser qwen3         → 无等价项：思考文本大概率以 <think>...</think> 内联在 content 里返回，
+#                                      无独立 reasoning_content 字段 → bench 的思考三段拆分（think_ms）不可测
+#   MTP 投机解码 3token              → 默认不开；engine 编译路径下可通过 speculative config 开启
+#
+# bench 侧注意点：
+#   - 换引擎先跑 ./bench probe -c <bench 配置>：重点看思考字段与 usage 回传是否齐全，
+#     缺项时报告中相应指标会按「不可测」口径降级（属预期，不是工具故障）
+#   - 端口 8849:8000 与 vLLM 基线一致，bench 配置 endpoint 不用改
+#   - TRT-LLM 引擎编译路径（追求极限吞吐时，非本 compose 默认）：
+#       步骤1 python3 -m tensorrt_llm.commands.quantize --model_dir ... --output_dir ...（可选 fp8 量化）
+#       步骤2 trtllm-build --checkpoint_dir ... --output_dir ... --max_batch_size 4 --max_seq_len 262144
+#       然后 trtllm-serve serve <engine目录>
+
+services:
+  qwen3.8:
+    image: nvcr.io/nvidia/tensorrt-llm/release:1.2.1
+    container_name: qwen3.8-27b-trtllm
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["2", "3"]
+              capabilities: [gpu]
+    ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ports:
+      - "8849:8000"
+    volumes:
+      - /data/aleexjiang/models:/models
+    environment:
+      - HF_HOME=/models/.cache
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
+    command: >
+      trtllm-serve serve /models/Qwen3.8-27B
+      --tp_size 2
+      --max_batch_size 4
+      --max_seq_len 262144
+      --host 0.0.0.0
+      --port 8000

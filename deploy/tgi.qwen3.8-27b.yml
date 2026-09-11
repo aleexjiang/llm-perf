@@ -1,0 +1,58 @@
+# Qwen3.8-27B TGI（Text Generation Inference）服务（对照 vLLM 基线 docker-compose.qwen3.8-27b.yml）
+#
+# ⚠️ 选型提醒：TGI 已进入 maintenance mode（官方 README 明确，新项目推荐 vLLM / SGLang / llama.cpp）。
+#   本文件仅作跨引擎横评的对照项；Qwen3 系新架构支持情况视 3.3.x 版本而定，起不来属正常，优先用前三套。
+#
+# 镜像：ghcr.io/huggingface/text-generation-inference:3.3.5（维护模式下的最后稳定线）。
+#
+# 与 vLLM 基线的参数对照：
+#   --tensor-parallel-size 2         → --num-shard 2
+#   --max-num-seqs 4                 → --max-concurrent-requests 4
+#   --max-model-len 262144           → --max-input-length / --max-total-tokens 拆成两个参数；
+#                                      TGI 对超长上下文支持有限，262144 未必可用，本文件先给 131072 折中值
+#   --dtype float16                  → --dtype float16
+#   --enable-prefix-caching          → 无等价项：TGI 无 vLLM 式前缀缓存
+#                                      → bench 的 single fixed_seed Run1 vs Run2 对照在 TGI 上预期无差异（属预期）
+#   --reasoning-parser qwen3         → 无等价项：无独立 reasoning 字段，思考文本内联 → think_ms 不可测
+#   MTP 投机解码 3token              → TGI 有内置 n-gram speculative，无 Qwen3.8 MTP 支持
+#
+# bench 侧注意点：
+#   - 容器内端口是 80（非 8000），端口映射写 8849:80；bench endpoint 仍不变（宿主机侧同为 8849）
+#   - --max-input-length / --max-total-tokens 超过 KV 显存承载时启动即报错，按显存账收紧：
+#     FP16 KV ≈ 256KB/token，--max-total-tokens 上限 ≈ (可用显存 × 分数) / 256KB，并发档位高时需同步下调
+#   - 先跑 ./bench probe 确认 OpenAI 兼容面（TGI 的 /v1/chat/completions 是 Messages API 映射层，
+#     usage / stream_options 等字段回传与原生引擎有差异，probe 会逐项判定）
+
+services:
+  qwen3.8:
+    image: ghcr.io/huggingface/text-generation-inference:3.3.5
+    container_name: qwen3.8-27b-tgi
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["2", "3"]
+              capabilities: [gpu]
+    ipc: host
+    shm_size: "1g"
+    ports:
+      - "8849:80"
+    volumes:
+      - /data/aleexjiang/models:/models
+    environment:
+      - HF_HOME=/models/.cache
+      - HUGGINGFACE_HUB_CACHE=/models/.cache
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
+    command: >
+      --model-id /models/Qwen3.8-27B
+      --dtype float16
+      --num-shard 2
+      --max-concurrent-requests 4
+      --max-input-length 131072
+      --max-total-tokens 139264

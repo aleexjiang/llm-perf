@@ -1,4 +1,4 @@
-# Qwen3.8-27B vLLM 推理服务（云上实例，配套 bench 配置见 configs/qwen3.8-27b.yaml）
+# Qwen3.8-27B vLLM 推理服务（配套 bench 配置在本地测试目录 llm-perf-test/configs/，不入库）
 #
 # 与 bench 配置对齐的要点：
 #   --enable-prefix-caching          前缀缓存 → single fixed_seed 的 Run1 vs Run2 对照有效

@@ -1,0 +1,68 @@
+# Qwen3.8-27B llama.cpp 推理服务（对照 vLLM 基线 docker-compose.qwen3.8-27b.yml）
+#
+# 镜像：ghcr.io/ggml-org/llama.cpp:server-cuda（滚动 latest，构建日期以 digest 为准）。
+#
+# 【前置条件】llama.cpp 只吃 GGUF，不能直接读 HF safetensors。先在任一有 python 环境的机器转换：
+#   git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
+#   pip install -r requirements.txt
+#   python3 convert_hf_to_gguf.py /data/aleexjiang/models/Qwen3.8-27B \
+#       --outtype f16 --outfile /data/aleexjiang/models/Qwen3.8-27B/qwen3.8-27b-f16.gguf
+#   （FP16 精度对应 --outtype f16；追求体积可再量化 Q8_0，注意与 FP16 对照实验混精度不可比）
+#
+# 【KV cache 显存账——为什么本文件不照抄 262144 × 4 并发】
+#   Qwen3 架构（64 层 × 8 KV heads × head_dim 128，f16）≈ 256KB/token：
+#     ctx 262144 × --parallel 4 ≈ 256GB → 放不下（两卡合计才 144GB）
+#     ctx 262144 × --parallel 1 ≈  64GB → 放得下，但并发=1，测不了并发档位
+#     ctx 131072 × --parallel 2 ≈  64GB → 本文件取的折中：并发档位最多到 2
+#   llama.cpp 的 --ctx-size 是全部 slot 共享的总 KV 池（--parallel 均分），与 vLLM 的
+#   "每请求独立 context"语义不同，压测并发档位设计时要按上表核算。
+#
+# 与 vLLM 基线的参数对照：
+#   --tensor-parallel-size 2         → --split-mode layer --tensor-split 1,1（逐层切分，跨 PCIe 时 ITL 开销更大）
+#   --max-num-seqs 4                 → --parallel 2（同时受上面 KV 账约束）
+#   --max-model-len 262144           → --ctx-size 131072（折中值，理由见上）
+#   --enable-prefix-caching          → --cache-reuse 256（prompt cache 复用，语义近似非严格等价）
+#   --reasoning-parser qwen3         → --jinja（启用内置 chat template，Qwen3 思考由模板处理；
+#                                      思考文本内联 <think> 标签，无独立 reasoning_content → think_ms 不可测）
+#   MTP 投机解码                     → 无 Qwen3.8 MTP 支持（可用 --model-draft 挂小模型 speculative，另配）
+#
+# bench 侧注意点：
+#   - 先跑 ./bench probe：llama.cpp 属"细节字段差异大"的引擎（usage 回传/非标 delta），probe 会逐项给出结论
+#   - 并发档位别配超过 --parallel（超出的请求在 llama.cpp 侧排队，测的是排队不是并行）
+#   - 若镜像版本较旧不支持 --flash-attn on 写法，改用 -fa
+
+services:
+  qwen3.8:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    container_name: qwen3.8-27b-llamacpp
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["2", "3"]
+              capabilities: [gpu]
+    ipc: host
+    ports:
+      - "8849:8000"
+    volumes:
+      - /data/aleexjiang/models:/models
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
+    command: >
+      -m /models/Qwen3.8-27B/qwen3.8-27b-f16.gguf
+      --alias qwen3.8-27b
+      --host 0.0.0.0
+      --port 8000
+      -ngl 999
+      --split-mode layer
+      --tensor-split 1,1
+      --ctx-size 131072
+      --parallel 2
+      --cache-reuse 256
+      --flash-attn on
+      --jinja

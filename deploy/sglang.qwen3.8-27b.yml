@@ -1,0 +1,67 @@
+# Qwen3.8-27B SGLang 推理服务（对照 vLLM 基线 docker-compose.qwen3.8-27b.yml）
+#
+# 镜像：lmsysorg/sglang:v0.5.19（2026-09 稳定版，默认 CUDA 13 环境，需驱动 580+）；
+#   驱动较旧/CUDA 12 环境换 v0.5.19-cu12 后缀 tag。
+#
+# 与 vLLM 基线的参数对照：
+#   --enable-prefix-caching          → SGLang 的 RadixAttention 默认开启（无需参数）
+#   --enable-chunked-prefill         → 默认开启
+#   --max-num-seqs 4                 → --max-running-requests 4
+#   --tensor-parallel-size 2         → --tp-size 2
+#   --dtype float16                  → --dtype float16（本次 FP16 环境；vLLM 基线文件为 bfloat16）
+#   --max-model-len 262144           → --context-length 262144
+#   --kv-cache-dtype fp8             → --kv-cache-dtype fp8（默认未开，保持与 FP16 环境一致先不开）
+#   --reasoning-parser qwen3         → --reasoning-parser qwen3（流式思考字段拆分）
+#   MTP 投机解码 3token              → 见下方注释（默认不开，公平对照基线先不开）
+#
+# bench 侧注意点：
+#   - 换引擎先跑 ./bench probe -c <bench 配置>，确认思考字段名与 usage 回传
+#   - 端口 8849:8000 与 vLLM 基线一致，bench 配置 endpoint 不用改
+#   - SGLang 自带 /metrics Prometheus 指标，server_metrics: true 可开观测层
+
+services:
+  qwen3.8:
+    image: lmsysorg/sglang:v0.5.19
+    container_name: qwen3.8-27b-sglang
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["2", "3"]
+              capabilities: [gpu]
+    ipc: host
+    shm_size: "32g"
+    ports:
+      - "8849:8000"
+    volumes:
+      - /data/aleexjiang/models:/models
+    environment:
+      - HF_HOME=/models/.cache
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
+    command: >
+      --model-path /models/Qwen3.8-27B
+      --served-model-name qwen3.8-27b
+      --tp-size 2
+      --dtype float16
+      --context-length 262144
+      --max-running-requests 4
+      --mem-fraction-static 0.9
+      --reasoning-parser qwen3
+      --host 0.0.0.0
+      --port 8000
+
+# 可选：对齐 vLLM 基线的 MTP 投机解码（Qwen3.8 带 MTP 头时生效，按镜像版本支持的参数名校准）：
+#   --speculative-algorithm NEXTN
+#   --speculative-num-steps 3
+#   --speculative-eagle-topk 1
+#   --speculative-num-draft-tokens 4
+#
+# 可选：tool-call 结构化解析（llm-perf 的 bench probe 会做 tool-call 健康检查；
+#   parser 枚举名按镜像版本支持情况选 qwen25 / qwen3 / qwen3_coder）：
+#   --tool-call-parser qwen25
