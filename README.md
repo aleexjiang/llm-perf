@@ -233,6 +233,10 @@ gauge 轮询自带健康度：从未成功或连续失败 ≥5 时 JSON 标记 `
   或重启服务端清缓存（二选一）
 - **预热**：`warmup_requests: N` 每场景开始前发 N 条小请求暖连接（不计入统计，唯一内容不污染缓存对照）
 - **连接层重试**：`retry: {max_attempts: 2, backoff_ms: 300}` 对瞬时失败（reset/5xx/429）重试，默认关闭；重试留痕 warnings/retry_count
+- **降速熔断**：`stall_guard: {min_tps: 20, window_seconds: 600, cooldown_seconds: 300}` 按**聚合输出速度**
+  （窗口内在飞请求输出 token 之和 / 时长）判定服务端退化，持续低于阈值即中止**当前场景**（不是整轮），
+  冷却后继续下一个场景；已完成数据照常落盘，报告 note 标注熔断原因与现场速度。空闲与纯 prefill 不参与
+  判定。CLI `--stall-tps/--stall-window/--stall-cooldown`、`--no-stall-guard`
 - **goodput**：`goodput: {ttft_ms: 2000, tpot_ms: 100}` 定义 SLO，concurrent 结果输出达标数与有效吞吐
 - **正确性抽查**：`correctness: {samples: 8}` 数字转写金丝雀，防"HTTP 200 但内容异常"的假成功
 
@@ -317,6 +321,10 @@ scripts/smoke.sh    # 自动化冒烟：mock 服务 + 多组合运行 + 输出�
                     #   错误路径/报告管线；mock 含 /models、/metrics 与 tool-call 好路径）
                     # 运行产物全部落 /tmp 随脚本退出清理，不污染仓库
 scripts/mock_server.py   # 本地 mock OpenAI 兼容流式服务（smoke.sh 底层依赖）
+                    # 环境变量 MOCK_TOKEN_DELAY 可调每 chunk 间隔（默认 0.05≈20 tok/s），用来构造降速现场
+scripts/stall-e2e/  # 降速熔断端到端回归：假慢速服务端 + 配置，验证
+                    # 「聚合降速 → 中止当前场景 → 冷却 → 续跑下一场景 → 报告 note 留痕」整条链路
+                    # （与 smoke.sh 分开：这里的 mock 需要按请求区分快慢，探针必须秒回）
 scripts/gen_html_report.py  # JSON → 自包含 HTML 分析报告（多文件合并 + 自动结论 + 内嵌 AI 摘要）
 scripts/validate_report.js  # 报告 JS 校验（占位符/图表可执行）
 deploy/             # 推理服务 compose 存档：vLLM 基线 + SGLang / TensorRT-LLM / llama.cpp / TGI

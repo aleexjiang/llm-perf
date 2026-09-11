@@ -14,6 +14,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -21,6 +22,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -196,6 +198,12 @@ func main() {
 	corpusFlag := fs.String("corpus", "", "填充语料：en/zh（内置公版书）或自定义文件路径（.txt/.txt.gz）；覆盖配置 filler_corpus")
 	maxCtxFlag := fs.Int("max-ctx", 0, "上下文截止（tokens）：>0 时所有请求 prompt 不超过该值；覆盖配置 max_prompt_tokens")
 	saltFlag := fs.Int("seed-salt", 0, "种子盐值：隔离测试（服务端 prefix cache 未清空时重测用）；覆盖配置 seed_salt")
+	stallTPSFlag := fs.Float64("stall-tps", 0, "降速熔断阈值（tok/s，聚合输出速度）：>0 时开启并覆盖 stall_guard.min_tps（默认 20）")
+	stallWindowFlag := fs.Int("stall-window", 0, "降速熔断判定窗口（秒）：覆盖 stall_guard.window_seconds（默认 600）")
+	stallCooldownFlag := fs.Int("stall-cooldown", 0, "熔断后到下一个场景的冷却（秒）：覆盖 stall_guard.cooldown_seconds（默认 300；0 表示用配置值）")
+	stallProbeFlag := fs.Float64("stall-probe-factor", 0, "熔断冷却后的恢复探针倍数：探针实测 tok/s ≥ 倍数×min_tps 才继续下一场景，否则停止整轮；>0 覆盖 stall_guard.probe_factor（默认 2，0=关闭退回纯计时；关闭只能走配置）")
+	noStallFlag := fs.Bool("no-stall-guard", false, "关闭降速熔断（覆盖配置 stall_guard，用于需要跑完整轮的场景）")
+	noStallTraceFlag := fs.Bool("no-stall-trace", false, "关闭降速采样序列落盘（<结果 JSON 同名>.stall.csv；默认开启，纯记录不影响行为）")
 	thinkingFlag := fs.String("thinking", "", "只跑某个思考变体：on/off（开思考费 token，建议 off/on 分开两轮跑，互不连坐）；按变体名过滤，模型无该变体则跳过；both=全部")
 	noToolCallFlag := fs.Bool("no-toolcall", false, "probe: 关闭 tool-call 健康检查（默认开启，多 4 次请求秒级）")
 	captureFlag := fs.String("probe-capture", "", "probe: tool-call 检查原始响应落盘目录（排障证据/判据 fixture；含业务数据外发前脱敏）")
@@ -227,6 +235,46 @@ func main() {
 	}
 	if *saltFlag > 0 {
 		cfg.SeedSalt = *saltFlag
+	}
+	// 降速熔断：CLI 覆盖配置（配置校验已在 Load 内完成并填过默认值，这里补同样的默认口径）
+	if *noStallFlag {
+		cfg.StallGuard = nil
+		log.Printf("降速熔断: 已由 CLI 关闭（--no-stall-guard）")
+	} else if *stallTPSFlag > 0 || *stallWindowFlag > 0 || *stallCooldownFlag > 0 || *stallProbeFlag > 0 {
+		sg := cfg.StallGuard
+		if sg == nil {
+			sg = &config.StallGuardCfg{}
+			cfg.StallGuard = sg
+		}
+		on := true
+		sg.Enabled = &on
+		if *stallTPSFlag > 0 {
+			sg.MinTPS = *stallTPSFlag
+		}
+		if *stallWindowFlag > 0 {
+			sg.WindowSeconds = *stallWindowFlag
+		}
+		if *stallCooldownFlag > 0 {
+			sg.CooldownSeconds = *stallCooldownFlag
+		}
+		if *stallProbeFlag > 0 {
+			pf := *stallProbeFlag
+			sg.ProbeFactor = &pf
+		}
+		if sg.MinTPS <= 0 {
+			sg.MinTPS = 20
+		}
+		if sg.WindowSeconds <= 0 {
+			sg.WindowSeconds = 600
+		}
+		if sg.CooldownSeconds <= 0 {
+			sg.CooldownSeconds = 300
+		}
+		if sg.SampleSeconds <= 0 {
+			sg.SampleSeconds = 2
+		}
+		log.Printf("降速熔断（CLI 覆盖）: 聚合输出速度持续低于 %.0f tok/s 达 %ds 即中止当前场景，冷却 %ds 后探针（×%.0f）决定续跑或停整轮",
+			sg.MinTPS, sg.WindowSeconds, sg.CooldownSeconds, sg.EffProbeFactor())
 	}
 	if *thinkingFlag != "" {
 		if err := applyThinkingCLI(cfg, *thinkingFlag); err != nil {
@@ -531,14 +579,20 @@ func main() {
 		os.Exit(1)
 	}
 
-	run := func(name string, fn func() (*report.Report, error)) {
+	// lastAbort 最近一次场景的中止原因（非空 = 该场景被降速熔断中止，run 据此换掉"完成"措辞）
+	lastAbort := ""
+	// lastWritten 最近一次场景实际落盘的 JSON 路径（按模型分区时有多条）：
+	// 8.2 探针未恢复停止整轮时，把「探针未恢复」追加进被熔断场景的 note 留痕
+	var lastWritten []string
+
+	run := func(name, outPath, stallPath string, fn func() (*report.Report, error)) {
 		start := time.Now()
+		lastWritten = lastWritten[:0]
 		rep, err := fn()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[%s] 失败: %v\n", name, err)
 			os.Exit(1)
 		}
-		outPath := resolveOutPath(*outFlag, cfg.OutputDir, name)
 		// 环境存档随每份分区落盘（引擎识别 + 配置原文）；测试画像同附（回溯"当时的计划"）
 		rep.Environment = envInfo
 		rep.ConfigRaw = cfg.Raw
@@ -554,10 +608,17 @@ func main() {
 			os.Exit(1)
 		}
 		write := func(p *report.Report, path string) {
+			// stall_trace 记相对路径：单模型布局 = 同目录文件名；分区布局 = ../<同名>.stall.csv
+			if stallPath != "" {
+				if rel, rerr := filepath.Rel(filepath.Dir(path), stallPath); rerr == nil {
+					p.StallTrace = rel
+				}
+			}
 			if err := p.SaveJSON(path); err != nil {
 				fmt.Fprintf(os.Stderr, "[%s] 写出 JSON 失败: %v\n", name, err)
 				os.Exit(1)
 			}
+			lastWritten = append(lastWritten, path)
 		}
 		if len(parts) == 1 {
 			write(parts[0], outPath)
@@ -572,6 +633,10 @@ func main() {
 				name, len(rep.Single)+len(rep.Multiturn)+len(rep.Concurrent), outPath)
 			return
 		}
+		if lastAbort != "" {
+			fmt.Printf("[%s] ⛔ 已中止（%s）——已完成数据已保存: %s\n", name, lastAbort, outPath)
+			return
+		}
 		if len(parts) > 1 {
 			var dirs []string
 			for _, p := range parts {
@@ -584,16 +649,185 @@ func main() {
 		}
 	}
 
-	for _, it := range items {
+	// 8.2 恢复探针用的模型：与场景同源（ActiveModels 按 -m 过滤后取第一个）
+	probeModel := ""
+	for _, m := range cfg.ActiveModels() {
+		if *modelFilter == "" || m == *modelFilter {
+			probeModel = m
+			break
+		}
+	}
+
+	for idx, it := range items {
 		it := it
 		cc := *cfg // 场景间互不影响：并发档位/多轮开关按本项覆盖
 		if len(it.highs) > 0 {
 			cc.Concurrent.Levels = it.highs
 			cc.Concurrent.Multiturn = it.mt
 		}
-		run(it.name, func() (*report.Report, error) { return it.sc.Run(ctx, &cc, client, *modelFilter) })
+
+		// 每个场景各自派生 ctx + 熔断器：降速熔断只中止**本场景**（避免一个慢场景把整轮
+		// 后面的场景一起带走），冷却后续跑；真中断（Ctrl+C / SSH 断连）仍由根 ctx 决定，
+		// 走 run() 里的"中断"分支直接返回。
+		sctx, scancel := context.WithCancel(ctx)
+		var guard *engine.StallGuard
+		if cc.StallGuard.StallEnabled() {
+			sg := cc.StallGuard
+			guard = engine.NewStallGuard(
+				sg.MinTPS,
+				time.Duration(sg.WindowSeconds)*time.Second,
+				time.Duration(sg.SampleSeconds*float64(time.Second)),
+				func(engine.StallEvent) { scancel() },
+			)
+			client.Stall = guard
+		}
+
+		lastAbort = ""
+		// 降速采样序列侧文件（8.3）：每场景一个，与结果 JSON 同名同层；正常段与
+		// 空闲/prefill 段也记录，熔断原因以 # 注释行追加。文件在场景开始创建、
+		// 场景结束（含熔断中止）关闭——已完成数据照常落盘，trace 也照常保留。
+		outPath := resolveOutPath(*outFlag, cfg.OutputDir, it.name)
+		stallPath := ""
+		var stallFile *os.File
+		if guard != nil && !*noStallTraceFlag {
+			stallPath = strings.TrimSuffix(outPath, ".json") + ".stall.csv"
+			// -o 目录可能还不存在（SaveJSON 在场景结束后才建目录），先补齐
+			os.MkdirAll(filepath.Dir(stallPath), 0o755)
+			f, ferr := os.Create(stallPath)
+			if ferr != nil {
+				log.Printf("⚠️ 降速采样序列文件创建失败（%v）——本次不落盘，其余行为不变", ferr)
+			} else {
+				stallFile = f
+				guard.W = f
+			}
+		}
+		guardDone := make(chan struct{})
+		if guard != nil {
+			go func() {
+				guard.Run(sctx)
+				close(guardDone)
+			}()
+		}
+		run(it.name, outPath, stallPath, func() (*report.Report, error) {
+			rep, err := it.sc.Run(sctx, &cc, client, *modelFilter)
+			if guard != nil && guard.Tripped() {
+				ev, _ := guard.Event()
+				lastAbort = fmt.Sprintf("降速熔断: 聚合输出速度 %.1f tok/s 持续 %s 低于阈值 %.0f tok/s",
+					ev.Rate, ev.LowFor.Round(time.Second), ev.MinTPS)
+				if rep != nil {
+					// 报告留痕：几周后回看这份 JSON 时，"为什么数据是半截的"必须有据可查
+					n := lastAbort
+					if rep.Note != "" {
+						n = rep.Note + "；" + n
+					}
+					rep.Note = n
+				}
+			}
+			return rep, err
+		})
+
+		scancel()
+		client.Stall = nil
+		if guard != nil {
+			<-guardDone // 等采样 goroutine 退出再关文件，避免最后一行写进已关闭的 fd
+			if stallFile != nil {
+				guard.W = nil
+				stallFile.Close()
+			}
+		}
+
 		if ctx.Err() != nil {
-			return // 中断后不再启动后续场景
+			return // 真中断：不再启动后续场景
+		}
+		if lastAbort != "" && idx < len(items)-1 {
+			// 8.2 冷却+探针：冷却只给恢复留时间窗，续跑与否由短探针实测决定——
+			// 恢复了白等 5 分钟、没恢复照样熔断下一场景，两头都是纯计时冷却的堵点
+			sg := cc.StallGuard
+			if cd := time.Duration(sg.CooldownSeconds) * time.Second; cd > 0 {
+				log.Printf("⏳ 冷却 %s 后继续下一个场景「%s」（Ctrl+C 可立即退出）",
+					cd, items[idx+1].name)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(cd):
+				}
+			}
+			if pf := sg.EffProbeFactor(); pf > 0 && sg.MinTPS > 0 {
+				threshold := pf * sg.MinTPS
+				tps, perr := recoveryProbe(ctx, client, cfg, probeModel)
+				if perr != nil || tps < threshold {
+					reason := fmt.Sprintf("熔断后探针 %.1f tok/s < 恢复阈值 %.1f tok/s（%.1f×min_tps），停止后续场景",
+						tps, threshold, pf)
+					if perr != nil {
+						reason = fmt.Sprintf("熔断后探针失败（%v），停止后续场景", perr)
+					}
+					log.Printf("🛑 服务端未恢复：%s", reason)
+					patchReportNote(lastWritten, reason) // 留痕进被熔断场景的 JSON note
+					return
+				}
+				log.Printf("✅ 探针 %.1f tok/s ≥ 恢复阈值 %.1f tok/s，服务端已恢复，继续下一个场景", tps, threshold)
+			} else {
+				log.Printf("冷却结束，继续下一个场景")
+			}
+		}
+	}
+}
+
+// recoveryProbe 8.2 恢复探针：发 3 条短请求（4k prompt / 256 输出，thinking 关）实测服务端
+// decode 速度，取中位——单发串行下聚合速度即单请求速度。探针发生在场景之间，此时
+// client.Stall 已置 nil，探针自身不会触发二次熔断。
+func recoveryProbe(ctx context.Context, client *engine.Client, cfg *config.Config, model string) (float64, error) {
+	msgs := []engine.Message{engine.UserMsg(cfg.ClampOne(4000), int64(cfg.SeedSalt+99001), cfg.FillerLang)}
+	vOff := config.ThinkingVariant{Name: "off"} // 配置未启用 off 变体时退化为默认（无思考参数）
+	for _, v := range cfg.Thinking.Variants() {
+		if v.Name == "off" {
+			vOff = v
+			break
+		}
+	}
+	var rates []float64
+	for i := 0; i < 3; i++ {
+		m, err := client.Chat(ctx, engine.ChatOptions{
+			Model:     model,
+			Messages:  msgs,
+			MaxTokens: 256,
+			Stream:    cfg.StreamEnabled(),
+			Thinking:  vOff.Enabled,
+			ExtraBody: vOff.ExtraBody,
+		})
+		if err != nil || m.Error != "" {
+			if err == nil {
+				err = fmt.Errorf("%s", m.Error)
+			}
+			return 0, fmt.Errorf("探针请求 %d/3 失败: %w", i+1, err)
+		}
+		rates = append(rates, m.TokensPerSec)
+	}
+	sort.Float64s(rates)
+	return rates[1], nil // 中位：3 条里偶发 1 条慢不误判
+}
+
+// patchReportNote 给已落盘的结果 JSON 追加 note（8.2 探针未恢复留痕用）。
+// 读写失败只告警不致命：日志已留痕，不为此丢已完成的数据。
+func patchReportNote(paths []string, note string) {
+	for _, p := range paths {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			log.Printf("⚠️ 读取 %s 失败，note 留痕跳过: %v", p, err)
+			continue
+		}
+		var rep report.Report
+		if err := json.Unmarshal(b, &rep); err != nil {
+			log.Printf("⚠️ 解析 %s 失败，note 留痕跳过: %v", p, err)
+			continue
+		}
+		if rep.Note != "" {
+			rep.Note += "；" + note
+		} else {
+			rep.Note = note
+		}
+		if err := rep.SaveJSON(p); err != nil {
+			log.Printf("⚠️ 回写 %s 失败，note 留痕跳过: %v", p, err)
 		}
 	}
 }

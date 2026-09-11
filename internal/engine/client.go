@@ -58,6 +58,10 @@ type Client struct {
 	DebugDir     string       // 非空时留存每个请求的原始响应到该目录（排查魔改引擎）；请求失败时即使为空也会留存
 	Retry        *RetryPolicy // nil = 不重试（压测默认）
 
+	// Stall 降速熔断（nil = 关闭）：按聚合输出速度判定服务端是否退化，
+	// 触发后由场景层取消该场景。计数在流式增量处接线，见 stall.go。
+	Stall *StallGuard
+
 	seq atomic.Int64 // 原始流量转储文件序号
 }
 
@@ -189,6 +193,17 @@ type TurnMetrics struct {
 	rawResp        []byte // 原始响应头部片段（用于失败/调试转储）
 
 	reasoningBuf string // 思考增量累积（日志预览用；json:"-" 不入库，上限 64KB）
+
+	// onToken 流式输出增量回调（降速熔断的实时速率采样用）：每收到一个 content/reasoning
+	// 增量调用一次，n 近似为 token 数。非流式没有实时信号，不调用。json:"-" 不入库。
+	onToken func(n int)
+}
+
+// emitTokens 向 onToken 回调报告一次输出增量（未接线时空转）。
+func (m *TurnMetrics) emitTokens(n int) {
+	if m.onToken != nil {
+		m.onToken(n)
+	}
 }
 
 // ReasoningText 返回思考增量的累积文本（日志预览用；流式与非流式都填）。
@@ -423,6 +438,25 @@ func (c *Client) attempt(ctx context.Context, o ChatOptions) (m *TurnMetrics, er
 	}
 
 	m = &TurnMetrics{Model: o.Model, Stream: o.Stream, Thinking: o.Thinking}
+	// 降速熔断接线：请求在飞 + "已开始输出"两个状态。defer 保证任何返回路径都归位
+	// （含早退的错误分支）；retry 时每次 attempt 各自计一次，退避等待期间不占在飞数。
+	if c.Stall != nil {
+		c.Stall.Enter()
+		defer c.Stall.Exit()
+		decoding := false // 只被本请求的流式回调读写，与 attempt 同 goroutine
+		m.onToken = func(n int) {
+			if !decoding {
+				decoding = true
+				c.Stall.DecodeStart()
+			}
+			c.Stall.Tokens(n)
+		}
+		defer func() {
+			if decoding {
+				c.Stall.DecodeStop()
+			}
+		}()
+	}
 	m.appendRaw(string(payload) + "\n--- RESPONSE ---\n")
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.ChatURL(), bytes.NewReader(payload))
 	if err != nil {

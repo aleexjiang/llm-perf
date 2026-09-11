@@ -29,6 +29,11 @@ type MultiturnRun struct {
 	Session   int                   `json:"session"`
 	MaxTokens int                   `json:"max_tokens"` // 输出长度（max_tokens 扫描维度；thinking=on 时已含 floor 抬高）
 	Turns     []*engine.TurnMetrics `json:"turns"`
+
+	// 5.7 闭环错峰发车：批次号（1 起）与相对本档位开始的启动偏移（秒）。
+	// 报告侧据此标爬坡窗口；0/空 = 该档位未启用爬坡（barrier 齐射）。
+	Batch        int     `json:"batch,omitempty"`
+	StartOffsetS float64 `json:"start_offset_s,omitempty"`
 }
 
 // ConcurrentLevel：一个模型在一个并发档位 × 思考模式下的结果。
@@ -54,6 +59,10 @@ type ConcurrentLevel struct {
 
 	// 混合负载形状分解（concurrent.mix，5.6）：按形状聚合的中位数统计；Requests 全量不动
 	Shapes []ShapeStat `json:"shapes,omitempty"`
+
+	// Aborted 非空 = 本档位被提前终止（5.7 爬坡发车的 fail-fast / 全局止损），
+	// 值为终止原因；场景层据此停止后续档位。已完成数据照常保留。
+	Aborted string `json:"aborted,omitempty"`
 }
 
 // ShapeStat 混跑单形状统计（中位数口径与并发表一致）。
@@ -185,6 +194,10 @@ type Report struct {
 	// 环境存档：几周后回看数据时"当时是什么引擎/什么配置跑的"必须有据可查。
 	Environment *engine.ProbeResult `json:"environment,omitempty"`
 	ConfigRaw   string              `json:"config_raw,omitempty"`
+
+	// StallTrace 降速采样序列侧文件（<结果 JSON 同名>.stall.csv，相对本 JSON 所在目录）。
+	// 仅 stall_guard 启用且未 --no-stall-trace 时存在；字段缺失 = 未启用或已关闭。
+	StallTrace string `json:"stall_trace,omitempty"`
 
 	// PartitionModel 按模型分区时该分区归属的模型名（不落盘）：main 据此拼 <output_dir>/<模型>/ 子目录
 	PartitionModel string `json:"-"`

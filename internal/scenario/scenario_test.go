@@ -595,3 +595,37 @@ func TestFinishWindowNoWindowDeltaOnFailedSnapshot(t *testing.T) {
 		t.Error("窗口内已轮询到的 gauges 与结束快照无关，应照常挂回")
 	}
 }
+
+// 5.7 爬坡发车的批次计划：首批 1，指数放大，尾批收剩余
+func TestRampBatches(t *testing.T) {
+	cases := []struct {
+		level, factor int
+		want          []int
+	}{
+		{1, 2, []int{1}},
+		{4, 2, []int{1, 2, 1}},
+		{8, 2, []int{1, 2, 4, 1}},
+		{7, 2, []int{1, 2, 4}},
+		{6, 3, []int{1, 3, 2}},
+		{5, 2, []int{1, 2, 2}},
+	}
+	for _, c := range cases {
+		got := rampBatches(c.level, c.factor)
+		if len(got) != len(c.want) {
+			t.Fatalf("rampBatches(%d,%d) = %v, want %v", c.level, c.factor, got, c.want)
+		}
+		sum := 0
+		for i, v := range got {
+			if v != c.want[i] {
+				t.Fatalf("rampBatches(%d,%d) = %v, want %v", c.level, c.factor, got, c.want)
+			}
+			if v <= 0 {
+				t.Fatalf("rampBatches(%d,%d) 含非正批次: %v", c.level, c.factor, got)
+			}
+			sum += v
+		}
+		if sum != c.level {
+			t.Fatalf("rampBatches(%d,%d) 批次之和 %d != level", c.level, c.factor, sum)
+		}
+	}
+}

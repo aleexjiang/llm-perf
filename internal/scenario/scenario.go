@@ -483,7 +483,7 @@ func Single(ctx context.Context, cfg *config.Config, client *engine.Client, mode
 					}
 					rep.Single = append(rep.Single, row)
 					if interrupted(ctx) {
-						log.Printf("🛑 收到中断信号——停止新请求，已完成数据全部保留")
+						log.Printf("🛑 已中止（中断或降速熔断）——停止新请求，已完成数据全部保留")
 						return rep, nil
 					}
 					if ctxAborted {
@@ -657,7 +657,7 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 							if dropped > 0 {
 								extra = fmt.Sprintf("，另 %d 轮被中断作废（error 非空，未计入）", dropped)
 							}
-							log.Printf("    🛑 收到中断信号——提前结束会话（有效 %d/%d 轮保留%s）",
+							log.Printf("    🛑 已中止（中断或降速熔断）——提前结束会话（有效 %d/%d 轮保留%s）",
 								done, mt.Turns, extra)
 							break
 						}
@@ -670,7 +670,7 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 					}
 					rep.Multiturn = append(rep.Multiturn, run)
 					if interrupted(ctx) {
-						log.Printf("🛑 收到中断信号——停止新请求，已完成会话全部保留")
+						log.Printf("🛑 已中止（中断或降速熔断）——停止新请求，已完成会话全部保留")
 						return rep, nil
 					}
 					if ctxAborted {
@@ -697,11 +697,16 @@ func openRates(cc config.Concurrent) []float64 {
 	return nil
 }
 
+// sessionTurnHook 每轮完成后的回调（5.7 止损用）：turn 为 0 基轮次、m 为该轮指标；
+// 返回 false = 提前终止该会话（已完成轮保留）。nil = 无钩子。
+type sessionTurnHook func(turn int, m *engine.TurnMetrics) bool
+
 // collectSessionTurns 执行一次完整多轮会话并采集逐 turn 指标（并发多轮用：每个虚拟用户一次）。
 // filler 模式为合成模拟对话（逐轮滚动 history）；trace 数据源才是真实会话重放。
 // maxTok 由调用方传入（输出长度扫描维度，已含思考 floor 抬高）。
 func collectSessionTurns(ctx context.Context, e *env, cfg *config.Config,
-	model string, v config.ThinkingVariant, sessionIdx int, turnLimit int, maxTok int) []*engine.TurnMetrics {
+	model string, v config.ThinkingVariant, sessionIdx int, turnLimit int, maxTok int,
+	hook sessionTurnHook) []*engine.TurnMetrics {
 
 	mt := cfg.Multiturn
 	baseSeed := sessionSeed(sessionIdx, cfg.SeedSalt)
@@ -762,6 +767,9 @@ func collectSessionTurns(ctx context.Context, e *env, cfg *config.Config,
 			estPrompt = m.PromptTokens // usage 恢复：估算基线对齐实测
 		}
 		out = append(out, m)
+		if hook != nil && !hook(turn, m) {
+			break
+		}
 		if mt.KeepAssistant && m.ReplyText != "" && !e.fullReplay() {
 			msgs = append(msgs, engine.Message{Role: "assistant", Content: engine.TruncateRunes(m.ReplyText, mt.MaxReplyChars)})
 		}
@@ -789,6 +797,8 @@ func Concurrent(ctx context.Context, cfg *config.Config, client *engine.Client, 
 	loadModel := "闭环并发"
 	if rates != nil {
 		loadModel = fmt.Sprintf("开环到达率 %v req/s", rates)
+	} else if cc.RampEnabled() {
+		loadModel += fmt.Sprintf(" 爬坡发车×%d", cc.EffRampFactor()) // 5.7 错峰启动
 	}
 	if len(cc.Mix) > 0 {
 		labels := make([]string, len(cc.Mix))
@@ -831,7 +841,7 @@ func Concurrent(ctx context.Context, cfg *config.Config, client *engine.Client, 
 						logConcurrent(&lv)
 						rep.Concurrent = append(rep.Concurrent, lv)
 						if interrupted(ctx) {
-							log.Printf("🛑 收到中断信号——停止新请求，已完成档位全部保留")
+							log.Printf("🛑 已中止（中断或降速熔断）——停止新请求，已完成档位全部保留")
 							return rep, nil
 						}
 					}
@@ -841,8 +851,13 @@ func Concurrent(ctx context.Context, cfg *config.Config, client *engine.Client, 
 					lv := runClosedRound(ctx, e, mc, model, v, level, maxTok)
 					logConcurrent(&lv)
 					rep.Concurrent = append(rep.Concurrent, lv)
+					if lv.Aborted != "" {
+						// 5.7 fail-fast / 止损：首轮挂大概率模型服务有问题，后续档位不必再跑
+						log.Printf("🛑 %s——停止后续档位与场景，已完成数据全部保留", lv.Aborted)
+						return rep, nil
+					}
 					if interrupted(ctx) {
-						log.Printf("🛑 收到中断信号——停止新请求，已完成档位全部保留")
+						log.Printf("🛑 已中止（中断或降速熔断）——停止新请求，已完成档位全部保留")
 						return rep, nil
 					}
 				}
@@ -968,8 +983,35 @@ func aggregateShapes(mp *mixPlan, reqs []*engine.TurnMetrics, idxs []int) []repo
 	return out
 }
 
-// runClosedRound 闭环并发档位：level 个 worker 同时发车，各自跑 runs_per_worker 次请求（或一次完整会话）。
+// rampBatches 5.7 爬坡发车的批次计划：首批 1，之后每批 min(上批×factor, 剩余)。
+// 例：level=4,factor=2 → [1 2 1]；level=8,factor=2 → [1 2 4 1]；level=1 → [1]。
+func rampBatches(level, factor int) []int {
+	if factor < 2 {
+		factor = 2
+	}
+	var sizes []int
+	remaining, batch := level, 1
+	for remaining > 0 {
+		b := batch
+		if b > remaining {
+			b = remaining
+		}
+		sizes = append(sizes, b)
+		remaining -= b
+		batch *= factor
+	}
+	return sizes
+}
+
+// runClosedRound 闭环并发档位：level 个 worker 各自跑 runs_per_worker 次请求（或一次完整会话）。
 // maxTok 输出长度由调用方传入（输出长度扫描维度，已含思考 floor 抬高）。
+//
+// 5.7 错峰发车（concurrent.ramp，默认开，ramp=false 退回 barrier 齐射旧行为）：worker 按
+// 指数批次发放（1→2→4→…），每批等「该批全部完成首轮」再放下一批——批次节奏由服务端首轮
+// 实际耗时决定（自适应，无需按端点调参），替代齐射对服务端的瞬间满额冲击。
+// 爬坡启用时叠加失败语义（ramp=false 时保持旧行为：失败只逐条记录，不取消兄弟会话）：
+//   - fail-fast：任一 worker 首轮失败 → 取消本轮，场景层终止后续档位（首轮挂大概率服务有问题）；
+//   - 双止损：会话内连续失败 3 轮提前弃会话；全局连续失败 ≥ 2×level 终止本轮。
 func runClosedRound(ctx context.Context, e *env, cfg *config.Config,
 	model string, v config.ThinkingVariant, level int, maxTok int) report.ConcurrentLevel {
 
@@ -988,42 +1030,160 @@ func runClosedRound(ctx context.Context, e *env, cfg *config.Config,
 	var wg sync.WaitGroup
 	startBarrier := make(chan struct{})
 	var reqSeq atomic.Int64
-	for w := 0; w < level; w++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-			<-startBarrier // 所有 worker 就绪后同时发车
-			if cc.Multiturn {
-				s := report.MultiturnRun{Model: model, Thinking: v.Name, Session: workerID + 1, MaxTokens: maxTok}
-				s.Turns = collectSessionTurns(ctx, e, cfg, model, v, workerID, 0, maxTok)
-				mu.Lock()
-				lv.Sessions = append(lv.Sessions, s)
-				mu.Unlock()
-				return
-			}
-			for r := 0; r < cc.RunsPerWorker; r++ {
-				promptTokens := cfg.ClampOne(cc.PromptTokens)
-				reqMaxTok := maxTok
-				si := -1
-				if mp != nil {
-					seqNo := int(reqSeq.Add(1)) - 1
-					sh, mt := mp.at(seqNo)
-					promptTokens = cfg.ClampOne(sh.PromptTokens)
-					reqMaxTok = mt
-					si = mp.seq[seqNo%len(mp.seq)]
-				}
-				seed := workerSeed(workerID, r, cfg.SeedSalt) // 每用户不同 prompt
-				msgs := []engine.Message{engine.UserMsg(promptTokens, seed, cfg.FillerLang)}
-				m := runOne(ctx, e, model, msgs, reqMaxTok, v)
-				mu.Lock()
-				lv.Requests = append(lv.Requests, m)
-				shapeIdxs = append(shapeIdxs, si)
-				mu.Unlock()
-			}
-		}(w)
+
+	ramp := cc.RampEnabled() && level > 1
+	roundCtx, roundCancel := context.WithCancel(ctx)
+	defer roundCancel()
+
+	// 失败语义（仅爬坡路径）：全局连续失败计数，达 2×level 止损终止本轮
+	var firstTurnFail, stopLoss atomic.Bool
+	globalConsec := 0
+	markFail := func() {
+		mu.Lock()
+		globalConsec++
+		gc := globalConsec
+		mu.Unlock()
+		if gc >= 2*level && stopLoss.CompareAndSwap(false, true) {
+			log.Printf("🛑 全局连续失败 %d 轮（≥ 2×level=%d）——止损终止本档位", gc, 2*level)
+			roundCancel()
+		}
 	}
-	close(startBarrier)
+	markOK := func() {
+		mu.Lock()
+		globalConsec = 0
+		mu.Unlock()
+	}
+
+	worker := func(workerID, batchNo int, firstDone chan struct{}) {
+		defer wg.Done()
+		var once sync.Once
+		// 首轮完成信号：爬坡批次门放行用。首轮完成处显式发、defer 兜底（会话 0 轮结束
+		// 等边角不挂死批次门）；非爬坡路径 firstDone 为 nil，markFirst 是空操作。
+		markFirst := func() {
+			once.Do(func() {
+				if firstDone != nil {
+					firstDone <- struct{}{}
+				}
+			})
+		}
+		defer markFirst()
+		if !ramp {
+			<-startBarrier // 所有 worker 就绪后同时发车（旧行为）
+		}
+		if cc.Multiturn {
+			s := report.MultiturnRun{Model: model, Thinking: v.Name, Session: workerID + 1, MaxTokens: maxTok}
+			if ramp {
+				s.Batch = batchNo
+				s.StartOffsetS = time.Since(start).Seconds()
+			}
+			var hook sessionTurnHook
+			if ramp {
+				consec := 0
+				hook = func(turn int, m *engine.TurnMetrics) bool {
+					if turn == 0 {
+						markFirst()
+						if m.Error != "" {
+							// 首轮挂大概率模型服务有问题：fail-fast，取消本轮全部会话
+							firstTurnFail.Store(true)
+							roundCancel()
+						}
+					}
+					if m.Error != "" {
+						consec++
+						markFail()
+						if consec >= 3 {
+							log.Printf("    会话 %d 连续 %d 轮失败，提前终止该会话（止损）", s.Session, consec)
+							return false
+						}
+					} else {
+						consec = 0
+						markOK()
+					}
+					return true
+				}
+			}
+			s.Turns = collectSessionTurns(roundCtx, e, cfg, model, v, workerID, 0, maxTok, hook)
+			mu.Lock()
+			lv.Sessions = append(lv.Sessions, s)
+			mu.Unlock()
+			return
+		}
+		for r := 0; r < cc.RunsPerWorker; r++ {
+			if ramp && roundCtx.Err() != nil {
+				return // fail-fast / 止损后不再发新请求
+			}
+			promptTokens := cfg.ClampOne(cc.PromptTokens)
+			reqMaxTok := maxTok
+			si := -1
+			if mp != nil {
+				seqNo := int(reqSeq.Add(1)) - 1
+				sh, mt := mp.at(seqNo)
+				promptTokens = cfg.ClampOne(sh.PromptTokens)
+				reqMaxTok = mt
+				si = mp.seq[seqNo%len(mp.seq)]
+			}
+			seed := workerSeed(workerID, r, cfg.SeedSalt) // 每用户不同 prompt
+			msgs := []engine.Message{engine.UserMsg(promptTokens, seed, cfg.FillerLang)}
+			m := runOne(roundCtx, e, model, msgs, reqMaxTok, v)
+			if r == 0 {
+				markFirst()
+				if ramp && m.Error != "" {
+					firstTurnFail.Store(true)
+					roundCancel()
+				}
+			}
+			if ramp {
+				if m.Error != "" {
+					markFail()
+				} else {
+					markOK()
+				}
+			}
+			mu.Lock()
+			lv.Requests = append(lv.Requests, m)
+			shapeIdxs = append(shapeIdxs, si)
+			mu.Unlock()
+		}
+	}
+
+	if ramp {
+		launched := 0
+		for bi, size := range rampBatches(level, cc.EffRampFactor()) {
+			if roundCtx.Err() != nil || firstTurnFail.Load() {
+				break
+			}
+			firstDone := make(chan struct{}, size)
+			for w := launched; w < launched+size; w++ {
+				wg.Add(1)
+				go worker(w, bi+1, firstDone)
+			}
+			launched += size
+			log.Printf("    爬坡发车批次 %d：发放 %d 路（累计 %d/%d，偏移 %.1fs）",
+				bi+1, size, launched, level, time.Since(start).Seconds())
+			// 等本批全部完成首轮（或本轮被取消/首轮失败），再决定放不放下一批
+		gate:
+			for i := 0; i < size; i++ {
+				select {
+				case <-firstDone:
+				case <-roundCtx.Done():
+					break gate
+				}
+			}
+		}
+	} else {
+		for w := 0; w < level; w++ {
+			wg.Add(1)
+			go worker(w, 0, nil)
+		}
+		close(startBarrier)
+	}
 	wg.Wait()
+	if firstTurnFail.Load() {
+		lv.Aborted = "首轮失败，fail-fast 终止（爬坡发车）"
+		log.Printf("⛔ %s", lv.Aborted)
+	} else if stopLoss.Load() {
+		lv.Aborted = "全局连续失败达 2×level，止损终止（爬坡发车）"
+	}
 	lv.Shapes = aggregateShapes(mp, lv.Requests, shapeIdxs)
 	finalizeLevel(e, lv, time.Since(start).Seconds())
 	return *lv
@@ -1072,7 +1232,7 @@ func runOpenRound(ctx context.Context, e *env, cfg *config.Config,
 			}
 			if cc.Multiturn {
 				s := report.MultiturnRun{Model: model, Thinking: v.Name, Session: i + 1, MaxTokens: maxTok}
-				s.Turns = collectSessionTurns(ctx, e, cfg, model, v, i, 0, maxTok)
+				s.Turns = collectSessionTurns(ctx, e, cfg, model, v, i, 0, maxTok, nil)
 				mu.Lock()
 				lv.Sessions = append(lv.Sessions, s)
 				mu.Unlock()

@@ -24,6 +24,19 @@ server_metrics: true              # 服务端观测层：抓推理服务原生 /
                                   # 排队深度、prefill/decode 分解、MTP 接受率；不可达时自动降级纯客户端计时
 warmup_requests: 0                # 每场景开始前的预热请求数（不计入统计，唯一内容不污染缓存对照）
 
+# 降速熔断 stall_guard（可选，默认关闭；写了即生效）：聚合输出速度持续低于 min_tps 达
+# window_seconds 只中止当前场景，已完成数据照常落盘。min_tps 必须按实例稳态 decode
+# 速率标定（实测 16.6 tok/s 的实例用默认 20 会在正常运行时误触发）。
+# stall_guard:
+#   enabled: true
+#   min_tps: 20                    # 阈值（tok/s，聚合输出速度），默认 20
+#   window_seconds: 600            # 持续低于阈值多久触发，默认 600（10 分钟）
+#   cooldown_seconds: 300          # 熔断后到下一场景的冷却，默认 300；只给恢复留时间窗
+#   sample_seconds: 2              # 采样周期（秒），默认 2；支持亚秒（回归用 0.5）
+#   probe_factor: 2                # 8.2 恢复探针倍数，默认 2：冷却结束发 4k/256×3 短探针取中位，
+#                                  #   实测 ≥ probe_factor×min_tps 才继续下一场景，否则停止整轮；
+#                                  #   显式 0 = 关闭探针退回纯计时冷却
+
 # 数据源：filler（默认）= token 精确填充，用于缓存对照/上下文深度等变量控制实验；
 #         trace = 真实会话回放（ShareGPT/自定义），贴近实际流量分布，token 以服务端 usage 为准
 dataset:
@@ -61,6 +74,20 @@ dataset:
 # retry:
 #   max_attempts: 2     # 总尝试次数
 #   backoff_ms: 300     # 退避基数（指数退避，封顶 5s）
+
+# 降速熔断（默认关闭）：长测下服务端退化会白白烧掉几小时——聚合输出速度持续低于阈值
+# 就中止**当前场景**（不是整轮），冷却后续跑下一个场景。已完成数据照常落盘，报告的
+# note 与 run.log 里标注熔断原因与现场速度。
+# 口径：窗口内**所有在飞请求输出 token 之和 / 窗口时长**（非单请求速度——并发下单请求慢
+# 可能只是排队）；每个场景独立计时，空闲与纯 prefill（首个 token 之前）不参与判定，
+# 避免长上下文档位误触发。速度回升即重置计时（"持续不升"才算降速）。
+# CLI 覆盖：--stall-tps / --stall-window / --stall-cooldown；--no-stall-guard 直接关闭。
+# stall_guard:
+#   enabled: true               # 默认 true（写了该段即生效）
+#   min_tps: 20                 # 阈值（tok/s）
+#   window_seconds: 600         # 连续低于阈值多久触发（10 分钟）
+#   cooldown_seconds: 300       # 触发后到下一个场景的冷却（5 分钟；0 = 立即继续）
+#   sample_seconds: 2           # 采样周期；须小于 window_seconds
 
 models:
   - "/models/DeepSeek-V4-Flash-0731"
@@ -123,6 +150,11 @@ concurrent:
   runs_per_worker: 2              # 单轮模式下每个虚拟用户连续发几次
   prompt_tokens: 10000
   max_tokens: 256                 # 标量或列表，同 single（列表会与 levels 相乘，注意总请求量）
+  # 5.7 闭环错峰发车（默认开）：首批发 1 路，等该批全部完成首轮后放下一批
+  # min(上批×ramp_factor, 剩余)，批次节奏自适应服务端首轮耗时；任一批次首轮失败即
+  # 终止测试（fail-fast），会话内连败 3 轮弃会话、全局连败 ≥2×level 终止（止损）。
+  # ramp: false                    # 显式 false 退回 barrier 齐射（所有 worker 同时发车）
+  # ramp_factor: 2                 # 批次放大系数，默认 2（可设 3；1 = 逐个串行发车）
   # 开环到达率模式（对齐 vLLM bench serve / inference-perf）：请求按 Poisson 过程到达，
   # 能测出排队-延迟曲线与饱和点；与 levels 互斥，两者都配时 rate_sweep 优先
   # request_rate: 4                # 到达率 req/s

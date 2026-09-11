@@ -14,6 +14,8 @@
 #   开环到达率（request_rate/num_prompts/max_concurrency）configs/smoke-openloop.yaml
 #   思考档位 levels 机制 + 档位名过滤       configs/smoke-levels.yaml
 #   -m 模型过滤 / --max-ctx 截断
+#   SIGHUP 优雅中断 / 降速熔断（两场景相继熔断续跑）+ stall_trace 落盘
+#   8.2 熔断恢复探针（未恢复停整轮 / 恢复后续跑）+ 5.7 闭环爬坡发车批次落盘
 #   参数错误路径（非法变体名 / levels 下用 on / 多场景 -o 单文件）
 #   报告管线（gen_html_report.py + validate_report.js）
 #
@@ -24,10 +26,19 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PORT=18099
+PORT_STALL=18100
+PORT_STALL_B=18101
+PORT_STALL_C=18102
 TMP="$(mktemp -d /tmp/llm-perf-smoke.XXXXXX)"
 MOCK_PID=""
+MOCK_STALL_PID=""
+MOCK_STALL_B_PID=""
+MOCK_STALL_C_PID=""
 cleanup() {
   [ -n "$MOCK_PID" ] && kill "$MOCK_PID" 2>/dev/null || true
+  [ -n "$MOCK_STALL_PID" ] && kill "$MOCK_STALL_PID" 2>/dev/null || true
+  [ -n "$MOCK_STALL_B_PID" ] && kill "$MOCK_STALL_B_PID" 2>/dev/null || true
+  [ -n "$MOCK_STALL_C_PID" ] && kill "$MOCK_STALL_C_PID" 2>/dev/null || true
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -38,7 +49,7 @@ trap cleanup EXIT
 # 漏 output-smoke*/run.log。
 # dataset.path 同理：它相对配置文件所在目录解析，配置搬到 TMP 后会指向
 # $TMP/fixtures/ 落空，需一并改写为仓库内的绝对路径。
-for f in smoke smoke-all smoke-overrides smoke-openloop smoke-levels; do
+for f in smoke smoke-all smoke-overrides smoke-openloop smoke-levels smoke-stall; do
   sed -e "s#^output_dir:.*#output_dir: $TMP/runlog#" \
       -e "s#\([[:space:]]*path:[[:space:]]*[\"']\{0,1\}\)fixtures/#\1$PWD/configs/fixtures/#" \
       "configs/$f.yaml" >"$TMP/$f.yaml"
@@ -140,6 +151,64 @@ if [ -z "$(find "$TMP/out-hup" -name '*.json' 2>/dev/null)" ]; then
 fi
 echo "  ✅ SIGHUP 优雅退出（rc=0）且已完成数据落盘"
 
+# 12) 降速熔断（stall_guard）+ 采样序列落盘（stall_trace）：
+#     单独起一个 stall-e2e 假慢速服务端（主 mock 不调速，互不影响）。它按 max_tokens
+#     全量吐 token、5 tok/s → 每个流式场景都在窗口后熔断：应「中止当前场景 → 冷却 →
+#     续跑下一场景」，各场景 JSON 带 note、旁落 .stall.csv（正常段也记录 + # tripped 原因行）
+echo "==> 启动慢速 mock (127.0.0.1:$PORT_STALL, 5 tok/s)"
+python3 scripts/stall-e2e/mockserver.py "$PORT_STALL" 5 &
+MOCK_STALL_PID=$!
+ready=0
+for _ in $(seq 1 25); do
+  if curl -sf "http://127.0.0.1:$PORT_STALL/v1/models" >/dev/null 2>&1; then ready=1; break; fi
+  sleep 0.2
+done
+[ "$ready" = 1 ] || { echo "❌ 慢速 mock 未就绪"; exit 1; }
+run "降速熔断（两场景相继熔断续跑）" out-stall -c "$TMP/smoke-stall.yaml" --turns both
+# --no-stall-trace：JSON 不带 stall_trace、不落 .stall.csv（熔断行为本身不变）
+run "no-stall-trace 关闭落盘" out-stall-notrace -c "$TMP/smoke-stall.yaml" --turns single --no-stall-trace
+
+# 12b) 8.2 探针：冷却后探针实测未恢复 → 停止整轮（只剩首个场景的输出）
+#      40 tok/s < min_tps=45（触发熔断）且 < 2×45=90（探针必不达标）。
+#      max_tokens 抬到 160：请求时长 4s > 2s 窗口才熔断得起来（32tk @40tok/s=0.8s 跑不完窗口）；
+#      探针 3×256tk @40tok/s ≈ 19s，是"未恢复路径"的固定实测成本
+sed 's/^  max_tokens: 32/  max_tokens: 160/' "$TMP/smoke-stall.yaml" \
+  | sed "s#127.0.0.1:$PORT_STALL#127.0.0.1:$PORT_STALL_B#" >"$TMP/smoke-stall-b.yaml"
+echo "==> 启动慢速 mock (127.0.0.1:$PORT_STALL_B, 40 tok/s)"
+python3 scripts/stall-e2e/mockserver.py "$PORT_STALL_B" 40 &
+MOCK_STALL_B_PID=$!
+ready=0
+for _ in $(seq 1 25); do
+  if curl -sf "http://127.0.0.1:$PORT_STALL_B/v1/models" >/dev/null 2>&1; then ready=1; break; fi
+  sleep 0.2
+done
+[ "$ready" = 1 ] || { echo "❌ 慢速 mock(B) 未就绪"; exit 1; }
+run "熔断探针未恢复停整轮" out-stall-probe -c "$TMP/smoke-stall-b.yaml" --turns both \
+  --stall-tps 45 --stall-cooldown 1 --stall-probe-factor 2
+kill "$MOCK_STALL_B_PID" 2>/dev/null || true
+MOCK_STALL_B_PID=""
+
+# 12c) 8.2 探针：服务端中途恢复 → 探针通过 → 继续下一个场景。
+#      mock 恢复时钟锚定「首个慢速请求到达」+4s（对 bench 启动方差免疫）：
+#      熔断窗口 1s → 首请求后 ~1.2-2.5s 熔断；恢复在 +4s；冷却 3s → 探针最早 +4.5s。
+#      熔断 << 恢复 < 探针，两边都有裕量；探针撞上边界由 3 条取中位兜底。
+#      独立端口（18102）：避免同端口 kill/重绑竞态让 readiness 探到垂死的旧实例
+echo "==> 启动可恢复 mock (127.0.0.1:$PORT_STALL_C, 5 tok/s → 首个慢速请求 4s 后恢复)"
+python3 scripts/stall-e2e/mockserver.py "$PORT_STALL_C" 5 4 &
+MOCK_STALL_C_PID=$!
+ready=0
+for _ in $(seq 1 25); do
+  if curl -sf "http://127.0.0.1:$PORT_STALL_C/v1/models" >/dev/null 2>&1; then ready=1; break; fi
+  sleep 0.2
+done
+[ "$ready" = 1 ] || { echo "❌ 可恢复 mock 未就绪"; exit 1; }
+# smoke-stall-b.yaml 的端点已是 PORT_STALL_B（12b 改写过），从它换成 PORT_STALL_C
+sed "s#127.0.0.1:$PORT_STALL_B#127.0.0.1:$PORT_STALL_C#" "$TMP/smoke-stall-b.yaml" >"$TMP/smoke-stall-c.yaml"
+run "熔断探针恢复后续跑" out-stall-recover -c "$TMP/smoke-stall-c.yaml" --turns both \
+  --stall-tps 50 --stall-window 1 --stall-cooldown 3 --stall-probe-factor 2
+kill "$MOCK_STALL_C_PID" 2>/dev/null || true
+MOCK_STALL_C_PID=""
+
 # ── 断言：校验输出 JSON 的模型×变体分布与指标完整性，不再靠目测 ──
 echo "==> 断言输出数据形状"
 python3 - "$TMP" <<'PYEOF'
@@ -197,6 +266,24 @@ check(basic_m and all(x.get("ttft_ms", 0) > 0 and x.get("e2e_ms", 0) > 0
                       and x.get("prompt_tokens", 0) > 0 and x.get("completion_tokens", 0) > 0
                       and not x.get("error") for x in basic_m),
       f"基础冒烟指标完整（{len(basic_m)} 条: ttft/e2e/tokens>0 且无 error）")
+
+# 1b) 5.7 爬坡发车（闭环默认启用）：批次号与启动偏移落盘，首批 1 路、批次递增。
+#     注意挂 out-all：基础冒烟默认 concurrency=[1]，1 不组成并发场景，闭环档只在
+#     --concurrency 1,cfg 的 smoke-all 里跑（levels=[2] → 批次 [1,1]）；
+#     且只看多轮闭环档（单轮闭环没有 sessions 字段）
+basic_conc = [lv for rep in load_all("out-all") for lv in rep.get("concurrent", [])
+              if not lv.get("request_rate") and lv.get("sessions")]
+check(len(basic_conc) > 0, "smoke-all 含闭环多轮并发档位")
+sess_all = [s for lv in basic_conc for s in lv.get("sessions", [])]
+check(sess_all and all(s.get("batch", 0) >= 1 for s in sess_all),
+      f"爬坡发车批次号落盘（{len(sess_all)} 个会话）")
+check(all(sum(1 for s in lv.get("sessions", []) if s.get("batch") == 1) == 1 for lv in basic_conc),
+      "每个并发档位首批只发 1 个会话")
+check(all({s.get("batch") for s in lv.get("sessions", [])} == {1, 2} for lv in basic_conc),
+      "level=2 的批次号为 {{1,2}}（首批 1 + 第二批 1）")
+check(all([s.get("start_offset_s", -1) for s in lv.get("sessions", [])] ==
+          sorted(s.get("start_offset_s", -1) for s in lv.get("sessions", [])) for lv in basic_conc),
+      "启动偏移随批次单调不减")
 
 # 2) -thinking off：所有行必须是 off；两模型都有 off 数据（回归点：旧 bug 下 b 混入 on）
 off, _ = rows("out-off")
@@ -282,6 +369,59 @@ check(len(ll) > 0 and thinks(ll) == {"low"}, "levels 档位名过滤：--thinkin
 # 10) -m 过滤：只剩 mock-model-b
 mf, _ = rows("out-mfilter")
 check(len(mf) > 0 and models(mf) == {"mock-model-b"}, "-m 过滤后只剩目标模型")
+
+# 11) 降速熔断：两场景相继熔断续跑，note 与 stall_trace 双留痕
+import glob
+stall_reps = load_all("out-stall")
+check(len(stall_reps) == 2,
+      f"熔断场景两场景都落盘（实际 {len(stall_reps)} 份 JSON）")
+check(all("降速熔断" in (r.get("note") or "") for r in stall_reps),
+      "每个熔断场景 JSON 的 note 都含熔断原因")
+for rep in stall_reps:
+    st = rep.get("stall_trace")
+    ok_st = bool(st) and os.path.exists(os.path.join(tmp, "out-stall", st))
+    check(ok_st, f"{rep.get('scenario')}: stall_trace={st!r} 存在")
+csvs = sorted(glob.glob(os.path.join(tmp, "out-stall", "*.stall.csv")))
+check(len(csvs) == 2, f"两场景各落一个 .stall.csv（实际 {len(csvs)} 个）")
+for csvp in csvs:
+    base = os.path.basename(csvp)
+    lines = open(csvp, encoding="utf-8").read().splitlines()
+    check(lines[0] == "t_s,agg_tps,in_flight,emitting,phase", f"{base}: 表头正确")
+    data = [l for l in lines[1:] if l and not l.startswith("#")]
+    check(len(data) >= 2, f"{base}: 采样行 {len(data)} 行")
+    ts = [float(l.split(",")[0]) for l in data]
+    check(all(b > a for a, b in zip(ts, ts[1:])), f"{base}: t_s 单调递增")
+    check(any(l.startswith("# tripped:") for l in lines), f"{base}: 熔断原因已留痕")
+    phases = {l.split(",")[4] for l in data}
+    check("emit" in phases, f"{base}: 有 emit 相位记录（正常段也落盘）")
+    check(all(("-1" not in l.split(',')[2]) and l.split(',')[3] != "-1" for l in data),
+          f"{base}: in_flight/emitting 无负值")
+# --no-stall-trace：字段与文件都不落
+nt = load_all("out-stall-notrace")
+check(len(nt) == 1 and not nt[0].get("stall_trace"),
+      "--no-stall-trace 下 JSON 无 stall_trace 字段")
+check(not glob.glob(os.path.join(tmp, "out-stall-notrace", "*.stall.csv")),
+      "--no-stall-trace 不落 .stall.csv")
+
+# 11b) 8.2 探针未恢复：冷却后探针实测 < 阈值 → 停止整轮，只剩首个场景输出且 note 留痕
+pb = load_all("out-stall-probe")
+check(len(pb) == 1 and pb[0].get("scenario") == "single",
+      f"探针未恢复：整轮在首个场景后停止（实际 {len(pb)} 份: {[r.get('scenario') for r in pb]}）")
+check(any("探针" in (r.get("note") or "") and "停止后续场景" in (r.get("note") or "") for r in pb),
+      f"探针未恢复留痕进 note（实际: {[r.get('note') for r in pb]}）")
+with open(os.path.join(tmp, "out-stall-probe.log"), encoding="utf-8") as fp:
+    plog = fp.read()
+check("服务端未恢复" in plog, "探针未恢复日志留痕")
+
+# 11c) 8.2 探针恢复：服务端 3s 后转快 → 探针通过 → 第二个场景正常跑完
+rc_reps = load_all("out-stall-recover")
+check(len(rc_reps) == 2, f"探针恢复后两场景都跑完（实际 {len(rc_reps)} 份）")
+mt_reps = [r for r in rc_reps if r.get("scenario") == "multiturn"]
+check(mt_reps and "降速熔断" not in (mt_reps[0].get("note") or ""),
+      "恢复后第二个场景正常完成（note 无熔断标记）")
+with open(os.path.join(tmp, "out-stall-recover.log"), encoding="utf-8") as fp:
+    rlog = fp.read()
+check("服务端已恢复" in rlog, "探针通过日志留痕")
 
 if failures:
     print(f"\n❌ 冒烟断言失败 {len(failures)} 项")

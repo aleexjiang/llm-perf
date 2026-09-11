@@ -192,6 +192,7 @@ func (m *TurnMetrics) ingestEvent(ev *SSEEvent, now time.Time) {
 	}
 	if rt := d.reasoningText(); rt != "" {
 		m.ReasoningChunks++
+		m.emitTokens(1)                                // 降速熔断采样：思考增量也是服务端产出，计入聚合输出速度
 		m.ReasoningChars += utf8.RuneCountInString(rt) // 字符数（非字节），与日志" N字"及报告"思考字符"口径一致
 		if len(m.reasoningBuf) < 64*1024 {
 			m.reasoningBuf += rt
@@ -206,6 +207,7 @@ func (m *TurnMetrics) ingestEvent(ev *SSEEvent, now time.Time) {
 	}
 	if d.Content != "" {
 		m.ContentChunks++
+		m.emitTokens(1) // 降速熔断采样
 		m.ContentChars += utf8.RuneCountInString(d.Content)
 		if len(m.ReplyText) < 64*1024 {
 			m.ReplyText += d.Content

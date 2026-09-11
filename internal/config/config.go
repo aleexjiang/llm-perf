@@ -97,6 +97,24 @@ type Concurrent struct {
 	RateSweep      []float64 `yaml:"rate_sweep"`      // 多档到达率扫描（饱和点寻找），每档跑一轮开环
 	NumPrompts     int       `yaml:"num_prompts"`     // 开环模式总请求数（multiturn 时为总会话数）
 	MaxConcurrency int       `yaml:"max_concurrency"` // 开环模式并发上限（0=不限）
+
+	// 5.7 闭环错峰发车（默认开，仅闭环 levels 生效）：首批发 1 个会话/worker，等该批
+	// 全部完成首轮后放下一批 min(上批×RampFactor, 剩余)——批次节奏由服务端首轮实际
+	// 耗时决定（自适应，无需按端点调参），替代 barrier 齐射对服务端的瞬间满额冲击。
+	// Ramp 显式 false 退回齐射；RampFactor 默认 2（1 = 逐个串行发车，无爬坡意义，报错）。
+	Ramp       *bool `yaml:"ramp"`
+	RampFactor int   `yaml:"ramp_factor"`
+}
+
+// RampEnabled 闭环错峰发车是否启用（nil = 默认开）。
+func (c Concurrent) RampEnabled() bool { return c.Ramp == nil || *c.Ramp }
+
+// EffRampFactor 生效的批次放大系数（<2 回落 2）。
+func (c Concurrent) EffRampFactor() int {
+	if c.RampFactor < 2 {
+		return 2
+	}
+	return c.RampFactor
 }
 
 // DatasetCfg 数据源：filler（默认，token 精确的合成/语料填充，用于变量控制实验）
@@ -125,6 +143,45 @@ type GoodputCfg struct {
 type RetryCfg struct {
 	MaxAttempts int `yaml:"max_attempts"` // 总尝试次数；0/1 = 不重试
 	BackoffMS   int `yaml:"backoff_ms"`   // 退避基数，默认 300ms，指数退避封顶 5s
+}
+
+// StallGuardCfg 降速熔断（2026-09-11 新增，默认关闭）：按「聚合输出速度」判定服务端
+// 是否已退化到不值得继续跑——长窗口下低产出会白白烧掉几小时。
+//
+// 口径：窗口内所有在飞请求的输出 token 之和 / 窗口时长（不是单请求速度）。
+// 判定：速度连续低于 min_tps 达 window_seconds 即触发；任一次采样回升到阈值以上即重置计时。
+// 空闲与纯 prefill 阶段不参与判定，避免误触发（细节见 internal/engine/stall.go）。
+//
+// 触发后只中止**当前场景**（不是整轮），冷却 cooldown_seconds 后继续下一个场景；
+// 已完成的数据照常落盘，报告 note 与 run.log 里标注熔断原因与现场速度。
+type StallGuardCfg struct {
+	Enabled         *bool   `yaml:"enabled"`          // 默认 true（写了该段即生效）；false = 保留配置但不启用
+	MinTPS          float64 `yaml:"min_tps"`          // 阈值（tok/s），默认 20
+	WindowSeconds   int     `yaml:"window_seconds"`   // 连续低于阈值多久触发，默认 600（10 分钟）
+	CooldownSeconds int     `yaml:"cooldown_seconds"` // 触发后到下一个场景的冷却，默认 300（5 分钟）；0 = 不等
+	SampleSeconds   float64 `yaml:"sample_seconds"`   // 采样周期（秒），默认 2；支持亚秒（熔断回归用 0.5）
+
+	// 8.2 冷却+探针：冷却只给恢复留时间窗，续跑与否由探针实测决定——冷却结束后发短探针
+	// （4k prompt / 256 输出 ×3 取中位），实测 tok/s ≥ ProbeFactor×min_tps 才继续下一个
+	// 场景，否则停止整轮。默认 2；显式 0 = 关闭探针、退回纯计时冷却（旧行为）。
+	// 指针类型是为了区分「未配置」（默认 2）与「显式 0」（关闭）。
+	ProbeFactor *float64 `yaml:"probe_factor"`
+}
+
+// EffProbeFactor 生效的探针倍数（nil = 默认 2；负数视作 0 = 关闭）。
+func (sg *StallGuardCfg) EffProbeFactor() float64 {
+	if sg == nil || sg.ProbeFactor == nil {
+		return 2
+	}
+	if *sg.ProbeFactor < 0 {
+		return 0
+	}
+	return *sg.ProbeFactor
+}
+
+// StallEnabled 该配置段是否生效（未配置或 enabled:false 都返回 false）。
+func (s *StallGuardCfg) StallEnabled() bool {
+	return s != nil && (s.Enabled == nil || *s.Enabled)
 }
 
 // CorrectnessCfg 正确性抽查（llmperf 式防"假成功"）：向服务发数字转写金丝雀请求，
@@ -475,6 +532,7 @@ type Config struct {
 	Dataset     DatasetCfg      `yaml:"dataset"`
 	Goodput     *GoodputCfg     `yaml:"goodput"`
 	Retry       *RetryCfg       `yaml:"retry"`
+	StallGuard  *StallGuardCfg  `yaml:"stall_guard"` // 降速熔断（默认关闭）
 	Correctness *CorrectnessCfg `yaml:"correctness"`
 
 	Thinking Thinking `yaml:"thinking"`
@@ -771,6 +829,13 @@ func Load(path string) (*Config, error) {
 	if cfg.Concurrent.RequestRate < 0 {
 		return nil, fmt.Errorf("concurrent.request_rate 不能为负")
 	}
+	if cfg.Concurrent.RampFactor < 0 {
+		return nil, fmt.Errorf("concurrent.ramp_factor 不能为负（默认 2；1 = 逐个串行发车，无爬坡意义）")
+	}
+	if cfg.Concurrent.RampFactor == 1 {
+		cfg.Warnings = append(cfg.Warnings,
+			"concurrent.ramp_factor=1 相当于逐个串行发车：爬坡期被拉到整个场景长度，通常不是想要的效果")
+	}
 
 	// ── 输入合理性校验：错误在开跑前暴露，而不是跑完才发现 ──
 
@@ -1017,6 +1082,37 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Correctness != nil && cfg.Correctness.Samples < 0 {
 		return nil, fmt.Errorf("correctness.samples 不能为负")
+	}
+	if cfg.StallGuard != nil {
+		sg := cfg.StallGuard
+		if sg.MinTPS < 0 || sg.WindowSeconds < 0 || sg.CooldownSeconds < 0 || sg.SampleSeconds < 0 {
+			return nil, fmt.Errorf("stall_guard 的 min_tps/window_seconds/cooldown_seconds/sample_seconds 不能为负")
+		}
+		if sg.ProbeFactor != nil && *sg.ProbeFactor < 0 {
+			return nil, fmt.Errorf("stall_guard.probe_factor=%.3g 不能为负（0 = 关闭探针，退回纯计时冷却）", *sg.ProbeFactor)
+		}
+		if sg.StallEnabled() {
+			if sg.MinTPS == 0 {
+				sg.MinTPS = 20 // 默认阈值 20 tok/s
+			}
+			if sg.WindowSeconds == 0 {
+				sg.WindowSeconds = 600 // 默认持续 10 分钟
+			}
+			if sg.SampleSeconds == 0 {
+				sg.SampleSeconds = 2
+			}
+			if sg.SampleSeconds > float64(sg.WindowSeconds) {
+				return nil, fmt.Errorf("stall_guard.sample_seconds=%.3g 大于 window_seconds=%d：采样间隔比判定窗口还长，永远判不出持续降速",
+					sg.SampleSeconds, sg.WindowSeconds)
+			}
+			// 冷却默认 5 分钟：由 main 在场景之间执行；0 表示触发后立即继续下一个场景。
+			if sg.CooldownSeconds == 0 {
+				sg.CooldownSeconds = 300
+			}
+			cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
+				"降速熔断已启用：聚合输出速度持续低于 %.0f tok/s 达 %ds 即中止当前场景，冷却 %ds 后继续下一个场景",
+				sg.MinTPS, sg.WindowSeconds, sg.CooldownSeconds))
+		}
 	}
 	if cfg.WarmupRequests < 0 {
 		return nil, fmt.Errorf("warmup_requests 不能为负")

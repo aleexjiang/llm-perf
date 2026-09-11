@@ -9,8 +9,13 @@
 - 请求带 tools -> 返回结构化 tool_calls（非流式 message.tool_calls /
   流式 delta.tool_calls 按 index 分片增量拼 arguments），probe tool-call 检查的"好引擎"路径
 """
-import json, time
+import json, os, time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
+# TOKEN_DELAY：每个输出 chunk 的间隔秒数，默认 0.05（≈20 tok/s）。
+# 调大可构造"服务端降速"现场，用于验证降速熔断（stall_guard）——
+# 见 scripts/stall-e2e/ 的完整回归用例。
+TOKEN_DELAY = float(os.environ.get("MOCK_TOKEN_DELAY", "0.05"))
 
 
 class H(BaseHTTPRequestHandler):
@@ -138,13 +143,13 @@ class H(BaseHTTPRequestHandler):
         time.sleep(0.2)  # 模拟 prefill
         if thinking:
             for i in range(n_reason):
-                time.sleep(0.05)
+                time.sleep(TOKEN_DELAY)
                 emit({"choices": [{"delta": {"reasoning_content": f"reason{i} "}}]})
         for i in range(n_content):
-            time.sleep(0.05)
+            time.sleep(TOKEN_DELAY)
             emit({"choices": [{"delta": {"content": f"chunk{i} "}}]})
         emit({"choices": [], "usage": usage})
         self.wfile.write(b"data: [DONE]\n\n")
 
 
-HTTPServer(("127.0.0.1", 18099), H).serve_forever()
+HTTPServer(("127.0.0.1", int(os.environ.get("MOCK_PORT", "18099"))), H).serve_forever()
