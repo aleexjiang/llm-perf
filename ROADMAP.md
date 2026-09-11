@@ -236,6 +236,31 @@ thinking mode/levels 双轨（levels 优先已显式声明并告警）；api_key
 
 ---
 
+## 6. Anthropic Messages API 兼容（P2，触发后启动）
+
+> 触发条件：首个 Anthropic-only 客户环境（agent 侧以 `/v1/messages` 消费，常见于 Claude Code /
+> Claude SDK 生态 + LiteLLM / one-api / 自研网关转换链路），或引擎横评需要覆盖该协议面。
+
+- **不是换 URL 就完事**：SSE 是事件制（`message_start` → `content_block_delta`(`thinking_delta`/`text_delta`)
+  → `message_delta` → `message_stop`），与 OpenAI 的单流 chunk 模型完全不同；TTFT 分思考/正文两口径的
+  计时锚点要按事件重锚。
+- **适配清单**：
+  - `internal/engine/sse.go` 对位物：Anthropic 事件解析器（`sse_anthropic.go`），按 `delta.type` 分流思考/正文；
+    usage 拆在 `message_start`（input_tokens）与 `message_delta`（output_tokens）两处回收。
+  - 口径校准：Anthropic 缓存是显式上报（`cache_read_input_tokens` / `cache_creation_input_tokens`），
+    与 OpenAI `cached_tokens` 语义不同——报告侧按数据源标注口径，不混算。
+  - 请求侧差异：system 顶层字段、`max_tokens` 必填（三场景构造请求时注意）、`stop_reason`
+    （`end_turn`/`max_tokens`/`tool_use`）替换 `finish_reason` 语义。
+  - probe T2–T5 tool-call 判据翻写：`tool_use` content block + `stop_reason=tool_use` 对应
+    OpenAI 的 `tool_calls` + `finish_reason=tool_calls`；T4 流式聚合按 content block 序号分桶。
+  - smetrics 不受影响（服务端 Prometheus 与 API 格式无关）。
+- **工作量定位**：中等——新增协议适配层 + probe 判据翻写，不碰测量核心算法与报告管线；
+  报告侧已实现的三档基线、p95/p99、混合负载分解全部直接复用。
+- **验收**：fixture 回放单测（参照 toolprobe 的六特征模式）+ 网关转换环境真机（可用 LiteLLM
+  现场把现有 OpenAI 端点转 Anthropic 格式自造环境，零客户依赖）。
+
+---
+
 ## 实施顺序
 
 ```
