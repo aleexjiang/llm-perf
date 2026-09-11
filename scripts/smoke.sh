@@ -32,6 +32,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# 冒烟配置改写后落 TMP：output_dir 全部指向 $TMP/runlog。
+# bench 的 run.log/raw 恒写配置的 output_dir（-o 只重定向 JSON 落点，
+# 见 cmd/bench/main.go run.log 段），不改写的话每轮冒烟都会在项目根
+# 漏 output-smoke*/run.log。
+# dataset.path 同理：它相对配置文件所在目录解析，配置搬到 TMP 后会指向
+# $TMP/fixtures/ 落空，需一并改写为仓库内的绝对路径。
+for f in smoke smoke-all smoke-overrides smoke-openloop smoke-levels; do
+  sed -e "s#^output_dir:.*#output_dir: $TMP/runlog#" \
+      -e "s#\([[:space:]]*path:[[:space:]]*[\"']\{0,1\}\)fixtures/#\1$PWD/configs/fixtures/#" \
+      "configs/$f.yaml" >"$TMP/$f.yaml"
+done
+
 # ── bench 二进制：外部传入或临时构建 ──
 if [ -n "${BENCH:-}" ]; then
   echo "==> 使用指定二进制: $BENCH"
@@ -71,48 +83,48 @@ expect_fail() { # expect_fail <label> [bench 参数...] —— 期望非零退�
 }
 
 # 1) 基础冒烟：两模型 × both 变体 × 全场景（流式多轮并发闭环）
-run "基础冒烟 smoke.yaml" out-basic -c configs/smoke.yaml
+run "基础冒烟 smoke.yaml" out-basic -c "$TMP/smoke.yaml"
 
 # 2) CLI 优先级回归：全局 off + overrides both（踩坑形状）
 #    -thinking off：a/b 都应只剩 off；旧 bug 下 b 会混入 on 行
-run "thinking off 过滤" out-off -c configs/smoke-overrides.yaml --thinking off --turns both --concurrency 1
+run "thinking off 过滤" out-off -c "$TMP/smoke-overrides.yaml" --thinking off --turns both --concurrency 1
 #    -thinking on：a 无 on 变体应整模型跳过，只有 b 出数据且全是 on
-run "thinking on 过滤" out-on -c configs/smoke-overrides.yaml --thinking on --turns both --concurrency 1
+run "thinking on 过滤" out-on -c "$TMP/smoke-overrides.yaml" --thinking on --turns both --concurrency 1
 
 # 3) --max-ctx 截断：配置档位 500，CLI 截到 300
-run "max-ctx 截断" out-ctx -c configs/smoke-overrides.yaml --turns single --concurrency 1 --max-ctx 300
+run "max-ctx 截断" out-ctx -c "$TMP/smoke-overrides.yaml" --turns single --concurrency 1 --max-ctx 300
 
 # 4) 全能力冒烟：trace 回放 + 观测层 + 预热 + goodput + correctness + max_tokens 列表
-run "全能力 smoke-all.yaml" out-all -c configs/smoke-all.yaml --turns both --concurrency 1,cfg
+run "全能力 smoke-all.yaml" out-all -c "$TMP/smoke-all.yaml" --turns both --concurrency 1,cfg
 
 # 5) probe 兼容性探测（mock 已提供 /models + tool-call 好路径）
 echo "==> bench: probe 探测"
-"$BENCH" probe -c configs/smoke-overrides.yaml -o "$TMP/probe.json" >"$TMP/probe.log" 2>&1 \
+"$BENCH" probe -c "$TMP/smoke-overrides.yaml" -o "$TMP/probe.json" >"$TMP/probe.log" 2>&1 \
   || { echo "❌ probe 失败（日志: $TMP/probe.log）"; tail -30 "$TMP/probe.log"; exit 1; }
 
 # 6) 非流式路径（原 smoke-nostream 变体）：stream 关 + thinking on
 sed -e 's/^stream: true/stream: false/' -e 's/^  mode: both/  mode: on/' \
-  configs/smoke.yaml >"$TMP/nostream.yaml"
+  "$TMP/smoke.yaml" >"$TMP/nostream.yaml"
 run "非流式 thinking on" out-nostream -c "$TMP/nostream.yaml" --turns single --concurrency 1
 
 # 7) 开环到达率（原 smoke-open 变体）
-run "开环到达率" out-openloop -c configs/smoke-openloop.yaml --turns single --concurrency cfg
+run "开环到达率" out-openloop -c "$TMP/smoke-openloop.yaml" --turns single --concurrency cfg
 
 # 8) 思考档位 levels：全档 + 档位名过滤
-run "levels 全档" out-levels-all -c configs/smoke-levels.yaml --turns single --concurrency 1
-run "levels 过滤 low" out-levels-low -c configs/smoke-levels.yaml --thinking low --turns single --concurrency 1
+run "levels 全档" out-levels-all -c "$TMP/smoke-levels.yaml" --turns single --concurrency 1
+run "levels 过滤 low" out-levels-low -c "$TMP/smoke-levels.yaml" --thinking low --turns single --concurrency 1
 
 # 9) -m 模型过滤
-run "-m 模型过滤" out-mfilter -c configs/smoke.yaml -m mock-model-b --turns single --concurrency 1
+run "-m 模型过滤" out-mfilter -c "$TMP/smoke.yaml" -m mock-model-b --turns single --concurrency 1
 
 # 10) 错误路径：非法变体名 / levels 下用 on / 多场景输出到单 .json
-expect_fail "非法变体名 --thinking badname" -c configs/smoke-overrides.yaml --thinking badname
-expect_fail "levels 配置下 --thinking on 应报错" -c configs/smoke-levels.yaml --thinking on
-expect_fail "多场景 -o 指到单 .json 应报错" -c configs/smoke.yaml --turns both --concurrency 1 -o "$TMP/bad.json"
+expect_fail "非法变体名 --thinking badname" -c "$TMP/smoke-overrides.yaml" --thinking badname
+expect_fail "levels 配置下 --thinking on 应报错" -c "$TMP/smoke-levels.yaml" --thinking on
+expect_fail "多场景 -o 指到单 .json 应报错" -c "$TMP/smoke.yaml" --turns both --concurrency 1 -o "$TMP/bad.json"
 
 # 11) SIGHUP 优雅中断（2026-09-09 现场事故回归：SSH 断开发 SIGHUP，进程被杀丢整个场景）
 #     把多轮拉长到 8 轮，跑 2 秒后发 SIGHUP：应优雅退出（退出码 0，非强退 130）且部分数据落盘
-sed -e 's/^  turns: 2$/  turns: 8/' configs/smoke.yaml >"$TMP/hup.yaml"
+sed -e 's/^  turns: 2$/  turns: 8/' "$TMP/smoke.yaml" >"$TMP/hup.yaml"
 echo "==> bench(SIGHUP 中断): 优雅保存验证"
 "$BENCH" -c "$TMP/hup.yaml" --turns multi --concurrency 1 -o "$TMP/out-hup" >"$TMP/out-hup.log" 2>&1 &
 HUP_PID=$!
