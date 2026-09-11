@@ -2,6 +2,8 @@
 
 > 面向报告侧开发者与数据分析者：Go 产出的 JSON 结构、报告侧聚合口径、两边如何对齐不漂移。
 > 模块与代码组织见 [architecture.md](architecture.md)；判级阈值的来源依据见 [latency-baselines.md](latency-baselines.md)。
+>
+> **本文不写行号**——行号随每次提交漂移（历史教训），定位一律用函数/类型名 grep。
 
 ## 数据流与落盘组织
 
@@ -20,7 +22,7 @@ gen_html_report.py f1.json f2.json ... [标题]
 - 一次调用可传多份 JSON（merge 逻辑按模型×场景×思考模式分桶合并 runs）；同名键冲突时合并而非覆盖。
 - probe 结果是独立结构（ProbeResult），不与场景 Report 同构，落 `<模型>/probe-*.json`。
 
-## Go 侧输出：Report 顶层结构（report.go:118）
+## Go 侧输出：Report 顶层结构（report.go `Report`）
 
 ```
 Report
@@ -48,7 +50,7 @@ Report
 
 注意：`RequestRate>0` 即开环模式（Level=0）；`Level>0` 为闭环并发档位。
 
-## TurnMetrics 字段要点（client.go:102）
+## TurnMetrics 字段要点（client.go `TurnMetrics`）
 
 所有场景行的叶子单元。三类字段语义不同，消费时必须区分：
 
@@ -100,13 +102,13 @@ Report
 
 | 口径 | 规则 | 位置 |
 |---|---|---|
-| 并发表中位/min/max | mmm()，中位数；偶数个样本取两中值平均 | mmm(135) |
-| p95/p99 | 线性插值（numpy 默认口径）；**样本 <20（MIN_PCT_SAMPLE=145 行常量）不输出分位**，退回中位 | pct9599(165) |
-| 前缀缓存判级 | 按 prompt_tokens 与 cached_tokens 关系分类 | classify_cache(219) |
-| 增量 prefill 斜率 | TTFT 对 new_tokens 的线性拟合，ms/千新 token | slope_ms_per_token(204) |
-| 混跑形状聚合 | 按 label×weight 分桶取中位；撞 key 合并 runs | shapes_table(751) |
+| 并发表中位/min/max | mmm()，中位数；偶数个样本取两中值平均 | mmm() |
+| p95/p99 | 线性插值（numpy 默认口径）；**样本 <20（MIN_PCT_SAMPLE 常量）不输出分位**，退回中位 | pct9599() |
+| 前缀缓存判级 | 按 prompt_tokens 与 cached_tokens 关系分类 | classify_cache() |
+| 增量 prefill 斜率 | TTFT 对 new_tokens 的线性拟合，ms/千新 token | slope_ms_per_token() |
+| 混跑形状聚合 | 按 label×weight 分桶取中位；撞 key 合并 runs | shapes_table() |
 
-### 体验基线判级（第 8 节，SLO_TIERS=150 行）
+### 体验基线判级（第 8 节，SLO_TIERS 常量）
 
 - **3 档制归组**：输入 ≤4K 打档1/2；≥24K 打档3（agent 大上下文）；4–24K 不判级。
 - **判级方向**：TTFT/TPOT 是低优口径（`badge`：≤good ✅ / ≤pass ⚠️ / 超 ❌）；tok/s 是**高优口径（`badge_hi`）**——加新指标时先想清楚方向，别混用。
@@ -114,7 +116,7 @@ Report
 - 阈值内置在 SLO_TIERS 常量：档1 优 0.45s/档2 及格 2s/档3 优 3s 及格 6s；TPOT 40/200ms；tok/s 25/10。未来由 `slo:` 配置段覆盖（ROADMAP 5.8 待做）。
 - 基线评估结果写进 perf-summary 的 `baseline` 数组（评估单元含场景/模型/档位/判级/证据），**不进退出码**——判级是参考结论不是门禁。
 
-## perf-summary.json 结构（summary_json=1227 行）
+## perf-summary.json 结构（summary_json 函数）
 
 ```
 { about, endpoint, tool, generated_at,

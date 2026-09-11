@@ -107,8 +107,9 @@ type DatasetCfg struct {
 	Format      string `yaml:"format"`       // sharegpt | sessions（空=自动识别）
 	MinTurns    int    `yaml:"min_turns"`    // 会话最少 user 轮数（sharegpt 过滤），默认 2
 	MaxSessions int    `yaml:"max_sessions"` // 最多加载多少会话，0=不限
-	// ReplayMode 回放保真度：user_only（默认，只回放 user 轮，行为与历史版本一致）
-	// | full（按原序注入全部 role——assistant/tool 消息进上下文，测真实 history 深度）。
+	// ReplayMode 回放保真度：full（默认，按原序注入全部 role——assistant/tool 消息进上下文，
+	// 测真实 history 深度）| user_only（显式配置，只回放 user 轮——ShareGPT 问答类数据集
+	// 或对比历史口径时用）。
 	// user_only 的回放上下文系统性偏小（真实 agent 会话里工具结果往往占大头），full 才是忠实回放
 	ReplayMode string `yaml:"replay_mode"`
 }

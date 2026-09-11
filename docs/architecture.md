@@ -3,6 +3,8 @@
 > 面向维护者/二开者：模块边界、数据流、扩展点、已知坑位。使用方法见 [README](../README.md)；
 > 数据契约（JSON 输出与聚合口径）见 [data-contract.md](data-contract.md)；
 > 设计决策与测量哲学见 [AGENTS.md](../AGENTS.md)；能力规划见 [ROADMAP.md](../ROADMAP.md)。
+>
+> **本文不写行号**——行号随每次提交漂移（历史教训），定位一律用函数/类型名 grep。
 
 ## 总体数据流
 
@@ -32,31 +34,31 @@ scripts/gen_html_report.py ── 读多份 JSON → merge/analyze → 自包含
 
 | 包 | 关键文件 | 职责 | 备注 |
 |---|---|---|---|
-| `cmd/bench` | main.go（515 行） | CLI 入口：flag 解析、模式派发、Ctrl+C 优雅中断、输出路径/模型分区 | `--concurrency cfg` 是字面量（读配置 concurrent.levels），不是文件路径 |
+| `cmd/bench` | main.go | CLI 入口：flag 解析、模式派发、Ctrl+C/SIGHUP 优雅中断、输出路径/模型分区 | `--concurrency cfg` 是字面量（读配置 concurrent.levels），不是文件路径 |
 | `internal/config` | config.go | YAML 加载 + env 覆盖 + `model_overrides` 合并（ForModel）；`IntList` 支持标量/列表（输出长度扫描） | schema 不保向后兼容（决策见 AGENTS.md） |
 | `internal/corpus` | corpus.go | 填充语料加载（en/zh/自定义路径），供 filler 构造 token 精确文本 | |
 | `internal/auth` | auth.go | 认证方案抽象：bearer / 裸 key / 自定义 header / none，chat 与 /metrics 共用 | 替代了早期 3 处硬编码 `Bearer ` |
 | `internal/engine` | client.go / sse.go / filler.go / trace.go / probe.go / toolprobe.go / corpus_filler.go | OpenAI 兼容客户端与逐 chunk 计时；SSE 解析；负载生成；兼容性探针 | 见下"engine 内部" |
-| `internal/scenario` | scenario.go（1111 行）、plan.go（测试画像） | 三场景编排：Single(374) / Multiturn(505) / Concurrent(700)；闭环(885)/开环(946)；混跑形状计划(803)/聚合(839)；正确性金丝雀(317)；goodput(296-316)；plan.go：PlanSummary 开跑前估算请求量（复用 ClampLadder/MaxTokensList/Variants，展示口径=执行口径） | 场景经 Register 注册表派发（main 不直接 import 各场景实现） |
-| `internal/smetrics` | smetrics.go | 服务端 /metrics 采集（**可选的第二数据源**，客户端实测才是基线）：counter 差值 / gauge 轮询 / histogram 分位估计；指标名归一化（去 `_total`）。缺失或抓取失败一律不产生错误语义（`finishWindow` 返回 `Available=false`+`Note`，观测关闭返回 nil） | 引擎指标名表(249-298)硬编码，未知引擎回落 vLLM(302-307) 无告警（ROADMAP 附录 C） |
+| `internal/scenario` | scenario.go、plan.go（测试画像） | 三场景编排：Single / Multiturn / Concurrent；闭环 runClosedRound / 开环 runOpenRound；混跑形状计划/聚合；正确性金丝雀；goodput；plan.go：PlanSummary 开跑前估算请求量（复用 ClampLadder/MaxTokensList/Variants，展示口径=执行口径） | 场景经 Register 注册表派发（main 不直接 import 各场景实现） |
+| `internal/smetrics` | smetrics.go | 服务端 /metrics 采集（**可选的第二数据源**，客户端实测才是基线）：counter 差值 / gauge 轮询 / histogram 分位估计；指标名归一化（去 `_total`）。缺失或抓取失败一律不产生错误语义（`finishWindow` 返回 `Available=false`+`Note`，观测关闭返回 nil） | 引擎指标名表硬编码；指标名前缀自动识别引擎（vllm:/sglang:），**未识别显式告警、不静默回落 vLLM**（2026-09-08 修） |
 | `internal/report` | report.go | JSON 输出结构定义与落盘：Report / SingleRow / MultiturnRun / ConcurrentLevel / PartitionByModel | 只定义结构不做聚合 |
 
 ## engine 内部
 
-- **client.go**：`Client.Chat`(307) = 重试循环（RetryPolicy 只重试连接层瞬时失败：传输错误/5xx/429/流中断；4xx 是确定性行为不重试）→ `attempt`(357) 组请求体（ExtraBody 透传只挡 model/messages）→ 流式走 `readStream`，非流式走 `readWhole` → `Finalize`(223) 由原始时间戳算派生指标（TTFT/思考拆分/ITL 分位/TPOT）。自定义 Transport：连接池 256/128 + DisableCompression（压缩攒批破坏 ITL 精度）。
-- **sse.go**：`ingestSSEBody` 是流解析唯一入口（时钟注入，生产 time.Now / 测试合成时钟）；`deltaPayload`(35) 自定义 UnmarshalJSON 一次解析同时拿值和键名清单，`knownDeltaKeys`(19) 白名单之外的键记 warnings（魔改引擎探测）；`tool_calls` 分片按 index 分桶聚合。
-- **filler.go**：token 精确的合成填充。注意 `SystemMsg`(74) 把工具定义当纯文本塞 system 消息——只模拟体积，不发真实 `tools` 字段（定位见 AGENTS.md tool-call 一节）。
-- **trace.go**：`LoadTrace`(61) 加载 ShareGPT / sessions 格式；`replay_mode: full` 按原序注入全部 role，user_only 只回放 user 轮。
-- **probe.go**：`Probe`(180) 兼容性探针。核心是 **`ProbeCheck` 的证据分级**：`TierCore`（标准 OpenAI 兼容面，`/chat/completions`）才是配置基线；`TierExt`（`/metrics`、`/models` 的 `max_model_len`、`Server` 头）只作增强，服务端未提供时记 `NA`（`OK=true`），不判失败也不进通过率——很多服务经网关代理后没有这些端点，把缺失当故障会到处误报。`Tally`/`Summarize` 按分级出统计。另有 `buildSuggestedConfig` 把结论收敛成可粘回的 YAML（扩展面推导项一律注释掉）；认证自举（`auth_scheme`）与挂载点扫描（`chat_path`/`models_path`/`metrics_path`）只在明确被拒（401/403）或落空（404/405）时触发。URL 统一按 `origin + 绝对路径` 拼装（`splitOrigin`/`resolvePath`），候选挂载点因此能整体替换。
-- **toolprobe.go**：tool-call 健康检查，verdict 分级 PASS/FAIL/WARN/INCOMPLETE（检查自身失败不计 ❌），带 `toolCallSelfCheckNotice`(37) 自检提示常量。
+- **client.go**：`Client.Chat` = 重试循环（RetryPolicy 只重试连接层瞬时失败：传输错误/5xx/429/流中断；4xx 是确定性行为不重试）→ `attempt` 组请求体（ExtraBody 透传只挡 model/messages）→ 流式走 `readStream`，非流式走 `readWhole` → `Finalize` 由原始时间戳算派生指标（TTFT/思考拆分/ITL 分位/TPOT）。自定义 Transport：连接池 256/128 + DisableCompression（压缩攒批破坏 ITL 精度）。
+- **sse.go**：`ingestSSEBody` 是流解析唯一入口（时钟注入，生产 time.Now / 测试合成时钟）；`deltaPayload` 自定义 UnmarshalJSON 一次解析同时拿值和键名清单，`knownDeltaKeys` 白名单之外的键记 warnings（魔改引擎探测）；`tool_calls` 分片按 index 分桶聚合。
+- **filler.go**：token 精确的合成填充。注意 `SystemMsg` 把工具定义当纯文本塞 system 消息——只模拟体积，不发真实 `tools` 字段（定位见 AGENTS.md tool-call 一节）。
+- **trace.go**：`LoadTrace` 加载 ShareGPT / sessions 格式；`replay_mode` **默认 full**（按原序注入全部 role），`user_only` 只回放 user 轮（显式配置才生效）。
+- **probe.go**：`Probe` 兼容性探针。核心是 **`ProbeCheck` 的证据分级**：`TierCore`（标准 OpenAI 兼容面，`/chat/completions`）才是配置基线；`TierExt`（`/metrics`、`/models` 的 `max_model_len`、`Server` 头）只作增强，服务端未提供时记 `NA`（`OK=true`），不判失败也不进通过率——很多服务经网关代理后没有这些端点，把缺失当故障会到处误报。`Tally`/`Summarize` 按分级出统计。另有 `buildSuggestedConfig` 把结论收敛成可粘回的 YAML（扩展面推导项一律注释掉）；认证自举（`auth_scheme`）与挂载点扫描（`chat_path`/`models_path`/`metrics_path`）只在明确被拒（401/403）或落空（404/405）时触发。URL 统一按 `origin + 绝对路径` 拼装（`splitOrigin`/`resolvePath`），候选挂载点因此能整体替换。
+- **toolprobe.go**：tool-call 健康检查，verdict 分级 PASS/FAIL/WARN/INCOMPLETE（检查自身失败不计 ❌），带 `toolCallSelfCheckNotice` 自检提示常量。
 
 ## 关键数据结构
 
-- **`engine.TurnMetrics`**（client.go:102）：单请求全量计时+token 统计，是所有场景行的叶子单元。注意两类字段的区别：
+- **`engine.TurnMetrics`**（client.go）：单请求全量计时+token 统计，是所有场景行的叶子单元。注意两类字段的区别：
   - 带 `json:"-"` 的字段**不进压测数据**（`ToolCalls` 只被 probe 消费）——给 TurnMetrics 加字段时先想清楚是否污染压测 JSON；
   - `omitempty` 派生指标在非流式/无思考时缺省——报告侧必须容忍缺失。
-- **`report.Report`**（report.go:118）：单场景单文件。`Environment`（引擎识别存档）与 `ConfigRaw`（配置原文）随每份 JSON 落盘——回看数据时"当时什么引擎什么配置"有据可查。
-- **`smetrics.Sample`**：一次 /metrics 抓取快照；场景层 `startWindow/finishWindow`（scenario.go:251/264）取窗口差值挂到 Report.Server。
+- **`report.Report`**（report.go）：单场景单文件。`Environment`（引擎识别存档）与 `ConfigRaw`（配置原文）随每份 JSON 落盘——回看数据时"当时什么引擎什么配置"有据可查。
+- **`smetrics.Sample`**：一次 /metrics 抓取快照；场景层 `startWindow/finishWindow` 取窗口差值挂到 Report.Server。
 
 ## 扩展点指引
 
@@ -74,8 +76,8 @@ scripts/gen_html_report.py ── 读多份 JSON → merge/analyze → 自包含
 ## 已知坑位（改代码前先看）
 
 1. **`--concurrency cfg` 是字面量**：main.go 据此读 `config.Concurrent.Levels`，与逗号数字列表两条解析路径。
-2. **seed 规则**（scenario.go:1067-1082）：`fixed_seed` / 会话 / worker 三套确定性 seed 公式 + `--seed-salt` 测试隔离——重跑对照必须换盐，否则命中服务端前缀缓存。
-3. **截断必须按 rune**：`TruncateRunes`（client.go:207）是唯一正确姿势，按字节切中文出半个 UTF-8 字符（历史 bug）。
-4. **多模型分区**：`PartitionByModel`（report.go:166）+ main.go `modelDirName`（保留 Unicode，中文模型名不清洗成同形碰撞）；run.log 与 raw/ 留在 output_dir 顶层共享。
-5. **run.log 追加不覆盖**（main.go:233）：同目录多轮测试日志都要留得住。
+2. **seed 规则**（scenario.go「种子派生」一节）：`fixed_seed` / 会话 / worker 三套确定性 seed 公式 + `--seed-salt` 测试隔离——重跑对照必须换盐，否则命中服务端前缀缓存。
+3. **截断必须按 rune**：`TruncateRunes`（client.go）是唯一正确姿势，按字节切中文出半个 UTF-8 字符（历史 bug）。
+4. **多模型分区**：`PartitionByModel`（report.go）+ main.go `modelDirName`（保留 Unicode，中文模型名不清洗成同形碰撞）；run.log 与 raw/ 留在 output_dir 顶层共享。
+5. **run.log 追加不覆盖**：同目录多轮测试日志都要留得住。
 6. **Bash grep 静默空**：本仓库维护中已多次踩到 shell grep 对部分模式返回空导致误判，扫描代码用结构化搜索工具并交叉验证。

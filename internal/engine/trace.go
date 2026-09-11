@@ -8,12 +8,12 @@
 //   - sessions：本工具自定义精简格式
 //     [ {"turns": ["user1", "user2", ...]} , ... ]  或  [ ["user1", "user2"], ... ]
 //
-// 回放保真度（dataset.replay_mode）：
-//   - user_only（默认）：只取 user 侧消息作为回放轮次，assistant 回复由被测服务实时生成——
-//     与旧行为完全兼容，但真实会话里的 assistant/tool 消息（含大段工具结果）不进上下文，
-//     回放上下文系统性偏小
-//   - full：按原序注入全部 role（user / assistant / tool / system），第 i 轮请求 =
-//     完整消息序列到第 i 条 user 消息为止的前缀——测的是真实 history 深度下的增量 prefill
+// 回放保真度（dataset.replay_mode，默认 full）：
+//   - full（默认）：按原序注入全部 role（user / assistant / tool / system），第 i 轮请求 =
+//     完整消息序列到第 i 条 user 消息为止的前缀——测的是真实 history 深度下的增量 prefill。
+//     真实 agent 会话里工具结果往往占上下文大头，user_only 会系统性低估回放深度
+//   - user_only（显式配置才生效）：只取 user 侧消息作为回放轮次，assistant 回复由被测服务实时生成——
+//     ShareGPT 问答类数据集或对比历史口径时仍可用
 package engine
 
 import (

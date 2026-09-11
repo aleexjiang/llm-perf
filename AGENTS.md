@@ -26,7 +26,9 @@
 
 ## 工作纪律
 
-- `configs/customer.yaml`、`configs/customer-*.md` 含客户端点与 key，已被 .gitignore 覆盖，严禁入库。
+- **实测配置不入库**（2026-09-11 拍板）：客户环境配置 `configs/customer.yaml`（gitignore 兜底）、
+  自有环境配置放仓库外本地测试目录（当前 `../llm-perf-test/configs/`）——仓库只保留模板
+  （`example.yaml`）与 smoke 系列，端点/key/场景参数一律不进 git。
 - ROADMAP 只写"接下来加什么能力"的清单，不展开论证；重要设计拍板沉淀到本文件。
 - 验证基线：`gofmt -l internal/ cmd/` 必须无输出（连续多轮提交遗漏 gofmt 格式，已成惯性问题——提交前必跑，新文件也不例外）+ `go build ./... && go vet ./... && go test ./... -count=1` 全绿再交付；HTML 报告改动用真实 JSON 渲染人工核对。
 - CLI/config 交互逻辑改动后必跑 `scripts/smoke.sh`（BENCH 指向已有二进制免编译）：它对输出 JSON 做数据形状断言（模型×变体分布、CLI 过滤、错误路径、报告管线），`go test` 覆盖不到的端到端行为都在这里兜底。

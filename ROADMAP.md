@@ -1,11 +1,13 @@
 # ROADMAP
 
-> 三件事：① probe 阶段加 tool-call 检测；② trace 回放增强；③ 硬编码改造。
+> 原「三件事」（probe tool-call 检测 / trace 回放增强 / 硬编码改造）已全部完成（第 1–3 节）。
+> 当前在途：5.5 跨运行比对脚本、5.7 闭环错峰发车、5.8 `slo:` 配置段、5.9 起步值补样（n≥20）、
+> 6 Anthropic Messages API 兼容（触发后启动）。
 > 定位不变：本工具负责**发现**问题，修复由服务方完成后重测。
 
 ---
 
-## 1. probe 增加 tool-call 检测（默认开启，`--no-toolcall` 关闭）
+## 1. probe 增加 tool-call 检测（默认开启，`--no-toolcall` 关闭）【已实现，2026-09-09】
 
 只做**前置门禁**：告诉客户引擎能不能正常调工具、不能的话该改哪里。不测性能、不进主压测路径。
 
@@ -38,7 +40,7 @@
 
 ---
 
-## 2. trace 回放增强（P0：保真度）
+## 2. trace 回放增强（P0：保真度）【已实现，2026-09-09】
 
 - **现状**：`trace.go` 只取 user 侧消息，真实会话的 assistant / tool 消息（含大段工具结果）全丢，
   测的是小 context 却标称"回放真实会话"，长上下文衰减曲线横轴失真。
@@ -50,7 +52,7 @@
 
 ---
 
-## 3. 硬编码改造（一次做完"客户环境适配"）
+## 3. 硬编码改造（一次做完"客户环境适配"）【已实现，2026-09-09】
 
 全量清单曾扫描出 32 处（见 git 历史），必修的就两组，其余一次改造顺带处理：
 
@@ -59,10 +61,11 @@
 - 回放：见第 2 节（同一处改造）
 
 **建议（一次改造顺带）**：
-- 接口路径：`/chat/completions`、`/metrics` 可配
-- probe 超时：`probe.go:96` 15s、`probe.go:168` 120s → 读配置 `timeout_seconds`
-- 引擎识别：`DetectProvider` 无法识别时不回落 vLLM，改为显式提示"未知引擎，服务端指标跳过"；Server 头匹配不到不生成交叉验证命令时打一行日志
-- SSE 字段白名单：`deltaPayload` 补 `tool_calls` 值（随第 1 节一并修）；思考字段命名放开为可配置列表
+- 接口路径：`/chat/completions`、`/metrics` 可配 ✅
+- probe 超时：`probe.go:96` 15s、`probe.go:168` 120s → 读配置 `timeout_seconds` ✅
+- 引擎识别：`DetectProvider` 无法识别时不回落 vLLM，改为显式提示"未知引擎，服务端指标跳过"；Server 头匹配不到不生成交叉验证命令时打一行日志 ✅
+- SSE 字段白名单：`deltaPayload` 补 `tool_calls` 值 ✅；思考字段命名放开为可配置列表——
+  **被双字段自动识别（`reasoning` / `reasoning_content`）+ 未知字段告警方案覆盖，无需配置化**
 
 其余 20 余处（常量、预览截断、文件大小上限等）**不动**，真机反馈有问题再说。
 
@@ -203,7 +206,7 @@ thinking mode/levels 双轨（levels 优先已显式声明并告警）；api_key
   上调路径：`system_tokens + tool_defs_tokens` 基座 21k → ~44k 档。
 - 配置联动 ✅（无需改代码，按预期）：`example.yaml` 与 `customer.yaml` multiturn 已改为
   `system_tokens: 18000` + `tool_defs_tokens: 3000` + `turn_tokens: 10000`、`turns: 8`（turn1 ≈ 32.5k，末轮 ≈108k）。
-  qwen3.8-27b.yaml（256k 模型自算预算）与 smoke 系列保持不变。
+  qwen3.8-27b.yaml（256k 模型自算预算，**该文件已迁出仓库**，2026-09-11）与 smoke 系列保持不变。
 - 末端约束（2026-09-08 定，方案 B）：`turn_tokens` 由 12300 降到 **10000**、保持 `turns: 8`
   → 末端 prompt ≈108k（thinking on 含 8k 输出 ≈116k），128k 模型留 ~12k 余量；probe 确认各模型上限后再微调。
   代价：逐轮增量变小（模拟"每轮新增工具结果 + 追问"，10k 仍不失真）。✅ 口径已注明：multiturn 报告 Note
@@ -264,9 +267,8 @@ thinking mode/levels 双轨（levels 优先已显式声明并告警）；api_key
 ## 实施顺序
 
 ```
-1. 认证格式改造        ← 解开裸 key 环境的验证阻塞
-2. probe tool-call 检测 ← 不依赖数据集，fixture 单测 + 好端点即可交付
-3. trace 回放增强       ← 依赖真实 agent trace 验收
-4. 硬编码其余项（路径/超时/引擎识别）与回放改造合并一次提交
-5. 测量方法论 5.2/5.3/5.4 → 5.1 → 5.6 → 5.8（报告侧+配置段）→ 5.9（配置✅ 取证✅ 待补样）→ 5.10 ✅；剩 5.5 / 5.7
+已完成：认证格式改造 → probe tool-call 检测 → trace 回放增强 → 硬编码其余项
+        → 5.0–5.4 / 5.6（测量方法论第一批）→ 5.8 报告侧 → 5.9 配置联动+首轮取证 → 5.10 测试画像
+剩余：  5.5 跨运行比对脚本（恒为脚本）→ 5.7 闭环错峰发车（续跑 P2 等 soak 需求）
+        → 5.8 `slo:` 配置段 → 5.9 补样至 n≥20 后定起步值 → 6 Anthropic 兼容（触发后启动）
 ```

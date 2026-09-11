@@ -315,10 +315,12 @@ make test
 scripts/smoke.sh    # 自动化冒烟：mock 服务 + 多组合运行 + 输出数据形状断言
                     # （模型×变体分布/CLI 过滤回归/全能力 trace/开环/levels/-m/--max-ctx/
                     #   错误路径/报告管线；mock 含 /models、/metrics 与 tool-call 好路径）
+                    # 运行产物全部落 /tmp 随脚本退出清理，不污染仓库
 scripts/mock_server.py   # 本地 mock OpenAI 兼容流式服务（smoke.sh 底层依赖）
 scripts/gen_html_report.py  # JSON → 自包含 HTML 分析报告（多文件合并 + 自动结论 + 内嵌 AI 摘要）
 scripts/validate_report.js  # 报告 JS 校验（占位符/图表可执行）
-deploy/             # 模型服务 docker-compose 存档（与 bench 配置对齐说明）
+deploy/             # 推理服务 compose 存档：vLLM 基线 + SGLang / TensorRT-LLM / llama.cpp / TGI
+                    # 引擎横评（各文件头部含与基线的逐参数对照与 bench 侧注意点）
 ```
 
 ## 设计文档
