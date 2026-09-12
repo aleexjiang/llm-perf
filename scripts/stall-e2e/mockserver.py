@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """降速熔断端到端验证用的假服务端。
 
-区分两类请求（探针 vs 压测场景）：
-  - prompt 很短（<2000 字符）= 启动时的环境探针 → 立刻吐完所有 token，让探针快点过；
-  - prompt 很长（≥2000 字符）= 压测场景的 filler 请求 → 按 SLOW_TPS 慢速吐，逼出熔断。
+区分两类请求（探针 vs 压测场景）——**两个条件都要满足才算压测请求**：
+  - prompt 足够长（≥ PROMPT_CHARS_THRESHOLD 字符）= 压测场景的 filler 请求；
+  - 且带真实输出预算（max_tokens ≥ MIN_BENCH_MAX_TOKENS）= 排除 probe 的 filler_fidelity
+    校准请求（2000tk 长样本、max_tokens=1）——它会抢走恢复时钟锚点。
+命中者按 SLOW_TPS 慢速吐，逼出熔断；其余（启动探针）立刻吐完，让探针快点过。
 流式/非流式都按请求的 stream 字段如实响应。
 
 用法: mockserver.py [PORT] [SLOW_TPS] [RECOVER_AFTER]
@@ -21,7 +23,15 @@ PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 18849
 SLOW_TPS = float(sys.argv[2]) if len(sys.argv) > 2 else 5.0
 RECOVER_AFTER = float(sys.argv[3]) if len(sys.argv) > 3 else 0.0
 SLOW = 1.0 / SLOW_TPS
-PROMPT_CHARS_THRESHOLD = 200
+# 阈值取「启动探针」与「最小压测档位」之间，两侧都要留裕量：
+# 探针 prompt 实测 ≤29 字符（2.8×），最小压测档 32tk → 约 130 字符 @4 chars/token（1.6×）。
+# ⚠️ 改 filler 的 chars/token 口径、或调小 smoke-stall.yaml 的档位时必须复核这里——
+# 曾经按 200 设，filler 长度口径修正后 32tk 掉到 130 字符，压测请求被误判成探针、熔断不触发。
+PROMPT_CHARS_THRESHOLD = 80
+# 压测请求还必须带真实输出预算：probe 的 filler_fidelity 校准发 2000tk 长样本（≈8000 字符）
+# 但 max_tokens=1——若被当成慢速请求，它会抢占 RECOVER_AFTER 的恢复时钟锚点，
+# 让「熔断 → 冷却 → 恢复 → 续跑」的时序整体前移而失效。
+MIN_BENCH_MAX_TOKENS = 4
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # 恢复时钟锚定「首个慢速请求到达」而非服务端启动：bench 启动耗时有方差，
@@ -63,7 +73,9 @@ class H(BaseHTTPRequestHandler):
         max_tokens = int(req.get("max_tokens") or 8)
         stream = bool(req.get("stream"))
         chars = sum(len(str(m.get("content") or "")) for m in req.get("messages", []))
-        slow = chars >= PROMPT_CHARS_THRESHOLD and is_slow()
+        # 两个条件分开判：is_slow() 有副作用（设恢复时钟锚点），只能对真正的压测请求调用
+        is_bench_req = chars >= PROMPT_CHARS_THRESHOLD and max_tokens >= MIN_BENCH_MAX_TOKENS
+        slow = is_bench_req and is_slow()
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "reqs.log"), "a") as fh:
             fh.write(f"{time.time():.1f} stream={stream} max_tokens={max_tokens} chars={chars} slow={slow}\n")
 

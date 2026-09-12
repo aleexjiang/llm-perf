@@ -91,8 +91,10 @@
 | `filler_corpus: "zh"` | 红楼梦（120 回全文） | ≈ 62 万 token（超出部分循环填充） |
 | `filler_corpus: "path/to/x.txt(.gz)"` | 自定义语料（UTF-8） | 不限 |
 
-字符/token 换算比已在真实 Qwen 服务上校准（en 4.0 chars/token 实测偏差 <2%，zh 1.4 实测偏差 ≈3%）；
-`filler_lang` 决定语料语言与换算比；同 seed 仍产出相同文本（`fixed_seed` 缓存实验不受影响）。
+字符/token 换算比已在真实 Qwen 服务上校准（en 4.0 chars/token 实测偏差 <2%，zh 1.4 实测偏差 ≈3%），
+**合成词表与语料两条路径共用该系数**（否则同一档位切换语料会换一个负载量级）；
+`filler_lang` 决定填充语言与换算比；同 seed 仍产出相同文本（`fixed_seed` 缓存实验不受影响）。
+`bench probe` 的 `filler_fidelity` 检查会实测本部署的真实换算比，偏离构造系数 >25% 时告警。
 
 **上下文截止**：`max_prompt_tokens`（或 CLI `--max-ctx`）设定压测的上下文上限——
 

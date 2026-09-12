@@ -3,6 +3,8 @@ package engine
 import (
 	"strings"
 	"testing"
+
+	"github.com/aleexjiang/llm-perf/internal/corpus"
 )
 
 func init() { // 保证合成词表测试不被语料注册表污染（Go 测试同包共享状态）
@@ -25,19 +27,52 @@ func TestFiller_Deterministic(t *testing.T) {
 	}
 }
 
-// 生成量与目标 token 数的近似度（合成词表路径）
+// 生成量与目标 token 数的近似度（合成词表路径）：与语料路径共用 corpus.CharsPerToken
+// 的字符/token 换算，断言锚在**字符数**上。
+//
+// 回归防护：早期按「1.33 词/token」（假设 1 词 ≈ 0.75 token，方向性错误）构造，真机实测
+// 500tk 档实际发出 1246 token（3.99 chars/token，偏差 2.49×）。旧断言只数词数
+// （12000~15000 词），换算系数错得再离谱也恒过——必须锚字符数才能抓住这类偏差。
 func TestFiller_TokenApproximation(t *testing.T) {
-	// en: 1 word ≈ 0.75 token → target*1.33 词
+	// en ≈4 字符/token：10000tk → ~40000 字符（追加式构造，末词最多溢出 ~8 字符）
+	cptEn := corpus.CharsPerToken("en")
 	en := Filler(10000, 7, "en")
-	words := len(strings.Fields(en))
-	if words < 12000 || words > 15000 {
-		t.Errorf("en 10000tk → %d words, want ~13300", words)
+	wantEn := float64(10000) * cptEn
+	if got := float64(len(en)); got < wantEn*0.95 || got > wantEn*1.05 {
+		t.Errorf("en 10000tk → %d 字符, want ~%.0f（%.1f chars/token）", len(en), wantEn, cptEn)
 	}
-	// zh: 1 字 ≈ 1 token
+	// 顺带守住"自然词流"形态：字符数达标的同时仍应是空格分词（防退化成无空格长串）
+	if w := len(strings.Fields(en)); w < 4000 || w > 7000 {
+		t.Errorf("en 10000tk → %d 词, 期望 ~5350（空格分隔的自然词流）", w)
+	}
+	// zh ≈1.4 字/token：5000tk → 7000 字（按 rune 精确截断）
+	cptZh := corpus.CharsPerToken("zh")
 	zh := Filler(5000, 7, "zh")
-	runes := len([]rune(zh))
-	if runes < 4800 || runes > 5200 {
-		t.Errorf("zh 5000tk → %d runes, want ~5000", runes)
+	if got, want := len([]rune(zh)), int(5000*cptZh); got != want {
+		t.Errorf("zh 5000tk → %d 字, want %d（%.1f chars/token）", got, want, cptZh)
+	}
+	// 边界：非正目标返回空串（不产出无意义的单个词/句）
+	if Filler(0, 7, "en") != "" || Filler(-1, 7, "zh") != "" {
+		t.Error("targetTokens ≤ 0 应返回空串")
+	}
+}
+
+// 两条填充路径（语料窗口 / 合成词表）必须共用同一长度口径：同一档位的字符数应落在同一
+// 目标附近。否则"切语料"会变成换一个负载量级，受控变量实验失效——这正是早期合成路径
+// 按词构造时的问题（比语料路径多发 2.49×）。
+func TestFiller_PathScalesAgree(t *testing.T) {
+	const tokens = 4000
+	UnloadCorpus("en") // 先测合成路径
+	synth := len(Filler(tokens, 7, "en"))
+	if err := LoadCorpus("en", "en"); err != nil {
+		t.Skip("内置语料不可用:", err)
+	}
+	t.Cleanup(func() { UnloadCorpus("en") })
+	corp := len([]rune(Filler(tokens, 7, "en")))
+
+	if ratio := float64(synth) / float64(corp); ratio < 0.9 || ratio > 1.1 {
+		t.Errorf("同档位字符数 合成/语料 = %.2f（合成 %d vs 语料 %d）——两条路径的 chars/token 口径分叉",
+			ratio, synth, corp)
 	}
 }
 

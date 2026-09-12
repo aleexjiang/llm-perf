@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"math/rand"
 	"strings"
+
+	"github.com/aleexjiang/llm-perf/internal/corpus"
 )
 
 // 英文填充词表（低信息量、确定性可复现）。
@@ -23,39 +25,50 @@ var zhSentences = []string{
 }
 
 // Filler 生成近似 targetTokens 的确定性填充文本。
-// lang: "en" 按词生成（约 1.33 word/token），"zh" 按字生成（约 1 char/token）。
 // seed 相同则文本相同（用于前缀缓存测试）；seed 不同则文本不同（避免伪缓存命中）。
 // 若该语言注册了语料（LoadCorpus），优先使用真实文本窗口——
 // 自然文本的 tokenization 与语义分布都比随机词表更贴近真实负载。
+//
+// **长度口径按字符控制，两条路径共用同一个 chars/token 系数**（corpus.CharsPerToken）：
+// 目标字符数 = targetTokens × charsPerToken。理由：英文 BPE 的「字符/token」是稳定量
+// （≈4.0，cl100k / Qwen 系 / 与本地实测均吻合），而「词/token」随词表任意波动——
+// 早期按 1.33 词/token（假设 1 词 ≈ 0.75 token，方向性错误）构造，真机实测 500tk 档
+// 实际发出 1246 token（3.99 chars/token，偏差 2.49×），且与语料路径口径不一致
+// （同一档位切语料会得到长度差 2.5× 的负载，受控变量失效）。
+//
+// 该系数仍是近似值（随 tokenizer/内容形状波动）：probe 的 filler_fidelity 检查会实测
+// 本部署的真实偏差并告警；报告横轴一律以服务端 usage.prompt_tokens 实测中位为准，
+// 不信构造侧的标称值（见 scripts/gen_html_report.py 的实测分箱）。
 func Filler(targetTokens int, seed int64, lang string) string {
 	if w := corpusWindow(targetTokens, seed, lang); w != "" {
 		return w
 	}
+	if targetTokens <= 0 {
+		return ""
+	}
+	targetChars := int(float64(targetTokens) * corpus.CharsPerToken(lang))
+	if targetChars <= 0 {
+		return ""
+	}
 	rng := rand.New(rand.NewSource(seed))
 	switch lang {
 	case "zh":
-		need := targetTokens // 每字约 1 token
 		var b strings.Builder
-		for b.Len() < need*3 { // UTF-8 中文每字 3 字节
+		for b.Len() < targetChars*3 { // UTF-8 中文每字 3 字节（写超再按 rune 截）
 			b.WriteString(zhSentences[rng.Intn(len(zhSentences))])
 		}
 		// 按字节截断可能截断多字节字符，按 rune 截
 		runes := []rune(b.String())
-		if len(runes) > need {
-			runes = runes[:need]
+		if len(runes) > targetChars {
+			runes = runes[:targetChars]
 		}
 		return string(runes)
 	default: // en
-		need := int(float64(targetTokens) * 1.33) // 1 word ≈ 0.75 token
-		words := make([]string, 0, need)
-		for i := 0; i < need; i++ {
-			words = append(words, enWords[rng.Intn(len(enWords))])
-		}
-		// 按句号分组提升"自然度"
+		// 追加到字符数达标（最后可能多一个词，误差 < 1 词 ≈ 8 字符）
 		var b strings.Builder
-		for i, w := range words {
-			b.WriteString(w)
-			if (i+1)%12 == 0 {
+		for i := 0; b.Len() < targetChars; i++ {
+			b.WriteString(enWords[rng.Intn(len(enWords))])
+			if (i+1)%12 == 0 { // 按句号分组提升"自然度"
 				b.WriteString(". ")
 			} else {
 				b.WriteString(" ")

@@ -335,6 +335,15 @@ check("models_list" in {c["name"] for c in probe.get("checks", [])} and not bad,
 tc = [c for c in probe.get("checks", []) if c["name"].startswith("toolcall")]
 check(tc and all(c.get("ok") for c in tc), "probe tool-call 检查通过（mock 结构化 tool_calls 好路径）")
 
+# 填充保真度自举校准（10.3）：发已知标称样本、用 usage 反推实测 chars/token。
+# mock 的 usage 按 4 chars/token 模拟，与构造系数（corpus.CharsPerToken en=4.0）一致
+# → 必须给出"可信"结论并落盘实测值。真机上偏离 >25% 才告警，这里验证好路径不误报。
+ff = next((c for c in probe.get("checks", []) if c["name"] == "filler_fidelity"), None)
+check(ff is not None and ff.get("ok") and not ff.get("na"),
+      f"probe 填充保真度检查通过（{(ff or {}).get('detail', '缺 filler_fidelity 检查项')}）")
+cpt = probe.get("filler_cpt") or 0
+check(abs(cpt - 4.0) < 0.2, f"probe 实测 chars/token ≈4.0（实际 {cpt}）")
+
 # probe 证据分级：扩展面（/metrics、max_model_len 等）服务端未提供时记 na，绝不判失败；
 # 汇总行必须区分标准面与扩展面，避免可选端点的缺失拉低通过率
 bad_na = [c["name"] for c in probe.get("checks", []) if c.get("na") and not c.get("ok")]

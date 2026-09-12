@@ -467,10 +467,22 @@ thinking mode/levels 双轨（levels 优先已显式声明并告警）；api_key
   判级复用 5.8 三档制阈值（随 JSON `slo.baseline` 透出），不另设一套；`meta.correctness` 按模型归集，
   多模型报告下能给出"哪个模型答错"。浏览器实测：折叠态图表不渲染、展开后 Chart.js 4.4.1 经 ResizeObserver 正常重绘。
 
-**10.3 filler 拍板落地**
+**10.3 filler 拍板落地**【已实现，2026-09-12】
 
-- `multiturn.shared_base` 开关（true = 基座跨会话共享/固定 seed，贴近"一套部署一套提示词"；false = 现状每会话独立基座）——**默认 true（2026-09-12 拍板）**；两种形态都测，本身即新受控变量"跨用户共享前缀值多少 TTFT"
-- 【已拍板 2026-09-12】probe token 自举校准（发已知构造样本、usage 反推 chars/token 回填构造系数——复用 decode_speed 模式，零新依赖）+ 报告横轴 usage 实测分箱（纯 Python）。不引入真实 tokenizer 库（依赖重且有循环性）
+- `multiturn.shared_base` 开关（true = 基座跨会话共享/固定 seed，贴近"一套部署一套提示词"；false = 现状每会话独立基座）——**默认 true（2026-09-12 拍板）** ✅；两种形态都测，本身即新受控变量"跨用户共享前缀值多少 TTFT"
+- **长度口径统一（本项真正的 bug）** ✅：合成词表路径原按「1.33 词/token」（假设 1 词 ≈ 0.75 token，
+  方向性错误）构造，与语料路径的 `CharsPerToken`（en 4.0 / zh 1.4，真机校准偏差 <2%）互相打架——
+  同一档位切语料，负载长度差 **2.49×**（真机实测 500tk 档实发 1246 token = 3.99 chars/token，
+  与英文 BPE 的 4.0 经典值吻合）。现两条路径共用同一系数，合成路径改为**按目标字符数构造**
+  （追加式，末词溢出 <1 词）；`TestFiller_PathScalesAgree` 锁住"切语料不再换量级"
+- **probe token 自举校准** ✅：新增 `filler_fidelity` 扩展面检查——发一条已知标称的填充样本
+  （2000tk、非流式、max_tokens=1），用 usage.prompt_tokens 反推本部署实测 chars/token，
+  与构造系数对比，偏离 >25% 告警（只告警不判失败：构造近似不是服务端问题）；
+  `ProbeResult.FillerCPT` 落盘实测值，单测覆盖告警路径（2 chars/token 端点）。
+  **未加配置旋钮**（刻意）：报告横轴已按 usage 实测分箱，构造偏差对结论无影响；
+  偏离过大时的行动路径是改用 `filler_corpus` 真实语料（比在每个客户环境调系数更贴近真实
+  tokenization），符合"配置面不开新旋钮"——原措辞"回填构造系数"据此收窄为"实测+告警"
+- 报告横轴 usage 实测分箱 ✅（纯 Python，不引入真实 tokenizer 库——依赖重且"测试工具绑定被测模型 tokenizer"有循环性）
 
 **10.4 suite 层（四层模型唯一缺失层）**
 
@@ -545,8 +557,9 @@ thinking mode/levels 双轨（levels 优先已显式声明并告警）；api_key
         → 11.2 接缝死重量（直方图 P50/P99 表 / 爬坡窗口标注 / 三处均取补渲染）【2026-09-12】
         → 10.1 两源一致性守卫 + per-model 熔断标定【2026-09-12】
         → 10.2 报告一页纸（四个数 + 徽章 + 三分归因；详细区降级折叠附录）【2026-09-12】
-剩余：  10.3 filler 拍板落地（shared_base 默认 true / probe token 自举校准 / 报告横轴 usage 分箱）
-        → 10.4 suite 层（`test:` 顶层 + 报告按类别切换结论区 + 基准套件预设配置）
+        → 10.3 filler 拍板落地（shared_base 默认 true / 两条路径长度口径统一修 2.49× 偏差 /
+          probe filler_fidelity 自举校准 / 报告横轴 usage 实测分箱）【2026-09-12】
+剩余：  10.4 suite 层（`test:` 顶层 + 报告按类别切换结论区 + 基准套件预设配置）
         → 10.5 稳定性 soak（5.7 会话续跑提级为 soak 原语 + 报告稳定性区）
         → 5.9 补样至 n≥20 后定起步值
 暂缓/条件触发：见文末「附：暂缓与条件触发」——按各自的复活条件启动，不排期。

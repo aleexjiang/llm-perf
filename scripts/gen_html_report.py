@@ -537,8 +537,9 @@ def analyze(data, meta):
          "tiers": tiers, "baseline_enabled": baseline_enabled(meta),
          "slo": (meta or {}).get("slo"), "source_check": (meta or {}).get("source_check"),
          # 10.3 横轴实测分箱：{(model, thinking, max_tokens, 标称档位): 实测 usage 中位数}。
-         # 构造 filler 的 chars/token 是近似系数（probe 可校准），trace 模式下更只是估算——
-         # 报告横轴与档位分箱一律以服务端 usage 为准，配置档位只在偏差 >5% 时并列标出。
+         # 构造 filler 的 chars/token 是近似系数（bench probe 的 filler_fidelity 检查实测本部署
+         # 保真度并告警），trace 模式下更只是估算——报告横轴与档位分箱一律以服务端 usage 为准，
+         # 配置档位只在偏差 >5% 时并列标出。
          "usage_med": {}}
 
     all_single_runs = [r for e in data["single"] for r in e["runs"]]
@@ -1098,7 +1099,7 @@ def short(model):
 
 def axis_cell(l):
     """单发档位列：以服务端实测 usage 为主，与配置标称偏差 >5% 时并列标出配置值（10.3）。
-    构造 filler 的 chars/token 是近似系数（probe 可校准），trace 模式更是估算——
+    构造 filler 的 chars/token 是近似系数（bench probe 的 filler_fidelity 实测），trace 模式更是估算——
     「档位 tk」列若只写配置目标值，读者会把构造偏差误当服务端行为。"""
     size, usage = l.get("size"), l.get("usage")
     if not usage or not size:
@@ -2304,7 +2305,8 @@ def main():
                      '（构造 filler 的 chars/token 只是近似系数，trace 模式更只是估算）；'
                      '与配置标称档位偏差 &gt;5% 时并列标出配置值。'
                      '档位分箱与基线判级同样按实测走——判读锚在服务端真实看到的规模上。'
-                     '实测与配置系统性偏离时，用 <code>bench probe</code> 的构造系数建议值校准。</div>')
+                     '偏离超过 25% 时 <code>bench probe</code> 的 filler_fidelity 检查会告警，'
+                     '此时建议改用 <code>filler_corpus</code> 真实语料（比调系数更贴近真实 tokenization）。</div>')
         sec.append(("<h2>4 · 单发·单轮结果</h2>", body))
     # 多轮
     if A["coverage"]["has_multiturn"]:

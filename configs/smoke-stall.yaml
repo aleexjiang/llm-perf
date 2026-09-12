@@ -1,8 +1,11 @@
 # 降速熔断回归（stall_guard）+ 采样序列落盘（stall_trace），配 scripts/smoke.sh 第 12 节用。
 # smoke.sh 会单独起一个 scripts/stall-e2e/mockserver.py 实例（端口 18100，SLOW_TPS=5）：
-# 该假服务端按 max_tokens 全量吐 token、每 token 间隔 1/5s——长 prompt（filler ≥200 字符）
-# 的流式请求持续 6s+ 低于 min_tps=50 → 每个场景都在窗口后熔断中止，用来验证
-# 「熔断 → 只中止当前场景 → 冷却 → 续跑下一场景」与 note / stall_trace 留痕。
+# 该假服务端按 max_tokens 全量吐 token、每 token 间隔 1/5s——长 prompt（filler ≥80 字符，
+# 见 mockserver.py 的 PROMPT_CHARS_THRESHOLD）的流式请求持续 6s+ 低于 min_tps=50 →
+# 每个场景都在窗口后熔断中止，用来验证「熔断 → 只中止当前场景 → 冷却 → 续跑下一场景」
+# 与 note / stall_trace 留痕。
+# ⚠️ 档位与阈值耦合：改 filler 的长度口径（chars/token）时必须复核各档位生成的字符数
+# 仍 > 阈值——single.prompt_tokens=32 → ≈130 字符、multiturn turn1 ≈346 字符，目前都有裕量。
 # （不用主 mock_server.py：它每请求只吐 3 个 content chunk，单请求不足判定窗口，
 #   MOCK_TOKEN_DELAY 构造不出「持续低速」现场。）
 

@@ -102,6 +102,8 @@ class H(BaseHTTPRequestHandler):
         thinking = bool(body.get("chat_template_kwargs", {}).get("enable_thinking"))
         stream = bool(body.get("stream", True))
         tools = body.get("tools")
+        # usage 按 4 chars/token 模拟——刻意与构造侧的 en 系数（corpus.CharsPerToken=4.0）一致：
+        # 这样 smoke 里 probe 的 filler_fidelity 落到"保真度可信"，两源一致性检查也对得上。
         prompt_tokens = sum(len(m["content"]) for m in body["messages"]) // 4 or 1
         n_reason, n_content = (4, 3) if thinking else (0, 3)
         usage = {

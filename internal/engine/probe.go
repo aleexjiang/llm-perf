@@ -123,6 +123,11 @@ type ProbeResult struct {
 	// DecodeSpeeds 逐模型实测输出速度（多模型配置时填充）：各模型 decode 速度差异大时，
 	// 按 model_overrides.<模型>.stall_guard.min_tps 分别标定，避免误熔断更慢的模型。
 	DecodeSpeeds map[string]float64 `json:"decode_speeds,omitempty"`
+	// FillerCPT 实测字符/token（填充保真度，自举校准）：发一条已知标称 token 数的填充样本，
+	// 用服务端 usage.prompt_tokens 反推本部署真实的 chars/token，与构造侧系数
+	// （corpus.CharsPerToken：en 4.0 / zh 1.4）对比即知档位标称偏了多少。
+	// 0 = 未测出（网关不给 usage / 请求失败）。
+	FillerCPT float64 `json:"filler_cpt,omitempty"`
 
 	// ThinkingLevel 探测到的思考等级控制参数（空 = 未探测到可控参数）
 	ThinkingLevelParam string `json:"thinking_level_param,omitempty"`
@@ -718,6 +723,58 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 		} else {
 			// NA 而非失败：无 usage 的网关照样能压测，只是没有部署级建议值
 			checkExt("decode_speed", false, "无法测出输出速度（流式失败或缺 usage）——min_tps 无建议值，请人工确认服务状态")
+		}
+	}
+
+	// ── 5.6 填充保真度：构造侧标称 token 数与真实 tokenizer 的自举校准 ──
+	// 合成词表 / 语料窗口都靠一个 chars/token 近似系数把"目标 token 数"换算成字符数
+	// （见 corpus.CharsPerToken）。不同 tokenizer（尤其魔改/蒸馏模型）会系统性偏离，
+	// 让"标称 4k 档"实际发出 10k——受控变量的档位语义失真。
+	// 这里发一条已知构造的样本、用服务端 usage 反推真实 chars/token，把系数的可信度
+	// 变成每次 probe 都能复测的事实（复用 decode_speed 的"实测→可见偏差"模式，零新依赖）。
+	// 只告警不判失败：构造近似不是服务端问题；报告横轴一律以服务端 usage 为准
+	// （gen_html_report.py 的实测分箱），偏差大时改用语料即得真实文本形状。
+	{
+		lang := o.FillerLang
+		if lang == "" {
+			lang = "en"
+		}
+		const calibTokens = 2000 // 足够长：chat template 开销 <1%；prefill 快，探针时长可控
+		sample := Filler(calibTokens, 90001, lang)
+		src := "合成词表"
+		if CorpusInfo(lang) != "" {
+			src = "内置语料"
+		}
+		switch {
+		case sample == "":
+			checkExtNA("filler_fidelity", "填充样本为空——跳过长度口径校验")
+		default:
+			cli := NewClient(origin, o.APIKey, timeout, o.IncludeUsage)
+			cli.Auth = effAuth
+			cli.ChatPath = chatPath
+			m, err := cli.Chat(ctx, ChatOptions{
+				Model: model, MaxTokens: 1, Stream: false,
+				Messages: []Message{{Role: "user", Content: sample}},
+			})
+			if err != nil || m.Error != "" || m.PromptTokens <= 0 {
+				// NA：无 usage 的网关照样能压测，只是档位标称的保真度无法核验
+				checkExtNA("filler_fidelity", "无法实测填充 token 数（请求失败或缺 usage）——"+
+					"档位标称与真实 token 数可能有偏差，报告横轴以服务端 usage 为准")
+				break
+			}
+			chars := len([]rune(sample)) // rune 口径，与 corpus.CharsPerToken 对齐（中文 1 字 ≠ 3 字符）
+			cpt := float64(chars) / float64(m.PromptTokens)
+			ratio := float64(m.PromptTokens) / float64(calibTokens)
+			res.FillerCPT = cpt
+			detail := fmt.Sprintf("填充保真度（%s）：标称 %dtk → 实测 %d token（%.1f chars/token，偏差 %+.0f%%）",
+				src, calibTokens, m.PromptTokens, cpt, (ratio-1)*100)
+			if ratio < 0.75 || ratio > 1.25 {
+				checkExt("filler_fidelity", false, detail+
+					"——本部署 tokenizer 与构造近似偏离较大：报告横轴已按服务端 usage.prompt_tokens 实测分箱（不受影响），"+
+					"需要精确档位时改用 filler_corpus 真实语料")
+			} else {
+				checkExt("filler_fidelity", true, detail+"——长度口径可信，档位标称与实发基本一致")
+			}
 		}
 	}
 

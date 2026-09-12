@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -103,6 +104,67 @@ func TestProbe_GatewayWithoutExtSurfaces(t *testing.T) {
 	// 汇总里的标准面分母不该被 NA 撑大
 	if !strings.Contains(res.Summary, "标准面 5/5 通过") {
 		t.Errorf("标准面计数不符，实际 summary=%s checks=%s", res.Summary, dumpChecks(res))
+	}
+}
+
+// 填充保真度（自举校准）：服务端 tokenizer 与构造近似（corpus.CharsPerToken=4.0）
+// 系统性偏离时，probe 必须实测出来并告警——否则"标称 4k 档"实际发 10k，档位语义失真。
+// 这里造一个 usage 只有字符数一半的端点（等价于 2 chars/token 的紧凑 tokenizer）。
+func TestProbe_FillerFidelityWarnsOnDeviation(t *testing.T) {
+	UnloadCorpus("en") // 走合成词表路径，确保测的是 filler.go 的构造口径
+	t.Cleanup(func() { UnloadCorpus("en") })
+
+	srv := newProbeServer(t, func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path != "/v1/chat/completions" {
+			return false
+		}
+		body, _ := io.ReadAll(r.Body)
+		var req struct {
+			Stream   bool `json:"stream"`
+			Messages []struct {
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		_ = json.Unmarshal(body, &req)
+		chars := 0
+		for _, m := range req.Messages {
+			chars += len([]rune(m.Content))
+		}
+		usage := chars / 2 // 2 chars/token：构造侧按 4.0 换算 → 实测 token 数是标称的 2 倍
+		if !req.Stream {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"choices":[{"finish_reason":"stop","message":{"content":"OK"}}],`+
+				`"usage":{"prompt_tokens":%d,"completion_tokens":1,"total_tokens":%d}}`, usage, usage+1)
+			return true
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"想一想\"}}]}\n\n"+
+			"data: {\"choices\":[{\"delta\":{\"content\":\"OK\"},\"finish_reason\":\"stop\"}]}\n\n")
+		fmt.Fprintf(w, "data: {\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":1,\"total_tokens\":%d}}\n\n", usage, usage+1)
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		return true
+	})
+
+	res := Probe(context.Background(), ProbeOptions{
+		Endpoint: srv.URL + "/v1", Model: "compact-tok", Timeout: 5 * time.Second, FillerLang: "en",
+	})
+
+	c := findCheck(res, "filler_fidelity")
+	if c == nil {
+		t.Fatal("缺少 filler_fidelity 检查项")
+	}
+	if c.Tier != TierExt {
+		t.Errorf("filler_fidelity 应归扩展面（构造近似不是服务端问题），实际 %q", c.Tier)
+	}
+	if c.OK {
+		t.Errorf("2 chars/token 的端点应判偏离（构造按 4.0 换算），实际 OK: %s", c.Detail)
+	}
+	if res.FillerCPT < 1.9 || res.FillerCPT > 2.1 {
+		t.Errorf("实测 chars/token 应 ≈2.0，实际 %.2f（detail=%s）", res.FillerCPT, c.Detail)
+	}
+	// 告警必须给出可行动路径，否则用户只能看着偏差无从下手
+	if !strings.Contains(c.Detail, "语料") {
+		t.Errorf("告警应给出可行动建议（改用语料），实际 detail=%s", c.Detail)
 	}
 }
 
