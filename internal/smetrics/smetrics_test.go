@@ -278,3 +278,42 @@ func TestScrapeTruncatedBodyRejected(t *testing.T) {
 		t.Fatalf("超限响应应报截断错误, got %v", err)
 	}
 }
+
+// LatestWaiting：饱和止损取实时排队深度用——最后一次成功采样的值，从未采到时 ok=false。
+func TestPollerLatestWaiting(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "vllm:num_requests_running 2\nvllm:num_requests_waiting 7\n")
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	g := StartGaugePoller(ctx, NewScraperAt(srv.URL, "/metrics"), 5*time.Millisecond, VLLM())
+	defer g.Stop()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if w, ok := g.LatestWaiting(); ok {
+			if w != 7 {
+				t.Fatalf("LatestWaiting = %v, want 7", w)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("轮询成功后 LatestWaiting 应可取值")
+}
+
+func TestPollerLatestWaitingNeverSampled(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "vllm:num_requests_running 2\n") // 无 waiting 指标
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	g := StartGaugePoller(ctx, NewScraperAt(srv.URL, "/metrics"), 5*time.Millisecond, VLLM())
+	defer g.Stop()
+	time.Sleep(60 * time.Millisecond)
+	if _, ok := g.LatestWaiting(); ok {
+		t.Fatal("引擎不暴露 waiting 指标时 LatestWaiting 应 ok=false")
+	}
+}

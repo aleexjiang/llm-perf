@@ -17,33 +17,61 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 # 见 scripts/stall-e2e/ 的完整回归用例。
 TOKEN_DELAY = float(os.environ.get("MOCK_TOKEN_DELAY", "0.05"))
 
+# 直方图桶分布：确定性（越小的桶装越多），便于冒烟断言分位落在预期区间。
+HIST_FRACS = ((0.01, 0.10), (0.05, 0.35), (0.1, 0.55), (0.25, 0.80),
+              (0.5, 0.90), (1.0, 0.97), (2.5, 0.995))
+
+
+def hist_family(name, count, avg):
+    """生成一个 Prometheus 直方图 family（延迟类指标单位秒）。
+
+    smetrics 只对 `HistNames()` 里的 family 取窗口差值，分位按桶边界估算——
+    因此这里给出真实的 _bucket/_sum/_count 三件套即可跑通「服务端延迟分解」。
+    """
+    lines = ['%s_bucket{le="%g"} %d' % (name, le, int(count * frac)) for le, frac in HIST_FRACS]
+    lines.append('%s_bucket{le="+Inf"} %d' % (name, count))
+    lines.append("%s_sum %.3f" % (name, count * avg))
+    lines.append("%s_count %d" % (name, count))
+    return "\n".join(lines) + "\n"
+
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
     # 模拟 vLLM /metrics：让观测层（counter 差值 / gauge 轮询 / histogram 窗口）有真路径可测。
-    # 计数器随请求数累加（全局可变状态），gauge/gauge 直方图为静态样例。
+    # requests_served 随抓取次数累加（counter 差值恒为正）；chat_served/gen_tokens 随真实
+    # 推理请求累加——后者是 10.1「两源一致性守卫」的服务端基准（客户端吞吐 vs 服务端生成吞吐）。
     requests_served = 0
+    chat_served = 0
+    gen_tokens = 0
 
     def do_GET(self):
         if self.path.endswith("/metrics"):
             H.requests_served += 1
             n = H.requests_served
+            nc = H.chat_served
             body = (
                 f'vllm:prefix_cache_queries_total{{engine="0"}} {n * 1000}\n'
                 f'vllm:prefix_cache_hits_total{{engine="0"}} {n * 800}\n'
                 f'vllm:num_preemptions_total{{engine="0"}} 0\n'
                 f'vllm:spec_decode_num_drafts_total{{engine="0"}} {n * 10}\n'
                 f'vllm:spec_decode_num_accepted_tokens_total{{engine="0"}} {n * 16}\n'
-                f'vllm:num_requests_running{{engine="0"}} 1\n'
-                f'vllm:num_requests_waiting{{engine="0"}} 0\n'
+                f'vllm:generation_tokens_total{{engine="0"}} {H.gen_tokens}\n'
+                f'vllm:num_requests_running{{engine="0"}} {1 + nc % 3}\n'
+                # 排队深度随负载变化（非零）：报告「waiting 峰值」列与 saturation_guard.max_waiting
+                # 建议值需要真实的非零观测才走得到（恒 0 会让该列整片不渲染，路径测试不到）
+                f'vllm:num_requests_waiting{{engine="0"}} {(nc // 2) % 3}\n'
                 f'vllm:gpu_cache_usage_perc{{engine="0"}} 0.31\n'
-                f'vllm:request_queue_time_seconds_bucket{{le="0.01"}} {n}\n'
-                f'vllm:request_queue_time_seconds_bucket{{le="+Inf"}} {n}\n'
-                f'vllm:request_queue_time_seconds_sum {n * 0.005}\n'
-                f'vllm:request_queue_time_seconds_count {n}\n'
-            ).encode()
+            ).encode() + "".join(
+                hist_family(name, nc, avg) for name, avg in (
+                    ("vllm:request_queue_time_seconds", 0.005),
+                    ("vllm:request_prefill_time_seconds", 0.05),
+                    ("vllm:request_decode_time_seconds", 0.20),
+                    ("vllm:time_to_first_token_seconds", 0.06),
+                    ("vllm:inter_token_latency_seconds", 0.02),
+                    ("vllm:e2e_request_latency_seconds", 0.25),
+                )).encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; version=0.0.4")
             self.send_header("Content-Length", str(len(body)))
@@ -82,6 +110,10 @@ class H(BaseHTTPRequestHandler):
             "total_tokens": prompt_tokens + n_reason + n_content,
             "completion_tokens_details": {"reasoning_tokens": n_reason},
         }
+        # 服务端自身的产出统计（/metrics 口径）：与 usage 一致，便于两源一致性检查对得上，
+        # 也对得上「客户端 loss」类断言的失败方向（客户端少算 → 偏差为负）。
+        H.chat_served += 1
+        H.gen_tokens += n_reason + n_content
 
         # ── tool-call 路径：请求带 tools 即返回结构化调用（好引擎形态） ──
         if tools:

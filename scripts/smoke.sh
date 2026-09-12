@@ -49,7 +49,7 @@ trap cleanup EXIT
 # 漏 output-smoke*/run.log。
 # dataset.path 同理：它相对配置文件所在目录解析，配置搬到 TMP 后会指向
 # $TMP/fixtures/ 落空，需一并改写为仓库内的绝对路径。
-for f in smoke smoke-all smoke-overrides smoke-openloop smoke-levels smoke-stall; do
+for f in smoke smoke-all smoke-overrides smoke-openloop smoke-sweep smoke-levels smoke-stall; do
   sed -e "s#^output_dir:.*#output_dir: $TMP/runlog#" \
       -e "s#\([[:space:]]*path:[[:space:]]*[\"']\{0,1\}\)fixtures/#\1$PWD/configs/fixtures/#" \
       "configs/$f.yaml" >"$TMP/$f.yaml"
@@ -120,6 +120,11 @@ run "非流式 thinking on" out-nostream -c "$TMP/nostream.yaml" --turns single 
 
 # 7) 开环到达率（原 smoke-open 变体）
 run "开环到达率" out-openloop -c "$TMP/smoke-openloop.yaml" --turns single --concurrency cfg
+
+# 7b) 速率扫描（rate_sweep 多档）+ 观测层 + goodput + slo.baseline：
+#     报告侧「速率扫描」表与图、拐点/goodput 上限、测试画像、服务端延迟分解、两源一致性
+#     都以这份产物为数据源（报告断言见文末报告管线段）
+run "速率扫描（rate_sweep）" out-sweep -c "$TMP/smoke-sweep.yaml" --turns both --concurrency cfg
 
 # 8) 思考档位 levels：全档 + 档位名过滤
 run "levels 全档" out-levels-all -c "$TMP/smoke-levels.yaml" --turns single --concurrency 1
@@ -370,6 +375,45 @@ check(len(ll) > 0 and thinks(ll) == {"low"}, "levels 档位名过滤：--thinkin
 mf, _ = rows("out-mfilter")
 check(len(mf) > 0 and models(mf) == {"mock-model-b"}, "-m 过滤后只剩目标模型")
 
+# 10b) 速率扫描（rate_sweep）+ 两源一致性 + slo.baseline：JSON 侧的数据形状
+reps = load_all("out-sweep")
+cl = [lv for rep in reps for lv in rep.get("concurrent", [])]
+check(cl and {lv.get("request_rate") for lv in cl} == {2, 8},
+      f"速率扫描两档到达率落盘（实际 {sorted({lv.get('request_rate') for lv in cl})}）")
+check(cl and all(lv.get("goodput_rps", 0) > 0 and lv.get("slo_total", 0) > 0 for lv in cl),
+      "开环档位 goodput 落盘（slo.goodput 生效）")
+# waiting_max 是「本档窗口内新采到的样本峰值」口径（omitempty：0 落键消失 → 取 0 兜底）
+wm = {lv.get("request_rate"): (lv.get("waiting_max") or 0) for lv in cl}
+check(any(v > 0 for v in wm.values()),
+      f"waiting 排队峰值落盘且有非零观测（{wm}）")
+# 档位峰值不得超过本场景窗口的服务端观测峰值（越界 = 串了别的窗口的样本）
+gw = []
+for rep in reps:
+    gauges = (rep.get("server_metrics") or {}).get("gauges") or {}
+    mx = (gauges.get("waiting") or {}).get("max")
+    if isinstance(mx, (int, float)):
+        gw.append(mx)
+check(gw and all(w <= max(gw) + 0.5 for w in wm.values()),
+      f"档位 waiting 峰值不超过场景窗口峰值（档位 {wm}，窗口 {gw}）")
+scs = [rep.get("source_check") for rep in reps if rep.get("source_check")]
+check(len(scs) == 2 and all(s.get("client_tps", 0) > 0 and s.get("server_tps", 0) > 0 for s in scs),
+      f"两源一致性判定落盘（{len(scs)} 份并发产物）")
+check(all(abs(s.get("deviation", 9)) <= 0.15 for s in scs),
+      f"mock 两源一致（偏差 {[round(s.get('deviation', 9), 3) for s in scs]}，应 ≤15%）")
+check(all("deviation" in s for s in scs),
+      "deviation 键恒在（0 = 完全一致，不能因 omitempty 消失——否则报告把最好情况渲染成 NA）")
+sb = next((rep.get("slo_baseline") for rep in reps if rep.get("slo_baseline")), None)
+check(sb is not None and sb.get("long_min_tokens") == 300,
+      f"slo.baseline 阈值随 JSON 透出（实际 {sb}）")
+plans = [rep.get("plan") for rep in reps if rep.get("plan")]
+concs = [s for p in plans for m in (p.get("models") or []) for s in (m.get("scenarios") or [])
+         if s.get("name") == "concurrent"]
+check(concs and all("开环到达率" in s.get("detail", "") for s in concs),
+      f"测试画像按开环口径估算（不是 levels 矩阵；实际 {[s.get('detail') for s in concs][:1]}）")
+reqs = sorted({s.get("requests") for s in concs})
+check(reqs == [8, 16],
+      f"开环画像请求估算：单轮 2 档 × 4 请求 = 8，多轮 2 档 × 4 会话 × 2 轮 = 16（实际取值集 {reqs}）")
+
 # 11) 降速熔断：两场景相继熔断续跑，note 与 stall_trace 双留痕
 import glob
 stall_reps = load_all("out-stall")
@@ -431,8 +475,18 @@ PYEOF
 
 # ── 报告管线：合并 → HTML 生成 → JS 校验（node 缺失时降级为提示）──
 echo "==> 报告管线冒烟（gen_html_report + validate_report）"
-mkdir -p "$TMP/flat"
-find "$TMP/out-basic" -name '*.json' -exec cp {} "$TMP/flat/" \;
+# 保留模型分区子目录：多模型产物的文件名相同（scenario-时间戳），平铺 cp 会互相覆盖，
+# 只留一个模型 → 多模型落地页/切换器路径根本进不到。
+flat_copy() { # flat_copy <源目录> <目标目录>
+  local src="$1" dst="$2"
+  mkdir -p "$dst"
+  for f in $(find "$src" -name '*.json'); do
+    local out="$dst/${f#$src/}"
+    mkdir -p "$(dirname "$out")"
+    cp "$f" "$out"
+  done
+}
+flat_copy "$TMP/out-basic" "$TMP/flat"
 python3 scripts/gen_html_report.py "$TMP/flat" >"$TMP/report.log" 2>&1 \
   || { echo "❌ gen_html_report 失败（日志: $TMP/report.log）"; tail -20 "$TMP/report.log"; exit 1; }
 HTML="$TMP/flat/llm-perf-报告.html"
@@ -440,11 +494,28 @@ HTML="$TMP/flat/llm-perf-报告.html"
 echo "  ✅ 报告 HTML 已生成（$(wc -c <"$HTML" | tr -d ' ') bytes）"
 python3 - "$HTML" <<'PYEOF'
 import sys, re, html
-t = html.unescape(re.sub(r"<[^>]+>", "", open(sys.argv[1], encoding="utf-8").read()))
+raw = open(sys.argv[1], encoding="utf-8").read()
+t = html.unescape(re.sub(r"<[^>]+>", " ", raw))
 assert "数据来源" in t, "报告缺少『数据来源』声明（/metrics 是可选数据源，口径必须在报告里标注）"
 bad = re.findall(r"服务端观测（\w+）：。", t)
 assert not bad, "报告出现空的服务端观测面板: {}".format(bad)
+# 10.2 一页纸：顶层 = 四个数 + 三分归因；详细区降级为折叠附录（能力不砍）
+assert 'id="onepager"' in raw, "报告缺少一页纸区块"
+assert "一页纸结论" in t and "三分归因" in t, "一页纸未渲染标题/三分归因说明"
+for nm in ("① TTFT", "② decode 速度", "③ goodput@SLO", "④ 正确性"):
+    assert nm in t, "一页纸缺少四个数之一: {}".format(nm)
+for nm in ("服务端推理", "客户端与网络", "负载层（测试设计）"):
+    assert nm in t, "三分归因缺少: {}".format(nm)
+assert 'id="appendix"' in raw, "详细数据未降级为附录"
+assert 'id="appendix" open' not in raw, "附录默认不应展开（顶层只留一页纸）"
+# 多模型：一页纸表格必须两个模型都在（平铺 cp 覆盖文件曾导致只剩一个模型）
+assert "mock-model-a" in t and "mock-model-b" in t, "多模型报告缺模型"
+# 原章节仍在附录里（能力不砍）：抽查几个只可能来自详细区的字样
+for nm in ("指标口径", "缓存判定", "数据质量"):
+    assert nm in t, "附录缺少原章节内容: {}".format(nm)
+assert raw.find("const grid=") < raw.find('class="foot"'), "图表应随详细数据一起收进附录"
 print("  ✅ 数据来源已标注；无空的服务端观测面板")
+print("  ✅ 一页纸（四个数 + 三分归因）就位；详细区降级为折叠附录")
 PYEOF
 if command -v node >/dev/null 2>&1; then
   node scripts/validate_report.js "$HTML" >"$TMP/validate.log" 2>&1 \
@@ -453,5 +524,34 @@ if command -v node >/dev/null 2>&1; then
 else
   echo "  ⚠️ 无 node，跳过 validate_report.js（报告 JS 校验未执行）"
 fi
+
+# ── 报告侧：速率扫描（9.2）+ 测试画像（5.10）+ 服务端延迟分解（11.2）+ 两源一致性（10.1）──
+echo "==> 报告管线冒烟（速率扫描 / 画像 / 直方图 / 两源一致性）"
+mkdir -p "$TMP/sweepflat"
+find "$TMP/out-sweep" -name '*.json' -exec cp {} "$TMP/sweepflat/" \;
+python3 scripts/gen_html_report.py "$TMP/sweepflat" >"$TMP/report-sweep.log" 2>&1 \
+  || { echo "❌ gen_html_report 失败（速率扫描；日志: $TMP/report-sweep.log）"; tail -20 "$TMP/report-sweep.log"; exit 1; }
+HTML2="$TMP/sweepflat/llm-perf-报告.html"
+[ -f "$HTML2" ] || { echo "❌ 速率扫描报告 HTML 未生成"; exit 1; }
+python3 - "$HTML2" <<'PYEOF'
+import sys, re, html
+t = html.unescape(re.sub(r"<[^>]+>", " ", open(sys.argv[1], encoding="utf-8").read()))
+need = {
+    "速率扫描（开环到达率）": "9.2 速率扫描表",
+    "吞吐拐点": "吞吐拐点结论",
+    "goodput 达标上限": "goodput 上限结论",
+    "测试画像": "5.10 测试画像表渲染（此前落盘无人读）",
+    "服务端延迟分解": "11.2 直方图窗口差值表",
+    "两源一致性（客户端": "10.1 两源一致性判定",
+    "waiting 峰值": "9.4 waiting 排队峰值列",
+    "max_waiting": "9.4 阈值标定建议",
+    "≥300": "slo.baseline 阈值覆盖生效（档位标签跟随 JSON 阈值）",
+}
+missing = [why for key, why in need.items() if key not in t]
+assert not missing, "报告缺少: {}".format("、".join(missing))
+# 画像表必须列出开环到达率（而不是被忽略的 levels 矩阵）
+assert "开环到达率" in t, "测试画像未按开环口径渲染"
+print("  ✅ 速率扫描 / 画像 / 直方图 / 两源一致性 全部渲染")
+PYEOF
 
 echo "==> 冒烟完成（运行目录已清理；详细日志见上方各步输出）"

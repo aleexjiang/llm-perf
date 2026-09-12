@@ -10,9 +10,10 @@ dataset:
   mode: "trace"
   path: "fixtures/trace-sessions.json"   # 相对配置文件目录解析（原 /tmp 绝对路径导致新克隆环境测试必挂）
   format: "sessions"
-goodput:
-  ttft_ms: 5000
-  tpot_ms: 100000
+slo:
+  goodput:
+    ttft_ms: 5000
+    tpot_ms: 100000
 correctness:
   samples: 2
 

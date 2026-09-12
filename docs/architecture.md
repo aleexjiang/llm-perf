@@ -2,7 +2,7 @@
 
 > 面向维护者/二开者：模块边界、数据流、扩展点、已知坑位。使用方法见 [README](../README.md)；
 > 数据契约（JSON 输出与聚合口径）见 [data-contract.md](data-contract.md)；
-> 设计决策与测量哲学见 [AGENTS.md](../AGENTS.md)；能力规划见 [ROADMAP.md](../ROADMAP.md)。
+> 设计决策与测量哲学见 [AGENTS.md](../AGENTS.md)；评测体系（指标/分层/减法）见 [testing-architecture.md](testing-architecture.md)；能力规划见 [ROADMAP.md](../ROADMAP.md)。
 >
 > **本文不写行号**——行号随每次提交漂移（历史教训），定位一律用函数/类型名 grep。
 

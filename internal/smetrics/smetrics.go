@@ -275,6 +275,8 @@ func (vllmProvider) CounterNames() map[string][]string {
 		"preemptions":          {"vllm:num_preemptions", "vllm:num_preemptions_total"},
 		"spec_drafts":          {"vllm:spec_decode_num_drafts", "vllm:spec_decode_num_drafts_total"},
 		"spec_accepted":        {"vllm:spec_decode_num_accepted_tokens", "vllm:spec_decode_num_accepted_tokens_total"},
+		// 生成 token 总数：两源一致性校验用（不是评测指标，只做交叉验证）
+		"generation_tokens": {"vllm:generation_tokens", "vllm:generation_tokens_total"},
 	}
 }
 
@@ -373,6 +375,10 @@ type CounterDelta struct {
 	Preemptions            float64 `json:"preemptions,omitempty"`
 	SpecDrafts             float64 `json:"spec_drafts,omitempty"`
 	SpecAcceptedTokens     float64 `json:"spec_accepted_tokens,omitempty"`
+	// GenerationTokens 服务端自报的生成 token 数（vLLM: generation_tokens_total；SGLang 暂缺）。
+	// 用途单一：与客户端实测的 completion tokens 做**两源一致性**交叉校验（10.1）——
+	// 数百并发流下客户端可能自己成瓶颈，客户端读数会系统性偏低。0 = 引擎未暴露该 counter。
+	GenerationTokens float64 `json:"generation_tokens,omitempty"`
 }
 
 // CacheHitRate 返回窗口内前缀缓存 token 命中率（无查询时返回 0）。
@@ -407,6 +413,7 @@ func DiffCounters(before, after *Sample, p MetricsProvider) *CounterDelta {
 		"preemptions":          &d.Preemptions,
 		"spec_drafts":          &d.SpecDrafts,
 		"spec_accepted":        &d.SpecAcceptedTokens,
+		"generation_tokens":    &d.GenerationTokens,
 	} {
 		delta := get(after, key) - get(before, key)
 		if delta < 0 {
@@ -616,6 +623,42 @@ func (g *GaugePoller) Health() GaugeHealth {
 
 // Stop 停止轮询（幂等；不等待 loop 退出，Summary 会先 Stop 再读数据）。
 func (g *GaugePoller) Stop() { g.stopOnce.Do(func() { close(g.done) }) }
+
+// LatestWaiting 返回最近一次成功采样到的排队深度（waiting，语义键）。
+// ok=false = 从未采到（观测层不可用 / 引擎无该指标）。
+// 饱和止损的 waiting 判据用它取实时值——Summary 的峰值/均值是事后聚合，档位中途不可读。
+func (g *GaugePoller) LatestWaiting() (float64, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	xs := g.samples["waiting"]
+	if len(xs) == 0 {
+		return 0, false
+	}
+	return xs[len(xs)-1], true
+}
+
+// WaitingSampleCount 返回 waiting 的累计成功采样条数。
+// 与 WaitingSamplesSince 配对，用于"只统计某段时间窗内新采到的样本"——
+// 档位级 waiting 峰值不能用 LatestWaiting（它读的是全局最后一帧，会串档位）。
+func (g *GaugePoller) WaitingSampleCount() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return len(g.samples["waiting"])
+}
+
+// WaitingSamplesSince 返回下标 i 之后新采到的 waiting 样本（i 越界按 0 处理）。
+// 返回副本，调用方可安全读取。
+func (g *GaugePoller) WaitingSamplesSince(i int) []float64 {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	xs := g.samples["waiting"]
+	if i < 0 || i > len(xs) {
+		i = 0
+	}
+	out := make([]float64, len(xs)-i)
+	copy(out, xs[i:])
+	return out
+}
 
 // Summary 返回各 gauge 的峰值/均值。
 func (g *GaugePoller) Summary() map[string]GaugeSummary {

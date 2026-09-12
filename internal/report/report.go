@@ -60,8 +60,14 @@ type ConcurrentLevel struct {
 	// 混合负载形状分解（concurrent.mix，5.6）：按形状聚合的中位数统计；Requests 全量不动
 	Shapes []ShapeStat `json:"shapes,omitempty"`
 
-	// Aborted 非空 = 本档位被提前终止（5.7 爬坡发车的 fail-fast / 全局止损），
-	// 值为终止原因；场景层据此停止后续档位。已完成数据照常保留。
+	// WaitingMax 本档位观测到的 waiting 排队深度峰值（服务端 /metrics gauge；0 = 观测层
+	// 不可用或未采样）。与饱和止损是否启用无关，常开记录——它是 saturation_guard.max_waiting
+	// 的标定数据源（建议阈值 = 峰值 × 3–5，报告侧会自动给出建议值）。
+	WaitingMax float64 `json:"waiting_max,omitempty"`
+
+	// Aborted 非空 = 本档位被提前终止（5.7 爬坡发车的 fail-fast / 全局止损；
+	// saturation_guard 的饱和/墙钟 drain），值为终止原因；场景层据此停止后续档位。
+	// drain 语义：已发出的请求全部保留完整数据，仅样本量少于配置值。
 	Aborted string `json:"aborted,omitempty"`
 }
 
@@ -81,6 +87,22 @@ type ShapeStat struct {
 type SLO struct {
 	TTFTMS float64 `json:"ttft_ms"`
 	TPOTMS float64 `json:"tpot_ms"`
+}
+
+// SLOBaseline 记录本次评测的体验基线评估阈值（slo.baseline，5.8）：键名与报告脚本
+// 内置默认（SLO_TIERS）一致，报告侧直接合流覆盖。数值字段 0/缺省 = 未配置（用内置默认）。
+type SLOBaseline struct {
+	Enabled        bool    `json:"enabled"` // false = 报告跳过基线评估节
+	ShortMaxTokens int     `json:"short_max_tokens,omitempty"`
+	LongMinTokens  int     `json:"long_min_tokens,omitempty"`
+	ShortGoodTTFT  float64 `json:"short_good_ttft,omitempty"`
+	ShortPassTTFT  float64 `json:"short_pass_ttft,omitempty"`
+	LongGoodTTFT   float64 `json:"long_good_ttft,omitempty"`
+	LongPassTTFT   float64 `json:"long_pass_ttft,omitempty"`
+	GoodTPOT       float64 `json:"good_tpot,omitempty"`
+	PassTPOT       float64 `json:"pass_tpot,omitempty"`
+	GoodTPS        float64 `json:"good_tps,omitempty"`
+	PassTPS        float64 `json:"pass_tps,omitempty"`
 }
 
 // Plan 测试画像（5.10）：配置校验通过后、发首个请求前估算的"这次要跑什么形状"总览。
@@ -158,6 +180,13 @@ type ServerMetricsSummary struct {
 	SpecDrafts         float64 `json:"spec_drafts,omitempty"`
 	SpecAcceptedTokens float64 `json:"spec_accepted_tokens,omitempty"`
 
+	// GenerationTokens 窗口内服务端自报的生成 token 数（counter 差值；0 = 引擎未暴露该指标）。
+	// 服务端观测面的原始事实，报告侧据此做两源一致性交叉校验；不参与任何评测指标。
+	GenerationTokens float64 `json:"generation_tokens,omitempty"`
+
+	// WindowSeconds 本场景观测窗口时长（开始快照 → 结束快照，秒）。给两源一致性换算 tok/s 用。
+	WindowSeconds float64 `json:"window_seconds,omitempty"`
+
 	// gauge 轮询聚合（running/waiting 排队深度、kv_usage KV 池占用率）
 	Gauges map[string]GaugeSummary `json:"gauges,omitempty"`
 
@@ -172,6 +201,28 @@ type ServerMetricsSummary struct {
 // GaugeSummary 复用 smetrics 的轮询聚合类型。
 type GaugeSummary = smetrics.GaugeSummary
 
+// SourceCheck 两源一致性（10.1）：客户端实测聚合吞吐 vs 服务端自报生成吞吐的交叉校验。
+//
+// 【定位】诊断层守卫，不产生新的评测指标（指标层仍是四数）。要防的危险形态是「数百并发流 +
+// 高 chunk 率下客户端自身成瓶颈」——此时客户端读数系统性偏低，而服务端产出其实正常，
+// 单看客户端数字会得出「服务变慢了」的错误归因。
+//
+// 【口径】两边用同一分母（本场景各档位墙钟之和），因此比较等价于 token 量比较；
+// 服务端分子是 counter 窗口差值，含窗口内其他流量属已知近似。
+// 【降级】观测层缺失/不可比时只填 Note 记 NA，绝不因此改变任何结论——与 server_metrics
+// 的降级原则一致（客户端实测是唯一基线）。
+type SourceCheck struct {
+	ClientTPS     float64 `json:"client_tps,omitempty"`     // 客户端实测聚合吞吐（tok/s）
+	ServerTPS     float64 `json:"server_tps,omitempty"`     // 服务端生成吞吐（tok/s）
+	ClientTokens  float64 `json:"client_tokens,omitempty"`  // 客户端累计 completion tokens
+	ServerTokens  float64 `json:"server_tokens,omitempty"`  // 服务端 counter 窗口差值
+	WindowSeconds float64 `json:"window_seconds,omitempty"` // 共同分母（各档位墙钟之和）
+	// 刻意不加 omitempty：0 = 两源完全一致，是**最有意义的好结果**。加了之后该键会消失，
+	// 报告会把它渲染成「NA（缺可比口径）」——把最好的情况报成测不出来。
+	Deviation float64 `json:"deviation"`      // (client-server)/server；负 = 客户端偏低
+	Note      string  `json:"note,omitempty"` // 不可比原因（NA 口径）
+}
+
 // Version 是工具版本，随每个 JSON 输出落盘（报告追溯用）。
 // 默认 dev；Makefile 构建时用 -ldflags 注入 git describe 版本号。
 var Version = "llm-perf/dev"
@@ -184,12 +235,15 @@ type Report struct {
 	Endpoint    string                `json:"endpoint"`
 	Note        string                `json:"note,omitempty"`
 	SLO         *SLO                  `json:"slo,omitempty"`
+	SLOBaseline *SLOBaseline          `json:"slo_baseline,omitempty"`
 	Plan        *Plan                 `json:"plan,omitempty"`
 	Single      []SingleRow           `json:"single,omitempty"`
 	Multiturn   []MultiturnRun        `json:"multiturn,omitempty"`
 	Concurrent  []ConcurrentLevel     `json:"concurrent,omitempty"`
 	Correctness []CorrectnessRow      `json:"correctness,omitempty"`
 	Server      *ServerMetricsSummary `json:"server_metrics,omitempty"`
+	// SourceCheck 两源一致性（10.1，仅并发场景计算）：客户端 vs 服务端生成吞吐。
+	SourceCheck *SourceCheck `json:"source_check,omitempty"`
 
 	// 环境存档：几周后回看数据时"当时是什么引擎/什么配置跑的"必须有据可查。
 	Environment *engine.ProbeResult `json:"environment,omitempty"`
@@ -244,8 +298,10 @@ func (r *Report) PartitionByModel() []*Report {
 			Endpoint:       r.Endpoint,
 			Note:           r.Note,
 			SLO:            r.SLO,
+			SLOBaseline:    r.SLOBaseline,
 			Plan:           r.Plan,
 			Server:         r.Server,
+			SourceCheck:    r.SourceCheck,
 			Environment:    r.Environment,
 			ConfigRaw:      r.ConfigRaw,
 			PartitionModel: model,

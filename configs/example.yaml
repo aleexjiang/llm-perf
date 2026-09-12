@@ -56,10 +56,35 @@ dataset:
                              # 测真实 history 深度）| user_only（只回放 user 轮——上下文系统性偏小，
                              # 仅问答类数据集或快速对比用）
 
-# goodput（SLO 约束吞吐）：同时满足以下两条的请求才算有效（concurrent 结果里出 goodput 列）
-# goodput:
-#   ttft_ms: 2000
-#   tpot_ms: 100
+# slo 段（SLO 口径统一入口，2026-09-12 由顶层 goodput 合流而来）：
+#   goodput（SLO 约束吞吐）：同时满足以下两条的请求才算有效（concurrent 结果里出 goodput 列）
+#   baseline（体验基线评估阈值，报告第 8 节的 ✅/⚠️/❌ 判据；未写的键用报告内置默认，
+#   判据与出处 docs/latency-baselines.md §7；enabled: false = 报告跳过该节）
+# slo:
+#   goodput:
+#     ttft_ms: 2000
+#     tpot_ms: 100
+#   baseline:
+#     short_max_tokens: 4000    # 短输入档上界
+#     long_min_tokens: 24000    # agent 大上下文档下界
+#     short_good_ttft: 0.45     # s（MLPerf Interactive p99）
+#     short_pass_ttft: 2.0      # s（MLPerf Server p99）
+#     long_good_ttft: 3.0       # s（agent 大上下文，推导值）
+#     long_pass_ttft: 6.0
+#     good_tpot: 40             # ms
+#     pass_tpot: 200            # ms
+
+# 饱和止损（默认关闭）：负载饱和时停止加压，与降速熔断互补（stall_guard 管「服务端变慢」，
+# 本段管「负载积压」）。任一判据触发即**停止向当前档位发新请求**（drain：在飞跑完，已发出
+# 的请求全部保留完整数据）并停止后续档位，aborted 留痕。
+# max_waiting 标定：首轮关着 guard 跑，各档 waiting 峰值会落盘（waiting_max），
+# 报告建议区自动给建议值（≈4× 峰值）——阈值低于正常水位会把正常排队当饱和误切。
+# CLI 覆盖：--sat-waiting / --sat-window / --sat-max-wall；--no-sat-guard 关闭。
+# saturation_guard:
+#   max_waiting: 32           # waiting 排队深度阈值（需 server_metrics: true；0=不启用）
+#   window_seconds: 120       # 持续超阈多久触发（任何一次回落即重置计时）
+#   sample_seconds: 5         # 探测周期
+#   max_wall_seconds: 3600    # 单档发射窗口上限（0=不启用；到点只停发新请求，在飞跑完）
 
 # 正确性抽查（防"HTTP 200 但内容异常"的假成功）：数字转写金丝雀，结果进 JSON 与报告数据质量节
 # correctness:

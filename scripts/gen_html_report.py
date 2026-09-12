@@ -274,7 +274,8 @@ def merge(reports):
     报告里那两段「服务端观测」代码成了死代码。现在按场景归集到 meta["server"]。
     """
     data = {k: [] for k in SCENARIOS}
-    meta = {"endpoint": "?", "tool": "?", "notes": [], "generated": [], "slo": None, "server": {}}
+    meta = {"endpoint": "?", "tool": "?", "notes": [], "generated": [], "slo": None,
+            "slo_baseline": None, "source_check": None, "server": {}, "correctness": {}}
     for p, d in reports:
         scen = d.get("scenario")
         if scen not in data:
@@ -288,12 +289,23 @@ def merge(reports):
         if d.get("generated_at"):
             meta["generated"].append(d["generated_at"])
         meta["slo"] = d.get("slo") or meta["slo"]
+        # 9.1 合流：slo.baseline 阈值随 JSON 透出（键名与内置 SLO_TIERS 一致）——此前 Go 侧
+        # goodput 判定与报告侧基线判据是两份互不相识的常量，改一处漂移一处，现在以 JSON 为准。
+        meta["slo_baseline"] = d.get("slo_baseline") or meta["slo_baseline"]
+        # 10.1 两源一致性（客户端实测 vs 服务端 /metrics 生成吞吐）判定结果，由 Go 侧算好落盘
+        meta["source_check"] = d.get("source_check") or meta["source_check"]
         if d.get("environment"):
             meta["environment"] = d["environment"]
         if d.get("config_raw"):
             meta["config_raw"] = redact_secrets(d["config_raw"])
         if d.get("plan"):
             meta["plan"] = d["plan"]
+        # 正确性金丝雀按模型归集（10.2 四个数之一）：每份产物顶层一份 correctness，
+        # 多模型报告下逐文件归到各自模型，一页纸才能给出「哪个模型答错」。
+        for cr in (d.get("correctness") or []):
+            cm = cr.get("model") or "?"
+            p_, t_ = meta["correctness"].get(cm, (0, 0))
+            meta["correctness"][cm] = (p_ + (1 if cr.get("match") else 0), t_ + 1)
         sm = d.get("server_metrics")
         if isinstance(sm, dict):  # probe 的 server_metrics 是字符串，别混进来
             cur = meta["server"].get(scen)
@@ -354,7 +366,37 @@ SLO_TIERS = {
     "good_tps": 25.0,           # 单请求输出速度 tok/s（comfortable 区上沿；依据 docs/latency-baselines.md §8）
     "pass_tps": 10.0,           # 阅读速度 ~4 tok/s × 2 安全系数（勉强区上沿；依据 §8）
 }
-BUCKET_LABEL = {"short": "≤4K", "mid": "4–24K", "long": "≥24K"}
+def bucket_label(bkt, tiers):
+    """输入档标签按**生效阈值**生成。
+
+    slo.baseline 可在 JSON 里覆盖档位边界（9.1 合流），标签写死「≤4K / ≥24K」会在客户
+    改过阈值之后说谎——档位名必须跟着阈值走。
+    """
+    if bkt == "short":
+        return "≤{:,}".format(tiers["short_max_tokens"])
+    if bkt == "long":
+        return "≥{:,}".format(tiers["long_min_tokens"])
+    return "{:,}–{:,}".format(tiers["short_max_tokens"] + 1, tiers["long_min_tokens"] - 1)
+
+
+def eff_tiers(meta):
+    """生效的体验基线阈值：JSON 的 `slo_baseline`（9.1 合流）覆盖脚本内置默认。
+
+    未写的键（0/缺省）与旧产物（无该字段）自动回落 SLO_TIERS，存量数据照样出报告。
+    """
+    t = dict(SLO_TIERS)
+    sb = (meta or {}).get("slo_baseline") or {}
+    for k in SLO_TIERS:
+        v = sb.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and v != 0:
+            t[k] = v
+    return t
+
+
+def baseline_enabled(meta):
+    """是否出「体验基线评估」节：slo.baseline.enabled=false 整节跳过（缺省 = 评估）。"""
+    sb = (meta or {}).get("slo_baseline") or {}
+    return sb.get("enabled", True) is not False
 
 
 def pct9599(vals, nd=2):
@@ -432,6 +474,26 @@ def table(headers, rows):
     return '<table><thead><tr>{}</tr></thead><tbody>{}</tbody></table>'.format(h, body)
 
 
+def plan_table(plan):
+    """5.10 测试画像：开跑前估算的「这次跑什么形状、多少请求」。
+
+    此前 plan 三件套（Go 落盘 → py 收集 → 无人渲染）是唯一完整的死管线——落盘了却没有任何
+    读者。画像的价值恰恰是回答「这份数据是什么形状跑出来的」，因此必须渲染。
+    """
+    rows = []
+    for m in plan.get("models") or []:
+        for s in m.get("scenarios") or []:
+            rows.append([esc(short(m.get("model", ""))), esc(s.get("name", "")),
+                         esc(s.get("detail", "")), "{:,}".format(s.get("requests", 0))])
+    if not rows:
+        return ""
+    rows.append(["<b>合计</b>", "", "不含预热与金丝雀", "<b>{:,}</b>".format(plan.get("total_requests", 0))])
+    note = '<div class="note">画像按<b>执行口径</b>估算（档位截断、思考 floor、变体展开、模型覆盖逐层同构），' \
+           '用于回答「这次跑了什么形状、总共多少请求」；上下文 reach 为估算值（4 字符/token × 1.07 模板开销），' \
+           '带 <code>~</code> 前缀。</div>'
+    return "<h3>测试画像（开跑前估算）</h3>" + table(["模型", "场景", "明细", "请求估算"], rows) + note
+
+
 def esc(s):
     return html.escape(str(s))
 
@@ -470,7 +532,14 @@ def mts_of(d, model, thinking):
 
 def analyze(data, meta):
     s_by, m_by, c_lvls, models = organize(data)
-    A = {"models": models, "per_model": OrderedDict(), "coverage": {}, "events": []}
+    tiers = eff_tiers(meta)
+    A = {"models": models, "per_model": OrderedDict(), "coverage": {}, "events": [],
+         "tiers": tiers, "baseline_enabled": baseline_enabled(meta),
+         "slo": (meta or {}).get("slo"), "source_check": (meta or {}).get("source_check"),
+         # 10.3 横轴实测分箱：{(model, thinking, max_tokens, 标称档位): 实测 usage 中位数}。
+         # 构造 filler 的 chars/token 是近似系数（probe 可校准），trace 模式下更只是估算——
+         # 报告横轴与档位分箱一律以服务端 usage 为准，配置档位只在偏差 >5% 时并列标出。
+         "usage_med": {}}
 
     all_single_runs = [r for e in data["single"] for r in e["runs"]]
     all_mt_turns = [t for sess in data["multiturn"] for t in sess["turns"]]
@@ -505,6 +574,13 @@ def analyze(data, meta):
         ok_turns = [t for t in turns if not t.get("error")]
         n_fails = len(turns) - len(ok_turns)
         src = ok_turns
+        # 5.7 爬坡发车窗口：批次号 >1 才算出窗口（齐射/单批次不标），span 取首批→末批的启动偏移差
+        ramp = None
+        if lv.get("sessions"):
+            offs = [s.get("start_offset_s", 0) or 0 for s in lv["sessions"]]
+            batches = sorted({s.get("batch", 0) or 0 for s in lv["sessions"]})
+            if len(batches) > 1:
+                ramp = {"batches": len(batches), "span_s": round(max(offs) - min(offs), 1)}
         A[quad].append({
             "model": lv["model"],
             "thinking": lv.get("thinking", "off"),
@@ -524,6 +600,15 @@ def analyze(data, meta):
             "finish": sorted({t.get("finish_reason", "?") for t in src}),
             "shapes": lv.get("shapes") or [],  # 5.6 混合负载：形状分解（非空 = 混跑轮）
             "request_rate": lv.get("request_rate", 0),
+            # 9.1/9.4 goodput 与排队观测：slo_total=0 表示未配置 slo.goodput（不出这两列）；
+            # waiting_max 为服务端 /metrics gauge 峰值（0 = 观测层不可用或未采样）
+            "slo_meet": lv.get("slo_meet", 0),
+            "slo_total": lv.get("slo_total", 0),
+            "goodput_rps": lv.get("goodput_rps", 0),
+            "goodput_tps": lv.get("goodput_tps", 0),
+            "waiting_max": lv.get("waiting_max", 0),
+            "aborted": lv.get("aborted", ""),
+            "ramp": ramp,
         })
 
     for m in models:
@@ -540,8 +625,13 @@ def analyze(data, meta):
                     # 失败 run（如 HTTP 504）剔除后再统计——与并发侧口径一致，防 ttft=0 拉低中位数；
                     # 整档全失败不回退全集（stats 为空渲染 "—"，fails/n 表达失败规模）
                     rs = [r for r in rs_all if not r.get("error")]
+                    # 实测输入规模（usage）：横轴与档位分箱的权威口径（10.3）
+                    _us = [r.get("prompt_tokens") for r in rs if r.get("prompt_tokens")]
+                    _usage = int(round(st.median(_us))) if _us else None
+                    A["usage_med"][(m, th, mt, size)] = _usage
                     ladder.append({
                         "size": size,
+                        "usage": _usage,
                         "mt": mt,
                         "fails": len(rs_all) - len([r for r in rs_all if not r.get("error")]),
                         "ttft": mmm([r["ttft_ms"] / 1000 for r in rs if r.get("ttft_ms") is not None], 2),
@@ -658,15 +748,30 @@ def analyze(data, meta):
     # TTFT 按输入档池化（跨输出档——TTFT 与输出长度无关）；TPOT/tok/s 取最大输出档组
     # （输出越长 decode 爬坡段占比越小，与 ladder_top 的口径一致）
     def bucket_of(p):
-        if p <= SLO_TIERS["short_max_tokens"]:
+        if p <= tiers["short_max_tokens"]:
             return "short"
-        if p >= SLO_TIERS["long_min_tokens"]:
+        if p >= tiers["long_min_tokens"]:
             return "long"
         return "mid"
 
     def prompt_lbl(ps):
         lo, hi = min(ps), max(ps)
         return "{:,}".format(lo) if lo == hi else "{:,}–{:,}".format(lo, hi)
+
+    def axis_size(m, th, mt, size):
+        """横轴/分箱用的输入规模：优先服务端实测 usage，缺失才退回配置标称档位（10.3）。"""
+        u = A["usage_med"].get((m, th, mt, size))
+        return u if u else size
+
+    def axis_lbl(m, th, mt, size):
+        """档位标签：实测与配置偏差 >5% 时并列标出配置值（构造系数只影响近似程度，
+        判读必须锚在服务端真实看到的规模上）。"""
+        u = A["usage_med"].get((m, th, mt, size))
+        if not u or not size:
+            return "{:,}".format(size)
+        if abs(u - size) / float(size) > 0.05:
+            return "{:,}<span class='rng'>（配置 {:,}）</span>".format(u, size)
+        return "{:,}".format(size)
 
     def mk_unit(scene, model, th, bkt, lbl, ttfts, tpots, tpss, n):
         ttfts = [v for v in ttfts if v]
@@ -697,7 +802,8 @@ def analyze(data, meta):
                 groups = []
                 for mt in mts:
                     for size in sorted(s_by[(m, th, mt)]):
-                        if bucket_of(size) != bkt:
+                        # 分箱按**实测 usage**（构造系数偏差不会把档位归错桶）
+                        if bucket_of(axis_size(m, th, mt, size)) != bkt:
                             continue
                         # 显式剔除失败 run（n=成功数；不依赖 mk_unit 内 if v 的隐式滤 0）
                         rs = [r for r in s_by[(m, th, mt)][size]["runs"] if not r.get("error")]
@@ -709,7 +815,8 @@ def analyze(data, meta):
                 top_mt = max(mt for mt, _, _ in groups)
                 top_rs = [r for mt, _, rs in groups if mt == top_mt for r in rs]
                 base.append(mk_unit(
-                    "单发·单轮", m, th, bkt, prompt_lbl([size for _, size, _ in groups]),
+                    "单发·单轮", m, th, bkt,
+                    prompt_lbl([axis_size(m, th, mt, size) for mt, size, _ in groups]),
                     ttfts, [r.get("tpot_ms") for r in top_rs],
                     [r.get("tokens_per_sec") for r in top_rs], len(ttfts)))
             # 单发·多轮：逐轮按该轮 prompt 归档（会话越深输入越大）；失败轮显式剔除
@@ -750,7 +857,7 @@ def analyze(data, meta):
                                 [t.get("ttft_ms", 0) / 1000 for t in ts],
                                 [t.get("tpot_ms") for t in ts],
                                 [t.get("tokens_per_sec") for t in ts], len(ts)))
-    A["baseline"] = base
+    A["baseline"] = base if A["baseline_enabled"] else []
 
     # 全局事件
     trunc = sum(1 for r in all_single_runs + all_mt_turns if r.get("thinking_no_content"))
@@ -801,6 +908,13 @@ def build_charts(data, A):
         canvases.append((cid, title))
 
     # 单发 TTFT vs 档位（每个 thinking 变体一张图，每模型×输出档一条线）
+    def meas_label(size, th):
+        """横轴标签用服务端实测 usage 中位（跨模型取中位，横轴是共享的）；
+        实测缺失才退回配置标称档位。构造系数只决定"近似到什么程度"，判读锚实测（10.3）。"""
+        us = [u for (m2, t, _mt, sz), u in (A.get("usage_med") or {}).items()
+              if t == th and sz == size and u]
+        return "{:,}".format(int(round(st.median(us)))) if us else "{:,}".format(size)
+
     for th in ("off", "on"):
         sizes = sorted({size for (m2, t, _mt) in s_by for size in s_by[(m2, t, _mt)] if t == th})
         if not sizes:
@@ -817,9 +931,9 @@ def build_charts(data, A):
                 if len(mts) > 1:
                     lbl += " out={}".format(mt)
                 ds.append(line_ds(lbl, ys, color_of(models, m), dash=[5, 4] if i_mt > 0 else None))
-        scales = {"x": spread({"title": {"display": True, "text": "prompt tokens（目标档位）"}}),
+        scales = {"x": spread({"title": {"display": True, "text": "prompt tokens（服务端 usage 实测中位）"}}),
                   "y": spread({"title": {"display": True, "text": "TTFT ms"}})}
-        stmts.append(chart_js("c_s_ttft_" + th, "line", [str(s) for s in sizes], ds,
+        stmts.append(chart_js("c_s_ttft_" + th, "line", [meas_label(s, th) for s in sizes], ds,
                               "单发 TTFT vs 上下文档位（3 runs 中位数）", scales))
         add("c_s_ttft_" + th, "单发 TTFT vs 档位（thinking={}）".format(th))
 
@@ -921,6 +1035,58 @@ def build_charts(data, A):
                                   "{}：TTFT vs 并发（上翘=开始排队）".format(qname), scales))
             add(cid_ttft, "{} TTFT vs 并发".format(qname))
 
+    # 9.2 速率扫描（开环到达率）：每象限两张图 —— 吞吐/goodput vs 到达率、TTFT 中位/p99 vs 到达率。
+    # 开环轮次 level=0，并发表那两张「vs 并发」图对它们整片不可见，容量曲线只能靠这一组。
+    for quad, cid_tps, cid_ttft, qname in (("conc_single", "c_rs_tps", "c_rs_ttft", "并发·单轮"),
+                                           ("conc_multi", "c_rsm_tps", "c_rsm_ttft", "并发·多轮")):
+        items = [e for e in A.get(quad, []) if e.get("request_rate") and not e.get("shapes")]
+        if not items:
+            continue
+        rates = sorted({e["request_rate"] for e in items})
+        if len(rates) < 2:
+            continue  # 单档到达率画不出曲线（该图的价值在趋势）
+        groups = sorted({(e["model"], e["thinking"], e["mt"]) for e in items})
+        multi_mt = len({g[2] for g in groups}) > 1
+        ds_load, ds_ttft = [], []
+        for m, th, mt in groups:
+            ys_tps, ys_gp, ys_med, ys_p99 = [], [], [], []
+            for r in rates:
+                es = [e for e in items if e["model"] == m and e["thinking"] == th
+                      and e["mt"] == mt and e["request_rate"] == r]
+                if not es:
+                    ys_tps.append(None); ys_gp.append(None)
+                    ys_med.append(None); ys_p99.append(None)
+                    continue
+                ys_tps.append(round(sum(x["tps"] or 0 for x in es) / len(es), 1))
+                gp = [x["goodput_rps"] for x in es if x.get("goodput_rps")]
+                ys_gp.append(round(sum(gp) / len(gp), 2) if gp else None)
+                meds = [x["ttft"][0] for x in es if x["ttft"]]
+                ys_med.append(round(st.median(meds), 2) if meds else None)
+                p99s = [x["ttft_p"][1] for x in es if x["ttft_p"]]
+                ys_p99.append(round(max(p99s), 2) if p99s else None)
+            if not any(v is not None for v in ys_tps):
+                continue
+            lbl = "{} (thinking={})".format(short(m), th) + (" out={}".format(mt) if multi_mt else "")
+            col = color_of(models, m, 1 if th == "on" else 0)
+            ds_load.append(line_ds(lbl, ys_tps, col))
+            ds_ttft.append(line_ds(lbl + " TTFT 中位", ys_med, col))
+            ds_ttft.append(line_ds(lbl + " TTFT p99", ys_p99, col, dash=[5, 4]))
+            if any(v is not None for v in ys_gp):
+                ds_load.append(line_ds(lbl + " goodput", ys_gp, col, dash=[5, 4]))
+        labels = ["{:g}".format(r) for r in rates]
+        if ds_load:
+            scales = {"x": spread({"title": {"display": True, "text": "到达率 req/s（Poisson）"}}),
+                      "y": spread({"title": {"display": True, "text": "tok/s（吞吐 / goodput）"}})}
+            stmts.append(chart_js(cid_tps, "line", labels, ds_load,
+                                  "{}：吞吐 / goodput vs 到达率（走平=容量边界）".format(qname), scales))
+            add(cid_tps, "{} 吞吐 vs 到达率".format(qname))
+        if ds_ttft:
+            scales = {"x": spread({"title": {"display": True, "text": "到达率 req/s（Poisson）"}}),
+                      "y": spread({"title": {"display": True, "text": "TTFT 秒"}})}
+            stmts.append(chart_js(cid_ttft, "line", labels, ds_ttft,
+                                  "{}：TTFT 中位 / p99 vs 到达率（上翘=排队开始）".format(qname), scales))
+            add(cid_ttft, "{} TTFT vs 到达率".format(qname))
+
     return canvases, stmts
 
 
@@ -929,6 +1095,18 @@ def short(model):
 
 
 # ────────────────────────── 表格 ──────────────────────────
+
+def axis_cell(l):
+    """单发档位列：以服务端实测 usage 为主，与配置标称偏差 >5% 时并列标出配置值（10.3）。
+    构造 filler 的 chars/token 是近似系数（probe 可校准），trace 模式更是估算——
+    「档位 tk」列若只写配置目标值，读者会把构造偏差误当服务端行为。"""
+    size, usage = l.get("size"), l.get("usage")
+    if not usage or not size:
+        return "{:,}".format(size or 0)
+    if abs(usage - size) / float(size) > 0.05:
+        return "{:,}<span class='rng'>（配置 {:,}）</span>".format(usage, size)
+    return "{:,}".format(size)
+
 
 def single_table(A, th):
     rows = []
@@ -940,7 +1118,7 @@ def single_table(A, th):
             fail_cell = str(l.get("fails") or 0)
             if l.get("fails"):
                 fail_cell = '<span style="color:#e5484d;font-weight:600">{}</span>'.format(l["fails"])
-            row = [esc(short(m)), str(l["mt"]), "{:,}".format(l["size"]), str(l["n"]), fail_cell,
+            row = [esc(short(m)), str(l["mt"]), axis_cell(l), str(l["n"]), fail_cell,
                    f3(l["ttft"]), f3(l["ttft_content"])]
             if th == "on":
                 # 思考占比 = 思考总时长 / E2E（思考与正文输出交错，占比为口径近似）
@@ -956,30 +1134,66 @@ def single_table(A, th):
                     f0(l["rc"]) if th == "on" else "—",
                     " / ".join(l["finish"])]
             rows.append(row)
-    head = ["模型", "输出 tk", "档位 tk", "runs", "失败", "TTFT s", "首内容 s"] + \
+    head = ["模型", "输出 tk", "输入 tk（实测）", "runs", "失败", "TTFT s", "首内容 s"] + \
            (["思考 s", "思考占比"] if th == "on" else []) + \
            ["E2E s", "decode s", "ITL p50 ms", "ITL p99 ms", "tok/s", "输出 tok"] + \
            (["思考字符"] if th == "on" else []) + ["finish"]
     return table(head, rows) if rows else "<p>无数据</p>"
 
 
+def load_cell(e):
+    """负载单元格：闭环 L{n}；开环 rate=X/s（开环档 level 恒为 0，只显示 level 会把整片读数变成 0）。"""
+    if e.get("request_rate"):
+        return "rate={:g}/s".format(e["request_rate"])
+    return "L{}".format(e["level"])
+
+
 def concurrent_table(A, quad):
     qname = "并发·多轮" if quad == "conc_multi" else "并发·单轮"
-    has_think = any(e["thinking"] != "off" or (e["think"] and e["think"][0] > 0) for e in A[quad])
-    head = ["模型", "thinking", "输出 tk", "并发", "单元数", "请求总数", "失败", "墙钟 s", "吞吐 tok/s",
-            "TTFT s", "TTFT p95/p99 s", "E2E s", "E2E p95/p99 s"] + (["思考 s"] if quad == "conc_multi" else []) + \
-           ["单请求 tok/s", "finish"]
+    items = A[quad]
+    has_think = any(e["thinking"] != "off" or (e["think"] and e["think"][0] > 0) for e in items)
+    has_slo = any(e.get("slo_total") for e in items)      # 未配置 slo.goodput 时不出这两列
+    has_wait = any(e.get("waiting_max") for e in items)   # 观测层不可用时不出
+    has_ramp = any(e.get("ramp") for e in items)
+    head = ["模型", "thinking", "输出 tk", "负载", "单元数", "请求总数", "失败", "墙钟 s", "吞吐 tok/s"]
+    if has_slo:
+        head += ["SLO 达标", "goodput req/s"]
+    if has_wait:
+        head += ["waiting 峰值"]
+    if has_ramp:
+        head += ["发车"]
+    head += ["TTFT s", "TTFT p95/p99 s", "E2E s", "E2E p95/p99 s"] + \
+            (["思考 s"] if quad == "conc_multi" else []) + ["单请求 tok/s", "finish"]
     rows = []
-    for e in sorted(A[quad], key=lambda x: (x["model"], x["thinking"], x["mt"], x["level"])):
+    for e in sorted(items, key=lambda x: (x["model"], x["thinking"], x["mt"],
+                                          x.get("request_rate", 0), x["level"])):
         mt_cell = "mix({})".format("/".join(s["label"] for s in e["shapes"])) if e["shapes"] else str(e["mt"])
         fail_cell = str(e.get("fails") or 0)
         if e.get("fails"):
             fail_cell = '<span style="color:#e5484d;font-weight:600">{}</span>'.format(e["fails"])
-        row = [esc(short(e["model"])), e["thinking"], mt_cell, str(e["level"]),
+        lcell = esc(load_cell(e))
+        if e.get("aborted"):
+            # drain 语义：已发出的请求数据完整保留，只是样本量少于配置值——必须标出来，
+            # 否则读者会把「被止损截断的档位」当成完整档位去比较吞吐
+            lcell += ' <span style="color:#b45309;font-weight:600" title="{}">⚠️ 提前终止</span>'.format(
+                esc(e["aborted"]))
+        row = [esc(short(e["model"])), e["thinking"], mt_cell, lcell,
                "{:,}".format(e["n_units"]), "{:,}".format(e["n_turns"]), fail_cell,
                "{:.1f}".format(e["wall"]) if e["wall"] else "—",
-               "{:.0f}".format(e["tps"]) if e["tps"] else "—",
-               f3(e["ttft"]), fpct(e["ttft_p"], 2), f1(e["e2e"]), fpct(e["e2e_p"], 1)]
+               "{:.0f}".format(e["tps"]) if e["tps"] else "—"]
+        if has_slo:
+            if e.get("slo_total"):
+                row += ["{}/{}({:.0%})".format(e["slo_meet"], e["slo_total"],
+                                               e["slo_meet"] / e["slo_total"]),
+                        "{:.2f}".format(e.get("goodput_rps") or 0)]
+            else:
+                row += ["—", "—"]
+        if has_wait:
+            row += ["{:.0f}".format(e["waiting_max"]) if e.get("waiting_max") else "—"]
+        if has_ramp:
+            row += ["爬坡 {} 批 / {:.0f}s".format(e["ramp"]["batches"], e["ramp"]["span_s"])
+                    if e.get("ramp") else "齐射"]
+        row += [f3(e["ttft"]), fpct(e["ttft_p"], 2), f1(e["e2e"]), fpct(e["e2e_p"], 1)]
         if quad == "conc_multi":
             row.append(f1(e["think"]))
         row += [f0(e["tokps"]), " / ".join(e["finish"])]
@@ -988,10 +1202,92 @@ def concurrent_table(A, quad):
            'p95/p99 仅在成功请求数 ≥ {} 时计算——长短混跑时中位数可能几乎不动而 p99 数倍膨胀，' \
            '请对照 p95/p99 列判断尾部时延风险。</div>'.format(
         "独立多轮会话（每用户各自跑完整会话）" if quad == "conc_multi" else "独立单轮请求", MIN_PCT_SAMPLE)
-    if any(e.get("fails") for e in A[quad]):
+    if has_slo:
+        note += '<div class="note">SLO 达标 = 满足 <code>slo.goodput</code>（TTFT/TPOT 阈值）的请求数 / 总请求数；' \
+                'goodput req/s = 达标请求 ÷ 墙钟（配置阈值见第 2 节配置存档）。未达标不等于故障，' \
+                '它表示该负载下已超出业务可接受时延。</div>'
+    if has_wait:
+        note += '<div class="note">waiting 峰值 = 服务端 <code>num_requests_waiting</code> 排队深度峰值' \
+                '（<code>saturation_guard.max_waiting</code> 的标定依据，建议阈值 ≈ 峰值 × 4；' \
+                '具体建议值见「结论与建议」）。</div>'
+    if has_ramp:
+        note += '<div class="note">发车 = 5.7 闭环错峰发车（指数爬坡：首批 1 路，等该批全部完成首轮再放大一倍）。' \
+                '「爬坡 N 批 / Xs」表示本档位的会话在 X 秒窗口内陆续启动——' \
+                '该窗口内尚处暂态，读数请以窗口后为准；齐射（<code>ramp: false</code>）无此问题。</div>'
+    if any(e.get("aborted") for e in items):
+        note += '<div class="note" style="color:#b45309;font-weight:600">⚠️ 存在提前终止的档位（hover 见原因）：' \
+                '饱和止损/爬坡止损触发后关闭发射闸门，已发出的请求全部保留完整数据（drain 语义），' \
+                '但样本量少于配置值，档位间吞吐对比需扣除该因素。</div>'
+    if any(e.get("fails") for e in items):
         note += '<div class="note" style="color:#b45309;font-weight:600">⚠️ 该象限存在失败请求（已从延迟统计剔除）——' \
                 '对应档位的中位数/分位数仅基于幸存请求，真实体验比表中更差；失败明细见数据质量章。</div>'
     return table(head, rows) + note if rows else "<p>无数据</p>"
+
+
+def rate_sweep_table(A):
+    """9.2 速率扫描（开环到达率）：GuideLLM sweep 的容量交付物口径。
+
+    逐档吞吐 / goodput / SLO 达标率 / TTFT 中位与 p99，并给出两个容量结论：
+      - 吞吐拐点：吞吐 ≥ 0.9×峰值 的最大到达率（再加压只会排队）
+      - goodput 上限：SLO 达标率 ≥95% 的最大到达率（业务可接受的最大负载）
+    """
+    parts = []
+    for quad, qname in (("conc_single", "并发·单轮"), ("conc_multi", "并发·多轮")):
+        items = [e for e in A.get(quad, []) if e.get("request_rate")]
+        if not items:
+            continue
+        groups = defaultdict(list)
+        for e in items:
+            groups[(e["model"], e["thinking"], e["mt"])].append(e)
+        rows, notes = [], []
+        for (m, th, mt), es in sorted(groups.items()):
+            es.sort(key=lambda x: x["request_rate"])
+            peak = max((e["tps"] or 0) for e in es)
+            knee = max((e["request_rate"] for e in es if e["tps"] and e["tps"] >= 0.9 * peak),
+                       default=None)
+            slo_ok = [e for e in es if e.get("slo_total")]
+            gp_max = None
+            if slo_ok:
+                cands = [e["request_rate"] for e in slo_ok
+                         if e["slo_meet"] / e["slo_total"] >= 0.95]
+                gp_max = max(cands) if cands else None
+            for e in es:
+                ttft_p99 = e["ttft_p"][1] if e["ttft_p"] else None
+                rows.append([
+                    esc(short(m)), th + ("·out={}tk".format(mt) if mt else ""),
+                    "{:g}".format(e["request_rate"]),
+                    "{:.0f}".format(e["tps"] or 0),
+                    "{}/{}（{:.0%}）".format(e["slo_meet"], e["slo_total"],
+                                            e["slo_meet"] / e["slo_total"]) if e.get("slo_total") else "—",
+                    "{:.2f}".format(e.get("goodput_rps") or 0) if e.get("slo_total") else "—",
+                    f3(e["ttft"]),
+                    # p99 样本不足时明示（fpct 口径），而不是留空或硬算
+                    "{:.2f}".format(ttft_p99) if ttft_p99 is not None
+                    else "n&lt;{}".format(MIN_PCT_SAMPLE),
+                    "{:.1f}".format(e["wall"]) if e["wall"] else "—",
+                    "{:,}".format(e["n_turns"]),
+                    '<span style="color:#b45309">⚠️ 末尾</span>' if e.get("aborted") else "",
+                ])
+            if knee:
+                notes.append("{} {}：吞吐拐点 ≈ rate={:g}/s（0.9×峰值 {:.0f} tok/s）。".format(
+                    esc(short(m)), th, knee, peak))
+            if gp_max:
+                notes.append("{} {}：goodput 达标上限 ≈ rate={:g}/s（≥95% 请求满足 SLO 的最大到达率）。".format(
+                    esc(short(m)), th, gp_max))
+            elif slo_ok:
+                notes.append("{} {}：全部到达率档位均未达 95% SLO 达标率——即便最低档也已超出业务时延要求。".format(
+                    esc(short(m)), th))
+        if not rows:
+            continue
+        note = '<div class="note">开环到达率扫描：请求按 Poisson 过程到达（<code>rate_sweep</code>），' \
+               '每档一轮；吞吐为整档墙钟口径（含排队等待）。' \
+               '<b>拐点</b>之后吞吐不再增长、延迟快速上翘，即为该部署的容量边界。</div>'
+        if notes:
+            note += '<div class="finding">' + "".join("<p>{}</p>".format(n) for n in notes) + "</div>"
+        parts.append("<h3>{}</h3>".format(qname) + table(
+            ["模型", "变体", "到达率 req/s", "吞吐 tok/s", "SLO 达标", "goodput req/s",
+             "TTFT s", "TTFT p99 s", "墙钟 s", "请求数", "备注"], rows) + note)
+    return "".join(parts)
 
 
 def shapes_table(A, quad):
@@ -1109,6 +1405,7 @@ def baseline_section(A):
     base = A.get("baseline") or []
     if not base:
         return ""
+    tiers = A.get("tiers") or SLO_TIERS  # 9.1 合流：以 JSON 透出的 slo.baseline 为准
 
     def badge(v, good, pas):
         """越低越好的指标（TTFT/ITL，单位 s 或 ms）。"""
@@ -1151,16 +1448,17 @@ def baseline_section(A):
             note_html.append(note_once(
                 "thinking=on 的 TTFT 含思考时长（TTFAT 口径），不套用 TTFT 徽章；TPOT 与输出速度仍可判级。"))
         elif bkt == "mid":
-            note_html.append(note_once("输入 4K–24K 区间两档之间无权威锚点，只报数值不打徽章。"))
+            note_html.append(note_once("输入 {}–{} 区间两档之间无权威锚点，只报数值不打徽章。".format(
+                "{:,}".format(tiers["short_max_tokens"] + 1), "{:,}".format(tiers["long_min_tokens"] - 1))))
         else:
-            g = SLO_TIERS["short_good_ttft"] if bkt == "short" else SLO_TIERS["long_good_ttft"]
-            p = SLO_TIERS["short_pass_ttft"] if bkt == "short" else SLO_TIERS["long_pass_ttft"]
+            g = tiers["short_good_ttft"] if bkt == "short" else tiers["long_good_ttft"]
+            p = tiers["short_pass_ttft"] if bkt == "short" else tiers["long_pass_ttft"]
             t_b = badge(t_v, g, p)
-        tp_b = badge(u["tpot_med"], SLO_TIERS["good_tpot"], SLO_TIERS["pass_tpot"])
+        tp_b = badge(u["tpot_med"], tiers["good_tpot"], tiers["pass_tpot"])
         if u["thinking"] == "on" and u["tps"] is not None:
             note_html.append(note_once(
                 "tok/s 为整响应吞吐（thinking=on 时含思考 token），速度判级仅供参考。"))
-        ts_b = badge_hi(u["tps"], SLO_TIERS["good_tps"], SLO_TIERS["pass_tps"])
+        ts_b = badge_hi(u["tps"], tiers["good_tps"], tiers["pass_tps"])
         bs = [x for x in (t_b, tp_b, ts_b) if x != "—"]
         if not bs:
             verdict = "—"
@@ -1172,13 +1470,14 @@ def baseline_section(A):
             verdict = "✅ 优"
         if bkt in summary:
             summary[bkt].append(verdict)
-        rows.append([u["scene"], esc(short(u["model"])), u["thinking"], BUCKET_LABEL[bkt],
+        rows.append([u["scene"], esc(short(u["model"])), u["thinking"], bucket_label(bkt, tiers),
                      u["prompt"], "{:,}".format(u["n"]), t_txt, t_b,
                      "{:.0f}ms".format(u["tpot_med"]) if u["tpot_med"] is not None else "—", tp_b,
                      "{:.0f}".format(u["tps"]) if u["tps"] is not None else "—", ts_b, verdict])
 
     ps = []
-    for bkt, name in (("long", "agent 大上下文（≥24K）"), ("short", "短输入（≤4K）")):
+    for bkt, name in (("long", "agent 大上下文（{}）".format(bucket_label("long", tiers))),
+                      ("short", "短输入（{}）".format(bucket_label("short", tiers)))):
         vs = summary.get(bkt) or []
         if not vs:
             continue
@@ -1186,9 +1485,10 @@ def baseline_section(A):
         ps.append("<b>{}</b>：{} 项配置中 {} 优 / {} 及格 / {} 未达标。".format(name, len(vs), n_g, n_p, n_b))
     if any(u["bucket"] == "long" for u in base):
         ps.append("现代 agent 产品基线上下文即约 35K（系统提示 + 工具定义 + RAG 注入，用户发一句「你好」请求就已带 35K），"
-                  "<b>agent 场景的 TTFT 体验主判据是 ≥24K 档</b>，短输入档徽章代表不了 agent 体验。")
+                  "<b>agent 场景的 TTFT 体验主判据是 {} 档</b>，短输入档徽章代表不了 agent 体验。".format(
+                      bucket_label("long", tiers)))
         ps.append("暖路径提示：prefix cache 命中时大输入的 TTFT 只由新增 token 决定，会显著好于档位数字——"
-                  "≥24K 档判的是冷 prefill 最坏角落；命中率的实测见第 7 节缓存判定。")
+                  "{} 档判的是冷 prefill 最坏角落；命中率的实测见第 7 节缓存判定。".format(bucket_label("long", tiers)))
     note_html.append("<li>判级口径：TTFT 优先 p99，样本不足 {} 时退回中位数（括号内标注）；"
                      "TPOT 取<b>真实 per-token 解码间隔</b>（<code>tpot_ms</code>，即 (E2E−TTFT)/(输出 token−1)）"
                      "的中位数，<b>不用 ITL 分位</b>——ITL 按 chunk 计，投机解码（MTP）会把多个 token 合进"
@@ -1199,7 +1499,8 @@ def baseline_section(A):
     note_html.append("<li>判据出处：<code>docs/latency-baselines.md</code> §7 —— "
                      "MLPerf Server（TTFT p99 ≤2s / TPOT ≤200ms，锚定 ~240 wpm 阅读速度）、"
                      "MLPerf Interactive（450ms / 40ms，基于 ChatGPT/Perplexity 实测修订）、"
-                     "≥24K 档为推导值（particula 10K 实测 0.75–1.6s 线性外推 + MLPerf 405B 档 6s 上限佐证）。</li>")
+                     "{} 档为推导值（particula 10K 实测 0.75–1.6s 线性外推 + MLPerf 405B 档 6s 上限佐证）。</li>".format(
+                         bucket_label("long", tiers)))
 
     head = ["场景", "模型", "thinking", "输入档", "prompt tk", "样本", "TTFT", "TTFT 判级",
             "TPOT ms", "TPOT 判级", "tok/s", "速度判级", "综合"]
@@ -1357,6 +1658,41 @@ def gen_conclusions(A):
                     esc(short(e["model"])), qname, e["thinking"], load_lbl(e),
                     e["tps"], u["mt"], u["tps"], ratio * 100,
                     "（⚠️ 明显衰减）" if ratio < 0.85 else ""))
+    # 9.2 速率扫描（开环）：吞吐拐点与 goodput 达标上限——容量交付物的两个数
+    for quad, qname in (("conc_single", "并发·单轮"), ("conc_multi", "并发·多轮")):
+        by = defaultdict(list)
+        for e in A.get(quad, []):
+            if e.get("request_rate"):
+                by[(e["model"], e["thinking"], e["mt"])].append(e)
+        for (m, th, mt), es in sorted(by.items()):
+            if len(es) < 2:
+                continue
+            es.sort(key=lambda x: x["request_rate"])
+            peak = max((e["tps"] or 0) for e in es)
+            if peak <= 0:
+                continue
+            knee = max((e["request_rate"] for e in es if e["tps"] and e["tps"] >= 0.9 * peak),
+                       default=None)
+            p99l = [e["ttft_p"][1] for e in es if e["ttft_p"]]
+            ttft_txt = ""
+            if len(p99l) >= 2:
+                ttft_txt = "，TTFT p99 由 {:.2f}s 升到 {:.2f}s".format(p99l[0], p99l[-1])
+            cs.append("<b>{}</b>（{}·thinking={}）：开环速率扫描峰值吞吐 {:.0f} tok/s"
+                      "（到达率 {:g}/s 起进入 0.9×峰值平台{}）——再提高到达率只会排队，"
+                      "该点即容量边界。".format(
+                          esc(short(m)), qname, th, peak, knee if knee else es[-1]["request_rate"],
+                          ttft_txt))
+            slo_ok = [e for e in es if e.get("slo_total")]
+            if slo_ok:
+                hit = [e["request_rate"] for e in slo_ok if e["slo_meet"] / e["slo_total"] >= 0.95]
+                if hit:
+                    cs.append("<b>{}（{}·thinking={}）</b>：SLO 达标率 ≥95% 的最大到达率 ≈ {:g}/s"
+                              "（goodput 上限）——业务可接受的最大负载，超出后虽仍出吞吐但时延已不达标。".format(
+                                  esc(short(m)), qname, th, max(hit)))
+                else:
+                    cs.append("<b>{}（{}·thinking={}）</b>：所有到达率档位的 SLO 达标率均低于 95%"
+                              "——当前 <code>slo.goodput</code> 阈值下，最低档位也已超出业务时延要求。".format(
+                                  esc(short(m)), qname, th))
     # 6 agent 时延推算
     for m, P in A["per_model"].items():
         if "off" in P and P["off"].get("ladder_top"):
@@ -1395,6 +1731,22 @@ def gen_recommendations(A):
                  if "off" in P and P["off"].get("ladder_top")]
     if top_sizes and max(top_sizes) < 100000:
         rs.append(("后续", "本轮最大档位 {}k，如业务涉及更长上下文建议补测 100k/200k。".format(max(top_sizes) // 1000)))
+    # 9.4 waiting 峰值标定：阈值只能按实例标定（max_num_seqs 越小，正常负载下水位越高）
+    waits = [(e["model"], e["waiting_max"]) for quad in ("conc_single", "conc_multi")
+             for e in A.get(quad, []) if e.get("waiting_max")]
+    if waits:
+        wm, wv = max(waits, key=lambda x: x[1])
+        rs.append(("中", "<b>saturation_guard.max_waiting</b> 建议从 <b>{:.0f}</b> 起"
+                        "（本轮实测排队峰值 {:.0f} × 4，模型 {}）——阈值低于正常水位会把稳态排队误判为饱和、"
+                        "提前关闭发射闸门。标定流程：先关着 guard 跑一轮 → 读本报告的 waiting 峰值 → 启用重跑。".format(
+                            wv * 4, wv, esc(short(wm)))))
+    # 10.1 两源一致性告警（诊断层守卫，不是新指标）
+    sc = A.get("source_check") or {}
+    if sc.get("deviation") is not None and sc["deviation"] < -0.15:
+        rs.append(("中", "两源一致性异常：客户端实测聚合吞吐比服务端生成吞吐低 <b>{:.0%}</b>——"
+                        "客户端侧可能在数百并发流 + 高 chunk 率下自身成瓶颈（数值偏低，而非服务端更快）。"
+                        "复核方向：换更近的客户端/更少并发复测、检查 CPU 与网络读数、或降低 chunk 解析开销。".format(
+                            abs(sc["deviation"]))))
     if not rs:
         rs.append(("提示", "数据覆盖完整，未触发预置建议条件；可结合业务 SLO 进一步评估。"))
     return rs
@@ -1431,6 +1783,198 @@ def gen_limits(data, A):
     return lim
 
 
+# ────────────────────────── 10.2 一页纸（顶层 = 四个数 + 徽章 + 三分归因）──────────────────────────
+#
+# 表达层减法、能力不砍：顶层只留冻结的四个数（TTFT / decode 速度 / goodput@SLO /
+# 正确性 canary）与三分归因（服务端推理 / 客户端与网络 / 负载层测试设计），
+# 原 1–11 章与逐 run 明细整体降级为折叠附录——数字一个不少，只是不再挤在第一屏。
+# 判级复用 5.8 三档制阈值（随 JSON slo.baseline 透出），不另设一套。
+
+def _level_of(v, good, pas, lower_better=True):
+    """体验判级：0=优 / 1=及格 / 2=未达标 / None=不可判。"""
+    if v is None:
+        return None
+    if lower_better:
+        return 0 if v <= good else (1 if v <= pas else 2)
+    return 0 if v >= good else (1 if v >= pas else 2)
+
+
+def _badge_txt(lv):
+    return {0: "✅ 优", 1: "⚠️ 及格", 2: "❌ 未达标"}.get(lv, "—")
+
+
+def _ttft_unit(base, m):
+    """TTFT 判据单元：优先 agent 大上下文档（3 档制的 long，即体验判据档），
+    其次最大输入档；只取 thinking=off（thinking=on 的 TTFT 含思考，不套 TTFT 判据）。"""
+    cand = [x for x in base if x["model"] == m and x["thinking"] == "off"] or \
+           [x for x in base if x["model"] == m]
+    if not cand:
+        return None
+    singles = [x for x in cand if x["scene"] == "单发·单轮"] or cand
+    order = {"long": 0, "mid": 1, "short": 2}
+    return sorted(singles, key=lambda x: order.get(x["bucket"], 3))[0]
+
+
+def onepager(data, A, meta):
+    tiers = A.get("tiers") or SLO_TIERS
+    base = A.get("baseline") or []
+    models = A["models"]
+    corpus = meta.get("correctness") or {}
+    cov = A["coverage"]
+
+    rows, per_model = [], {}
+    for m in models:
+        u = _ttft_unit(base, m)
+        # ① TTFT：样本不足退回中位（与 5.8 同口径），标出实际输入与口径
+        t_val = t_lv = None
+        t_note = "本轮未测单发（无 TTFT 判据单元）"
+        if u:
+            t_val = u["ttft_p99"] if u["ttft_p99"] is not None else u["ttft_med"]
+            t_kind = "p99" if u["ttft_p99"] is not None else "中位"
+            if u["bucket"] == "long":
+                t_lv = _level_of(t_val, tiers["long_good_ttft"], tiers["long_pass_ttft"])
+            elif u["bucket"] == "short":
+                t_lv = _level_of(t_val, tiers["short_good_ttft"], tiers["short_pass_ttft"])
+            # mid 档两档之间无权威锚点 → 只报数不打徽章（与第 8 节同规则）
+            t_note = "{} 输入 {}（{}·n={}）{}".format(
+                u["scene"], u["prompt"], t_kind, u["n"],
+                "" if t_lv is not None else "；区间无权威锚点，不判级")
+        # ② decode 速度：TPOT（真实 per-token 间隔）+ 输出吞吐，同一单元取值
+        tp_val = u["tpot_med"] if u else None
+        ts_val = u["tps"] if u else None
+        tp_lv = _level_of(tp_val, tiers["good_tpot"], tiers["pass_tpot"])
+        ts_lv = _level_of(ts_val, tiers["good_tps"], tiers["pass_tps"], lower_better=False)
+        # ③ goodput@SLO：跨档位汇总达标率 + 峰值 goodput（只统计配了 slo.goodput 的档位）
+        es = [e for quad in ("conc_single", "conc_multi") for e in A.get(quad, [])
+              if e["model"] == m and e.get("slo_total")]
+        gp = None
+        if es:
+            meet = sum(e["slo_meet"] for e in es)
+            tot = sum(e["slo_total"] for e in es)
+            gpk = max(e["goodput_rps"] for e in es)
+            rate = meet / tot if tot else None
+            gp = (meet, tot, gpk)
+            gp_lv = _level_of(1 - rate if rate is not None else None, 0.05, 0.20)
+        else:
+            gp_lv = None
+        # ④ 正确性 canary
+        c = corpus.get(m)
+        c_lv = None if not c else (0 if c[0] == c[1] else 2)
+        lvs = [x for x in (t_lv, tp_lv, ts_lv, gp_lv, c_lv) if x is not None]
+        verdict = max(lvs) if lvs else None
+        per_model[m] = {"ttft": t_val, "ttft_lv": t_lv, "unit": u, "gp": gp,
+                        "gp_lv": gp_lv, "tp_lv": tp_lv, "ts_lv": ts_lv,
+                        "verdict": verdict, "correctness": c}
+        rows.append([
+            esc(short(m)),
+            "—" if t_val is None else "{:.2f}s {}".format(t_val, _badge_txt(t_lv)),
+            "—" if ts_val is None else "{:.0f} tok/s {}".format(ts_val, _badge_txt(ts_lv)),
+            "—" if not gp else "{} / {}（{:.0%}）".format(gp[0], gp[1], gp[0] / gp[1]) +
+            " {}".format(_badge_txt(gp_lv)),
+            "—" if not c else "{}/{} {}".format(c[0], c[1], "✅" if c[0] == c[1] else "❌"),
+            _badge_txt(verdict),
+        ])
+
+    # ── 三分归因：慢在哪一层，逐层给可核实判据；缺证据写 NA，不猜 ──
+    # ① 服务端推理
+    sv = []
+    verified = [(m, p) for m, p in per_model.items() if p["verdict"] is not None]
+    if not verified:
+        sv.append("本轮未取到可判级的单发指标（检查输入档位覆盖），服务端性能无从判定。")
+    else:
+        good = [m for m, p in verified if p["verdict"] == 0]
+        if good:
+            sv.append("{}：四个数全部达优——本次覆盖的负载区间内，服务端推理未见瓶颈。"
+                      .format("、".join(esc(short(m)) for m in good)))
+        for m, p in verified:
+            if p["verdict"] == 0:
+                continue
+            c = p["correctness"]
+            c_lv = None if not c else (0 if c[0] == c[1] else 2)
+            items = (("TTFT", p["ttft_lv"]), ("TPOT", p["tp_lv"]), ("输出速度", p["ts_lv"]),
+                     ("goodput@SLO", p["gp_lv"]), ("正确性 canary", c_lv))
+            bad = [nm for nm, lv in items if lv == 2]
+            mid = [nm for nm, lv in items if lv == 1]
+            seg = []
+            if bad:
+                seg.append("未达标 = " + "、".join(bad))
+            if mid:
+                seg.append("仅及格 = " + "、".join(mid))
+            sv.append("{}：{}。".format(esc(short(m)), "；".join(seg) or "—"))
+    aborts = [e for quad in ("conc_single", "conc_multi") for e in A.get(quad, []) if e.get("aborted")]
+    if aborts:
+        sv.append("{} 个档位提前终止（饱和止损 / 爬坡止损 / 降速熔断），已越容量边界——"
+                  "这些档位的样本量少于配置值，档间对比需扣除该因素。".format(len(aborts)))
+    stalls = [n for _, n in meta.get("notes", []) if "熔断" in (n or "")]
+    if stalls:
+        sv.append("存在降速熔断留痕：{}。".format(esc(stalls[0][:90] + ("…" if len(stalls[0]) > 90 else ""))))
+
+    # ② 客户端与网络（客户端计时是本工具的量测点，不是误差项）
+    cl = []
+    sc = A.get("source_check")
+    if sc and sc.get("deviation") is not None:
+        dev = sc["deviation"]
+        if dev < -0.15:
+            cl.append("⚠️ 两源偏差 {:+.0%}（客户端聚合吞吐低于服务端生成吞吐）——"
+                      "客户端侧可能有损或网络路径异常，真实服务吞吐应更高。".format(dev))
+        else:
+            cl.append("两源一致（偏差 {:+.0%}）：客户端聚合吞吐与服务端生成吞吐吻合，"
+                      "客户端计时链路未见异常。".format(dev))
+    else:
+        cl.append("无可比服务端观测 → 两源一致性记 <b>NA</b>；客户端实测即基线口径，不影响结论。")
+    cl.append("客户端逐 chunk 计时开销 µs 级，与被测间隔（数十 ms）差 3~4 个数量级。")
+
+    # ③ 负载层（测试设计是否够格下结论）
+    ld = []
+    miss = [nm for key, nm in (("has_single", "单发·单轮"), ("has_multiturn", "单发·多轮"),
+                               ("has_conc_single", "并发·单轮"), ("has_conc_multi", "并发·多轮"))
+            if not cov.get(key)]
+    if miss:
+        ld.append("未覆盖：{}——结论不外推到这些形状。".format("、".join(miss)))
+    if not cov.get("has_concurrent"):
+        ld.append("本轮未测并发：单发结论不外推服务吞吐。")
+    else:
+        rates = sorted({e["request_rate"] for e in A.get("conc_single", []) + A.get("conc_multi", [])
+                        if e.get("request_rate")})
+        if len(rates) < 2:
+            ld.append("并发只跑了 1 个负载档，无法给出容量拐点（建议 ≥2 档到达率扫描）。")
+        else:
+            ld.append("并发覆盖 {} 个负载档{}。".format(
+                len(rates), "（开环到达率扫描，可给容量拐点）" if rates else ""))
+    ev = A.get("events") or {}
+    if ev.get("thinking_trunc") or ev.get("no_content"):
+        ld.append("存在思考截断 {} 次 / 正文 0 token {} 次，相关内容类指标缺失。".format(
+            ev.get("thinking_trunc", 0), len(ev.get("no_content") or [])))
+    ld.append("受控变量测试（filler 合成负载）：tool-call 不进压测路径，"
+              "agent 主导业务下纯推理吞吐偏乐观。")
+
+    def blk(title, items):
+        return '<div class="att-i"><b>{}</b><br>{}</div>'.format(
+            title, "<br>".join(items) if items else "NA")
+
+    hrow = ["模型", "① TTFT（首字）", "② decode 速度", "③ goodput@SLO", "④ 正确性", "判定"]
+    th = "<tr>{}</tr>".format("".join("<th>{}</th>".format(esc(x)) for x in hrow))
+    body = "".join("<tr>{}</tr>".format("".join("<td>{}</td>".format(c) for c in r)) for r in rows)
+    gp_rule = "未配置 <code>slo.goodput</code>（goodput@SLO 不可判）"
+    _slo = A.get("slo") or {}
+    if _slo.get("ttft_ms") or _slo.get("tpot_ms"):
+        gp_rule = "达标 = 同时满足 TTFT ≤ {:,.0f}ms 且 TPOT ≤ {:,.0f}ms 的请求占比".format(
+            _slo.get("ttft_ms") or 0, _slo.get("tpot_ms") or 0)
+    return (
+        '<div id="onepager">'
+        '<div class="op-h">一页纸结论<span class="op-tag">'
+        '顶层只有四个数（TTFT / decode 速度 / goodput@SLO / 正确性 canary）+ 三分归因；'
+        '详细数据全部下沉附录，数字一个不少。</span></div>'
+        '<table class="opt"><thead>{th}</thead><tbody>{body}</tbody></table>'
+        '<div class="note">① TTFT 取 agent 大上下文档（无该档则取最大输入档），thinking=on 含思考不套 TTFT 判据；'
+        '② decode = 最大输出档组中位；③ {gp_rule}；④ 金丝雀为「按序转写数字」抽查。'
+        '判级阈值随 JSON <code>slo.baseline</code> 透出，改配置即改判据。</div>'
+        '<div class="att">{a}{b}{c}</div>'
+        '</div>'
+    ).format(th=th, body=body, gp_rule=gp_rule,
+             a=blk("① 服务端推理", sv), b=blk("② 客户端与网络", cl), c=blk("③ 负载层（测试设计）", ld))
+
+
 # ── 服务端观测（/metrics）：可选的第二数据源 ──
 # 原则：/metrics 是引擎实现细节、非标准端点。客户端实测是本工具唯一的标准口径，
 # 服务端观测只做增强与交叉验证。本函数只负责「如实描述来源」，任何分支都不削弱结论。
@@ -1459,6 +2003,72 @@ def metrics_provenance(server):
             continue
         (collected if _window_ok(sm) else no_data).append((k, sm))
     return collected, no_data, absent
+
+
+def hists_block(server):
+    """服务端直方图窗口差值（9.1 数据面 → 报告面）：服务端口径的延迟分解。
+
+    数据一直在 JSON 里（`server_metrics.histograms`）却无人消费——README 承诺渲染、实际零读取。
+    这里补一张 P50/P99 小表：服务端排队/排队外分解与客户端口径互为交叉验证。
+    口径保守标注：桶边界估算 + 多 label 合并（同一 family 的 model_name/finished_reason 各系列
+    被累加）+ 窗口内混入非本次压测流量——只做量级对照，不与客户端数字逐位对齐。
+    """
+    rows = []
+    for k in SCENARIOS:
+        for name, h in sorted(((server or {}).get(k) or {}).get("histograms", {}).items()):
+            if not h.get("count"):
+                continue
+            rows.append([k, esc(hist_label(name)), "{:,.0f}".format(h["count"]),
+                         "{:.3f}".format(h.get("mean") or 0),
+                         "{:.3f}".format(h.get("p50") or 0),
+                         "{:.3f}".format(h.get("p99") or 0)])
+    if not rows:
+        return ""
+    return "<h3>服务端延迟分解（/metrics 直方图窗口差值）</h3>" + table(
+        ["场景", "指标（服务端口径）", "观测数", "均值 s", "P50 s", "P99 s"], rows) + \
+        '<div class="note">口径：Prometheus 直方图窗口差值，分位为<b>桶边界估算</b>（非插值），' \
+        '且同一 family 的多 label 系列被累加、窗口内可能混入其他流量——只作服务端归因参考，' \
+        '与客户端实测（基线）不逐数对齐；不一致时以客户端为准。</div>'
+
+
+def hist_label(name):
+    """引擎直方图名 → 人读标签（认不出的原样显示，不猜）。"""
+    for key, lbl in (("time_to_first_token", "TTFT"), ("inter_token_latency", "ITL（token 间隔）"),
+                     ("e2e_request_latency", "E2E 请求延迟"), ("request_queue_time", "排队等待"),
+                     ("request_prefill_time", "prefill 耗时"), ("request_decode_time", "decode 耗时"),
+                     ("request_prefill_kv_computed", "prefill KV token 数")):
+        if key in name:
+            return lbl
+    return name
+
+
+def source_check_block(A):
+    """10.1 两源一致性守卫：客户端聚合吞吐 vs 服务端生成吞吐（smetrics counter 差值）。
+
+    定位：这是**诊断层**的守卫，不产生新的评测指标。危险形态是「数百并发流 + 高 chunk 率下
+    客户端自身成瓶颈」——此时客户端测到的速度会系统性低于服务端真实产出。偏差超阈值只**标注**，
+    不判失败：观测层缺失或不可比一律记 NA（绝不因为可选数据源缺失而少给结论）。
+    """
+    sc = A.get("source_check")
+    if not sc:
+        return ""
+    if not sc.get("server_tps"):
+        return '<p>两源一致性（客户端 vs 服务端生成吞吐）：<b>NA</b>——{}。</p>'.format(
+            esc(sc.get("note") or "本次无可比的服务端观测（未启用 /metrics 或未取到窗口差值）"))
+    dev = sc.get("deviation")
+    if dev is None:
+        return '<p>两源一致性：<b>NA</b>——{}。</p>'.format(
+            esc(sc.get("note") or "缺少可比口径"))
+    bad = dev < -0.15  # 客户端显著低于服务端 = 客户端侧可能有损/成瓶颈
+    tag = '<span style="color:#b45309;font-weight:600">⚠️ 客户端可能有损</span>' if bad else "✅ 一致"
+    extra = "；" + esc(sc["note"]) if sc.get("note") else ""
+    return '<p>两源一致性（客户端 vs 服务端生成吞吐）：客户端 <b>{:.0f}</b> tok/s，服务端 ' \
+           '<b>{:.0f}</b> tok/s（{} tokens / {:.0f}s 窗口），偏差 <b>{:+.0%}</b>——{}{}。</p>' \
+           '<p class="note">阈值 ±15%：客户端在数百并发流 + 高 chunk 率下可能自身成为瓶颈，' \
+           '此时客户端读数偏低、真实服务吞吐更高；服务端 counter 为本窗口差值，' \
+           '含窗口内的其他流量属已知近似。本项<b>只标注不判失败</b>。</p>'.format(
+        sc.get("client_tps") or 0, sc.get("server_tps") or 0,
+        "{:,.0f}".format(sc.get("server_tokens") or 0), sc.get("window_seconds") or 0, dev, tag, extra)
 
 
 def quality_block(data, A):
@@ -1533,6 +2143,14 @@ def quality_block(data, A):
             extra = "" if passed == len(corr) else "——⚠️ 存在回复与要求不符，警惕缓存污染/网关伪响应/截断"
             parts.append("<p>正确性抽查（{}）：{}/{} 通过{}。</p>".format(k, passed, len(corr), extra))
             break
+    # 两源一致性（10.1）：只在可比时给判定，不可比记 NA
+    sc_html = source_check_block(A)
+    if sc_html:
+        parts.append(sc_html)
+    # 服务端直方图窗口差值（有则出表，无则绝不空面板）
+    hb = hists_block(A.get("server") or {})
+    if hb:
+        parts.append(hb)
     return "".join(parts) or "<p>无数据</p>"
 
 
@@ -1555,6 +2173,7 @@ def summary_json(data, A, meta, conclusions, recommendations, limits):
         "endpoint": meta["endpoint"], "tool": meta["tool"],
         "generated_at": meta["generated"],
         "coverage": A["coverage"],
+        "source_check": A.get("source_check"),  # 10.1 两源一致性（客户端 vs 服务端吞吐）
         "baseline": A.get("baseline", []),  # 5.8 体验基线评估单元（3 档制）
         "events": {k: (len(v) if isinstance(v, list) else v) for k, v in A["events"].items()},
         "per_model": {short(m): clean(P) for m, P in A["per_model"].items()},
@@ -1605,10 +2224,13 @@ def main():
             bym[(e["model"], e["thinking"], e["mt"])].append(e)
         multi_mt = len({e["mt"] for e in A.get(quad, [])}) > 1
         for (m, th, mt), es in sorted(bym.items()):
-            top = max(es, key=lambda x: x["level"])
+            top = max(es, key=lambda x: (x["request_rate"], x["level"]))
             if top["tps"]:
                 lbl_q = qname + ("·out={}tk".format(mt) if multi_mt else "")
-                kpis.append(("吞吐@L{}·{} ({})".format(top["level"], lbl_q, short(m)),
+                # 开环档 level=0：标成「吞吐@L0」会把到达率维度整片藏起来（读者以为是并发 0）
+                load_lbl = "rate={:g}/s".format(top["request_rate"]) if top["request_rate"] \
+                    else "L{}".format(top["level"])
+                kpis.append(("吞吐@{}·{} ({})".format(load_lbl, lbl_q, short(m)),
                              "{:.0f} tok/s".format(top["tps"])))
     kpi_html = "".join('<div class="kpi"><div class="kpi-v">{}</div><div class="kpi-l">{}</div></div>'.format(
         esc(v), esc(l)) for l, v in kpis)
@@ -1649,6 +2271,8 @@ def main():
         sec2_body += "<h3>引擎环境（压测时自动探测）</h3>" + table(["项目", "值"], env_rows)
     else:
         sec2_body += '<div class="note">本份数据未包含引擎环境存档（旧版本工具产出）。</div>'
+    if meta.get("plan"):
+        sec2_body += plan_table(meta["plan"])
     sec.append(("<h2>2 · 测试配置与方法</h2>", sec2_body))
     sec.append(("<h2>3 · 指标口径</h2>",
                 '<p class="note">下表全部为<b>客户端实测</b>口径（基线）——与服务端是否存在 /metrics 无关。</p>'
@@ -1675,6 +2299,12 @@ def main():
                 chart_html = ('<div class="chart"><canvas id="{}" height="110"></canvas></div>'.format(cid)
                               if any(c == cid for c, _ in canvases) else "")
                 body += "<h3>{}</h3>{}{}".format(label, chart_html, single_table(A, th))
+        if body:
+            body += ('<div class="note">「输入 tk」列为服务端 <code>usage.prompt_tokens</code> 实测中位'
+                     '（构造 filler 的 chars/token 只是近似系数，trace 模式更只是估算）；'
+                     '与配置标称档位偏差 &gt;5% 时并列标出配置值。'
+                     '档位分箱与基线判级同样按实测走——判读锚在服务端真实看到的规模上。'
+                     '实测与配置系统性偏离时，用 <code>bench probe</code> 的构造系数建议值校准。</div>')
         sec.append(("<h2>4 · 单发·单轮结果</h2>", body))
     # 多轮
     if A["coverage"]["has_multiturn"]:
@@ -1700,6 +2330,14 @@ def main():
                 if any(c == cid for c, _ in canvases):
                     body += '<div class="chart"><canvas id="{}" height="110"></canvas></div>'.format(cid)
             body += concurrent_table(A, quad) + shapes_table(A, quad)
+        # 9.2 速率扫描（开环到达率）：容量边界交付物
+        sweep = rate_sweep_table(A)
+        if sweep:
+            body += "<h3>6.3 速率扫描（开环到达率）</h3>"
+            for cid in ("c_rs_tps", "c_rs_ttft", "c_rsm_tps", "c_rsm_ttft"):
+                if any(c == cid for c, _ in canvases):
+                    body += '<div class="chart"><canvas id="{}" height="110"></canvas></div>'.format(cid)
+            body += sweep
         if body:
             sec.append(("<h2>6 · 并发结果</h2>", body))
     # 分析
@@ -1749,6 +2387,20 @@ def main():
     summary_block = ('<script type="application/json" id="perf-summary">\n{}\n</script>').format(
         summary_json(data, A, meta, conclusions, recommendations, limits))
 
+    # 10.2 表达层减法：原 1–11 章 + 逐 run 明细 + 图表 + KPI 卡整体降级为折叠附录，
+    # 顶层只留一页纸（四个数 + 徽章 + 三分归因）。数字一个不少，只是不再挤第一屏。
+    one_html = onepager(data, A, meta)
+    appendix = ""
+    if body or chart_block:
+        appendix = (
+            '<details class="appendix" id="appendix"><summary>详细数据（附录）：'
+            '关键指标卡 · 摘要 · 配置与方法 · 指标口径 · 各场景结果 · 体验基线 · 数据质量 · 逐 run 明细 · 图表'
+            '</summary><p class="note">以下是完整明细与口径说明——数字一个都不少，'
+            '只是不再占用第一屏。排障时从一页纸的判定出发，在这里往下查证据。</p>'
+            '<div class="kpis">{kpi}</div>{body}{charts}</details>').format(
+                kpi=kpi_html, body=body,
+                charts=('<h2>图表</h2>' + chart_block) if chart_block else "")
+
     page = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>__TITLE__</title>
@@ -1786,10 +2438,20 @@ summary{cursor:pointer;font-size:13.5px;color:#374151}
 .mcard .mstats{margin-top:12px;font-size:12.8px;color:#374151;line-height:2.0}
 .mcard .mstats b{color:#1652f0}
 .mcard .menter{margin-top:12px;color:#1652f0;font-size:13px;font-weight:600}
+#onepager{background:#fff;border:1px solid var(--line);border-radius:12px;padding:16px 20px;margin:20px 0}
+.op-h{font-size:17px;font-weight:700;color:#111827}
+.op-h .op-tag{font-size:12px;font-weight:400;color:#6b7280;margin-left:10px}
+table.opt{margin:12px 0 6px}
+table.opt td:first-child{font-weight:600}
+.att{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px;margin:14px 0 4px}
+.att-i{background:#f8fafc;border:1px solid var(--line);border-left:3px solid #1652f0;border-radius:8px;padding:10px 13px;font-size:13px;line-height:1.65}
+.att-i b{color:#1652f0}
+details.appendix{background:#fff;border:1px solid var(--line);border-radius:12px;padding:12px 18px;margin:26px 0}
+details.appendix>summary{font-size:15px;font-weight:600;color:#374151}
 </style></head><body>
 <h1>__TITLE__</h1>
 <p class="sub">__SUB__</p>
-<div class="kpis">__KPI__</div>
+__ONEPAGER__
 __CARDS__
 <p class="backhome" id="backhome"><a href="#">← 返回首页（选择模型）</a></p>
 __BODY__
@@ -1813,11 +2475,11 @@ __CHARTS__
     page = (page.replace("__LIB__", lib)
                 .replace("__TITLE__", esc(title))
                 .replace("__SUB__", sub)
-                .replace("__KPI__", kpi_html)
+                .replace("__ONEPAGER__", one_html)
                 .replace("__CARDS__", cards_html)
-                .replace("__BODY__", body)
+                .replace("__BODY__", appendix)
                 .replace("__SUMMARY__", summary_block)
-                .replace("__CHARTS__", chart_block)
+                .replace("__CHARTS__", "")
                 .replace("__SWITCHER__", switcher))
     suffix = ""
     if scenarios != set(QUADS):

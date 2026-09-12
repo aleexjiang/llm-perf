@@ -263,17 +263,19 @@ func warmup(ctx context.Context, e *env, model string) {
 }
 
 // startWindow / finishWindow 场景窗口的服务端观测：开始快照+gauge 轮询 → 结束差值汇总。
-func startWindow(ctx context.Context, e *env) (*smetrics.Sample, *smetrics.GaugePoller) {
+// 起始时刻一并返回：窗口时长是两源一致性（客户端 tok/s vs 服务端 tok/s）的共同分母。
+func startWindow(ctx context.Context, e *env) (*smetrics.Sample, *smetrics.GaugePoller, time.Time) {
 	if e.srv == nil {
-		return nil, nil
+		return nil, nil, time.Time{}
 	}
+	start := time.Now()
 	before, err := e.srv.Scrape(ctx)
 	if err != nil {
 		log.Printf("⚠️ %s 起始快照失败（%v）——本场景无服务端观测", e.cfg.MetricsPath, err)
-		return nil, nil
+		return nil, nil, time.Time{}
 	}
 	poller := smetrics.StartGaugePoller(ctx, e.srv, time.Duration(e.cfg.MetricsIntervalMS)*time.Millisecond, e.provider)
-	return before, poller
+	return before, poller, start
 }
 
 // finishWindow 汇总场景窗口的服务端观测。
@@ -282,7 +284,8 @@ func startWindow(ctx context.Context, e *env) (*smetrics.Sample, *smetrics.Gauge
 // 无从计算，此时 Available=false 并保留 Note 说明原因——已轮询到的 gauges 仍然有效，照常挂回。
 // 这样报告侧能如实区分「已采集 / 已启用但未取到 / 未提供」，不会把一次失败渲染成全零面板
 // （历史 bug：中断场景下 available=true 且计数器全空，报告输出一句「服务端观测（single）：。」）。
-func finishWindow(ctx context.Context, e *env, before *smetrics.Sample, poller *smetrics.GaugePoller) *report.ServerMetricsSummary {
+func finishWindow(ctx context.Context, e *env, before *smetrics.Sample,
+	poller *smetrics.GaugePoller, start time.Time) *report.ServerMetricsSummary {
 	if e.srv == nil || before == nil {
 		if poller != nil {
 			poller.Stop()
@@ -304,20 +307,96 @@ func finishWindow(ctx context.Context, e *env, before *smetrics.Sample, poller *
 		return summary
 	}
 	summary.Available = true
+	if !start.IsZero() {
+		summary.WindowSeconds = time.Since(start).Seconds()
+	}
 	d := smetrics.DiffCounters(before, after, e.provider)
 	summary.CacheHitTokens = d.PrefixCacheHitTokens
 	summary.CacheQueryTokens = d.PrefixCacheQueryTokens
 	summary.Preemptions = d.Preemptions
 	summary.SpecDrafts = d.SpecDrafts
 	summary.SpecAcceptedTokens = d.SpecAcceptedTokens
+	summary.GenerationTokens = d.GenerationTokens
 	summary.Hists = smetrics.HistDeltas(before, after, e.provider)
 	return summary
 }
 
-// applySLO 把 goodput 配置挂到 Report（报告侧按 turn 级 TTFT/TPOT 计算达标率）。
+// applySourceCheck 两源一致性（10.1）：客户端实测聚合吞吐 vs 服务端生成吞吐。
+//
+// 只服务诊断层（不产生评测指标）：危险形态是「数百并发流 + 高 chunk 率下客户端自身成瓶颈」，
+// 那时客户端读数系统性偏低，只看客户端会把客户端问题误归因成服务变慢。
+//
+// 两边同分母：本场景各档位墙钟之和（客户端侧吞吐本就是这个口径），因此比较等价于 token 量比较。
+// 观测层缺失 / 引擎不暴露生成 token 数 / 无有效档位 → 只写 Note 记 NA，不改任何结论。
+func applySourceCheck(ctx context.Context, e *env, rep *report.Report, before *smetrics.Sample) {
+	if rep == nil || len(rep.Concurrent) == 0 {
+		return // 非并发场景（single/multiturn 无聚合吞吐口径）不做该检查
+	}
+	sc := &report.SourceCheck{}
+	var wall, tokens float64
+	for i := range rep.Concurrent {
+		lv := &rep.Concurrent[i]
+		wall += lv.WallSeconds
+		tokens += lv.ThroughputTPS * lv.WallSeconds
+	}
+	if wall <= 0 || tokens <= 0 {
+		sc.Note = "客户端侧无可比吞吐（本轮无有效档位数据）"
+		rep.SourceCheck = sc
+		return
+	}
+	sc.ClientTPS = tokens / wall
+	sc.ClientTokens = tokens
+	sc.WindowSeconds = wall
+	if e.srv == nil || before == nil {
+		sc.Note = "服务端观测不可用（未启用 /metrics 或起始快照失败）"
+		rep.SourceCheck = sc
+		return
+	}
+	after, err := e.srv.Scrape(ctx)
+	if err != nil {
+		sc.Note = "末档位后快照抓取失败：" + err.Error()
+		rep.SourceCheck = sc
+		return
+	}
+	d := smetrics.DiffCounters(before, after, e.provider)
+	if d.GenerationTokens <= 0 {
+		sc.Note = "引擎未暴露生成 token 数（generation_tokens），无法交叉校验"
+		rep.SourceCheck = sc
+		return
+	}
+	sc.ServerTokens = d.GenerationTokens
+	sc.ServerTPS = d.GenerationTokens / wall
+	if sc.ServerTPS > 0 {
+		sc.Deviation = (sc.ClientTPS - sc.ServerTPS) / sc.ServerTPS
+	}
+	if sc.Deviation < -0.15 {
+		log.Printf("⚠️ 两源一致性偏差 %.0f%%：客户端聚合 %.0f tok/s 低于服务端生成 %.0f tok/s"+
+			"——客户端侧可能有损（高并发 + 高 chunk 率下客户端自身成瓶颈）",
+			sc.Deviation*100, sc.ClientTPS, sc.ServerTPS)
+	}
+	rep.SourceCheck = sc
+}
+
+// applySLO 把 goodput 配置与基线评估阈值挂到 Report（报告侧按 turn 级 TTFT/TPOT 计算达标率；
+// 基线阈值随 JSON 透出供 HTML 报告替代内置默认，未配置时不透出 = 报告用内置 SLO_TIERS）。
 func applySLO(e *env, rep *report.Report) {
-	if e.cfg.Goodput != nil {
-		rep.SLO = &report.SLO{TTFTMS: e.cfg.Goodput.TTFTMS, TPOTMS: e.cfg.Goodput.TPOTMS}
+	if g := e.cfg.EffGoodput(); g != nil {
+		rep.SLO = &report.SLO{TTFTMS: g.TTFTMS, TPOTMS: g.TPOTMS}
+	}
+	if b := e.cfg.EffBaseline(); b != nil {
+		rep.SLOBaseline = &report.SLOBaseline{
+			Enabled:        b.BaselineEnabled(),
+			ShortMaxTokens: b.ShortMaxTokens,
+			LongMinTokens:  b.LongMinTokens,
+			ShortGoodTTFT:  b.ShortGoodTTFT,
+			ShortPassTTFT:  b.ShortPassTTFT,
+			LongGoodTTFT:   b.LongGoodTTFT,
+			LongPassTTFT:   b.LongPassTTFT,
+			GoodTPOT:       b.GoodTPOT,
+			PassTPOT:       b.PassTPOT,
+			GoodTPS:        b.GoodTPS,
+			PassTPS:        b.PassTPS,
+		}
 	}
 }
 
@@ -325,13 +404,14 @@ func applySLO(e *env, rep *report.Report) {
 // （阈值为 0 的维度不参与）；配置了 TTFT 阈值时要求 TTFT 可测（>0）——非流式
 // TTFT 不可测（N/A），不应凭 0 值白拿达标。非流式在配置了 TPOT 阈值时天然不达标。
 func goodputOf(e *env, m *engine.TurnMetrics) bool {
-	if e.cfg.Goodput == nil || m == nil || m.Error != "" {
+	g := e.cfg.EffGoodput()
+	if g == nil || m == nil || m.Error != "" {
 		return false
 	}
-	if e.cfg.Goodput.TTFTMS > 0 && (m.TTFT <= 0 || m.TTFT > e.cfg.Goodput.TTFTMS) {
+	if g.TTFTMS > 0 && (m.TTFT <= 0 || m.TTFT > g.TTFTMS) {
 		return false
 	}
-	if e.cfg.Goodput.TPOTMS > 0 && (m.TPOTMS <= 0 || m.TPOTMS > e.cfg.Goodput.TPOTMS) {
+	if g.TPOTMS > 0 && (m.TPOTMS <= 0 || m.TPOTMS > g.TPOTMS) {
 		return false
 	}
 	return true
@@ -409,8 +489,8 @@ func Single(ctx context.Context, cfg *config.Config, client *engine.Client, mode
 			cfg.Single.Runs, cfg.Single.FixedSeed, cfg.StreamEnabled(), cfg.Thinking.Mode, cfg.Thinking.MaxTokensFloor, cfg.Dataset.Mode, thinkingNoteSuffix(cfg)),
 	}
 	applySLO(e, rep)
-	before, poller := startWindow(ctx, e)
-	defer func() { rep.Server = finishWindow(ctx, e, before, poller) }()
+	before, poller, winStart := startWindow(ctx, e)
+	defer func() { rep.Server = finishWindow(ctx, e, before, poller, winStart) }()
 
 	for _, model := range filterModels(cfg.ActiveModels(), modelFilter) {
 		_, mc := forModel(e, cfg, model) // 该模型生效配置（model_overrides 差异覆盖）
@@ -553,12 +633,13 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 		Scenario:    "multiturn",
 		GeneratedAt: time.Now(),
 		Endpoint:    cfg.Endpoint,
-		Note: fmt.Sprintf("单发多轮 sessions=%d turns=%d stream=%v thinking=%s 数据源=%s%s（trace 模式下轮次来自回放会话，system/turn_tokens 不生效）%s",
-			mt.Sessions, mt.Turns, cfg.StreamEnabled(), cfg.Thinking.Mode, dataSrc, ctxShape, thinkingNoteSuffix(cfg)),
+		Note: fmt.Sprintf("单发多轮 sessions=%d turns=%d stream=%v thinking=%s 数据源=%s%s 基座=%s（trace 模式下轮次来自回放会话，system/turn_tokens 不生效）%s",
+			mt.Sessions, mt.Turns, cfg.StreamEnabled(), cfg.Thinking.Mode, dataSrc, ctxShape,
+			baseSharingDesc(mt), thinkingNoteSuffix(cfg)),
 	}
 	applySLO(e, rep)
-	before, poller := startWindow(ctx, e)
-	defer func() { rep.Server = finishWindow(ctx, e, before, poller) }()
+	before, poller, winStart := startWindow(ctx, e)
+	defer func() { rep.Server = finishWindow(ctx, e, before, poller, winStart) }()
 
 	for _, model := range filterModels(cfg.ActiveModels(), modelFilter) {
 		_, mc := forModel(e, cfg, model) // 该模型生效配置（model_overrides 差异覆盖）
@@ -579,7 +660,7 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 				for s := 0; s < mt.Sessions; s++ {
 					run := report.MultiturnRun{Model: model, Thinking: v.Name, Session: s + 1, MaxTokens: maxTok}
 					log.Printf("[multiturn] %s thinking=%s out=%dtk session%d", model, v.Name, maxTok, s+1)
-					baseSeed := sessionSeed(s, mc.SeedSalt)
+					baseSeed, turnSeed := sessionSeeds(mc, s)
 					msgs := []engine.Message{}
 					if e.trace == nil {
 						if sys := engine.SystemMsg(mt.SystemTokens, mt.ToolDefsTokens, baseSeed, mc.FillerLang); sys.Content != "" {
@@ -615,7 +696,7 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 								log.Printf("    已达 max_prompt_tokens=%d 截止，提前结束会话（%d/%d 轮）", mc.MaxPromptTokens, turn, mt.Turns)
 								break
 							}
-							msgs = append(msgs, engine.UserMsg(tt, baseSeed+int64(turn), mc.FillerLang))
+							msgs = append(msgs, engine.UserMsg(tt, turnSeed+int64(turn), mc.FillerLang))
 							estPrompt += tt // usage 缺失时的估算基线：本轮已追加进 history，下一轮的 prompt 必然包含它
 						}
 						m := runOne(ctx, e, model, msgs, maxTok, v)
@@ -709,7 +790,7 @@ func collectSessionTurns(ctx context.Context, e *env, cfg *config.Config,
 	hook sessionTurnHook) []*engine.TurnMetrics {
 
 	mt := cfg.Multiturn
-	baseSeed := sessionSeed(sessionIdx, cfg.SeedSalt)
+	baseSeed, turnSeed := sessionSeeds(cfg, sessionIdx)
 	msgs := []engine.Message{}
 	userTurns := e.sessionUserTurns(sessionIdx)
 	var fullPrefixes [][]engine.Message
@@ -748,7 +829,7 @@ func collectSessionTurns(ctx context.Context, e *env, cfg *config.Config,
 				log.Printf("    worker 会话已达 max_prompt_tokens=%d 截止，提前结束（%d/%d 轮）", cfg.MaxPromptTokens, turn, turns)
 				break
 			}
-			msgs = append(msgs, engine.UserMsg(tt, baseSeed+int64(turn), cfg.FillerLang))
+			msgs = append(msgs, engine.UserMsg(tt, turnSeed+int64(turn), cfg.FillerLang))
 			estPrompt += tt // 本轮已追加进 history，下一轮的 prompt 必然包含它
 		}
 		m := runOne(ctx, e, model, msgs, maxTok, v)
@@ -807,17 +888,43 @@ func Concurrent(ctx context.Context, cfg *config.Config, client *engine.Client, 
 		}
 		loadModel += " 混跑[" + strings.Join(labels, " ") + "]"
 	}
+	perUser := "每用户独立 prompt（不同 seed）"
+	if cc.Multiturn {
+		// 多轮下要说清基座形态：shared_base 默认 true = 全部会话同一套 system/tool defs
+		// 前缀（贴"一套部署一套提示词"），逐轮 user 内容仍按会话独立。
+		perUser = "每用户独立会话（逐轮内容不同 seed；基座" + baseSharingDesc(cfg.Multiturn) + "）"
+	}
 	rep := &report.Report{
 		Tool:        report.Version,
 		Scenario:    "concurrent",
 		GeneratedAt: time.Now(),
 		Endpoint:    cfg.Endpoint,
-		Note: fmt.Sprintf("并发%s %s prompt≈%dtk stream=%v thinking=%s；每用户独立 prompt/会话（不同 seed）%s",
-			mode, loadModel, cc.PromptTokens, cfg.StreamEnabled(), cfg.Thinking.Mode, thinkingNoteSuffix(cfg)),
+		Note: fmt.Sprintf("并发%s %s prompt≈%dtk stream=%v thinking=%s；%s%s",
+			mode, loadModel, cc.PromptTokens, cfg.StreamEnabled(), cfg.Thinking.Mode, perUser, thinkingNoteSuffix(cfg)),
 	}
 	applySLO(e, rep)
-	before, poller := startWindow(ctx, e)
-	defer func() { rep.Server = finishWindow(ctx, e, before, poller) }()
+	before, poller, winStart := startWindow(ctx, e)
+	defer func() { rep.Server = finishWindow(ctx, e, before, poller, winStart) }()
+	// 10.1 两源一致性：为交叉校验单开一对**更窄**的快照窗口——首个档位开始前 → 末个档位结束后。
+	// 刻意避开预热与金丝雀：场景窗口把它们算进服务端 token，而客户端侧的口径只含档位请求，
+	// 小数据集下这点偏差足以造出假告警（本轮观察窗口必须两侧同源）。
+	var chkBefore *smetrics.Sample
+	chkStarted := false
+	startSrcCheck := func() {
+		if chkStarted {
+			return
+		}
+		chkStarted = true
+		if e.srv != nil {
+			chkBefore, _ = e.srv.Scrape(ctx)
+		}
+	}
+	defer func() { applySourceCheck(ctx, e, rep, chkBefore) }()
+	// 饱和止损判据一依赖 waiting 排队深度（场景级 GaugePoller）；观测层不可用时提前
+	// 说一声——waiting 判定不生效，墙钟上限（判据二）仍有效
+	if cfg.SaturationGuard.SatEnabled() && cfg.SaturationGuard.MaxWaiting > 0 && poller == nil {
+		log.Printf("⚠️ saturation_guard.max_waiting 需要 server_metrics 观测（waiting 排队深度不可得）——waiting 判定不生效，墙钟上限仍有效")
+	}
 
 	for _, model := range filterModels(cfg.ActiveModels(), modelFilter) {
 		_, mc := forModel(e, cfg, model) // 该模型生效配置（model_overrides 差异覆盖）
@@ -837,9 +944,15 @@ func Concurrent(ctx context.Context, cfg *config.Config, client *engine.Client, 
 			for _, maxTok := range tiers {
 				if rates != nil {
 					for _, rate := range rates {
-						lv := runOpenRound(ctx, e, mc, model, v, rate, maxTok)
+						startSrcCheck()
+						lv := runOpenRound(ctx, e, mc, model, v, rate, maxTok, poller)
 						logConcurrent(&lv)
 						rep.Concurrent = append(rep.Concurrent, lv)
+						if lv.Aborted != "" {
+							// 饱和止损：本到达率已饱和/超时，更高档只会更糟——停止后续档位
+							log.Printf("🛑 %s——停止后续到达率档位，已完成数据全部保留", lv.Aborted)
+							return rep, nil
+						}
 						if interrupted(ctx) {
 							log.Printf("🛑 已中止（中断或降速熔断）——停止新请求，已完成档位全部保留")
 							return rep, nil
@@ -848,7 +961,8 @@ func Concurrent(ctx context.Context, cfg *config.Config, client *engine.Client, 
 					continue
 				}
 				for _, level := range cc.Levels {
-					lv := runClosedRound(ctx, e, mc, model, v, level, maxTok)
+					startSrcCheck()
+					lv := runClosedRound(ctx, e, mc, model, v, level, maxTok, poller)
 					logConcurrent(&lv)
 					rep.Concurrent = append(rep.Concurrent, lv)
 					if lv.Aborted != "" {
@@ -1005,6 +1119,7 @@ func rampBatches(level, factor int) []int {
 
 // runClosedRound 闭环并发档位：level 个 worker 各自跑 runs_per_worker 次请求（或一次完整会话）。
 // maxTok 输出长度由调用方传入（输出长度扫描维度，已含思考 floor 抬高）。
+// pol 为场景级 gauge 轮询器（饱和止损判据一的观测源；nil = 观测层不可用）。
 //
 // 5.7 错峰发车（concurrent.ramp，默认开，ramp=false 退回 barrier 齐射旧行为）：worker 按
 // 指数批次发放（1→2→4→…），每批等「该批全部完成首轮」再放下一批——批次节奏由服务端首轮
@@ -1012,8 +1127,11 @@ func rampBatches(level, factor int) []int {
 // 爬坡启用时叠加失败语义（ramp=false 时保持旧行为：失败只逐条记录，不取消兄弟会话）：
 //   - fail-fast：任一 worker 首轮失败 → 取消本轮，场景层终止后续档位（首轮挂大概率服务有问题）；
 //   - 双止损：会话内连续失败 3 轮提前弃会话；全局连续失败 ≥ 2×level 终止本轮。
+//
+// saturation_guard（2026-09-12，drain 语义）：waiting 持续超阈或墙钟到点 → 停止发新
+// 请求（在飞跑完保留全量），Aborted 留痕，场景层停止后续档位（饱和之后更高档只会更糟）。
 func runClosedRound(ctx context.Context, e *env, cfg *config.Config,
-	model string, v config.ThinkingVariant, level int, maxTok int) report.ConcurrentLevel {
+	model string, v config.ThinkingVariant, level int, maxTok int, pol *smetrics.GaugePoller) report.ConcurrentLevel {
 
 	cc := cfg.Concurrent
 	if cc.Multiturn {
@@ -1031,10 +1149,15 @@ func runClosedRound(ctx context.Context, e *env, cfg *config.Config,
 	startBarrier := make(chan struct{})
 	var reqSeq atomic.Int64
 
-	ramp := cc.RampEnabled() && level > 1
+	// 档位控制器：饱和/墙钟触发 = 关发射闸门（drain），不取消在飞
+	sat := cfg.SaturationGuard
+	lr := newLevelRun(sat)
+	defer lr.finish()
 	roundCtx, roundCancel := context.WithCancel(ctx)
 	defer roundCancel()
+	waitingMax, satWait := startSaturationWatch(roundCtx, sat, pol, lr)
 
+	ramp := cc.RampEnabled() && level > 1
 	// 失败语义（仅爬坡路径）：全局连续失败计数，达 2×level 止损终止本轮
 	var firstTurnFail, stopLoss atomic.Bool
 	globalConsec := 0
@@ -1076,31 +1199,36 @@ func runClosedRound(ctx context.Context, e *env, cfg *config.Config,
 				s.Batch = batchNo
 				s.StartOffsetS = time.Since(start).Seconds()
 			}
-			var hook sessionTurnHook
-			if ramp {
-				consec := 0
-				hook = func(turn int, m *engine.TurnMetrics) bool {
-					if turn == 0 {
-						markFirst()
-						if m.Error != "" {
-							// 首轮挂大概率模型服务有问题：fail-fast，取消本轮全部会话
-							firstTurnFail.Store(true)
-							roundCancel()
-						}
-					}
-					if m.Error != "" {
-						consec++
-						markFail()
-						if consec >= 3 {
-							log.Printf("    会话 %d 连续 %d 轮失败，提前终止该会话（止损）", s.Session, consec)
-							return false
-						}
-					} else {
-						consec = 0
-						markOK()
-					}
+			// hook 常开：drain 闸门要求会话中途也能停（已完成轮保留）；fail-fast/止损
+			// 仅爬坡路径启用（ramp=false 保持旧行为：失败只逐条记录）
+			consec := 0
+			hook := func(turn int, m *engine.TurnMetrics) bool {
+				if lr.Stop() {
+					return false // 饱和/墙钟触发：本会话到本轮为止，已发请求的数据全保留
+				}
+				if !ramp {
 					return true
 				}
+				if turn == 0 {
+					markFirst()
+					if m.Error != "" {
+						// 首轮挂大概率模型服务有问题：fail-fast，取消本轮全部会话
+						firstTurnFail.Store(true)
+						roundCancel()
+					}
+				}
+				if m.Error != "" {
+					consec++
+					markFail()
+					if consec >= 3 {
+						log.Printf("    会话 %d 连续 %d 轮失败，提前终止该会话（止损）", s.Session, consec)
+						return false
+					}
+				} else {
+					consec = 0
+					markOK()
+				}
+				return true
 			}
 			s.Turns = collectSessionTurns(roundCtx, e, cfg, model, v, workerID, 0, maxTok, hook)
 			mu.Lock()
@@ -1109,8 +1237,8 @@ func runClosedRound(ctx context.Context, e *env, cfg *config.Config,
 			return
 		}
 		for r := 0; r < cc.RunsPerWorker; r++ {
-			if ramp && roundCtx.Err() != nil {
-				return // fail-fast / 止损后不再发新请求
+			if roundCtx.Err() != nil || lr.Stop() {
+				return // 本档位取消（fail-fast/止损）或 drain 触发：不再发新请求
 			}
 			promptTokens := cfg.ClampOne(cc.PromptTokens)
 			reqMaxTok := maxTok
@@ -1149,7 +1277,7 @@ func runClosedRound(ctx context.Context, e *env, cfg *config.Config,
 	if ramp {
 		launched := 0
 		for bi, size := range rampBatches(level, cc.EffRampFactor()) {
-			if roundCtx.Err() != nil || firstTurnFail.Load() {
+			if roundCtx.Err() != nil || firstTurnFail.Load() || lr.Stop() {
 				break
 			}
 			firstDone := make(chan struct{}, size)
@@ -1178,11 +1306,18 @@ func runClosedRound(ctx context.Context, e *env, cfg *config.Config,
 		close(startBarrier)
 	}
 	wg.Wait()
+	// 本档位已结束：停观测器、收 waiting 峰值（标定数据），再组装终止原因
+	roundCancel()
+	satWait()
+	lv.WaitingMax = waitingMax()
 	if firstTurnFail.Load() {
 		lv.Aborted = "首轮失败，fail-fast 终止（爬坡发车）"
 		log.Printf("⛔ %s", lv.Aborted)
 	} else if stopLoss.Load() {
 		lv.Aborted = "全局连续失败达 2×level，止损终止（爬坡发车）"
+	} else {
+		// 饱和/墙钟触发的原因由 lr.Trip 记录并已打日志；正常跑完 Reason 为空
+		lv.Aborted = lr.Reason()
 	}
 	lv.Shapes = aggregateShapes(mp, lv.Requests, shapeIdxs)
 	finalizeLevel(e, lv, time.Since(start).Seconds())
@@ -1191,8 +1326,11 @@ func runClosedRound(ctx context.Context, e *env, cfg *config.Config,
 
 // runOpenRound 开环到达率：请求按 Poisson 过程到达（对齐 vLLM bench serve），测排队-延迟曲线。
 // maxTok 输出长度由调用方传入（输出长度扫描维度，已含思考 floor 抬高）。
+// pol 为场景级 gauge 轮询器（饱和止损判据一的观测源；nil = 观测层不可用）。
+// saturation_guard：waiting 持续超阈或墙钟超限 → 取消本档位（停止发新到达 + 取消在飞），
+// Aborted 留痕，场景层停止后续档位。
 func runOpenRound(ctx context.Context, e *env, cfg *config.Config,
-	model string, v config.ThinkingVariant, rate float64, maxTok int) report.ConcurrentLevel {
+	model string, v config.ThinkingVariant, rate float64, maxTok int, pol *smetrics.GaugePoller) report.ConcurrentLevel {
 
 	cc := cfg.Concurrent
 	lv := &report.ConcurrentLevel{Model: model, Thinking: v.Name, MaxTokens: maxTok, Level: 0, RequestRate: rate}
@@ -1213,6 +1351,13 @@ func runOpenRound(ctx context.Context, e *env, cfg *config.Config,
 		e.warnTraceWrap(n)
 	}
 	start := time.Now()
+	// 档位控制器：饱和/墙钟触发 = 关发射闸门（drain），不取消在飞
+	sat := cfg.SaturationGuard
+	lr := newLevelRun(sat)
+	defer lr.finish()
+	roundCtx, roundCancel := context.WithCancel(ctx)
+	defer roundCancel()
+	waitingMax, satWait := startSaturationWatch(roundCtx, sat, pol, lr)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	var sem chan struct{}
@@ -1227,12 +1372,18 @@ func runOpenRound(ctx context.Context, e *env, cfg *config.Config,
 		go func(i int) {
 			defer wg.Done()
 			if sem != nil {
-				sem <- struct{}{}
-				defer func() { <-sem }()
+				select {
+				case sem <- struct{}{}:
+					defer func() { <-sem }()
+				case <-roundCtx.Done():
+					return // 本档位已取消：不再占用并发槽
+				}
 			}
 			if cc.Multiturn {
 				s := report.MultiturnRun{Model: model, Thinking: v.Name, Session: i + 1, MaxTokens: maxTok}
-				s.Turns = collectSessionTurns(ctx, e, cfg, model, v, i, 0, maxTok, nil)
+				// drain 闸门要求会话中途也能停（已完成轮保留）
+				stopHook := sessionTurnHook(func(int, *engine.TurnMetrics) bool { return !lr.Stop() })
+				s.Turns = collectSessionTurns(roundCtx, e, cfg, model, v, i, 0, maxTok, stopHook)
 				mu.Lock()
 				lv.Sessions = append(lv.Sessions, s)
 				mu.Unlock()
@@ -1249,7 +1400,7 @@ func runOpenRound(ctx context.Context, e *env, cfg *config.Config,
 			}
 			seed := openWorkerSeed(i, cfg.SeedSalt)
 			msgs := []engine.Message{engine.UserMsg(promptTokens, seed, cfg.FillerLang)}
-			m := runOne(ctx, e, model, msgs, reqMaxTok, v)
+			m := runOne(roundCtx, e, model, msgs, reqMaxTok, v)
 			mu.Lock()
 			lv.Requests = append(lv.Requests, m)
 			shapeIdxs = append(shapeIdxs, si)
@@ -1260,14 +1411,30 @@ func runOpenRound(ctx context.Context, e *env, cfg *config.Config,
 	go func() { // Poisson 调度：指数分布到达间隔
 		defer close(schedDone)
 		for i := 0; i < n; i++ {
+			if lr.Stop() || roundCtx.Err() != nil {
+				return // drain 触发或本档位取消：停止发新到达
+			}
 			if i > 0 {
-				time.Sleep(time.Duration(rng.ExpFloat64() / rate * float64(time.Second)))
+				d := time.Duration(rng.ExpFloat64() / rate * float64(time.Second))
+				select {
+				case <-roundCtx.Done():
+					return // 本档位已取消（场景中止）：停止发新到达
+				case <-time.After(d):
+				}
+			}
+			if lr.Stop() {
+				return // 睡眠期间触发：尚未发出的到达不再发射
 			}
 			launch(i)
 		}
 	}()
-	<-schedDone // 全部请求已按到达序列发射
+	<-schedDone // 全部请求已按到达序列发射（或本档位被提前停止）
 	wg.Wait()
+	// 本档位已结束：停观测器、收 waiting 峰值（标定数据），再组装终止原因
+	roundCancel()
+	satWait()
+	lv.WaitingMax = waitingMax()
+	lv.Aborted = lr.Reason()
 	lv.Shapes = aggregateShapes(mp, lv.Requests, shapeIdxs)
 	finalizeLevel(e, lv, time.Since(start).Seconds())
 	return *lv
@@ -1284,7 +1451,7 @@ func finalizeLevel(e *env, lv *report.ConcurrentLevel, wall float64) {
 				continue
 			}
 			throughput += float64(m.CompletionTokens)
-			if e.cfg.Goodput != nil {
+			if e.cfg.EffGoodput() != nil {
 				lv.SLOTotal++
 				if goodputOf(e, m) {
 					meet++
@@ -1319,8 +1486,40 @@ func singleSeed(fixed bool, tokens, run, salt int) int64 {
 	return int64(tokens*100 + run + salt)
 }
 
+// baseSharingDesc 基座共享形态的人读描述（多轮场景 Note 用）。
+// 这是 10.3 的拍板点：默认共享，等于"一套部署一套提示词"的线上形态。
+func baseSharingDesc(mt config.Multiturn) string {
+	if mt.GetSharedBase() {
+		return "跨会话共享（同一套 system/tools，逐轮内容仍按会话独立）"
+	}
+	return "每会话独立（不同 seed，缓存不可跨会话复用）"
+}
+
 // sessionSeed 多轮会话：不同会话（含并发多轮的不同虚拟用户）内容互异。
 func sessionSeed(sessionIdx, salt int) int64 { return int64(5000 + sessionIdx*10000 + salt) }
+
+// sharedBaseSeed 共享基座（`multiturn.shared_base: true`，默认）的基座种子：
+// 与会话编号无关，只随盐值变化（换盐 = 换基座内容 = 重新冷）。
+//
+// 刻意不复用 sessionSeed(0)：两个形态的基座内容必须互不相同，否则「共享 vs 独立」
+// 的对照里，独立形态的 session0 会与共享形态的基座同前缀，被上一轮的 prefix cache
+// 提前热身，对照就不干净了。
+func sharedBaseSeed(salt int) int64 { return int64(7000 + salt) }
+
+// sessionSeeds 返回一个多轮会话的（基座种子, 逐轮种子）。
+//
+// SharedBase=true（默认）：基座跨会话共享——全部会话顶着同一套 system/tool defs 前缀，
+// 贴近"一套部署一套提示词"的真实形态，测的是**跨用户共享前缀值多少 TTFT**。
+// 逐轮种子始终按会话独立：否则会话之间会变成逐字节相同，跨会话对比与 per-session
+// 统计（会话间方差、失败隔离）都失去意义。
+func sessionSeeds(cfg *config.Config, sessionIdx int) (base int64, turn int64) {
+	turn = sessionSeed(sessionIdx, cfg.SeedSalt)
+	base = turn
+	if cfg.Multiturn.GetSharedBase() {
+		base = sharedBaseSeed(cfg.SeedSalt)
+	}
+	return base, turn
+}
 
 // workerSeed 闭环并发单轮：不同 worker / 不同 run 内容互异。
 // stride 取 1_000_000（≥ runs_per_worker 实际可达上限）：曾用 100，

@@ -336,3 +336,5 @@ deploy/             # 推理服务 compose 存档：vLLM 基线 + SGLang / Tenso
 - [docs/architecture.md](docs/architecture.md) — 内部架构：模块边界、数据流、扩展点、已知坑位（二开/维护者向）
 - [docs/data-contract.md](docs/data-contract.md) — 数据契约：JSON 输出结构、聚合口径、报告侧对齐规则
 - [docs/latency-baselines.md](docs/latency-baselines.md) — 体验基线 3 档制的依据与原文链接
+- [docs/scenario-guide.md](docs/scenario-guide.md) — 场景选型指南：真机窗口里测什么、跳过什么、为什么（含必测顺序与反例清单）
+- [docs/testing-architecture.md](docs/testing-architecture.md) — 评测体系架构：指标第一性原理与冻结、四层模型、三类测试、trace/filler 分工、客户端计时立场、减法纪律（2026-09-12 定稿）

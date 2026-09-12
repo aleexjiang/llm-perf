@@ -71,7 +71,20 @@ type Multiturn struct {
 	// MaxReplyChars assistant 回复保留进 history 的截断长度（按 rune 计，中文安全），默认 2000。
 	// 之前按字节切（reply[:2000]），中文会切出半个 UTF-8 字符发给服务端
 	MaxReplyChars int `yaml:"max_reply_chars"`
+	// SharedBase 基座（system + tool defs）跨会话共享：true = 全部会话用同一套前缀，
+	// 贴近"一套部署一套提示词"的真实形态，测的是**跨用户共享前缀值多少 TTFT**；
+	// false = 每会话独立基座（互异内容，缓存不可跨会话复用），基线形态。
+	// 用指针是刻意的：nil = 未配置 → 默认 true（2026-09-12 拍板），显式 false 才关。
+	// 逐轮 user 内容**始终**按会话独立（与基座共享与否无关），否则会话之间会变成
+	// 逐字节相同，跨会话对比与 per-session 统计都失去意义。
+	SharedBase *bool `yaml:"shared_base"`
 }
+
+// GetSharedBase 基座是否跨会话共享（未配置默认 true）。
+func (m Multiturn) GetSharedBase() bool { return m.SharedBase == nil || *m.SharedBase }
+
+// SetSharedBaseFalse 供测试与模型覆盖使用。
+func (m *Multiturn) SetSharedBaseFalse() { f := false; m.SharedBase = &f }
 
 // MixShape 混合负载的请求形状（5.6）：并发场景按 weight 确定性混跑长短请求。
 // 线上流量从不均匀——均匀负载测出的吞吐/p99 系统性偏乐观，混跑才能测出容量折扣与真实尾延迟。
@@ -133,9 +146,81 @@ type DatasetCfg struct {
 }
 
 // GoodputCfg SLO 约束（goodput 口径）：同时满足 TTFT 与 TPOT 上限的请求才算有效吞吐。
+// 挂在 slo.goodput 下（原顶层 goodput: 已合流进 slo:，schema 不保兼容）。
 type GoodputCfg struct {
 	TTFTMS float64 `yaml:"ttft_ms"` // 如 2000
 	TPOTMS float64 `yaml:"tpot_ms"` // 如 100
+}
+
+// SLOCfg SLO 口径段（5.8 合流）：goodput 判定阈值 + 报告"体验基线评估"阈值。
+// 之前 goodput 阈值在 Go 侧、基线三档判据是报告脚本内置常量——同一份 SLO 拆在两处，
+// 阈值改不动、口径对不齐；现在都从配置进、随 JSON 透出，报告侧消费同一份。
+type SLOCfg struct {
+	Goodput  *GoodputCfg     `yaml:"goodput"`  // goodput 判定（未配置 = 不算 goodput 列）
+	Baseline *SLOBaselineCfg `yaml:"baseline"` // 体验基线评估阈值（未配置 = 报告用内置默认）
+}
+
+// SLOBaselineCfg 体验基线评估（3 档制）阈值。所有数值字段可省略——省略的字段用
+// 报告脚本内置默认（SLO_TIERS，判据与出处 docs/latency-baselines.md §7）；写了就覆盖。
+// 键名与报告脚本 SLO_TIERS 一致，JSON 透出后报告侧可直接 dict.update 合流。
+type SLOBaselineCfg struct {
+	// Enabled 默认开；false = 报告跳过"体验基线评估"节（阈值仍可配但不渲染）。
+	// 指针区分"未写"（默认开）与显式 false。
+	Enabled        *bool   `yaml:"enabled"`
+	ShortMaxTokens int     `yaml:"short_max_tokens"` // 短输入档上界（默认 4000）
+	LongMinTokens  int     `yaml:"long_min_tokens"`  // agent 大上下文档下界（默认 24000）
+	ShortGoodTTFT  float64 `yaml:"short_good_ttft"`  // s，短档优线（默认 0.45）
+	ShortPassTTFT  float64 `yaml:"short_pass_ttft"`  // s，短档及格线（默认 2.0）
+	LongGoodTTFT   float64 `yaml:"long_good_ttft"`   // s，长档优线（默认 3.0）
+	LongPassTTFT   float64 `yaml:"long_pass_ttft"`   // s，长档及格线（默认 6.0）
+	GoodTPOT       float64 `yaml:"good_tpot"`        // ms，TPOT 优线（默认 40）
+	PassTPOT       float64 `yaml:"pass_tpot"`        // ms，TPOT 及格线（默认 200）
+	GoodTPS        float64 `yaml:"good_tps"`         // tok/s，单请求输出速度优线（默认 25）
+	PassTPS        float64 `yaml:"pass_tps"`         // tok/s，及格线（默认 10）
+}
+
+// BaselineEnabled 基线评估是否渲染（未配置段或 enabled 未写 = 默认开）。
+func (b *SLOBaselineCfg) BaselineEnabled() bool {
+	return b == nil || b.Enabled == nil || *b.Enabled
+}
+
+// SaturationGuardCfg 饱和止损（默认关闭）：负载已饱和时停止加压，别把时间烧在
+// 注定全错的深饱和区（stall_guard 管「服务端变慢」，本段管「负载积压」——互补）。
+//
+// 两个独立判据，任一触发即**停止向当前档位发新请求**（drain 语义：在飞请求自然跑完，
+// 已发出的每个请求都保留完整数据——被截断的档位是干净的前缀样本而非残缺数据；
+// 收尾最多多等一个 timeout_seconds），报告 aborted 留痕，场景层据此停止后续档位
+// （饱和之后更高档只会更糟，继续加压是纯浪费）：
+//   - max_waiting：服务端 waiting 排队深度持续 ≥ 阈值达 window_seconds（需 server_metrics）；
+//   - max_wall_seconds：本档位发射窗口超过上限（GuideLLM max_duration 语义，不依赖观测层）。
+type SaturationGuardCfg struct {
+	Enabled *bool `yaml:"enabled"` // 默认 true（写了该段即生效）；false = 保留配置但不启用
+
+	MaxWaiting     int     `yaml:"max_waiting"`      // waiting 排队深度阈值（0 = 不启用该判据）
+	WindowSeconds  int     `yaml:"window_seconds"`   // 持续超阈多久触发，默认 120
+	SampleSeconds  float64 `yaml:"sample_seconds"`   // 探测周期（秒），默认 5
+	MaxWallSeconds int     `yaml:"max_wall_seconds"` // 每档位墙钟上限（0 = 不启用该判据）
+}
+
+// SatEnabled 该配置段是否生效（未配置或 enabled:false 都返回 false）。
+func (s *SaturationGuardCfg) SatEnabled() bool {
+	return s != nil && (s.Enabled == nil || *s.Enabled)
+}
+
+// GetMaxWaiting / GetWindowSeconds nil 安全读取：观测器在 guard 未配置段时也要能
+// 构造判定核心（armed=false 时这些值不会被消费，但引用必须不 panic）。
+func (s *SaturationGuardCfg) GetMaxWaiting() int {
+	if s == nil {
+		return 0
+	}
+	return s.MaxWaiting
+}
+
+func (s *SaturationGuardCfg) GetWindowSeconds() int {
+	if s == nil {
+		return 0
+	}
+	return s.WindowSeconds
 }
 
 // RetryCfg 连接层重试策略（默认关闭）：只重试瞬时失败（TCP/流被 reset、HTTP 5xx/429），
@@ -444,6 +529,33 @@ func (c *Config) ForModel(model string) *Config {
 	if ov.Stream != nil {
 		v.Stream = ov.Stream
 	}
+	// 10.1 per-model 熔断标定：单模型标定值套全模型会误杀更慢的模型（同一份配置逐模型跑
+	// 就已踩此口径）——此处按字段级覆盖，未写的键继承顶层（顶层已做过默认值归一）。
+	if sg := ov.StallGuard; sg != nil {
+		m := StallGuardCfg{}
+		if c.StallGuard != nil {
+			m = *c.StallGuard
+		}
+		if sg.Enabled != nil {
+			m.Enabled = sg.Enabled
+		}
+		if sg.MinTPS > 0 {
+			m.MinTPS = sg.MinTPS
+		}
+		if sg.WindowSeconds > 0 {
+			m.WindowSeconds = sg.WindowSeconds
+		}
+		if sg.CooldownSeconds > 0 {
+			m.CooldownSeconds = sg.CooldownSeconds
+		}
+		if sg.SampleSeconds > 0 {
+			m.SampleSeconds = sg.SampleSeconds
+		}
+		if sg.ProbeFactor != nil {
+			m.ProbeFactor = sg.ProbeFactor
+		}
+		v.StallGuard = &m
+	}
 	return &v
 }
 
@@ -452,11 +564,15 @@ func (c *Config) ForModel(model string) *Config {
 // （fixed_seed、keep_assistant、concurrent.multiturn 等）无法在模型层显式改回 false，
 // 这类全局形状请保持各模型一致或拆分配置。端点级配置（endpoint/认证/timeout_seconds/
 // server_metrics）不在此覆盖——一个测试一个端点，超时由 client 统一持有。
+// 例外：stall_guard.enabled 是指针，故可在模型层显式关掉该模型的熔断。
 type ModelOverride struct {
 	Thinking   *Thinking   `yaml:"thinking"` // 覆盖全局 thinking（字段级，未写的继承）
 	Single     *Single     `yaml:"single"`
 	Multiturn  *Multiturn  `yaml:"multiturn"`
 	Concurrent *Concurrent `yaml:"concurrent"`
+	// StallGuard 按模型覆盖降速熔断阈值（字段级）：各模型 decode 速度不同——用同一个 min_tps
+	// 会把更慢的模型误熔断（或对更快的模型形同虚设）。建议取该模型 probe 实测速度的 10–20%。
+	StallGuard *StallGuardCfg `yaml:"stall_guard"`
 	// MaxPromptTokens 模型上下文截止：0 = 未写（继承顶层）；指针区分"未写"与"显式写 0（解除上限）"
 	MaxPromptTokens *int `yaml:"max_prompt_tokens"`
 	// Enabled 本次是否测试该模型：分批重测/单模型对照时临时关掉其他模型用。
@@ -529,11 +645,12 @@ type Config struct {
 	// 但启动时打印——数量级不合理、轮次不足、覆盖关系等"合法但值得知道"的事
 	Warnings []string `yaml:"-"`
 
-	Dataset     DatasetCfg      `yaml:"dataset"`
-	Goodput     *GoodputCfg     `yaml:"goodput"`
-	Retry       *RetryCfg       `yaml:"retry"`
-	StallGuard  *StallGuardCfg  `yaml:"stall_guard"` // 降速熔断（默认关闭）
-	Correctness *CorrectnessCfg `yaml:"correctness"`
+	Dataset         DatasetCfg          `yaml:"dataset"`
+	SLO             *SLOCfg             `yaml:"slo"` // SLO 口径：goodput 判定 + 基线评估阈值（原顶层 goodput 已合流）
+	Retry           *RetryCfg           `yaml:"retry"`
+	StallGuard      *StallGuardCfg      `yaml:"stall_guard"`      // 降速熔断（默认关闭）
+	SaturationGuard *SaturationGuardCfg `yaml:"saturation_guard"` // 饱和止损（默认关闭）
+	Correctness     *CorrectnessCfg     `yaml:"correctness"`
 
 	Thinking Thinking `yaml:"thinking"`
 
@@ -688,6 +805,15 @@ func Load(path string) (*Config, error) {
 				return nil, err
 			}
 			ov.Single.PromptTokens = normalized
+		}
+		if ov.StallGuard != nil {
+			sg := ov.StallGuard
+			if sg.MinTPS < 0 || sg.WindowSeconds < 0 || sg.CooldownSeconds < 0 || sg.SampleSeconds < 0 {
+				return nil, fmt.Errorf("model_overrides[%s].stall_guard 的 min_tps/window_seconds/cooldown_seconds/sample_seconds 不能为负", name)
+			}
+			if sg.ProbeFactor != nil && *sg.ProbeFactor < 0 {
+				return nil, fmt.Errorf("model_overrides[%s].stall_guard.probe_factor=%.3g 不能为负（0 = 关闭探针）", name, *sg.ProbeFactor)
+			}
 		}
 	}
 	// enabled 开关联动：全禁用直接拒绝（跑了个寂寞）；部分禁用提示跳过名单
@@ -1062,13 +1188,74 @@ func Load(path string) (*Config, error) {
 			cfg.Concurrent.PromptTokens)
 	}
 
-	// goodput / retry / correctness / warmup / salt
-	if cfg.Goodput != nil {
-		if cfg.Goodput.TTFTMS < 0 || cfg.Goodput.TPOTMS < 0 {
-			return nil, fmt.Errorf("goodput 阈值不能为负（ttft_ms=%v tpot_ms=%v）", cfg.Goodput.TTFTMS, cfg.Goodput.TPOTMS)
+	// slo（goodput + 基线）/ retry / correctness / warmup / salt
+	if cfg.SLO != nil {
+		if g := cfg.SLO.Goodput; g != nil {
+			if g.TTFTMS < 0 || g.TPOTMS < 0 {
+				return nil, fmt.Errorf("slo.goodput 阈值不能为负（ttft_ms=%v tpot_ms=%v）", g.TTFTMS, g.TPOTMS)
+			}
+			if g.TTFTMS == 0 && g.TPOTMS == 0 {
+				return nil, fmt.Errorf("slo.goodput 已启用但 ttft_ms/tpot_ms 均为 0——至少配置一项才有判定意义（不打算用请整段注释掉）")
+			}
 		}
-		if cfg.Goodput.TTFTMS == 0 && cfg.Goodput.TPOTMS == 0 {
-			return nil, fmt.Errorf("goodput 已启用但 ttft_ms/tpot_ms 均为 0——至少配置一项才有判定意义（不打算用请整段注释掉）")
+		if b := cfg.SLO.Baseline; b != nil {
+			neg := []struct {
+				name string
+				val  float64
+			}{
+				{"short_good_ttft", b.ShortGoodTTFT}, {"short_pass_ttft", b.ShortPassTTFT},
+				{"long_good_ttft", b.LongGoodTTFT}, {"long_pass_ttft", b.LongPassTTFT},
+				{"good_tpot", b.GoodTPOT}, {"pass_tpot", b.PassTPOT},
+				{"good_tps", b.GoodTPS}, {"pass_tps", b.PassTPS},
+			}
+			for _, kv := range neg {
+				if kv.val < 0 {
+					return nil, fmt.Errorf("slo.baseline.%s 不能为负", kv.name)
+				}
+			}
+			if b.ShortMaxTokens < 0 || b.LongMinTokens < 0 {
+				return nil, fmt.Errorf("slo.baseline.short_max_tokens / long_min_tokens 不能为负")
+			}
+			if b.ShortMaxTokens > 0 && b.LongMinTokens > 0 && b.LongMinTokens <= b.ShortMaxTokens {
+				return nil, fmt.Errorf(
+					"slo.baseline.long_min_tokens=%d 须大于 short_max_tokens=%d（短档上界与长档下界之间为中间带）",
+					b.LongMinTokens, b.ShortMaxTokens)
+			}
+		}
+	}
+	if cfg.SaturationGuard != nil {
+		sg := cfg.SaturationGuard
+		if sg.MaxWaiting < 0 || sg.WindowSeconds < 0 || sg.SampleSeconds < 0 || sg.MaxWallSeconds < 0 {
+			return nil, fmt.Errorf("saturation_guard 的 max_waiting/window_seconds/sample_seconds/max_wall_seconds 不能为负")
+		}
+		if sg.SatEnabled() {
+			if sg.MaxWaiting <= 0 && sg.MaxWallSeconds <= 0 {
+				cfg.Warnings = append(cfg.Warnings,
+					"saturation_guard 已启用但 max_waiting/max_wall_seconds 均未配置——没有判定阈值，本段不生效（0 = 关闭对应判据）")
+			}
+			if sg.MaxWaiting > 0 {
+				if sg.WindowSeconds == 0 {
+					sg.WindowSeconds = 120 // 默认持续 2 分钟
+				}
+				if sg.SampleSeconds == 0 {
+					sg.SampleSeconds = 5
+				}
+				if sg.SampleSeconds > float64(sg.WindowSeconds) {
+					return nil, fmt.Errorf("saturation_guard.sample_seconds=%.3g 大于 window_seconds=%d：探测间隔比判定窗口还长，永远判不出持续积压",
+						sg.SampleSeconds, sg.WindowSeconds)
+				}
+				if !cfg.ServerMetrics {
+					cfg.Warnings = append(cfg.Warnings,
+						"saturation_guard.max_waiting 依赖服务端 /metrics 的 waiting 排队深度（server_metrics: true），当前未启用——waiting 判定不生效，墙钟上限仍有效")
+				}
+				cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
+					"饱和止损已启用：排队深度 waiting≥%d 持续 %ds 即截断当前档位并停止后续档位（已完成数据照常落盘）",
+					sg.MaxWaiting, sg.WindowSeconds))
+			}
+			if sg.MaxWallSeconds > 0 {
+				cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
+					"饱和止损已启用：单个档位/到达率墙钟超过 %ds 即截断并停止后续档位", sg.MaxWallSeconds))
+			}
 		}
 	}
 	if cfg.Retry != nil {
@@ -1112,6 +1299,22 @@ func Load(path string) (*Config, error) {
 			cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
 				"降速熔断已启用：聚合输出速度持续低于 %.0f tok/s 达 %ds 即中止当前场景，冷却 %ds 后继续下一个场景",
 				sg.MinTPS, sg.WindowSeconds, sg.CooldownSeconds))
+			// 10.1 多模型标定提醒：一个阈值套所有模型会误杀更慢的模型（同一份配置逐模型
+			// 跑就已踩此口径）。提示按模型覆盖，但不阻止运行。
+			if active := cfg.ActiveModels(); len(active) > 1 {
+				var missing []string
+				for _, m := range active {
+					if ov := cfg.ModelOverrides[m]; ov == nil || ov.StallGuard == nil {
+						missing = append(missing, m)
+					}
+				}
+				if len(missing) > 0 {
+					cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
+						"多模型共用同一 min_tps=%.0f：各模型 decode 速度差异大时会把更慢的模型误熔断——"+
+							"建议按模型标定 model_overrides.<模型>.stall_guard.min_tps（取该模型 probe 实测速度的 10–20%%）；未单独标定: %s",
+						sg.MinTPS, strings.Join(missing, "、")))
+				}
+			}
 		}
 	}
 	if cfg.WarmupRequests < 0 {
@@ -1211,6 +1414,22 @@ func anyLevelEnabled(th Thinking) bool {
 
 // Timeout 返回超时 Duration。
 func (c *Config) Timeout() time.Duration { return time.Duration(c.TimeoutSeconds) * time.Second }
+
+// EffGoodput 返回生效的 goodput 判定配置（slo.goodput）；未配置返回 nil。
+func (c *Config) EffGoodput() *GoodputCfg {
+	if c.SLO == nil {
+		return nil
+	}
+	return c.SLO.Goodput
+}
+
+// EffBaseline 返回生效的体验基线评估阈值段（slo.baseline）；未配置返回 nil（报告用内置默认）。
+func (c *Config) EffBaseline() *SLOBaselineCfg {
+	if c.SLO == nil {
+		return nil
+	}
+	return c.SLO.Baseline
+}
 
 // StreamEnabled 返回是否使用流式请求。
 func (c *Config) StreamEnabled() bool { return *c.Stream }

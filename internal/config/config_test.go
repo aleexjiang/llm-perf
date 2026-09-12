@@ -717,3 +717,211 @@ func TestRampEnabledExplicitFalse(t *testing.T) {
 		t.Fatalf("显式 3 应保持 3，得到 %d", got)
 	}
 }
+
+// ── slo 段（goodput 合流 + 基线阈值透出，2026-09-12）──
+
+func TestLoad_SLOGoodput(t *testing.T) {
+	p := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+slo:
+  goodput:
+    ttft_ms: 2000
+    tpot_ms: 200
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := cfg.EffGoodput()
+	if g == nil || g.TTFTMS != 2000 || g.TPOTMS != 200 {
+		t.Fatalf("slo.goodput 解析不符：%+v", g)
+	}
+
+	// 旧顶层 goodput 已合流：KnownFields(true) 应直接拒绝（schema 不保兼容，2026-09-08 拍板）
+	p2 := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+goodput:
+  ttft_ms: 2000
+`)
+	if _, err := Load(p2); err == nil {
+		t.Error("顶层 goodput: 已迁入 slo.goodput，旧写法应报未知字段错误")
+	}
+
+	// 全 0 阈值拒绝
+	p3 := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+slo:
+  goodput:
+    ttft_ms: 0
+    tpot_ms: 0
+`)
+	if _, err := Load(p3); err == nil {
+		t.Error("goodput 全 0 阈值应报错")
+	}
+}
+
+func TestLoad_SLOBaseline(t *testing.T) {
+	off := false
+	p := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+slo:
+  baseline:
+    short_max_tokens: 8000
+    long_min_tokens: 48000
+    short_good_ttft: 0.3
+    good_tpot: 50
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := cfg.EffBaseline()
+	if b == nil {
+		t.Fatal("slo.baseline 应解析出配置")
+	}
+	if !b.BaselineEnabled() {
+		t.Error("enabled 未写应默认开")
+	}
+	if b.ShortMaxTokens != 8000 || b.LongMinTokens != 48000 || b.ShortGoodTTFT != 0.3 || b.GoodTPOT != 50 {
+		t.Fatalf("baseline 字段解析不符：%+v", b)
+	}
+	// 未写阈值 = 零值（报告侧回落内置默认）
+	if b.ShortPassTTFT != 0 || b.PassTPS != 0 {
+		t.Errorf("未写字段应保持零值待报告回落：%+v", b)
+	}
+
+	// enabled: false = 保留阈值但不渲染
+	p2 := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+slo:
+  baseline:
+    enabled: false
+`)
+	cfg2, err := Load(p2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg2.EffBaseline().BaselineEnabled() {
+		t.Error("enabled:false 应不渲染基线评估")
+	}
+	_ = off
+
+	// long_min_tokens ≤ short_max_tokens 报错
+	p3 := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+slo:
+  baseline:
+    short_max_tokens: 8000
+    long_min_tokens: 8000
+`)
+	if _, err := Load(p3); err == nil {
+		t.Error("long_min_tokens ≤ short_max_tokens 应报错")
+	}
+
+	// 负值报错
+	p4 := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+slo:
+  baseline:
+    good_tps: -1
+`)
+	if _, err := Load(p4); err == nil {
+		t.Error("baseline 阈值为负应报错")
+	}
+}
+
+// ── saturation_guard（饱和止损，2026-09-12）──
+
+func TestLoad_SaturationGuard(t *testing.T) {
+	p := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+server_metrics: true
+saturation_guard:
+  max_waiting: 32
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sg := cfg.SaturationGuard
+	if sg == nil || !sg.SatEnabled() {
+		t.Fatal("配置了 saturation_guard 段应默认启用")
+	}
+	if sg.MaxWaiting != 32 || sg.WindowSeconds != 120 || sg.SampleSeconds != 5 {
+		t.Errorf("默认值填充不符：%+v", sg)
+	}
+	if !strings.Contains(strings.Join(cfg.Warnings, "\n"), "饱和止损已启用") {
+		t.Errorf("应打印启用提示: %v", cfg.Warnings)
+	}
+
+	// 未配 server_metrics：waiting 判定不生效的提示
+	p2 := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+saturation_guard:
+  max_waiting: 32
+`)
+	cfg2, err := Load(p2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(cfg2.Warnings, "\n"), "server_metrics") {
+		t.Errorf("未开 server_metrics 应有提示: %v", cfg2.Warnings)
+	}
+
+	// 段写了但两个阈值都为 0：不生效提示
+	p3 := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+saturation_guard:
+  window_seconds: 60
+`)
+	cfg3, err := Load(p3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(cfg3.Warnings, "\n"), "没有判定阈值") {
+		t.Errorf("无阈值应有提示: %v", cfg3.Warnings)
+	}
+
+	// enabled: false = 保留配置但不启用
+	p4 := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+saturation_guard:
+  enabled: false
+  max_waiting: 32
+`)
+	cfg4, err := Load(p4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg4.SaturationGuard.SatEnabled() {
+		t.Error("enabled:false 应不启用")
+	}
+
+	// 负值 / 采样长于窗口报错
+	p5 := writeTemp(t, "endpoint: \"http://x:1/v1\"\nmodels: [\"m1\"]\nsaturation_guard:\n  max_waiting: -1\n")
+	if _, err := Load(p5); err == nil {
+		t.Error("max_waiting 为负应报错")
+	}
+	p6 := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+saturation_guard:
+  max_waiting: 32
+  window_seconds: 5
+  sample_seconds: 30
+`)
+	if _, err := Load(p6); err == nil {
+		t.Error("sample_seconds 大于 window_seconds 应报错")
+	}
+}

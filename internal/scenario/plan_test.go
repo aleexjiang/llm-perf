@@ -1,6 +1,7 @@
 package scenario
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/aleexjiang/llm-perf/internal/config"
@@ -69,6 +70,44 @@ func TestPlanSummaryCtxCutoff(t *testing.T) {
 	got := p.Models[0].Scenarios[0]
 	if got.Requests != 2 {
 		t.Fatalf("截止后 multiturn 估算 %d ≠ 2（1 变体 × 1 session × 2 轮）", got.Requests)
+	}
+}
+
+// 开环（rate_sweep/request_rate）：画像必须按到达率档位算，不能报 levels 矩阵。
+// 回归背景：默认 levels=[1,2,4,8,16] 在 Load 后始终填充，开环配置下仍被画像当成执行口径，
+// 把 8 个请求的小配置估成 60+ 请求，与实际执行量差一个数量级。
+func TestPlanSummaryOpenLoop(t *testing.T) {
+	cfg := &config.Config{
+		Endpoint: "http://x:1/v1",
+		Models:   []string{"m1"},
+		Single:   config.Single{Runs: 1, PromptTokens: []int{4000}, MaxTokens: config.IntList{64}},
+		// 多轮默认值（Load 后填充）；num_prompts 在多轮语义下是会话数，请求量按轮计
+		Multiturn: config.Multiturn{Sessions: 1, Turns: 2, SystemTokens: 100, ToolDefsTokens: 100,
+			TurnTokens: 200, MaxTokens: config.IntList{32}},
+		// Load 后的形态：levels 有默认值，但 rate_sweep 生效 → levels 被忽略
+		Concurrent: config.Concurrent{Levels: []int{1, 2, 4, 8, 16}, RunsPerWorker: 2,
+			RateSweep: []float64{2, 8}, NumPrompts: 4, MaxTokens: config.IntList{32}},
+	}
+	cfg.Thinking.Mode = "off"
+	p := PlanSummary(cfg, "", []PlanItem{{Name: "concurrent", Highs: []int{1, 2, 4, 8, 16}}})
+	got := p.Models[0].Scenarios[0]
+	if got.Requests != 8 { // 1 变体 × 1 输出档 × 2 到达率档 × 4 请求/档
+		t.Fatalf("开环估算 %d ≠ 8（%s）", got.Requests, got.Detail)
+	}
+	if !strings.Contains(got.Detail, "开环到达率") {
+		t.Fatalf("开环画像明细应说明到达率档位，实际: %s", got.Detail)
+	}
+	// 开环多轮：num_prompts 是会话数，请求量按轮计（2 档 × 4 会话 × 2 轮 = 16）
+	pMT := PlanSummary(cfg, "", []PlanItem{{Name: "concurrent-multi", MT: true, Highs: []int{1, 2, 4, 8, 16}}})
+	if gotMT := pMT.Models[0].Scenarios[0]; gotMT.Requests != 16 {
+		t.Fatalf("开环多轮估算 %d ≠ 16（%s）", gotMT.Requests, gotMT.Detail)
+	}
+	// request_rate 单档同样走开环口径
+	cfg.Concurrent.RateSweep = nil
+	cfg.Concurrent.RequestRate = 4
+	p2 := PlanSummary(cfg, "", []PlanItem{{Name: "concurrent", Highs: []int{1, 2, 4, 8, 16}}})
+	if got2 := p2.Models[0].Scenarios[0]; got2.Requests != 4 {
+		t.Fatalf("单档开环估算 %d ≠ 4（%s）", got2.Requests, got2.Detail)
 	}
 }
 

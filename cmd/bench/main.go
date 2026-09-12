@@ -204,6 +204,10 @@ func main() {
 	stallProbeFlag := fs.Float64("stall-probe-factor", 0, "熔断冷却后的恢复探针倍数：探针实测 tok/s ≥ 倍数×min_tps 才继续下一场景，否则停止整轮；>0 覆盖 stall_guard.probe_factor（默认 2，0=关闭退回纯计时；关闭只能走配置）")
 	noStallFlag := fs.Bool("no-stall-guard", false, "关闭降速熔断（覆盖配置 stall_guard，用于需要跑完整轮的场景）")
 	noStallTraceFlag := fs.Bool("no-stall-trace", false, "关闭降速采样序列落盘（<结果 JSON 同名>.stall.csv；默认开启，纯记录不影响行为）")
+	satWaitingFlag := fs.Int("sat-waiting", 0, "饱和止损：服务端 waiting 排队深度阈值（需 server_metrics；持续超过达 --sat-window 秒即停止向当前档位发新请求并停止后续档位）；>0 覆盖 saturation_guard.max_waiting；标定：关着 guard 跑一轮，取各档 waiting 峰值 ×3–5（报告会自动给建议值）")
+	satWindowFlag := fs.Int("sat-window", 0, "饱和止损判定窗口（秒）：持续超阈多久触发（默认 120）；覆盖 saturation_guard.window_seconds")
+	satWallFlag := fs.Int("sat-max-wall", 0, "饱和止损：单个档位/到达率发射窗口上限（秒，0=不限）——到点后停止发新请求，在飞跑完保留全量；>0 覆盖 saturation_guard.max_wall_seconds")
+	noSatFlag := fs.Bool("no-sat-guard", false, "关闭饱和止损（覆盖配置 saturation_guard）")
 	thinkingFlag := fs.String("thinking", "", "只跑某个思考变体：on/off（开思考费 token，建议 off/on 分开两轮跑，互不连坐）；按变体名过滤，模型无该变体则跳过；both=全部")
 	noToolCallFlag := fs.Bool("no-toolcall", false, "probe: 关闭 tool-call 健康检查（默认开启，多 4 次请求秒级）")
 	captureFlag := fs.String("probe-capture", "", "probe: tool-call 检查原始响应落盘目录（排障证据/判据 fixture；含业务数据外发前脱敏）")
@@ -275,6 +279,43 @@ func main() {
 		}
 		log.Printf("降速熔断（CLI 覆盖）: 聚合输出速度持续低于 %.0f tok/s 达 %ds 即中止当前场景，冷却 %ds 后探针（×%.0f）决定续跑或停整轮",
 			sg.MinTPS, sg.WindowSeconds, sg.CooldownSeconds, sg.EffProbeFactor())
+	}
+	// 饱和止损：CLI 覆盖配置（与降速熔断同一覆盖口径：flag >0 才写，默认值在 Load 已填）
+	if *noSatFlag {
+		cfg.SaturationGuard = nil
+		log.Printf("饱和止损: 已由 CLI 关闭（--no-sat-guard）")
+	} else if *satWaitingFlag > 0 || *satWindowFlag > 0 || *satWallFlag > 0 {
+		sg := cfg.SaturationGuard
+		if sg == nil {
+			sg = &config.SaturationGuardCfg{}
+			cfg.SaturationGuard = sg
+		}
+		on := true
+		sg.Enabled = &on
+		if *satWaitingFlag > 0 {
+			sg.MaxWaiting = *satWaitingFlag
+		}
+		if *satWindowFlag > 0 {
+			sg.WindowSeconds = *satWindowFlag
+		}
+		if *satWallFlag > 0 {
+			sg.MaxWallSeconds = *satWallFlag
+		}
+		if sg.MaxWaiting > 0 {
+			if sg.WindowSeconds <= 0 {
+				sg.WindowSeconds = 120
+			}
+			if sg.SampleSeconds <= 0 {
+				sg.SampleSeconds = 5
+			}
+			if !cfg.ServerMetrics {
+				log.Printf("⚠️ --sat-waiting 需要 server_metrics: true（waiting 排队深度不可得）——waiting 判定不生效，墙钟上限仍有效")
+			}
+			log.Printf("饱和止损: waiting≥%d 持续 %ds 或单档墙钟超 %ds 即截断当前档位并停止后续档位",
+				sg.MaxWaiting, sg.WindowSeconds, sg.MaxWallSeconds)
+		} else if sg.MaxWallSeconds > 0 {
+			log.Printf("饱和止损: 单个档位/到达率墙钟超过 %ds 即截断并停止后续档位", sg.MaxWallSeconds)
+		}
 	}
 	if *thinkingFlag != "" {
 		if err := applyThinkingCLI(cfg, *thinkingFlag); err != nil {
@@ -351,13 +392,15 @@ func main() {
 		th := cfg.ThinkingFor(model) // probe 也按模型解析思考配置（model_overrides.thinking 覆盖生效）
 		probeOn, probeOff := th.ProbeExtraBodies()
 		res := engine.Probe(ctx, engine.ProbeOptions{
-			Endpoint:        cfg.Endpoint,
-			APIKey:          cfg.APIKey,
-			Auth:            auth.Auth{Scheme: cfg.AuthScheme, Header: cfg.AuthHeader},
-			ChatPath:        cfg.ChatPath,
-			MetricsPath:     cfg.MetricsPath,
-			ModelsPath:      cfg.ModelsPath,
-			Model:           model,
+			Endpoint:    cfg.Endpoint,
+			APIKey:      cfg.APIKey,
+			Auth:        auth.Auth{Scheme: cfg.AuthScheme, Header: cfg.AuthHeader},
+			ChatPath:    cfg.ChatPath,
+			MetricsPath: cfg.MetricsPath,
+			ModelsPath:  cfg.ModelsPath,
+			Model:       model,
+			// 逐模型实测 decode 速度并给最慢模型出建议（10.1）：统一 min_tps 会误熔断更慢的模型
+			Models:          cfg.ActiveModels(),
 			ThinkingOn:      probeOn,
 			ThinkingOff:     probeOff,
 			IncludeUsage:    *cfg.IncludeUsage,

@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"sort"
 	"strings"
@@ -115,9 +116,13 @@ type ProbeResult struct {
 	Suggested     string       `json:"suggested_config,omitempty"` // 可直接粘回配置文件的 YAML 片段
 	CrossChecks   []CrossCheck `json:"cross_checks,omitempty"`     // 交叉验证建议（引擎→原生 perf 工具）
 	ServerMetrics string       `json:"server_metrics,omitempty"`   // /metrics 可用性（观测层前置条件，扩展面）
-	// DecodeSpeedTPS 实测流式输出速度（含思考，2 次取保守值）：本机健康基线，
-	// stall_guard.min_tps 的部署级建议依据（建议取其 10-20%，熔断兜"接近死机"）
+	// DecodeSpeedTPS 实测流式输出速度（含思考，保守值）：本机健康基线，
+	// stall_guard.min_tps 的部署级建议依据（建议取其 10-20%，熔断兜"接近死机"）。
+	// 多模型配置下取**最慢被测模型**的值（统一阈值必须照顾最慢的那个）。
 	DecodeSpeedTPS float64 `json:"decode_speed_tps,omitempty"`
+	// DecodeSpeeds 逐模型实测输出速度（多模型配置时填充）：各模型 decode 速度差异大时，
+	// 按 model_overrides.<模型>.stall_guard.min_tps 分别标定，避免误熔断更慢的模型。
+	DecodeSpeeds map[string]float64 `json:"decode_speeds,omitempty"`
 
 	// ThinkingLevel 探测到的思考等级控制参数（空 = 未探测到可控参数）
 	ThinkingLevelParam string `json:"thinking_level_param,omitempty"`
@@ -129,13 +134,16 @@ type ProbeResult struct {
 
 // ProbeOptions 探测参数。
 type ProbeOptions struct {
-	Endpoint     string
-	APIKey       string
-	Auth         auth.Auth      // 认证方案（默认 bearer + Authorization）
-	ChatPath     string         // 接口路径，默认 /chat/completions
-	MetricsPath  string         // 服务端 metrics 路径，默认 /metrics
-	ModelsPath   string         // 模型列表路径，默认 /models
-	Model        string         // 为空则取 /models 列表第一个
+	Endpoint    string
+	APIKey      string
+	Auth        auth.Auth // 认证方案（默认 bearer + Authorization）
+	ChatPath    string    // 接口路径，默认 /chat/completions
+	MetricsPath string    // 服务端 metrics 路径，默认 /metrics
+	ModelsPath  string    // 模型列表路径，默认 /models
+	Model       string    // 为空则取 /models 列表第一个
+	// Models 本次要压测的模型列表（多模型配置时传 cfg.ActiveModels()）：decode_speed 逐模型实测，
+	// 建议值取最慢的那个。为空 = 只测 Model（单模型路径，保持既有行为）。
+	Models       []string
 	ThinkingOn   map[string]any // 思考开启的 extra_body（可空）
 	ThinkingOff  map[string]any // 思考关闭的 extra_body（可空）
 	IncludeUsage bool
@@ -644,29 +652,69 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 	// 速度含思考增量（TTFT→结束），流式熔断计 reasoning chunk 也算服务端产出。
 	// 短 prompt 的 decode 速度 ≈ 本机健康上限——熔断下限取其 10-20%，任何机器都不会误触发；
 	// 这把"真机标定"自动化进 probe（换部署重跑一次即可），UX 评级线见 docs/latency-baselines.md §8。
+	//
+	// 10.1 多模型：逐模型实测（各测 1 条即可，串行短请求），取值按**最慢被测模型**给部署级
+	// 保守值（一个 min_tps 套全模型时，阈值要照顾最慢的那个）；同时逐模型给出建议值，
+	// 供 model_overrides.<模型>.stall_guard 分别标定。
 	{
 		cli := NewClient(origin, o.APIKey, 120*time.Second, o.IncludeUsage)
 		cli.Auth = effAuth
 		cli.ChatPath = chatPath
-		var speeds []float64
-		for i := 0; i < 2; i++ {
-			m, err := cli.Chat(ctx, ChatOptions{
-				Model: model, MaxTokens: 256, Stream: true,
-				Messages:  []Message{{Role: "user", Content: "请按顺序列出 100 以内的全部奇数，不要任何解释或前言。"}},
-				ExtraBody: o.ThinkingOff,
-			})
-			if err != nil || m.Error != "" || m.TTFT <= 0 || m.E2EMS <= m.TTFT {
-				continue
+		probeModels := o.Models
+		if len(probeModels) == 0 {
+			probeModels = []string{model}
+		}
+		perModel := map[string]float64{}
+		for _, pm := range probeModels {
+			var speeds []float64
+			// 单模型保持 2 次取小（保守）；多模型每个只测 1 次，避免探针时长随模型数线性膨胀
+			attempts := 2
+			if len(probeModels) > 1 {
+				attempts = 1
 			}
-			if sp := float64(m.CompletionTokens) / ((m.E2EMS - m.TTFT) / 1000); sp > 0 {
-				speeds = append(speeds, sp)
+			for i := 0; i < attempts; i++ {
+				m, err := cli.Chat(ctx, ChatOptions{
+					Model: pm, MaxTokens: 256, Stream: true,
+					Messages:  []Message{{Role: "user", Content: "请按顺序列出 100 以内的全部奇数，不要任何解释或前言。"}},
+					ExtraBody: o.ThinkingOff,
+				})
+				if err != nil || m.Error != "" || m.TTFT <= 0 || m.E2EMS <= m.TTFT {
+					continue
+				}
+				if sp := float64(m.CompletionTokens) / ((m.E2EMS - m.TTFT) / 1000); sp > 0 {
+					speeds = append(speeds, sp)
+				}
+			}
+			if len(speeds) > 0 {
+				sort.Float64s(speeds)
+				perModel[pm] = speeds[0] // 保守值：多次取较小者，避免建议过高的熔断线
 			}
 		}
-		if len(speeds) > 0 {
-			sort.Float64s(speeds)
-			res.DecodeSpeedTPS = speeds[0] // 保守值：两次取较小者，避免建议过高的熔断线
-			checkExt("decode_speed", true, fmt.Sprintf("输出速度 ≈ %.0f tok/s（%d 次取保守值，含思考）——本机健康基线；stall_guard.min_tps 建议取 10-15 或基线的 10-20%%",
-				res.DecodeSpeedTPS, len(speeds)))
+		if len(perModel) > 0 {
+			res.DecodeSpeeds = perModel
+			slowest, slow := "", 0.0
+			for m2, sp := range perModel {
+				if slowest == "" || sp < slow {
+					slowest, slow = m2, sp
+				}
+			}
+			res.DecodeSpeedTPS = slow // 部署级保守值 = 最慢被测模型
+			detail := fmt.Sprintf("输出速度 ≈ %.0f tok/s（最慢模型 %s，含思考）——本机健康基线；"+
+				"stall_guard.min_tps 建议取该值 10–20%%", slow, slowest)
+			if len(perModel) > 1 {
+				names := make([]string, 0, len(perModel))
+				for m2 := range perModel {
+					names = append(names, m2)
+				}
+				sort.Strings(names)
+				parts := make([]string, 0, len(names))
+				for _, m2 := range names {
+					parts = append(parts, fmt.Sprintf("%s=%.0f", m2, perModel[m2]))
+				}
+				detail += "；逐模型建议 min_tps（基线 × 10–20%）：" + strings.Join(parts, " / ") +
+					"，配置到 model_overrides.<模型>.stall_guard.min_tps（各模型 decode 速度不同，统一阈值会误熔断更慢的那个）"
+			}
+			checkExt("decode_speed", true, detail)
 		} else {
 			// NA 而非失败：无 usage 的网关照样能压测，只是没有部署级建议值
 			checkExt("decode_speed", false, "无法测出输出速度（流式失败或缺 usage）——min_tps 无建议值，请人工确认服务状态")
@@ -824,6 +872,25 @@ func buildSuggestedConfig(res *ProbeResult, o ProbeOptions, effAuth auth.Auth, o
 		fmt.Fprintf(&sb, "# thinking:  # 思考等级可控（参数=%s），按需定义 levels 变体做多档对比\n", res.ThinkingLevelParam)
 	} else {
 		sb.WriteString("# thinking:  # 未探测到可控的思考等级参数，建议按 thinking.on/off 两态压测\n")
+	}
+	// 10.1 多模型：各模型 decode 速度差异大时，统一 min_tps 会误熔断更慢的模型——
+	// 逐模型给出建议值（基线 × 10–20%），按 model_overrides.<模型>.stall_guard 覆盖。
+	if len(res.DecodeSpeeds) > 1 {
+		names := make([]string, 0, len(res.DecodeSpeeds))
+		for m := range res.DecodeSpeeds {
+			names = append(names, m)
+		}
+		sort.Strings(names)
+		sb.WriteString("# 多模型 decode 速度不同：建议按下表逐模型标定 stall_guard.min_tps（统一阈值会误熔断更慢的模型）\n")
+		for _, m := range names {
+			fmt.Fprintf(&sb, "#   %s: 实测 %.0f tok/s → min_tps 建议 %.0f\n",
+				m, res.DecodeSpeeds[m], math.Max(1, res.DecodeSpeeds[m]*0.15))
+		}
+		sb.WriteString("# model_overrides:\n")
+		for _, m := range names {
+			fmt.Fprintf(&sb, "#   %s:\n#     stall_guard:\n#       min_tps: %.0f\n",
+				m, math.Max(1, res.DecodeSpeeds[m]*0.15))
+		}
 	}
 	return sb.String()
 }

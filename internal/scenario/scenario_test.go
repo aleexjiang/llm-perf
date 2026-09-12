@@ -59,6 +59,53 @@ func TestSessionSeed(t *testing.T) {
 	}
 }
 
+// 10.3 基座共享（multiturn.shared_base，默认 true）的种子语义。
+// 共享的是**基座**（system + tool defs），逐轮 user 内容必须仍然按会话独立——
+// 否则会话之间逐字节相同，跨会话统计与 per-session 失败隔离都失去意义。
+func TestSessionSeedsSharedBase(t *testing.T) {
+	newCfg := func(shared *bool) *config.Config {
+		c := &config.Config{}
+		c.Multiturn.SharedBase = shared
+		return c
+	}
+	no := false
+	sharedDefault := newCfg(nil) // 未配置 = 默认共享
+	if !sharedDefault.Multiturn.GetSharedBase() {
+		t.Fatal("shared_base 未配置时应默认 true（2026-09-12 拍板）")
+	}
+	if newCfg(&no).Multiturn.GetSharedBase() {
+		t.Fatal("显式 shared_base=false 未生效")
+	}
+
+	// 默认（共享）：基座种子与会话无关；逐轮种子仍随会话变化
+	b0, t0 := sessionSeeds(sharedDefault, 0)
+	b1, t1 := sessionSeeds(sharedDefault, 1)
+	if b0 != b1 {
+		t.Fatalf("共享基座下基座种子应与会话无关：session0=%d session1=%d", b0, b1)
+	}
+	if t0 == t1 {
+		t.Fatal("共享基座不应让逐轮内容跨会话相同（会话将逐字节重复）")
+	}
+	// 换盐必须换基座：否则重跑命中的是上一轮的前缀缓存，冷启动测量被污染
+	saltCfg := newCfg(nil)
+	saltCfg.SeedSalt = 1
+	if bSalt, _ := sessionSeeds(saltCfg, 0); b0 == bSalt {
+		t.Fatal("盐值未生效——换盐后基座内容未变，重跑会命中上一轮缓存")
+	}
+
+	// 独立形态：基座种子随会话互异
+	i0, _ := sessionSeeds(newCfg(&no), 0)
+	i1, _ := sessionSeeds(newCfg(&no), 1)
+	if i0 == i1 {
+		t.Fatal("shared_base=false 下基座种子应随会话互异")
+	}
+	// 两形态的基座内容必须不同：否则对照实验里独立形态的 session0 会被共享形态的
+	// 上一轮缓存提前热身
+	if i0 == b0 {
+		t.Fatal("共享基座种子与独立形态 session0 相同——两形态对照会被前缀缓存污染")
+	}
+}
+
 func TestWorkerSeed(t *testing.T) {
 	if workerSeed(0, 0, 0) == workerSeed(1, 0, 0) {
 		t.Fatal("不同 worker 种子相同")
@@ -150,7 +197,7 @@ func TestOpenRates(t *testing.T) {
 // ── finalizeLevel：goodput 语义 ──
 
 func TestFinalizeLevelGoodput(t *testing.T) {
-	e := &env{cfg: &config.Config{Goodput: &config.GoodputCfg{TTFTMS: 2000, TPOTMS: 200}}}
+	e := &env{cfg: &config.Config{SLO: &config.SLOCfg{Goodput: &config.GoodputCfg{TTFTMS: 2000, TPOTMS: 200}}}}
 	lv := &report.ConcurrentLevel{}
 	lv.Requests = []*engine.TurnMetrics{
 		{TTFT: 1000, TPOTMS: 100, CompletionTokens: 100}, // 达标
@@ -494,7 +541,7 @@ func TestAggregateShapesExcludesFailed(t *testing.T) {
 
 func TestGoodputSLOSubset(t *testing.T) {
 	// 只配 TTFT：TPOT 缺失（如非流式/短输出）不应拖累判定
-	eTTFT := &env{cfg: &config.Config{Goodput: &config.GoodputCfg{TTFTMS: 2000}}}
+	eTTFT := &env{cfg: &config.Config{SLO: &config.SLOCfg{Goodput: &config.GoodputCfg{TTFTMS: 2000}}}}
 	if !goodputOf(eTTFT, &engine.TurnMetrics{Stream: true, TTFT: 1500}) {
 		t.Error("只配 TTFT 阈值时，TTFT 达标即应判达标（TPOT 未配置不参与）")
 	}
@@ -506,7 +553,7 @@ func TestGoodputSLOSubset(t *testing.T) {
 	}
 
 	// 只配 TPOT：TTFT 不参与判定
-	eTPOT := &env{cfg: &config.Config{Goodput: &config.GoodputCfg{TPOTMS: 200}}}
+	eTPOT := &env{cfg: &config.Config{SLO: &config.SLOCfg{Goodput: &config.GoodputCfg{TPOTMS: 200}}}}
 	if !goodputOf(eTPOT, &engine.TurnMetrics{Stream: true, TPOTMS: 150}) {
 		t.Error("只配 TPOT 阈值时，TPOT 达标即应判达标")
 	}
@@ -515,7 +562,7 @@ func TestGoodputSLOSubset(t *testing.T) {
 	}
 
 	// 双约束：任一超标即不达标（原有语义保持）
-	eBoth := &env{cfg: &config.Config{Goodput: &config.GoodputCfg{TTFTMS: 2000, TPOTMS: 200}}}
+	eBoth := &env{cfg: &config.Config{SLO: &config.SLOCfg{Goodput: &config.GoodputCfg{TTFTMS: 2000, TPOTMS: 200}}}}
 	if goodputOf(eBoth, &engine.TurnMetrics{Stream: true, TTFT: 1000, TPOTMS: 500}) {
 		t.Error("TPOT 超标应不达标")
 	}
@@ -549,7 +596,7 @@ func metricsStub(t *testing.T) *httptest.Server {
 // 报告据此走「未提供 /metrics」分支，而不是渲染一个全零面板。
 func TestFinishWindowNilWhenObservationOff(t *testing.T) {
 	e := &env{cfg: testCfg(t, "http://127.0.0.1:1"), perReqSrv: true} // srv == nil = 观测关闭
-	if got := finishWindow(context.Background(), e, nil, nil); got != nil {
+	if got := finishWindow(context.Background(), e, nil, nil, time.Time{}); got != nil {
 		t.Fatalf("观测层关闭时应返回 nil，实际: %+v", got)
 	}
 }
@@ -570,6 +617,7 @@ func TestFinishWindowNoWindowDeltaOnFailedSnapshot(t *testing.T) {
 		t.Fatalf("前置快照应抓取成功: %v", err)
 	}
 	e.provider = smetrics.DetectProvider(before)
+	winStart := time.Now() // 窗口起点：结束快照失败时窗口时长无意义，但签名要求（0 值亦可）
 
 	pctx, pcancel := context.WithCancel(context.Background())
 	poller := smetrics.StartGaugePoller(pctx, e.srv, 5*time.Millisecond, e.provider)
@@ -581,7 +629,7 @@ func TestFinishWindowNoWindowDeltaOnFailedSnapshot(t *testing.T) {
 	pcancel()
 	cancel() // 结束快照必然失败
 
-	sum := finishWindow(live, e, before, poller)
+	sum := finishWindow(live, e, before, poller, winStart)
 	if sum == nil {
 		t.Fatal("应返回带失败原因的汇总而不是 nil——nil 会被报告误判成「未启用 /metrics」")
 	}

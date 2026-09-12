@@ -135,11 +135,52 @@ func planScenario(mc *config.Config, it PlanItem) *report.PlanScenario {
 
 	case "concurrent", "concurrent-multi":
 		cc := mc.Concurrent
+		mixN := len(cc.Mix)
+		// 开环（request_rate/rate_sweep）在场景层优先于 levels，画像必须同口径——否则会报出
+		// 一个永远不会执行的档位矩阵（默认 levels=[1,2,4,8,16] 在开环配置下仍在线上，
+		// 曾把小配置的请求量估到实际值的 7 倍以上）。
+		rates := cc.RateSweep
+		if len(rates) == 0 && cc.RequestRate > 0 {
+			rates = []float64{cc.RequestRate}
+		}
+		if len(rates) > 0 {
+			n := cc.NumPrompts
+			if n <= 0 {
+				n = 32 // 与 runOpenRound 的兜底一致
+			}
+			unit := fmt.Sprintf("%d 请求/档", n)
+			if it.MT {
+				// 开环多轮：num_prompts 是**会话数**，每会话跑满 turns 轮——请求量按轮计
+				// （与闭环 multiturn 的 level × turns 同口径，否则画像与执行量差一个 turns 倍数）
+				unit = fmt.Sprintf("%d 会话/档（每会话 %d 轮）", n, effectiveTurns(mc))
+			}
+			total := 0
+			for _, v := range vs {
+				tiers := 1 // 混跑不走外层输出扫描（与场景层 tiers=[0] 对应）
+				if mixN == 0 {
+					tiers = len(th.MaxTokensList(cc.MaxTokens, v))
+				}
+				per := n
+				if it.MT {
+					per = n * effectiveTurns(mc)
+				}
+				total += tiers * len(rates) * per
+			}
+			name := it.Name
+			if name == "concurrent-multi" {
+				name = "concurrent"
+			}
+			return &report.PlanScenario{
+				Name: name,
+				Detail: fmt.Sprintf("开环到达率 %v req/s × %s × thinking %s（开环优先于 levels）",
+					rates, unit, thDesc),
+				Requests: total,
+			}
+		}
 		levels := it.Highs
 		if len(levels) == 0 {
 			levels = cc.Levels
 		}
-		mixN := len(cc.Mix)
 		var mode string
 		if it.MT {
 			mode = fmt.Sprintf("每用户多轮会话 × turns=%d", effectiveTurns(mc))
