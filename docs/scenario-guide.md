@@ -18,6 +18,13 @@
 
 ## 1. 必测清单（按执行顺序）
 
+> 本节清单已编成预设配置 **`configs/benchmark.yaml`**（`test: benchmark`）：
+> `bench -c configs/benchmark.yaml --turns both --concurrency 1,2,4,8` 一条命令覆盖场景 1–3，
+> 场景 4 由 `thinking.mode: both` 自动展开，场景 5（条件格）见该文件头部命令。
+> 预设固定了**格子、filler 口径、判据来源**——跨部署横比的前提正是这三者一致，
+> 所以不要为"跑得更全"去改预设里的档位（要铺更多格子请另开 performance 类别的配置）。
+> 报告侧按 `test` 类别切换结论区：benchmark 先说标准格水平，不追容量拐点。
+
 ### 0. 预检与标定（不是场景，但永远第一步）
 
 `/v1/models` 连通性 → 单流流式请求标定真实 TTFT/ITL/decode 速率 → 据此复核 `stall_guard.min_tps`

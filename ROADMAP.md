@@ -1,8 +1,10 @@
 # ROADMAP
 
 > 原「三件事」（probe tool-call 检测 / trace 回放增强 / 硬编码改造）已全部完成（第 1–3 节）。
-> 当前在途：**第 10 节体系收敛**的 10.3 filler 拍板落地 → 10.4 suite 层 → 10.5 稳定性 soak；
+> 当前在途：**第 10 节体系收敛**的 10.5 稳定性 soak（`renew` + 时长制 + 报告稳定性区）；
 > 5.9 起步值补样（n≥20）。
+> 已完成（2026-09-13）：10.4 suite 层（`test:` 类别 + 报告按类别切结论区 + 基准套件预设）；
+> 10.3 filler 拍板落地（shared_base / 长度口径统一 / probe filler_fidelity）。
 > 已完成（2026-09-12）：第 11 节审计对账全部收口（11.1 报告侧补齐、11.2 接缝死重量二选一均取"补渲染"）；
 > 10.1 两源一致性守卫 + per-model 熔断标定；10.2 报告一页纸重构。
 > 8.2 min_tps 标定已自动化（默认 10 兜底 + probe 实测建议值，2026-09-11）；
@@ -478,15 +480,31 @@ thinking mode/levels 双轨（levels 优先已显式声明并告警）；api_key
 - **probe token 自举校准** ✅：新增 `filler_fidelity` 扩展面检查——发一条已知标称的填充样本
   （2000tk、非流式、max_tokens=1），用 usage.prompt_tokens 反推本部署实测 chars/token，
   与构造系数对比，偏离 >25% 告警（只告警不判失败：构造近似不是服务端问题）；
-  `ProbeResult.FillerCPT` 落盘实测值，单测覆盖告警路径（2 chars/token 端点）。
-  **未加配置旋钮**（刻意）：报告横轴已按 usage 实测分箱，构造偏差对结论无影响；
-  偏离过大时的行动路径是改用 `filler_corpus` 真实语料（比在每个客户环境调系数更贴近真实
-  tokenization），符合"配置面不开新旋钮"——原措辞"回填构造系数"据此收窄为"实测+告警"
+  `ProbeResult.FillerCPT` 落盘实测值，单测覆盖告警路径（2 chars/token 端点）与
+  无 usage 路径（记 NA，见下）。
+  **不做自动回填（2026-09-13 拍板定案）**：① 有推理服务、尤其经网关代理之后**压根不返回 usage**，
+  "读 usage 回填构造系数"这条链路在真实异构现场不可依赖——不把结论建立在拿不到的信号上；
+  ② 报告横轴已按 usage 实测分箱，构造偏差对结论无影响。偏离过大时的行动路径是改用
+  `filler_corpus` 真实语料（比在每个客户环境调系数更贴近真实 tokenization），亦符合"配置面不开新旋钮"。
+  **探不到 usage 时记 NA 而非告警**（未知 ≠ 不达标；否则每个无 usage 客户现场都挂假警），
+  `TestProbe_FillerFidelityNAWithoutUsage` 锁死该语义——原措辞"回填构造系数"据此定案为"实测+告警"
 - 报告横轴 usage 实测分箱 ✅（纯 Python，不引入真实 tokenizer 库——依赖重且"测试工具绑定被测模型 tokenizer"有循环性）
 
-**10.4 suite 层（四层模型唯一缺失层）**
+**10.4 suite 层（四层模型唯一缺失层）**【已实现，2026-09-13】
 
-- 【已拍板 2026-09-12】suite 形态 = 配置顶层 `test: benchmark|performance|soak` + 报告按类别切换结论区；子命令方案否决 → 落地后基准套件 = scenario-guide 必测清单编成预设配置，跨部署可比
+- 配置顶层 `test: benchmark|performance|soak`（留空 = performance）【已实现】：Load 里枚举校验 +
+  大小写归一化；`Report.test` 恒落盘且**不带 omitempty**（JSON 自描述，读者不必猜"缺键 = 默认还是旧产物"）；
+  非默认类别启动时打一行日志。子命令方案保持否决
+- 报告按类别切换结论区【已实现】：不是三套版式——同一张四数表 + 三分归因，只换**首屏口径**。
+  benchmark 加「基准口径」块（标准格对齐是横比前提，容量拐点归 performance），
+  soak 加「稳定性三问」块（事故 / 正确性 / 漂移；取不到如实写 NA，不编趋势）。
+  performance（默认）路径输出零变化——历史产物重渲染不漂移
+- 基准套件预设 `configs/benchmark.yaml`【已实现】：格子 = scenario-guide §1 必测清单
+  （single 5 档阶梯含 4k/40k 判据档 + concurrent 2/4/8 + multiturn 8 轮 + 条件格命令），
+  刻意**不写** `slo.baseline`（判据走内置默认——各部署各写一把尺子则横比失效），
+  一格命令覆盖必测 1–3：`--turns both --concurrency 1,2,4,8`
+- smoke 固化【已实现】：复用 flat 产物改 `test` 键重渲染，断言三类别口径各自成立且四数俱在
+  （类别只影响表达层 → 无需额外压测即可端到端回归）
 
 **10.5 稳定性（filler 先行，不依赖 trace）**
 
@@ -559,8 +577,9 @@ thinking mode/levels 双轨（levels 优先已显式声明并告警）；api_key
         → 10.2 报告一页纸（四个数 + 徽章 + 三分归因；详细区降级折叠附录）【2026-09-12】
         → 10.3 filler 拍板落地（shared_base 默认 true / 两条路径长度口径统一修 2.49× 偏差 /
           probe filler_fidelity 自举校准 / 报告横轴 usage 实测分箱）【2026-09-12】
-剩余：  10.4 suite 层（`test:` 顶层 + 报告按类别切换结论区 + 基准套件预设配置）
-        → 10.5 稳定性 soak（5.7 会话续跑提级为 soak 原语 + 报告稳定性区）
+        → 10.4 suite 层（`test:` 类别 + 报告按类别切结论区 + 基准套件预设 configs/benchmark.yaml
+          + smoke 三类别回归）【2026-09-13】
+剩余：  10.5 稳定性 soak（5.7 会话续跑提级为 soak 原语 + 报告稳定性区）
         → 5.9 补样至 n≥20 后定起步值
 暂缓/条件触发：见文末「附：暂缓与条件触发」——按各自的复活条件启动，不排期。
 ```

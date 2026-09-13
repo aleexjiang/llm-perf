@@ -168,6 +168,42 @@ func TestProbe_FillerFidelityWarnsOnDeviation(t *testing.T) {
 	}
 }
 
+// 无 usage 的网关：填充保真度必须记 NA，而不是告警或失败。
+// 真实世界里有服务（尤其经网关代理后）压根不返回 usage——此时"档位标称偏多少"根本无从得知，
+// 把未知渲染成 WARN 会让每个这样的客户现场都挂一条假警。NA = 该面不存在，与"存在但不达标"严格区分。
+func TestProbe_FillerFidelityNAWithoutUsage(t *testing.T) {
+	UnloadCorpus("en")
+	t.Cleanup(func() { UnloadCorpus("en") })
+
+	// chatOnly 的非流式响应刻意不带 usage（见 mockChat）——正是无 usage 网关的形态。
+	srv := newProbeServer(t, chatOnly("/v1/chat/completions"))
+
+	res := Probe(context.Background(), ProbeOptions{
+		Endpoint: srv.URL + "/v1", Model: "no-usage-gw", Timeout: 5 * time.Second, FillerLang: "en",
+	})
+
+	c := findCheck(res, "filler_fidelity")
+	if c == nil {
+		t.Fatal("缺少 filler_fidelity 检查项")
+	}
+	if !c.NA {
+		t.Errorf("无 usage 时应记 NA（未知≠不达标），实际 NA=false ok=%v detail=%s", c.OK, c.Detail)
+	}
+	if c.Tier != TierExt {
+		t.Errorf("filler_fidelity 应归扩展面，实际 %q", c.Tier)
+	}
+	if res.FillerCPT != 0 {
+		t.Errorf("未测出时 FillerCPT 应为 0（omitempty 落盘即缺键），实际 %.2f", res.FillerCPT)
+	}
+	// NA 不该进入失败措辞，也不该撑大标准面分母
+	if tal := res.Tally(); tal.CoreFail != 0 {
+		t.Errorf("标准面不应有失败项，实际 CoreFail=%d，checks=%s", tal.CoreFail, dumpChecks(res))
+	}
+	if strings.Contains(res.Summary, "失败") {
+		t.Errorf("无 usage 不该出现在失败措辞里：%s", res.Summary)
+	}
+}
+
 // 认证自举：服务端只认 X-API-Key，配置里写的是默认 Bearer。
 // 期望：自举出可用方案并把它写进配置片段，而不是直接判死。
 func TestProbe_AuthBootstrap(t *testing.T) {

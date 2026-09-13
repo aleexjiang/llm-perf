@@ -1,0 +1,95 @@
+# 基准套件预设配置（test: benchmark）
+#
+# 用途：跨部署/跨版本横比。把 docs/scenario-guide.md §1 的必测清单编成固定格子，
+# 使「同一组格 + 同一 filler 口径 + 同一判据」在每台部署上都成立——三者缺一则数不可比。
+# 探索性内容（容量拐点、饱和点、输出长度扫描、混合负载）不在此列，属 performance 类别。
+#
+# 跑法（两条命令，覆盖必测清单 1–3；off/on 由 thinking.mode: both 自动展开）：
+#   bench probe -c configs/benchmark.yaml          # ① 预检标定：min_tps、模型上限、引擎形态
+#   bench -c configs/benchmark.yaml --turns both --concurrency 1,2,4,8
+#     单发阶梯（1）+ 单发多轮（1，多轮语义下即会话数）+ 并发爬坡（2/4/8）
+#     注：`1` 归 single/multiturn，不构成并发档——level 1 的基线由单发场景代表
+#   # 条件格（业务形态是多用户 agent 时才跑，见 scenario-guide §1.5）：
+#   bench -c configs/benchmark.yaml --turns multi --concurrency 2,4
+#
+# 每轮必须换盐：--seed-salt <递增整数>（服务端 prefix cache 是内存态，不换盐冷路径测不干净）
+
+test: "benchmark"
+
+endpoint: "http://<实例IP>:<端口>/router/v1"
+api_key: ""                       # 或 api_key_env: "LLM_PERF_API_KEY"
+auth_scheme: "bearer"             # bearer | raw（裸 key）| none；配合 auth_header 可用自定义 header
+output_dir: "output"
+timeout_seconds: 900              # 基准含 200k 档位，prefill 可能很久；客户环境实测后调整
+
+models:
+  - "/models/<模型名>"            # 必须与 /v1/models 返回的 id 完全一致
+
+# ── 口径：基准可比性的三条前提，改任何一条都会让「跨部署比」失效 ──
+filler_lang: "en"
+filler_corpus: "en"               # 真实语料填充（≈99 万 token）。留空=合成词表——同 seed 也产出不同文本，
+                                  # 与语料路径的长度口径虽已统一（corpus.CharsPerToken），但 tokenization 分布不同
+stream: true                      # TTFT/ITL 判据依赖流式；false 时这两项 N/A（基准不完整）
+include_usage: true               # 实测 token 数：报告横轴按服务端 usage 分箱，是可比性的锚
+server_metrics: true              # 服务端观测只做交叉验证/辅助归因；不可达时自动降级，不影响结论
+warmup_requests: 2                # 预热不污染缓存对照（内容唯一）
+
+# 判据**刻意留空**：走 slo.baseline 内置默认（docs/latency-baselines.md §7）。
+# 每台部署各自写一份阈值 = 每台部署各用一把尺子，横比立即失效。
+# 确需覆盖时在报告里同时标注判据来源。goodput@SLO 的阈值则按客户 SLO 显式配：
+# slo:
+#   goodput:
+#     ttft_ms: 2000
+#     tpot_ms: 100
+
+thinking:
+  mode: "both"                    # off 与 on 各跑一遍（基准必测：思考开销是容量规划系数）
+  extra_body_on:
+    chat_template_kwargs: {enable_thinking: true}
+  extra_body_off:
+    chat_template_kwargs: {enable_thinking: false}
+  max_tokens_floor: 8192          # 思考常 1500-2500+ token；cloud 实测 2048 会被吃光（finish=length 无正文）
+
+single:
+  runs: 3                         # 3 跑定冷/热：run1 冷、run2/3 热（fixed_seed 下同 prompt）
+  fixed_seed: true
+  prompt_tokens: [4000, 20000, 40000, 100000, 200000]
+                                  # 4000 = 短档判据；40000 对齐 agent 大上下文档（30–40K，现代 agent 基线形态）；
+                                  # 阶梯给 TTFT 衰减曲线与 TPOT 是否随深度漂移。超模型上限的档位会自动 400 跳过
+  max_tokens: [256]               # **固定**输出量：输出长度扫描是 performance 类别的探索，不进基准
+
+multiturn:
+  sessions: 2
+  turns: 8
+  system_tokens: 18000            # 基座形状对齐现代 agent：首调 ~35k，8 轮滚到 ~108k（128k 模型留余量）
+  tool_defs_tokens: 3000
+  turn_tokens: 10000
+  max_tokens: 256
+  keep_assistant: true
+  shared_base: true               # 基座跨会话共享（默认）＝「一套部署一套提示词」，测跨用户共享前缀值多少 TTFT
+
+concurrent:
+  multiturn: false                # 并发单轮（必测清单 §1.2）；并发多轮见文件头「条件格」
+  levels: [2, 4, 8]               # 基准只用 2/4/8；level 1 由单发场景代表（写 1 不构成并发档）
+  runs_per_worker: 2
+  prompt_tokens: 20000            # 并发档用中量输入：既有 prefill 压力又不至于让每档拖太久
+  max_tokens: 256                 # 与 single 同口径固定输出
+  # ramp / ramp_factor 用默认（错峰发车开、系数 2）——基准不追拐点，但错峰比齐射更贴真实到达
+
+# 降速熔断：基准跑 5 档含 200k，服务端退化会白烧几小时窗口。
+# min_tps 必须按本部署稳态标定——用 bench probe 输出的建议值覆盖下面的 10（实测 16.6 tok/s
+# 的实例用默认 20 会在正常运行时误触发）。
+stall_guard:
+  enabled: true
+  min_tps: 10
+  window_seconds: 600
+  cooldown_seconds: 300
+
+correctness:
+  samples: 8                      # 四个数之一：防"HTTP 200 但内容异常"的假成功
+
+# ── 基准不测（改这些等于换了一套基准，横比失效）──
+# saturation_guard     饱和止损属容量探索 → performance 类别
+# concurrent.mix       混合负载属容量折扣探索 → performance 类别
+# rate_sweep           开环到达率扫描＝找饱和点 → performance 类别
+# single.max_tokens    输出长度扫描 → performance 类别

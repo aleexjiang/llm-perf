@@ -526,6 +526,41 @@ assert raw.find("const grid=") < raw.find('class="foot"'), "图表应随详细�
 print("  ✅ 数据来源已标注；无空的服务端观测面板")
 print("  ✅ 一页纸（四个数 + 三分归因）就位；详细区降级为折叠附录")
 PYEOF
+
+# 10.4 测试类别（test: benchmark|performance|soak）：结论区按类别切换。
+# 复用上面那份 flat 产物改 test 键重渲染——类别只改表达层（Go 侧测量路径与类别无关，
+# 配置校验由 go test 覆盖），所以这里零额外压测即可端到端锁住三套口径。
+for K in benchmark soak; do
+  rm -rf "$TMP/kind-$K"
+  cp -r "$TMP/flat" "$TMP/kind-$K"
+  python3 - "$TMP/kind-$K" "$K" <<'KINDEOF'
+import json, os, sys, glob
+d, k = sys.argv[1], sys.argv[2]
+for f in glob.glob(os.path.join(d, "**", "*.json"), recursive=True):
+    j = json.load(open(f, encoding="utf-8"))
+    j["test"] = k
+    json.dump(j, open(f, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+KINDEOF
+  python3 scripts/gen_html_report.py "$TMP/kind-$K" >"$TMP/kind-$K.log" 2>&1 \
+    || { echo "❌ 类别 $K 渲染失败（日志: $TMP/kind-$K.log）"; tail -20 "$TMP/kind-$K.log"; exit 1; }
+done
+python3 - "$TMP/flat/llm-perf-报告.html" "$TMP/kind-benchmark/llm-perf-报告.html" "$TMP/kind-soak/llm-perf-报告.html" <<'PYEOF'
+import sys
+perf, bench, soak = (open(p, encoding="utf-8").read() for p in sys.argv[1:4])
+# performance 是默认类别：其 HTML 必须与历史产物逐字同形（无类别块），否则老产物重渲染会漂移
+assert "class=\"kn\"" not in perf, "performance（默认）不该有类别块"
+assert "顶层只有四个数" in perf, "performance 一页纸口径说明缺失"
+assert "基准口径" in bench and "class=\"kn\"" in bench, "benchmark 未渲染基准口径块"
+assert "稳定性口径" in soak and "是否随时间退化" in soak, "soak 未渲染稳定性三问块"
+for nm, h in (("benchmark", bench), ("soak", soak)):
+    assert "id=\"onepager\"" in h and "id=\"appendix\"" in h, "{} 的一页纸/折叠附录缺失".format(nm)
+# 类别只换首屏口径，四个数一个不少
+for nm, h in (("benchmark", bench), ("soak", soak)):
+    for k in ("① TTFT", "② decode 速度", "③ goodput@SLO", "④ 正确性"):
+        assert k in h, "{} 缺少四个数之一: {}".format(nm, k)
+print("  ✅ 类别切换：performance（默认）无类别块 / benchmark 基准口径 / soak 稳定性三问，四数俱在")
+PYEOF
+
 if command -v node >/dev/null 2>&1; then
   node scripts/validate_report.js "$HTML" >"$TMP/validate.log" 2>&1 \
     || { echo "❌ validate_report 校验失败（日志: $TMP/validate.log）"; tail -20 "$TMP/validate.log"; exit 1; }

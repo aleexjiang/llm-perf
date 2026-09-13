@@ -26,7 +26,9 @@ gen_html_report.py f1.json f2.json ... [标题]
 
 ```
 Report
-├── tool / scenario / generated_at / endpoint / note
+├── tool / scenario / generated_at / test / endpoint / note
+│                  #   test = 测试类别（benchmark | performance | soak），恒有值不带 omitempty；
+│                  #   只决定报告的结论区口径（首屏先说哪件事），不影响测量与判据
 ├── slo            # 本次 goodput 约束（config 配置了才填）：{ttft_ms, tpot_ms}
 ├── single[]       # SingleRow: model, thinking, prompt_tokens, max_tokens, runs[]→TurnMetrics
 ├── multiturn[]    # MultiturnRun: model, thinking, session, max_tokens, turns[]→TurnMetrics

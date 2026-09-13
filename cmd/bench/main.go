@@ -223,6 +223,11 @@ func main() {
 	for _, w := range cfg.Warnings {
 		log.Printf("配置提示: %s", w)
 	}
+	// 非默认类别才提示：performance 是常态不值得占一行；其它类别要让操作者知道
+	// 报告的结论区口径与默认不同（同一份数据，首屏先说哪件事不一样）。
+	if k := cfg.TestKind(); k != config.TestPerformance {
+		log.Printf("测试类别: %s（报告结论区按此口径渲染；预设见 configs/benchmark.yaml 头）", k)
+	}
 	if *corpusFlag != "" {
 		cfg.FillerCorpus = *corpusFlag
 	}

@@ -58,6 +58,35 @@ thinking: {mode: "maybe"}
 	}
 }
 
+// test 类别：留空 = performance（默认不改行为）；大小写不敏感；非法值报错。
+// 断言同时查 cfg.Test 与 cfg.TestKind()——报告侧读的是落盘的 Test 键，
+// 归一化必须在 Load 里完成，不能只靠读侧的 TestKind() 兜。
+func TestLoad_TestKind(t *testing.T) {
+	base := "endpoint: \"http://x:1/v1\"\nmodels: [\"m1\"]\n"
+	cases := []struct {
+		line string
+		want string
+	}{
+		{"", TestPerformance},
+		{"test: benchmark\n", TestBenchmark},
+		{"test: SOAK\n", TestSoak},
+		{"test: Performance\n", TestPerformance},
+	}
+	for _, c := range cases {
+		cfg, err := Load(writeTemp(t, base+c.line))
+		if err != nil {
+			t.Fatalf("test=%q: %v", c.line, err)
+		}
+		if cfg.TestKind() != c.want || cfg.Test != c.want {
+			t.Errorf("test=%q: TestKind=%q Test=%q, want %q", c.line, cfg.TestKind(), cfg.Test, c.want)
+		}
+	}
+	// 值域错误：KnownFields 只抓未知键，拼错的**值**要在这里兜住
+	if _, err := Load(writeTemp(t, base+"test: benchmar\n")); err == nil {
+		t.Error("test 非法值应报错")
+	}
+}
+
 // 认证 key 解析优先级：环境变量 > 字面量 api_key > api_key_env
 func TestAPIKeyResolution(t *testing.T) {
 	p := writeTemp(t, `

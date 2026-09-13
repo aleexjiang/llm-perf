@@ -622,6 +622,13 @@ type Config struct {
 	Debug          bool     `yaml:"debug"`         // true: 每个请求的原始响应留存到 <output_dir>/raw/，日志同步写 run.log（排查魔改引擎用）
 	Models         []string `yaml:"models"`
 
+	// Test 本轮测试类别（benchmark | performance | soak，留空 = performance）。
+	// 只切换报告的**结论区口径**，不改测量本身：三者共用同一套数据与判据
+	// （指标层已冻结为四个数，见 docs/testing-architecture.md）——类别是表达层的焦点声明，
+	// 不是第二套管线。soak 的时长制原语见 ROADMAP 10.5，落地前 soak 结论区只陈述
+	// 现有可得证据（事故/提前终止/canary），缺证据处如实写 NA。
+	Test string `yaml:"test"`
+
 	// MaxPromptTokens 上下文截止（tokens）：>0 时所有请求的 prompt 规模都不超过该值。
 	// single 档位超限截到该值并去重；多轮会话 ctx 到顶后停止加轮。0 = 不限制。
 	// CLI --max-ctx 可覆盖。建议同时参考 bench probe 报告的模型 max_model_len。
@@ -666,6 +673,26 @@ type Config struct {
 
 	// 运行时解析
 	APIKey string `yaml:"-"`
+}
+
+// 测试类别取值（Config.Test）。三者是同一个测量管线的三种**表达焦点**，
+// 不改变探针/场景/指标——报告按类别切换结论区首屏，回答不同的问题：
+// benchmark 回答"标准格上这台部署处于什么水平"（跨部署可比），
+// performance 回答"瓶颈在哪、容量边界多远"（默认），
+// soak 回答"长时间跑会不会退化/出事故"。
+const (
+	TestBenchmark   = "benchmark"
+	TestPerformance = "performance"
+	TestSoak        = "soak"
+)
+
+// TestKind 返回生效的测试类别：未配置 = performance。
+// 返回值为归一化小写，与 TestBenchmark/TestPerformance/TestSoak 可直接比较。
+func (c *Config) TestKind() string {
+	if c.Test == "" {
+		return TestPerformance
+	}
+	return strings.ToLower(c.Test)
 }
 
 // isBuiltinCorpus 判断 filler_corpus 是否为内置语料哨兵（en/zh）。
@@ -775,6 +802,15 @@ func Load(path string) (*Config, error) {
 	case "both", "on", "off":
 	default:
 		return nil, fmt.Errorf("thinking.mode 无效值 %q（可选 both/on/off）", cfg.Thinking.Mode)
+	}
+	// 测试类别：枚举校验 + 归一化。落盘统一小写——报告侧按 test 键直接切结论区，
+	// 大小写差异不该让"同一类别"被判成两个（配置拼错时 KnownFields 抓不到值域错误，这里兜）。
+	rawTest := cfg.Test
+	cfg.Test = cfg.TestKind()
+	switch cfg.Test {
+	case TestBenchmark, TestPerformance, TestSoak:
+	default:
+		return nil, fmt.Errorf("test 无效值 %q（可选 benchmark/performance/soak；留空 = performance）", rawTest)
 	}
 	if cfg.Thinking.MaxTokensFloor <= 0 {
 		cfg.Thinking.MaxTokensFloor = 2048

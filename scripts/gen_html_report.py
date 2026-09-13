@@ -275,7 +275,8 @@ def merge(reports):
     """
     data = {k: [] for k in SCENARIOS}
     meta = {"endpoint": "?", "tool": "?", "notes": [], "generated": [], "slo": None,
-            "slo_baseline": None, "source_check": None, "server": {}, "correctness": {}}
+            "slo_baseline": None, "source_check": None, "server": {}, "correctness": {},
+            "test": None}
     for p, d in reports:
         scen = d.get("scenario")
         if scen not in data:
@@ -294,6 +295,15 @@ def merge(reports):
         meta["slo_baseline"] = d.get("slo_baseline") or meta["slo_baseline"]
         # 10.1 两源一致性（客户端实测 vs 服务端 /metrics 生成吞吐）判定结果，由 Go 侧算好落盘
         meta["source_check"] = d.get("source_check") or meta["source_check"]
+        # 10.4 测试类别（benchmark|performance|soak）：报告据此切换结论区口径。
+        # 同一次运行的多份产物应当同类别；若拼了不同轮次的产物，取首份并标记混用——
+        # 静默按某一类渲染会让读者以为看到的是统一口径的结论。
+        tk = (d.get("test") or "").strip().lower()
+        if tk:
+            if meta["test"] is None:
+                meta["test"] = tk
+            elif meta["test"] != tk:
+                meta["test_mixed"] = True
         if d.get("environment"):
             meta["environment"] = d["environment"]
         if d.get("config_raw"):
@@ -1816,7 +1826,21 @@ def _ttft_unit(base, m):
     return sorted(singles, key=lambda x: order.get(x["bucket"], 3))[0]
 
 
+TEST_KINDS = ("benchmark", "performance", "soak")
+
+
+def test_kind(meta):
+    """生效的测试类别（10.4）：缺键 / 未知值一律回退 performance。
+
+    Go 侧已在 Load 里归一化并落盘（config.TestKind），这里再兜一层是为了吃得下
+    历史产物（无 test 键）：把未知值静默按 performance 渲染，比抛错或留一片空白好。
+    """
+    k = (meta.get("test") or "").strip().lower()
+    return k if k in TEST_KINDS else "performance"
+
+
 def onepager(data, A, meta):
+    kind = test_kind(meta)
     tiers = A.get("tiers") or SLO_TIERS
     base = A.get("baseline") or []
     models = A["models"]
@@ -1937,7 +1961,11 @@ def onepager(data, A, meta):
     else:
         rates = sorted({e["request_rate"] for e in A.get("conc_single", []) + A.get("conc_multi", [])
                         if e.get("request_rate")})
-        if len(rates) < 2:
+        if kind == "benchmark":
+            # 基准口径不追容量拐点——那是 performance 类别的问题；在基准结论里提它
+            # 会让读者以为"没给拐点"是本轮缺陷，其实是类别选择。
+            ld.append("基准口径只回答标准格上的水平，不追容量拐点（容量规划换 performance 类别）。")
+        elif len(rates) < 2:
             ld.append("并发只跑了 1 个负载档，无法给出容量拐点（建议 ≥2 档到达率扫描）。")
         else:
             ld.append("并发覆盖 {} 个负载档{}。".format(
@@ -1961,18 +1989,56 @@ def onepager(data, A, meta):
     if _slo.get("ttft_ms") or _slo.get("tpot_ms"):
         gp_rule = "达标 = 同时满足 TTFT ≤ {:,.0f}ms 且 TPOT ≤ {:,.0f}ms 的请求占比".format(
             _slo.get("ttft_ms") or 0, _slo.get("tpot_ms") or 0)
+    # ── 10.4 类别专属结论：同一套数据，按类别换「首屏先说哪件事」 ──
+    # 不造三套版式（指标层已冻结，类别只是表达焦点）；多出的内容只陈述现有证据，
+    # 取不到就写 NA——不为了"看起来完整"编一个趋势出来。
+    kind_html = ""
+    if kind == "benchmark":
+        kind_html = ('<div class="kn"><b>基准口径</b>：四个数按本轮标准格对齐——与其它部署比对前，'
+                     '须先确认对方跑的是同一组格（格清单见附录「测试画像」）。'
+                     '跨部署可比的前提是同一组格 + 同一 filler 长度口径（后者本工具已统一）；'
+                     '容量拐点、饱和点属 performance 类别，不在基准结论内。</div>')
+    elif kind == "soak":
+        ab = len([e for quad in ("conc_single", "conc_multi") for e in A.get(quad, [])
+                  if e.get("aborted")])
+        n_stall = len([1 for _, n in meta.get("notes", []) if "熔断" in (n or "")])
+        c_tot = sum(t for _, t in corpus.values())
+        c_ok = sum(p for p, _ in corpus.values())
+        items = [
+            "是否出事故：{}".format(
+                "<b>是</b>（降速熔断留痕 {} 条、档位提前终止 {} 个）".format(n_stall, ab)
+                if (n_stall or ab) else "未见（无熔断留痕、无档位提前终止）"),
+            "正确性是否保持：{}".format(
+                "canary {}/{}（{}）".format(c_ok, c_tot, "全部通过" if c_ok == c_tot else "有失败项")
+                if c_tot else "本轮未跑 canary（<b>NA</b>）"),
+            "是否随时间退化：<b>NA</b>——需分时段的长跑采样；本轮为定长跑，"
+            "只能给当前健康度，给不了趋势。",
+        ]
+        kind_html = '<div class="kn"><b>稳定性口径</b>（三问）<br>' + "<br>".join(items) + "</div>"
+
+    tag = {
+        "performance": "顶层只有四个数（TTFT / decode 速度 / goodput@SLO / 正确性 canary）"
+                       "+ 三分归因；详细数据全部下沉附录，数字一个不少。",
+        "benchmark": "基准口径：四个数按标准格对齐，回答「这台部署在标准格上处于什么水平」；"
+                     "全部数据仍在附录。",
+        "soak": "稳定性口径：四个数给当前健康度，稳定性三问回答「继续跑会不会出事」；"
+                "全部数据在附录。",
+    }[kind]
+    if meta.get("test_mixed"):
+        # 拼了不同轮次的产物时明说——静默按首份渲染会让读者以为口径统一
+        tag += "（注意：合并了不同 test 类别的产物，口径按首份渲染）"
+
     return (
         '<div id="onepager">'
-        '<div class="op-h">一页纸结论<span class="op-tag">'
-        '顶层只有四个数（TTFT / decode 速度 / goodput@SLO / 正确性 canary）+ 三分归因；'
-        '详细数据全部下沉附录，数字一个不少。</span></div>'
+        '<div class="op-h">一页纸结论<span class="op-tag">{tag}</span></div>'
         '<table class="opt"><thead>{th}</thead><tbody>{body}</tbody></table>'
+        '{kind_html}'
         '<div class="note">① TTFT 取 agent 大上下文档（无该档则取最大输入档），thinking=on 含思考不套 TTFT 判据；'
         '② decode = 最大输出档组中位；③ {gp_rule}；④ 金丝雀为「按序转写数字」抽查。'
         '判级阈值随 JSON <code>slo.baseline</code> 透出，改配置即改判据。</div>'
         '<div class="att">{a}{b}{c}</div>'
         '</div>'
-    ).format(th=th, body=body, gp_rule=gp_rule,
+    ).format(th=th, body=body, gp_rule=gp_rule, tag=tag, kind_html=kind_html,
              a=blk("① 服务端推理", sv), b=blk("② 客户端与网络", cl), c=blk("③ 负载层（测试设计）", ld))
 
 
@@ -2448,6 +2514,8 @@ table.opt td:first-child{font-weight:600}
 .att{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px;margin:14px 0 4px}
 .att-i{background:#f8fafc;border:1px solid var(--line);border-left:3px solid #1652f0;border-radius:8px;padding:10px 13px;font-size:13px;line-height:1.65}
 .att-i b{color:#1652f0}
+.kn{background:#f1f5ff;border:1px solid #dbe4ff;border-left:3px solid #1652f0;border-radius:8px;padding:10px 13px;font-size:13px;line-height:1.7;margin:12px 0 2px}
+.kn b{color:#1652f0}
 details.appendix{background:#fff;border:1px solid var(--line);border-radius:12px;padding:12px 18px;margin:26px 0}
 details.appendix>summary{font-size:15px;font-weight:600;color:#374151}
 </style></head><body>

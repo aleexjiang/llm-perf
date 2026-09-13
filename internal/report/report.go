@@ -229,9 +229,12 @@ var Version = "llm-perf/dev"
 
 // Report 是一次场景执行的完整数据，整体落盘为单个 JSON 文件。
 type Report struct {
-	Tool        string                `json:"tool"`
-	Scenario    string                `json:"scenario"`
-	GeneratedAt time.Time             `json:"generated_at"`
+	Tool        string    `json:"tool"`
+	Scenario    string    `json:"scenario"`
+	GeneratedAt time.Time `json:"generated_at"`
+	// Test 测试类别（benchmark | performance | soak）：报告据其切换结论区口径。
+	// 恒有值且**不带 omitempty**——JSON 自描述，读者不必猜"缺键 = 默认还是旧产物"。
+	Test        string                `json:"test"`
 	Endpoint    string                `json:"endpoint"`
 	Note        string                `json:"note,omitempty"`
 	SLO         *SLO                  `json:"slo,omitempty"`
@@ -295,6 +298,7 @@ func (r *Report) PartitionByModel() []*Report {
 			Tool:           r.Tool,
 			Scenario:       r.Scenario,
 			GeneratedAt:    r.GeneratedAt,
+			Test:           r.Test,
 			Endpoint:       r.Endpoint,
 			Note:           r.Note,
 			SLO:            r.SLO,

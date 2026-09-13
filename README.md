@@ -308,6 +308,12 @@ node scripts/validate_report.js <报告.html>   # JS 端校验（占位符/图�
 见 `configs/example.yaml`，含详细注释。端点与认证优先写配置文件（`endpoint` + `api_key` 字面量）；
 环境变量 `LLM_PERF_ENDPOINT`、`LLM_PERF_API_KEY` 优先级最高（应急通道；另有 `api_key_env` 指定从哪个变量读 key）。
 
+**测试类别（`test:`）决定报告结论区问什么，不改测量**：`performance`（默认，留空即此）= 瓶颈在哪、
+容量边界多远；`benchmark` = 标准格上这台部署处于什么水平（跨部署可比，预设配置见
+`configs/benchmark.yaml`，格子即 [docs/scenario-guide.md](docs/scenario-guide.md) 的必测清单）；
+`soak` = 长时间跑会不会退化/出事故。三者共用同一套四个数与判据——换类别只换首屏口径，
+详细数据仍在折叠附录里一个不少。
+
 **配置组织：顶部通用 + 底部 `model_overrides`**。一份文件写所有模型共享的通用配置，
 底部按模型只写差异项（场景参数/思考/max_prompt_tokens/stream 等，未写的键继承顶层）。
 每个模型可带 `enabled` 开关控制本次是否测试（分批重测时临时关掉，`enabled: false` 的模型
