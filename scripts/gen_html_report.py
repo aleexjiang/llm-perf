@@ -1525,8 +1525,11 @@ def gen_conclusions(A):
     cs = []
     # 1 prefill 扩展性（斜率取自最大输出档组 ladder_top，避免多输出档混线）
     for m, P in A["per_model"].items():
-        if "off" in P and P["off"].get("slope") is not None and len(P["off"].get("ladder_top") or []) >= 2:
-            l0, l1 = P["off"]["ladder_top"][0], P["off"]["ladder_top"][-1]
+        # 桶内整档失败（如超时）时该桶 ttft 为 None——先过滤，再取首尾做斜率描述
+        # （修复 2026-09-14 整档超时导致的崩溃：ladder_top 含 ttft=None 桶时 l0["ttft"][0] 对 None 取下标）
+        ltt = [l for l in (P.get("off", {}).get("ladder_top") or []) if l.get("ttft")]
+        if "off" in P and P["off"].get("slope") is not None and len(ltt) >= 2:
+            l0, l1 = ltt[0], ltt[-1]
             sl = P["off"]["slope"]
             if sl < CACHE_EFFECTIVE_MS_PER_TOKEN:
                 cs.append("<b>{}</b>（单发·单轮）：TTFT 几乎不随档位变化（{}k→{}k 仅 {}s→{}s，≈{:.3f} ms/token）——"
@@ -2483,9 +2486,10 @@ h3{font-size:15.5px;margin:20px 0 6px}
 .kpi{background:#fff;border:1px solid var(--line);border-radius:10px;padding:12px 14px}
 .kpi-v{font-size:20px;font-weight:700;color:#1652f0}.kpi-l{font-size:12px;color:#777;margin-top:2px}
 table{border-collapse:collapse;width:100%;font-size:12.5px;background:#fff;margin:10px 0;table-layout:auto}
-th,td{border:1px solid var(--line);padding:5px 9px;text-align:left;overflow-wrap:anywhere;word-break:break-word}
-th{background:#f1f5f9}
-.rng{color:#6b7280;font-size:11px;overflow-wrap:anywhere}
+th,td{border:1px solid var(--line);padding:5px 9px;text-align:left}
+th{background:#f1f5f9;white-space:nowrap}
+td{overflow-wrap:break-word}
+.rng{color:#6b7280;font-size:11px;white-space:nowrap}
 .note{background:#fff8e6;border-left:4px solid #f0b429;padding:10px 14px;border-radius:4px;font-size:13.5px;margin:10px 0}
 .finding{background:#eff6ff;border-left:4px solid #1652f0;padding:12px 16px;border-radius:4px;margin:10px 0}
 .good{background:#ecfdf5;border-left:4px solid #0e9f6e;padding:12px 16px;border-radius:4px;margin:10px 0}
