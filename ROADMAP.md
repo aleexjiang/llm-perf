@@ -21,6 +21,12 @@
 - 建议：① 配置加载时校验 levels 档位名不得为保留字（`on`/`off`/`both`），违者直接报配置错误（fail-fast，目前不校验）；② 或 CLI 过滤改为"先精确匹配档位名，命中即过滤，未命中再按 on/off/both 语义处理"。
 - 影响面：自部署 Qwen 已通过改名 `none` 绕过（llm-perf-test 配置），客户侧若复刻该配置会踩同一个坑，runbook 可补一行。
 
+### 12.8 levels 模式下 canary/预热 off 变体失效（2026-09-15 r4 实测踩坑）
+
+- 现象：`thinking.levels` 生效后，正确性金丝雀 0/4（reply 全空、e2e ~170ms）。根因：`scenario.go` 的 `runCorrectness` 与 `warmup` 各自构造 `vOff{ExtraBody: ThinkingFor(model).ExtraBodyOff}`，而 levels 模式下 `ExtraBodyOn/Off` 已废弃不回填（config.go:368 仅 mode 分支用它）→ 金丝雀请求裸发、无 `enable_thinking:false` → 默认开思考的模型把 `max_tokens=16` 全吃进思考链，content 为空 → match=false。预热同款（无害：1 token 不计统计）。
+- 修法建议：① levels 模式下 `ExtraBodyOff` 从 levels 中 `enabled:false` 的条目回填（保持两个消费点不用改）；或 ② `runCorrectness`/`warmup` 改为显式取「关闭态变体」（levels 里找 enabled=false，退化到 ExtraBodyOff）。附带收益：金丝雀应显式带上关闭态 extra_body，与「金丝雀测的是服务而不是思考形态」的语义对齐。
+- 影响面：仅 canary/预热两个固定 off 消费点；场景主路径（变体遍历）带显式 extra_body 不受影响。已被 llm-perf-test 的 Qwen3.8 实测坐实（r1 mode:off 下 16/16，r4 levels 下 0/4）。
+
 
 ## 1. probe 增加 tool-call 检测（默认开启，`--no-toolcall` 关闭）【已实现，2026-09-09】
 
