@@ -27,6 +27,13 @@
 - 修法建议：① levels 模式下 `ExtraBodyOff` 从 levels 中 `enabled:false` 的条目回填（保持两个消费点不用改）；或 ② `runCorrectness`/`warmup` 改为显式取「关闭态变体」（levels 里找 enabled=false，退化到 ExtraBodyOff）。附带收益：金丝雀应显式带上关闭态 extra_body，与「金丝雀测的是服务而不是思考形态」的语义对齐。
 - 影响面：仅 canary/预热两个固定 off 消费点；场景主路径（变体遍历）带显式 extra_body 不受影响。已被 llm-perf-test 的 Qwen3.8 实测坐实（r1 mode:off 下 16/16，r4 levels 下 0/4）。
 
+### 12.9 报告结论启发式：前缀缓存「未命中」误判（2026-09-15 r1 报告实锤）
+
+- 现象：r1 报告摘要判「多轮未命中前缀缓存，每轮全量重算历史」并给出【高】优先级建议「开启 enable_prefix_caching」——但同报告服务端观测区自报命中率 77–80%，且后续标定与 r4（208k 末轮 TTFT 19.1s vs 冷 prefill ~86s）证明缓存实际开启。判定与数据自相矛盾。
+- 根因（gen_html_report.py `classify_cache`，约 :417）：双判据都失真。①斜率比值：分母（单发斜率）被同题 warm runs 的全缓存命中压扁（204k TTFT 也仅 ~2.4s → 0.009 ms/token），分母趋零 → 比值 727% 天文数字；代码注释自知此污染（"此时候比值失效、以绝对判据为准"），但 ②绝对阈值 0.05 ms/token 定得过紧：缓存**生效**时逐轮 TTFT = prefill(每轮新增 token)，增量大的多轮设计（如 13.5k/轮）下斜率天然不趋零（r1 实测 0.066，turn2→8 段仅 0.039）。启发式把「TTFT 随 ctx 缓涨」误等价于「历史重算」。
+- 正确判据应是反证式：若真全量重算，末轮 TTFT ≈ ctx×冷 prefill 斜率（r1 turn8 100k 应 ~40s，实测 6.8s ≈ 只算新增 12k）。即「末轮实测 TTFT / 冷算预估」比值远小于 1 ⇒ 生效。
+- 修法建议：① 优先用客户端每请求 `usage.prompt_tokens_details.cached_tokens`（需 bench 落盘 usage，一次改造永久权威）；② 无 usage 时用「末轮 TTFT vs 冷 prefill 预估」比值替代斜率比值/绝对阈值；③ 服务端 /metrics 累计命中率只能作旁证（被 warm runs 主导，不能证明多轮命中）。
+
 
 ## 1. probe 增加 tool-call 检测（默认开启，`--no-toolcall` 关闭）【已实现，2026-09-09】
 
