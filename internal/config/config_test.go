@@ -954,3 +954,61 @@ saturation_guard:
 		t.Error("sample_seconds 大于 window_seconds 应报错")
 	}
 }
+
+// 12.7：levels 档位名不得使用保留字（on/off/both，大小写不敏感）——CLI --thinking
+// 按变体名过滤，档位恰好叫保留字时永远无法通过 CLI 选中。fail-fast 在加载时报错。
+func TestThinkingLevelsReservedNames(t *testing.T) {
+	base := "endpoint: \"http://x:1/v1\"\nmodels: [\"m1\"]\n"
+	for _, name := range []string{"off", "ON", "Both", "oFf"} {
+		yaml := base + "thinking:\n  levels:\n    - name: " + name + "\n      enabled: false\n"
+		p := writeTemp(t, yaml)
+		if _, err := Load(p); err == nil || !strings.Contains(err.Error(), "保留字") {
+			t.Errorf("档位名 %q 应报保留字错误，got %v", name, err)
+		}
+	}
+	// model_overrides 里的 levels 同样校验
+	yaml := base + "model_overrides:\n  \"m1\":\n    thinking:\n      levels:\n        - name: both\n          enabled: true\n"
+	p := writeTemp(t, yaml)
+	if _, err := Load(p); err == nil || !strings.Contains(err.Error(), "model_overrides") {
+		t.Errorf("model_overrides 内保留字应报错且带位置，got %v", err)
+	}
+	// 普通名字不受影响
+	ok := writeTemp(t, base+"thinking:\n  levels:\n    - name: none\n      enabled: false\n    - name: low\n      enabled: true\n")
+	if _, err := Load(ok); err != nil {
+		t.Errorf("普通档位名不应报错: %v", err)
+	}
+}
+
+// 12.8：levels 模式下 ExtraBodyOn/Off 废弃不回填 → 金丝雀/预热裸发 → 思考吃光
+// max_tokens → match=false（r4 实测）。ThinkingFor 从 levels 第一个 enabled=false
+// 的变体兜底 ExtraBodyOff；显式 extra_body_off 优先；无关闭档时保持 nil。
+func TestThinkingForBackfillsExtraBodyOff(t *testing.T) {
+	c := &Config{
+		Models: []string{"m1"},
+		Thinking: Thinking{
+			Levels: []LevelVariant{
+				{Name: "none", Enabled: false, ExtraBody: map[string]any{"k": "off-body"}},
+				{Name: "low", Enabled: true, ExtraBody: map[string]any{"k": "low-body"}},
+			},
+		},
+	}
+	q := c.ThinkingFor("m1")
+	if q.ExtraBodyOff == nil || q.ExtraBodyOff["k"] != "off-body" {
+		t.Fatalf("levels 模式应从 enabled=false 档兜底 ExtraBodyOff: %+v", q)
+	}
+	// 显式 extra_body_off 优先，不被兜底覆盖
+	c2 := &Config{Models: []string{"m1"}, Thinking: Thinking{
+		ExtraBodyOff: map[string]any{"k": "explicit"},
+		Levels:       []LevelVariant{{Name: "none", Enabled: false, ExtraBody: map[string]any{"k": "off-body"}}},
+	}}
+	if got := c2.ThinkingFor("m1").ExtraBodyOff["k"]; got != "explicit" {
+		t.Fatalf("显式 extra_body_off 应优先，got %v", got)
+	}
+	// 全 enabled 档：无兜底来源，保持 nil
+	c3 := &Config{Models: []string{"m1"}, Thinking: Thinking{
+		Levels: []LevelVariant{{Name: "low", Enabled: true}},
+	}}
+	if got := c3.ThinkingFor("m1").ExtraBodyOff; got != nil {
+		t.Fatalf("无关闭档时 ExtraBodyOff 应保持 nil，got %v", got)
+	}
+}

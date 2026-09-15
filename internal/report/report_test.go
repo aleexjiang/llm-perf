@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aleexjiang/llm-perf/internal/engine"
 )
 
 // SaveJSONAny：嵌套目录自动创建 + JSON 可回读 + 字段保真。
@@ -111,5 +113,31 @@ func TestServerMetricsPreemptionsZeroKept(t *testing.T) {
 	}
 	if !strings.Contains(string(b), `"preemptions":0`) {
 		t.Errorf("preemptions=0 必须显式出现在 JSON 中（否则与「未采集」不可区分）: %s", b)
+	}
+}
+
+// 12.3：末轮实测深度取最后一个非零 prompt 轮——失败轮（0）不计入，避免名义对照
+// 拿到 0/NaN；全零时保持 0（观测缺失语义，由 Python 侧标注）。
+func TestFillLastPromptTokens(t *testing.T) {
+	r := &MultiturnRun{Turns: []*engine.TurnMetrics{
+		{PromptTokens: 100},
+		{PromptTokens: 300},
+		{PromptTokens: 0}, // 失败轮：usage 缺失
+	}}
+	r.FillLastPromptTokens()
+	if r.LastPromptTokens != 300 {
+		t.Fatalf("应取最后一个非零轮，got %d", r.LastPromptTokens)
+	}
+	// 全零 → 保持 0
+	r2 := &MultiturnRun{Turns: []*engine.TurnMetrics{{PromptTokens: 0}}}
+	r2.FillLastPromptTokens()
+	if r2.LastPromptTokens != 0 {
+		t.Fatalf("全零轮应保持 0，got %d", r2.LastPromptTokens)
+	}
+	// 空轮次 → 0
+	r3 := &MultiturnRun{}
+	r3.FillLastPromptTokens()
+	if r3.LastPromptTokens != 0 {
+		t.Fatalf("空 Turns 应保持 0，got %d", r3.LastPromptTokens)
 	}
 }

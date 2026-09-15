@@ -628,9 +628,18 @@ func (g *GaugePoller) Stop() { g.stopOnce.Do(func() { close(g.done) }) }
 // ok=false = 从未采到（观测层不可用 / 引擎无该指标）。
 // 饱和止损的 waiting 判据用它取实时值——Summary 的峰值/均值是事后聚合，档位中途不可读。
 func (g *GaugePoller) LatestWaiting() (float64, bool) {
+	return g.latest("waiting")
+}
+
+// LatestRunning 返回最近一次成功采样到的执行数（running，语义键）。12.5 观测对偶。
+func (g *GaugePoller) LatestRunning() (float64, bool) {
+	return g.latest("running")
+}
+
+func (g *GaugePoller) latest(key string) (float64, bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	xs := g.samples["waiting"]
+	xs := g.samples[key]
 	if len(xs) == 0 {
 		return 0, false
 	}
@@ -641,17 +650,35 @@ func (g *GaugePoller) LatestWaiting() (float64, bool) {
 // 与 WaitingSamplesSince 配对，用于"只统计某段时间窗内新采到的样本"——
 // 档位级 waiting 峰值不能用 LatestWaiting（它读的是全局最后一帧，会串档位）。
 func (g *GaugePoller) WaitingSampleCount() int {
+	return g.sampleCount("waiting")
+}
+
+// RunningSampleCount 返回 running 的累计成功采样条数（12.5 观测对偶，与 RunningSamplesSince 配对）。
+func (g *GaugePoller) RunningSampleCount() int {
+	return g.sampleCount("running")
+}
+
+func (g *GaugePoller) sampleCount(key string) int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return len(g.samples["waiting"])
+	return len(g.samples[key])
 }
 
 // WaitingSamplesSince 返回下标 i 之后新采到的 waiting 样本（i 越界按 0 处理）。
 // 返回副本，调用方可安全读取。
 func (g *GaugePoller) WaitingSamplesSince(i int) []float64 {
+	return g.samplesSince("waiting", i)
+}
+
+// RunningSamplesSince 返回下标 i 之后新采到的 running 样本（12.5 观测对偶）。
+func (g *GaugePoller) RunningSamplesSince(i int) []float64 {
+	return g.samplesSince("running", i)
+}
+
+func (g *GaugePoller) samplesSince(key string, i int) []float64 {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	xs := g.samples["waiting"]
+	xs := g.samples[key]
 	if i < 0 || i > len(xs) {
 		i = 0
 	}

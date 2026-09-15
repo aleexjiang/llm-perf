@@ -339,7 +339,10 @@ type ThinkingVariant struct {
 
 // Variants 展开成变体列表：配了 levels 用 levels（保持声明顺序），否则按 mode 展开
 // （both 时先 off 后 on，便于报告对照）；CLI filter 非空时只留名字匹配的变体。
-// validateThinkingLevels 校验 levels 变体名非空且唯一（报告与日志按 name 分组，重名会串数据）。
+// validateThinkingLevels 校验 levels 变体：名字非空、唯一、且不得为保留字
+// （on/off/both，大小写不敏感，12.7）——CLI --thinking 的变体名过滤把保留字当成
+// 过滤值，档位恰好叫 off 时该档位永远无法通过 CLI 选中（运行时才发现且无解，
+// r4 实测踩坑）。fail-fast：配了就用不了，不如加载时报错逼着改名。
 func validateThinkingLevels(th Thinking, where string) error {
 	seen := map[string]bool{}
 	for _, lv := range th.Levels {
@@ -348,6 +351,11 @@ func validateThinkingLevels(th Thinking, where string) error {
 		}
 		if seen[lv.Name] {
 			return fmt.Errorf("%s thinking.levels 变体名 %q 重复——档位名必须唯一", where, lv.Name)
+		}
+		switch strings.ToLower(lv.Name) {
+		case "on", "off", "both":
+			return fmt.Errorf("%s thinking.levels 变体名 %q 是保留字（on/off/both，大小写不敏感）——"+
+				"CLI --thinking 按变体名过滤时该档位将永远无法选中，请改名（如 none）", where, lv.Name)
 		}
 		seen[lv.Name] = true
 	}
@@ -427,6 +435,19 @@ func (c *Config) ThinkingFor(model string) *Thinking {
 		}
 		if len(ot.Levels) > 0 {
 			t.Levels = ot.Levels
+		}
+	}
+	// 12.8 回填：levels 模式下 extra_body_off 通常不写（参数在 levels 里），而金丝雀/预热
+	// 这两个固定「关闭态」消费点直接读 ExtraBodyOff——不回填就裸发请求，默认开思考的
+	// 模型把 max_tokens=16 全吃进思考链，金丝雀 0/4（r4 实测坐实）。从 levels 里第一个
+	// enabled=false 的变体兜底，消费点不用改；主路径变体遍历带各变体自己的 extra_body，
+	// 不受影响。用户显式写了 extra_body_off 时尊重显式值。
+	if len(t.Levels) > 0 && t.ExtraBodyOff == nil {
+		for _, lv := range t.Levels {
+			if !lv.Enabled {
+				t.ExtraBodyOff = lv.ExtraBody
+				break
+			}
 		}
 	}
 	t.filter = c.Thinking.filter

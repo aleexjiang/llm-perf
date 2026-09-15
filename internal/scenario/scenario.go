@@ -580,6 +580,16 @@ func Single(ctx context.Context, cfg *config.Config, client *engine.Client, mode
 
 // ── Multiturn 单发多轮 ──
 
+// nominalLastPrompt 12.3：filler 口径的名义末轮上下文（基座 + 轮数×每轮增量，×1.07 模板开销，
+// 与开跑画像的估算口径一致）。trace 模式轮次来自回放会话，名义值无意义，返回 0
+// （报告侧据此跳过实测 vs 名义对照）。
+func nominalLastPrompt(trace bool, mt config.Multiturn) int {
+	if trace || mt.TurnTokens <= 0 || mt.Turns <= 0 {
+		return 0
+	}
+	return int(float64(mt.SystemTokens+mt.ToolDefsTokens+mt.Turns*mt.TurnTokens) * 1.07)
+}
+
 // sessionUserTurns 取会话的 user 消息序列：trace 模式来自回放会话，filler 模式返回 nil（走 token 填充）。
 func (e *env) sessionUserTurns(sessionIdx int) []string {
 	if e.trace == nil {
@@ -751,6 +761,8 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 							break
 						}
 					}
+					run.FillLastPromptTokens() // 12.3：末轮实测深度（名义外推偏乐观 10–15%，落盘实测供报告对照）
+					run.NominalLastPrompt = nominalLastPrompt(e.trace != nil, mt)
 					rep.Multiturn = append(rep.Multiturn, run)
 					if interrupted(ctx) {
 						log.Printf("🛑 已中止（中断或降速熔断）——停止新请求，已完成会话全部保留")
@@ -1158,7 +1170,7 @@ func runClosedRound(ctx context.Context, e *env, cfg *config.Config,
 	defer lr.finish()
 	roundCtx, roundCancel := context.WithCancel(ctx)
 	defer roundCancel()
-	waitingMax, satWait := startSaturationWatch(roundCtx, sat, pol, lr)
+	waitingMax, runningMax, satWait := startSaturationWatch(roundCtx, sat, pol, lr)
 
 	ramp := cc.RampEnabled() && level > 1
 	// 失败语义（仅爬坡路径）：全局连续失败计数，达 2×level 止损终止本轮
@@ -1234,6 +1246,8 @@ func runClosedRound(ctx context.Context, e *env, cfg *config.Config,
 				return true
 			}
 			s.Turns = collectSessionTurns(roundCtx, e, cfg, model, v, workerID, 0, maxTok, hook)
+			s.FillLastPromptTokens() // 12.3：末轮实测深度
+			s.NominalLastPrompt = nominalLastPrompt(e.trace != nil, cfg.Multiturn)
 			mu.Lock()
 			lv.Sessions = append(lv.Sessions, s)
 			mu.Unlock()
@@ -1309,10 +1323,11 @@ func runClosedRound(ctx context.Context, e *env, cfg *config.Config,
 		close(startBarrier)
 	}
 	wg.Wait()
-	// 本档位已结束：停观测器、收 waiting 峰值（标定数据），再组装终止原因
+	// 本档位已结束：停观测器、收 waiting/running 峰值（标定数据），再组装终止原因
 	roundCancel()
 	satWait()
 	lv.WaitingMax = waitingMax()
+	lv.RunningMax = runningMax()
 	if firstTurnFail.Load() {
 		lv.Aborted = "首轮失败，fail-fast 终止（爬坡发车）"
 		log.Printf("⛔ %s", lv.Aborted)
@@ -1360,7 +1375,7 @@ func runOpenRound(ctx context.Context, e *env, cfg *config.Config,
 	defer lr.finish()
 	roundCtx, roundCancel := context.WithCancel(ctx)
 	defer roundCancel()
-	waitingMax, satWait := startSaturationWatch(roundCtx, sat, pol, lr)
+	waitingMax, runningMax, satWait := startSaturationWatch(roundCtx, sat, pol, lr)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	var sem chan struct{}
@@ -1387,6 +1402,8 @@ func runOpenRound(ctx context.Context, e *env, cfg *config.Config,
 				// drain 闸门要求会话中途也能停（已完成轮保留）
 				stopHook := sessionTurnHook(func(int, *engine.TurnMetrics) bool { return !lr.Stop() })
 				s.Turns = collectSessionTurns(roundCtx, e, cfg, model, v, i, 0, maxTok, stopHook)
+				s.FillLastPromptTokens() // 12.3：末轮实测深度
+				s.NominalLastPrompt = nominalLastPrompt(e.trace != nil, cfg.Multiturn)
 				mu.Lock()
 				lv.Sessions = append(lv.Sessions, s)
 				mu.Unlock()
@@ -1433,10 +1450,11 @@ func runOpenRound(ctx context.Context, e *env, cfg *config.Config,
 	}()
 	<-schedDone // 全部请求已按到达序列发射（或本档位被提前停止）
 	wg.Wait()
-	// 本档位已结束：停观测器、收 waiting 峰值（标定数据），再组装终止原因
+	// 本档位已结束：停观测器、收 waiting/running 峰值（标定数据），再组装终止原因
 	roundCancel()
 	satWait()
 	lv.WaitingMax = waitingMax()
+	lv.RunningMax = runningMax()
 	lv.Aborted = lr.Reason()
 	lv.Shapes = aggregateShapes(mp, lv.Requests, shapeIdxs)
 	finalizeLevel(e, lv, time.Since(start).Seconds())

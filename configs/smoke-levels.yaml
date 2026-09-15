@@ -12,7 +12,8 @@ models: ["mock-model-a"]
 
 thinking:
   levels:
-    - {name: off,  enabled: false, extra_body: {chat_template_kwargs: {enable_thinking: false}}}
+    # 12.7：档位名不得叫 off/on/both（保留字，CLI 过滤冲突）——关闭态档位用 none
+    - {name: none, enabled: false, extra_body: {chat_template_kwargs: {enable_thinking: false}}}
     - {name: low,  enabled: true,  extra_body: {chat_template_kwargs: {enable_thinking: true}}}
     - {name: high, enabled: true,  extra_body: {chat_template_kwargs: {enable_thinking: true}}}
 

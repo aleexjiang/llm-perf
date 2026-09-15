@@ -374,9 +374,9 @@ check(cl and all(lv.get("request_rate") == 4 for lv in cl), "开环到达率 req
 nreq = sum(len(lv.get("requests") or []) for lv in cl)
 check(1 <= nreq <= 6, f"开环总请求数尊重 num_prompts=6（实际 {nreq}）")
 
-# 9) levels：全档三个变体；--thinking low 只剩 low
+# 9) levels：全档三个变体；--thinking low 只剩 low（12.7 后关闭态档位名用 none）
 la, _ = rows("out-levels-all")
-check(thinks(la) == {"off", "low", "high"}, f"levels 全档三变体都跑: {sorted(thinks(la))}")
+check(thinks(la) == {"none", "low", "high"}, f"levels 全档三变体都跑: {sorted(thinks(la))}")
 ll, _ = rows("out-levels-low")
 check(len(ll) > 0 and thinks(ll) == {"low"}, "levels 档位名过滤：--thinking low 只跑 low")
 

@@ -119,9 +119,12 @@ func TestStartSaturationWatchNilPoller(t *testing.T) {
 	defer cancel()
 	lr := newLevelRun(nil)
 	defer lr.finish()
-	waitMax, wait := startSaturationWatch(ctx, nil, nil, lr)
+	waitMax, runMax, wait := startSaturationWatch(ctx, nil, nil, lr)
 	if w := waitMax(); w != 0 {
-		t.Fatalf("nil poller 峰值应恒 0，got %v", w)
+		t.Fatalf("nil poller waiting 峰值应恒 0，got %v", w)
+	}
+	if w := runMax(); w != 0 {
+		t.Fatalf("nil poller running 峰值应恒 0，got %v", w)
 	}
 	wait() // 应立即返回（未启动 goroutine）
 }
@@ -130,6 +133,7 @@ func TestStartSaturationWatchObservesMax(t *testing.T) {
 	// 判据未启用（MaxWaiting=0）：观测器只记录峰值，不触发——标定数据源
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "vllm:num_requests_waiting{engine=\"0\"} 7\n")
+		fmt.Fprint(w, "vllm:num_requests_running{engine=\"0\"} 3\n")
 	}))
 	t.Cleanup(srv.Close)
 	pol := smetrics.StartGaugePoller(context.Background(), smetrics.NewScraperAt(srv.URL, "/metrics"),
@@ -141,10 +145,13 @@ func TestStartSaturationWatchObservesMax(t *testing.T) {
 	defer cancel()
 	lr := newLevelRun(nil)
 	defer lr.finish()
-	waitMax, wait := startSaturationWatch(ctx, &config.SaturationGuardCfg{}, pol, lr)
+	waitMax, runMax, wait := startSaturationWatch(ctx, &config.SaturationGuardCfg{}, pol, lr)
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		if w := waitMax(); w == 7 {
+			if r := runMax(); r != 3 {
+				t.Fatalf("running 峰值应同步观测到 3，got %v", r)
+			}
 			if lr.Stop() {
 				t.Fatalf("判据未启用不应触发: %q", lr.Reason())
 			}
@@ -161,6 +168,7 @@ func TestStartSaturationWatchTriggers(t *testing.T) {
 	// 持续报 waiting=64：远快于判定窗口，LatestWaiting 每 tick 都取到超阈值
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "vllm:num_requests_waiting{engine=\"0\"} 64\n")
+		fmt.Fprint(w, "vllm:num_requests_running{engine=\"0\"} 8\n")
 	}))
 	t.Cleanup(srv.Close)
 	pol := smetrics.StartGaugePoller(context.Background(), smetrics.NewScraperAt(srv.URL, "/metrics"),
@@ -174,7 +182,7 @@ func TestStartSaturationWatchTriggers(t *testing.T) {
 	defer cancel()
 	lr := newLevelRun(sg)
 	defer lr.finish()
-	waitMax, wait := startSaturationWatch(ctx, sg, pol, lr)
+	waitMax, runMax, wait := startSaturationWatch(ctx, sg, pol, lr)
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -185,6 +193,9 @@ func TestStartSaturationWatchTriggers(t *testing.T) {
 			}
 			if w := waitMax(); w < 32 {
 				t.Fatalf("触发前应已观测到超阈峰值，got %v", w)
+			}
+			if r := runMax(); r < 8 {
+				t.Fatalf("running 峰值应同步观测，got %v", r)
 			}
 			if ctx.Err() != nil {
 				t.Fatal("drain 语义：触发不应取消 ctx（在飞要跑完）")

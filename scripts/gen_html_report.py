@@ -276,7 +276,8 @@ def merge(reports):
     data = {k: [] for k in SCENARIOS}
     meta = {"endpoint": "?", "tool": "?", "notes": [], "generated": [], "slo": None,
             "slo_baseline": None, "source_check": None, "server": {}, "correctness": {},
-            "test": None}
+            "test": None, "tools": []}
+    tools_seen = []
     for p, d in reports:
         scen = d.get("scenario")
         if scen not in data:
@@ -285,6 +286,9 @@ def merge(reports):
         meta["endpoint"] = d.get("endpoint") or meta["endpoint"]
         if d.get("tool"):
             meta["tool"] = d["tool"]
+            # 12.1 版本握手：归集所有输入的 tool 字段（主渲染取首份；混版在这里可见）
+            if d["tool"] not in tools_seen:
+                tools_seen.append(d["tool"])
         if d.get("note"):
             meta["notes"].append((os.path.basename(p), d["note"]))
         if d.get("generated_at"):
@@ -323,6 +327,8 @@ def merge(reports):
             # 全都没取到则留首份（带 note），报告据此如实说明「已启用但未取到」。
             if cur is None or (sm.get("available") and not cur.get("available")):
                 meta["server"][scen] = sm
+    # 12.1 版本握手：所有输入的 tool 字段（去重保序）
+    meta["tools"] = tools_seen
     return data, meta
 
 
@@ -458,24 +464,47 @@ def slope_ms_per_token(pts):
     return (y1 - y0) / (x1 - x0) * 1000.0
 
 
-# 缓存判定阈值：多轮斜率低于它即认为历史前缀被缓存复用（绝对判据，
-# 防止单发参照系本身被缓存污染——同题 runs 全部命中时单发斜率≈多轮斜率，比值失效）
+# 缓存判定阈值：末轮实测 TTFT / 冷算预估 的比值判据（12.9）。
+# <0.5 ⇒ 实测远快于全量重算 ⇒ 生效；>0.8 ⇒ 与冷算基本一致 ⇒ 未命中；之间 ⇒ 部分命中。
 CACHE_EFFECTIVE_MS_PER_TOKEN = 0.05
+
+# 12.1 版本握手：官方产物的 tool 字段前缀。混版/异源输入只告警不拒绝渲染
+# （报告是给入看的，能出就出，但读者必须知道数据不是同一把尺子量出来的）。
+TOOL_FAMILY = "llm-perf"
 
 
 def classify_cache(P):
-    """返回 (标签, 斜率比值文本)。"""
+    """返回 (标签, 证据文本)。判据链（12.9 反证式重写，r1 实测教训）：
+
+    r1 踩坑：旧判据 =「多轮斜率 / 单发斜率 + 绝对阈值」。当单发参照系本身被缓存污染
+    （同题 runs 全命中，斜率≈0）时，比值变成 727% 的天文数字，把「缓存明明生效」
+    误判成「未命中」，还触发了「请开启前缀缓存」的错误建议。
+
+    重写为反证式判据链：
+      ① 客户端 cached_tokens：多轮第 2 轮起 usage.cached_tokens 中位 > 0 ⇒ 生效——
+         服务端自报，最硬的证据。键缺失 = 引擎未回传（不能当 0），全部无键才退化到 ②。
+      ② 末轮实测 TTFT ÷ 冷算预估（末轮 ctx × 单发斜率）：<0.5 生效 / >0.8 未命中 /
+         之间部分命中。实测远快于全量重算 ⇒ 必有缓存，对「参照系被污染」免疫。
+      ③ 服务端 /metrics 累计命中率只作旁证（累计口径跨场景，无法归因到多轮会话），不进判定。
+    """
     m_th = "off" if "off" in P else ("on" if "on" in P else None)
-    multi = P.get(m_th, {}).get("slope_multi") if m_th else None
-    ratio = P.get("cache_ratio")
+    ev = P.get(m_th, {}).get("cache_evidence") if m_th else None
+    if not ev:
+        return "—", "—"
+    # ① cached_tokens：键存在才计（键缺失 ≠ 0）
+    if ev.get("cached_med") is not None and ev["cached_med"] > 0:
+        return "生效", "①cached 中位 {:,.0f}tk（{} 轮）".format(ev["cached_med"], ev["cached_n"])
+    # ② 末轮实测 / 冷算预估
+    ratio = ev.get("cold_ratio")
     ratio_txt = "{:.0%}".format(ratio) if ratio is not None else "—"
-    if multi is None:
-        return "—", ratio_txt
-    if multi < CACHE_EFFECTIVE_MS_PER_TOKEN or (ratio is not None and ratio < 0.2):
-        return "生效", ratio_txt
-    if ratio is None or ratio > 0.8:
-        return "未命中", ratio_txt
-    return "部分命中", ratio_txt
+    if ratio is not None:
+        if ratio < 0.5:
+            return "生效", "②实测/冷算 {}".format(ratio_txt)
+        if ratio > 0.8:
+            return "未命中", "②实测/冷算 {}".format(ratio_txt)
+        return "部分命中", "②实测/冷算 {}".format(ratio_txt)
+    # 两判据都不可用（引擎未回传 cached_tokens 且单发斜率缺失）
+    return "—", "证据不足"
 
 
 def table(headers, rows):
@@ -618,6 +647,7 @@ def analyze(data, meta):
             "goodput_rps": lv.get("goodput_rps", 0),
             "goodput_tps": lv.get("goodput_tps", 0),
             "waiting_max": lv.get("waiting_max", 0),
+            "running_max": lv.get("running_max", 0),  # 12.5 观测对偶：执行数峰值（0 = 观测层不可用）
             "aborted": lv.get("aborted", ""),
             "ramp": ramp,
         })
@@ -679,7 +709,8 @@ def analyze(data, meta):
                           for r in s_by[(m, th, mt)][size]["runs"]
                           if not r.get("error")]
             P[th]["think_all"] = [v for v in _think_all if v is not None]
-            P[th]["rc_all"] = [r.get("reasoning_chars", 0) for mt in mts
+            # or 0：键存在但值为 None（畸形/手造 JSON）会毒进 median/min/max——12.6 fixture 抓出
+            P[th]["rc_all"] = [(r.get("reasoning_chars") or 0) for mt in mts
                                for size in sorted(s_by[(m, th, mt)])
                                for r in s_by[(m, th, mt)][size]["runs"]
                                if not r.get("error")]
@@ -734,6 +765,30 @@ def analyze(data, meta):
             P[th]["slope_multi"] = slope_ms_per_token(
                 [(t["prompt"][0], t["ttft"][0]) for t in top if t["ttft"]]) if len(top) >= 2 else None
             P[th]["mt_total"] = sum(t["e2e"][0] for t in top if t["e2e"])
+            # 12.9 缓存判定证据（反证式，见 classify_cache）：
+            # ①cached_tokens——第 2 轮起、键存在才计（键缺失 = 引擎未回传，不能当 0）
+            sess_top = m_by[(m, th, mts[-1])]
+            cvals = [t.get("cached_tokens") for s in sess_top for i, t in enumerate(s.get("turns", []))
+                     if i >= 1 and not t.get("error") and t.get("cached_tokens") is not None]
+            # ②末轮实测 TTFT 与末轮实测 ctx（12.3 落盘字段）——冷算预估的分母
+            lps = [s.get("last_prompt_tokens") for s in sess_top if s.get("last_prompt_tokens")]
+            last_ttft = top[-1]["ttft"][0] if top and top[-1].get("ttft") else None
+            cold_ratio = None
+            if last_ttft is not None and lps and P.get(th, {}).get("slope"):
+                cold_est_ms = st.median(lps) * P[th]["slope"]  # 末轮 ctx × 单发斜率 ms/token
+                if cold_est_ms > 0:
+                    cold_ratio = last_ttft * 1000.0 / cold_est_ms
+            P[th]["cache_evidence"] = {
+                "cached_med": st.median(cvals) if cvals else None,
+                "cached_n": len(cvals),
+                "last_ttft": last_ttft,
+                "last_prompt_med": int(st.median(lps)) if lps else None,
+                "cold_ratio": cold_ratio,
+            }
+            # 12.3 深度实测校验：末轮实测 vs 名义外推（Go 侧按 filler 口径落盘）
+            nms = [s.get("nominal_last_prompt") for s in sess_top if s.get("nominal_last_prompt")]
+            P[th]["depth"] = {"last_med": int(st.median(lps)) if lps else None,
+                              "nominal_med": int(st.median(nms)) if nms else None}
         # 缓存判定：多轮斜率 / 单发斜率（优先 off）
         s_th = "off" if "off" in P else ("on" if "on" in P else None)
         m_th = "off" if "off" in P else ("on" if "on" in P else None)
@@ -807,7 +862,11 @@ def analyze(data, meta):
         for th in ("off", "on"):
             if th not in P:
                 continue
-            mts = P[th]["mt_list"]
+            # mt_list 只由单发循环写入；纯多轮/纯并发的 thinking 变体没有该键——
+            # 12.6 fixture 抓出的 KeyError，跳过即可（基线只覆盖单发与并发象限）
+            mts = P[th].get("mt_list")
+            if not mts:
+                continue
             # 单发·单轮
             for bkt in ("short", "mid", "long"):
                 groups = []
@@ -822,7 +881,9 @@ def analyze(data, meta):
                             groups.append((mt, size, rs))
                 if not groups:
                     continue
-                ttfts = [r.get("ttft_ms", 0) / 1000 for _, _, rs in groups for r in rs]
+                # 键存在但值为 None（畸形数据）同样剔除——/ 1000 会 TypeError（12.6 fixture）
+                ttfts = [r.get("ttft_ms") / 1000 for _, _, rs in groups for r in rs
+                         if r.get("ttft_ms") is not None]
                 top_mt = max(mt for mt, _, _ in groups)
                 top_rs = [r for mt, _, rs in groups if mt == top_mt for r in rs]
                 base.append(mk_unit(
@@ -839,7 +900,7 @@ def analyze(data, meta):
                     continue
                 base.append(mk_unit(
                     "单发·多轮", m, th, bkt, prompt_lbl([t.get("prompt_tokens", 0) for t in ts]),
-                    [t.get("ttft_ms", 0) / 1000 for t in ts],
+                    [t.get("ttft_ms") / 1000 for t in ts if t.get("ttft_ms") is not None],
                     [t.get("tpot_ms") for t in ts],
                     [t.get("tokens_per_sec") for t in ts], len(ts)))
     # 并发：均匀轮按请求 prompt 归档；混跑轮逐形状评估（形状即输入档，只有中位数）
@@ -865,7 +926,7 @@ def analyze(data, meta):
                 continue
             base.append(mk_unit(scene, lv["model"], lv.get("thinking", "off"), bkt,
                                 prompt_lbl([t.get("prompt_tokens", 0) for t in ts]),
-                                [t.get("ttft_ms", 0) / 1000 for t in ts],
+                                [t.get("ttft_ms") / 1000 for t in ts if t.get("ttft_ms") is not None],
                                 [t.get("tpot_ms") for t in ts],
                                 [t.get("tokens_per_sec") for t in ts], len(ts)))
     A["baseline"] = base if A["baseline_enabled"] else []
@@ -1165,12 +1226,15 @@ def concurrent_table(A, quad):
     has_think = any(e["thinking"] != "off" or (e["think"] and e["think"][0] > 0) for e in items)
     has_slo = any(e.get("slo_total") for e in items)      # 未配置 slo.goodput 时不出这两列
     has_wait = any(e.get("waiting_max") for e in items)   # 观测层不可用时不出
+    has_run = any(e.get("running_max") for e in items)    # 12.5 观测对偶：执行数峰值（同上）
     has_ramp = any(e.get("ramp") for e in items)
     head = ["模型", "thinking", "输出 tk", "负载", "单元数", "请求总数", "失败", "墙钟 s", "吞吐 tok/s"]
     if has_slo:
         head += ["SLO 达标", "goodput req/s"]
     if has_wait:
         head += ["waiting 峰值"]
+    if has_run:
+        head += ["running 峰值"]
     if has_ramp:
         head += ["发车"]
     head += ["TTFT s", "TTFT p95/p99 s", "E2E s", "E2E p95/p99 s"] + \
@@ -1201,6 +1265,8 @@ def concurrent_table(A, quad):
                 row += ["—", "—"]
         if has_wait:
             row += ["{:.0f}".format(e["waiting_max"]) if e.get("waiting_max") else "—"]
+        if has_run:
+            row += ["{:.0f}".format(e["running_max"]) if e.get("running_max") else "—"]
         if has_ramp:
             row += ["爬坡 {} 批 / {:.0f}s".format(e["ramp"]["batches"], e["ramp"]["span_s"])
                     if e.get("ramp") else "齐射"]
@@ -1221,6 +1287,11 @@ def concurrent_table(A, quad):
         note += '<div class="note">waiting 峰值 = 服务端 <code>num_requests_waiting</code> 排队深度峰值' \
                 '（<code>saturation_guard.max_waiting</code> 的标定依据，建议阈值 ≈ 峰值 × 4；' \
                 '具体建议值见「结论与建议」）。</div>'
+    if has_run:
+        note += '<div class="note">running 峰值 = 服务端 <code>num_requests_running</code> 执行数峰值' \
+                '（12.5 观测对偶）：waiting 标定排队阈值，running 核对调度容量——vLLM 的' \
+                ' <code>max_num_seqs</code> 无法从 API 取到（参数默认值易被误沿用），以实测峰值为准；' \
+                '峰值远低于配置并发数 ⇒ 瓶颈在客户端发射或在途排队，不在调度容量。</div>'
     if has_ramp:
         note += '<div class="note">发车 = 5.7 闭环错峰发车（指数爬坡：首批 1 路，等该批全部完成首轮再放大一倍）。' \
                 '「爬坡 N 批 / Xs」表示本档位的会话在 X 秒窗口内陆续启动——' \
@@ -1366,6 +1437,20 @@ def multiturn_table(A, th):
             rows.append(row)
         cap = '<p class="cap">输出 {} tk</p>'.format("{:,}".format(mt)) if len(mts) > 1 else ""
         parts.append(cap + table(head, rows))
+    # 12.3 深度画像对照：末轮实测 ctx vs 名义外推（Go 侧 filler 口径落盘）
+    depth_notes = []
+    for m, P in per_model:
+        d = (P[th].get("depth") or {})
+        last, nom = d.get("last_med"), d.get("nominal_med")
+        if not last or not nom:
+            continue
+        dev = (last - nom) / float(nom)
+        flag = ' <span style="color:#b45309;font-weight:600">⚠️ 偏差 &gt;10%</span>' if abs(dev) > 0.10 else ""
+        depth_notes.append("{}：末轮实测 {:,} tk vs 名义 {:,} tk（{:+.0f}%）{}".format(
+            esc(short(m)), last, nom, dev * 100, flag))
+    if depth_notes:
+        parts.append('<div class="note">深度画像对照（12.3）：名义末轮 = (system + 工具定义 + 轮数×每轮 tk) × 1.07 模板开销；'
+                     + "；".join(depth_notes) + "。</div>")
     return "".join(parts) or "<p>无数据</p>"
 
 
@@ -1538,32 +1623,23 @@ def gen_conclusions(A):
             else:
                 cs.append("<b>{}</b>（单发·单轮）：TTFT 随档位线性增长，{}k={}s → {}k={}s（≈{:.2f} ms/token）。".format(
                     esc(short(m)), l0["size"] // 1000, l0["ttft"][0], l1["size"] // 1000, l1["ttft"][0], sl))
-    # 2 缓存判定
+    # 2 缓存判定（12.9 反证式判据链，证据文本见 classify_cache）
     for m, P in A["per_model"].items():
-        label, _ = classify_cache(P)
+        label, ev_txt = classify_cache(P)
         if label == "—":
+            if ev_txt == "证据不足":
+                cs.append("<b>{}</b>（多轮对话）：缓存判定证据不足——引擎未回传 <code>cached_tokens</code> "
+                          "且单发斜率缺失，无法给出反证式判定；服务端 /metrics 累计命中率仅可作旁证。".format(esc(short(m))))
             continue
-        r = P.get("cache_ratio")
         if label == "生效":
-            cs.append("<b>{}</b>（多轮对话）：TTFT 逐轮几乎不涨（斜率 ≈ {:.3f} ms/token{}）⇒ 前缀缓存生效，"
-                      "历史前缀跨轮复用。".format(
-                esc(short(m)),
-                P.get("off", P.get("on", {})).get("slope_multi") or 0,
-                "，为单发斜率的 {:.0%}".format(r) if r is not None and r < 1 else ""))
+            cs.append("<b>{}</b>（多轮对话）：前缀缓存生效（{}）——历史前缀跨轮复用。".format(
+                esc(short(m)), ev_txt))
         elif label == "未命中":
-            if r is not None:
-                cs.append("<b>{}</b>（多轮对话）：TTFT 斜率与单发一致（比值 {:.0%}）⇒ 未命中前缀缓存，每轮全量重算历史。".format(
-                    esc(short(m)), r))
-            else:
-                sm = (P.get("off") or P.get("on") or {}).get("slope_multi")
-                cs.append("<b>{}</b>（多轮对话）：多轮 TTFT 斜率 {:.3f} ms/token 超过绝对判据（{:.2f}）⇒ "
-                          "未命中前缀缓存，每轮全量重算历史。".format(
-                    esc(short(m)), sm if sm is not None else 0.0, CACHE_EFFECTIVE_MS_PER_TOKEN))
+            cs.append("<b>{}</b>（多轮对话）：末轮实测 TTFT 与冷算预估基本一致（{}）⇒ 未命中前缀缓存，"
+                      "每轮全量重算历史。".format(esc(short(m)), ev_txt))
         else:
-            if r is not None:
-                cs.append("<b>{}</b>（多轮对话）：TTFT 斜率为单发的 {:.0%} ⇒ 前缀缓存部分命中。".format(esc(short(m)), r))
-            else:
-                cs.append("<b>{}</b>（多轮对话）：前缀缓存部分命中（比值数据不足，按斜率判定）。".format(esc(short(m))))
+            cs.append("<b>{}</b>（多轮对话）：前缀缓存部分命中（{}）——部分前缀复用，"
+                      "TTFT 随上下文仍有可观增长。".format(esc(short(m)), ev_txt))
         # 冷/热形态佐证
         cw = P.get("off", {}).get("cold_warm_ratio")
         if cw and cw > 3:
@@ -1707,6 +1783,58 @@ def gen_conclusions(A):
                     cs.append("<b>{}（{}·thinking={}）</b>：所有到达率档位的 SLO 达标率均低于 95%"
                               "——当前 <code>slo.goodput</code> 阈值下，最低档位也已超出业务时延要求。".format(
                                   esc(short(m)), qname, th))
+    # 12.4 闭环并发拐点（levels 爬坡）：与 9.2 开环同口径——0.9×峰值平台 + 边际增益 <5% 首档。
+    # 只取闭环档位（level>0 且无 request_rate），开环轮次混入会破坏并发比口径。
+    for quad, qname in (("conc_single", "并发·单轮"), ("conc_multi", "并发·多轮")):
+        by = defaultdict(list)
+        for e in A.get(quad, []):
+            if e["level"] > 0 and not e.get("request_rate"):
+                by[(e["model"], e["thinking"], e["mt"])].append(e)
+        for (m, th, mt), es in sorted(by.items()):
+            if len(es) < 2:
+                continue
+            es.sort(key=lambda x: x["level"])
+            peak = max((e["tps"] or 0) for e in es)
+            if peak <= 0:
+                continue
+            knee = max((e["level"] for e in es if e["tps"] and e["tps"] >= 0.9 * peak), default=None)
+            # 边际增益 <5% 首档：相对前一档吞吐增益不足 5% 的最小并发数
+            marg = None
+            for i in range(1, len(es)):
+                prev, cur = es[i - 1], es[i]
+                if prev["tps"] and cur["tps"] and (cur["tps"] - prev["tps"]) / prev["tps"] < 0.05:
+                    marg = cur["level"]
+                    break
+            ttft_txt = ""
+            if es[0].get("ttft") and es[-1].get("ttft") and es[0]["ttft"][0] > 0:
+                ttft_txt = "，TTFT 中位 {:.2f}s→{:.2f}s（{:.1f}×）".format(
+                    es[0]["ttft"][0], es[-1]["ttft"][0],
+                    es[-1]["ttft"][0] / es[0]["ttft"][0])
+            bits = []
+            if knee is not None:
+                bits.append("并发 {} 起吞吐进入 0.9×峰值平台（{:.0f} tok/s）".format(knee, peak))
+            if marg is not None:
+                bits.append("并发 {} 起相对上一档吞吐增益不足 5%".format(marg))
+            if not bits:
+                continue
+            cs.append("<b>{}（{}·thinking={}·out={}tk）</b>：闭环并发爬坡——{}{}。"
+                      "该点之后再加并发只会拉长排队，容量规划取平台起点口径。".format(
+                          esc(short(m)), qname, th, mt, "；".join(bits), ttft_txt))
+    # 12.3 multiturn 深度实测校验：名义外推 vs 末轮实测，偏差 >10% 告警
+    # （filler 语料抽样去重/边界不足额会让名义口径系统性偏乐观 10–15%，r3/r4 实测坐实）
+    for m, P in A["per_model"].items():
+        for th in ("off", "on"):
+            d = (P.get(th, {}) or {}).get("depth") or {}
+            last, nom = d.get("last_med"), d.get("nominal_med")
+            if not last or not nom:
+                continue
+            dev = (last - nom) / float(nom)
+            if abs(dev) > 0.10:
+                cs.append("<b>{}（多轮·thinking={}）</b>：⚠️ 末轮上下文实测中位 {:,} tk，"
+                          "名义外推 {:,} tk（偏差 {:+.0f}%）——画像口径系统性{}，"
+                          "按名义 ctx 选档时请以实测值修正。".format(
+                              esc(short(m)), th, last, nom, dev * 100,
+                              "偏乐观" if dev < 0 else "偏保守"))
     # 6 agent 时延推算
     for m, P in A["per_model"].items():
         if "off" in P and P["off"].get("ladder_top"):
@@ -2343,6 +2471,17 @@ def main():
         sec2_body += '<div class="note">本份数据未包含引擎环境存档（旧版本工具产出）。</div>'
     if meta.get("plan"):
         sec2_body += plan_table(meta["plan"])
+    # 12.1 版本握手：输入产物版本一致性校验（告警不拒绝渲染；官方源 = 本仓库）
+    tools = meta.get("tools") or []
+    off_family = [t for t in tools if str(t).startswith(TOOL_FAMILY)]
+    if len(tools) > 1:
+        sec2_body += ('<div class="note" style="color:#b45309;font-weight:600">⚠️ 版本握手：输入产物来自多个工具版本'
+                      '（{}）——混版聚合的统计口径可能不一致，正式报告请用同一版本产物重新聚合。</div>').format(
+            esc("、".join(str(t) for t in tools)))
+    elif tools and not off_family:
+        sec2_body += ('<div class="note" style="color:#b45309;font-weight:600">⚠️ 版本握手：输入产物 tool 字段为「{}」，'
+                      '不属于官方 <code>{}</code> 家族——请核对数据来源（官方源为本仓库）。</div>').format(
+            esc("、".join(str(t) for t in tools)), TOOL_FAMILY)
     sec.append(("<h2>2 · 测试配置与方法</h2>", sec2_body))
     sec.append(("<h2>3 · 指标口径</h2>",
                 '<p class="note">下表全部为<b>客户端实测</b>口径（基线）——与服务端是否存在 /metrics 无关。</p>'
@@ -2425,12 +2564,15 @@ def main():
                          {"no_reasoning": "思考无输出", "budget_exhausted": "思考独占预算",
                           "normal": "正常长草稿"}.get(P.get("thinking_behavior"), "—")])
     sec.append(("<h2>7 · 分析：缓存 / 吞吐 / 思考</h2>", table(
-        ["模型", "单发斜率 ms/tk", "多轮斜率 ms/tk", "多轮/单发", "缓存判定", "decode tok/s", "思考行为"],
+        ["模型", "单发斜率 ms/tk", "多轮斜率 ms/tk", "缓存证据", "缓存判定", "decode tok/s", "思考行为"],
         ana_rows) +
-        '<div class="note">缓存判定规则：多轮 TTFT 斜率 &lt;{:.2f} ms/token（绝对判据）或 多轮/单发斜率比 &lt;20% ⇒ 生效；'
-        "比值 &gt;80% ⇒ 未命中。单发参照系本身可能被缓存污染（同题 runs 全命中时两者斜率同样低），此时候比值失效、以绝对判据为准。"
+        '<div class="note">缓存判定（12.9 反证式判据链）：'
+        "① 客户端 <code>cached_tokens</code>（多轮第 2 轮起、键存在才计）中位 &gt;0 ⇒ 生效——服务端自报，最硬证据；"
+        "② 末轮实测 TTFT ÷ 冷算预估（末轮 ctx × 单发斜率）&lt;50% ⇒ 生效、&gt;80% ⇒ 未命中、之间 ⇒ 部分命中——"
+        "实测远快于全量重算 ⇒ 必有缓存，对「单发参照系被缓存污染」免疫（旧斜率比值判据在此场景给出过 727% 的天文数字并误判）；"
+        "③ 服务端 /metrics 累计命中率只作旁证（累计口径无法归因到多轮会话）。"
         "思考行为：no_reasoning=开关未产生思考输出；budget_exhausted=思考耗尽 max_tokens（正文 0 token）；"
-        "normal=有思考草稿且正文正常。</div>".format(CACHE_EFFECTIVE_MS_PER_TOKEN)))
+        "normal=有思考草稿且正文正常。</div>"))
     # 体验基线评估（5.8，3 档制）
     base_html = baseline_section(A)
     if base_html:

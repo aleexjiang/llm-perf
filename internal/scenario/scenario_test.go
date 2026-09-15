@@ -677,3 +677,22 @@ func TestRampBatches(t *testing.T) {
 		}
 	}
 }
+
+// 12.3：名义末轮深度 = (system + tool_defs + turns×turn_tokens) × 1.07 模板开销。
+// trace 模式无名义口径（0）；参数非法（turns/turn_tokens 非正）也返回 0。
+func TestNominalLastPrompt(t *testing.T) {
+	mt := config.Multiturn{SystemTokens: 1000, ToolDefsTokens: 500, Turns: 8, TurnTokens: 4000}
+	// (1000+500+8×4000)×1.07 = 33500×1.07 = 35845
+	if got := nominalLastPrompt(false, mt); got != 35845 {
+		t.Fatalf("名义末轮应为 35845，got %d", got)
+	}
+	if got := nominalLastPrompt(true, mt); got != 0 {
+		t.Fatalf("trace 模式应为 0，got %d", got)
+	}
+	if got := nominalLastPrompt(false, config.Multiturn{Turns: 0, TurnTokens: 4000}); got != 0 {
+		t.Fatalf("turns=0 应为 0，got %d", got)
+	}
+	if got := nominalLastPrompt(false, config.Multiturn{Turns: 8}); got != 0 {
+		t.Fatalf("turn_tokens=0 应为 0，got %d", got)
+	}
+}

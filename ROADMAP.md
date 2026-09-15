@@ -15,24 +15,20 @@
 
 ---
 
-### 12.7 levels 档位名保留字校验（2026-09-15 r4 实测踩坑）
+### 12.7 levels 档位名保留字校验【已实现，2026-09-16】
 
-- 现象：`thinking.levels` 配置后，CLI `--thinking on/off` 被拒（`cmd/bench/main.go:148`）；若用户恰好把档位命名为 `off`，则**该档位无法通过 CLI 过滤**，只能改名或改配置 enabled——运行时才发现、且无解。
-- 建议：① 配置加载时校验 levels 档位名不得为保留字（`on`/`off`/`both`），违者直接报配置错误（fail-fast，目前不校验）；② 或 CLI 过滤改为"先精确匹配档位名，命中即过滤，未命中再按 on/off/both 语义处理"。
-- 影响面：自部署 Qwen 已通过改名 `none` 绕过（llm-perf-test 配置），客户侧若复刻该配置会踩同一个坑，runbook 可补一行。
+- 现象（r4 踩坑）：`thinking.levels` 配置后，CLI `--thinking on/off` 被拒（`cmd/bench/main.go:148`）；若用户恰好把档位命名为 `off`，则**该档位无法通过 CLI 过滤**——运行时才发现、且无解。
+- 落地：方案①（fail-fast）。`validateThinkingLevels` 校验档位名不得为保留字（`on`/`off`/`both`，大小写不敏感），全局与 `model_overrides` 内都校验，违者加载时报错提示改名；配套单测 + `configs/smoke-levels.yaml` 档位 `off→none`。
 
-### 12.8 levels 模式下 canary/预热 off 变体失效（2026-09-15 r4 实测踩坑）
+### 12.8 levels 模式下 canary/预热 off 变体失效【已实现，2026-09-16】
 
-- 现象：`thinking.levels` 生效后，正确性金丝雀 0/4（reply 全空、e2e ~170ms）。根因：`scenario.go` 的 `runCorrectness` 与 `warmup` 各自构造 `vOff{ExtraBody: ThinkingFor(model).ExtraBodyOff}`，而 levels 模式下 `ExtraBodyOn/Off` 已废弃不回填（config.go:368 仅 mode 分支用它）→ 金丝雀请求裸发、无 `enable_thinking:false` → 默认开思考的模型把 `max_tokens=16` 全吃进思考链，content 为空 → match=false。预热同款（无害：1 token 不计统计）。
-- 修法建议：① levels 模式下 `ExtraBodyOff` 从 levels 中 `enabled:false` 的条目回填（保持两个消费点不用改）；或 ② `runCorrectness`/`warmup` 改为显式取「关闭态变体」（levels 里找 enabled=false，退化到 ExtraBodyOff）。附带收益：金丝雀应显式带上关闭态 extra_body，与「金丝雀测的是服务而不是思考形态」的语义对齐。
-- 影响面：仅 canary/预热两个固定 off 消费点；场景主路径（变体遍历）带显式 extra_body 不受影响。已被 llm-perf-test 的 Qwen3.8 实测坐实（r1 mode:off 下 16/16，r4 levels 下 0/4）。
+- 现象（r4 踩坑）：levels 生效后正确性金丝雀 0/4——`runCorrectness`/`warmup` 走 `ExtraBodyOff`，而 levels 模式下该键废弃不回填 → 金丝雀裸发 → 思考吃光 `max_tokens=16` → match=false。
+- 落地：方案①。`ThinkingFor` 尾部从 levels 第一个 `enabled:false` 变体回填 `ExtraBodyOff`（显式 `extra_body_off` 优先、无关闭档保持 nil），两个消费点零改动；主路径变体遍历不受影响；配套单测。
 
-### 12.9 报告结论启发式：前缀缓存「未命中」误判（2026-09-15 r1 报告实锤）
+### 12.9 报告结论启发式：前缀缓存「未命中」误判【已实现，2026-09-16】
 
-- 现象：r1 报告摘要判「多轮未命中前缀缓存，每轮全量重算历史」并给出【高】优先级建议「开启 enable_prefix_caching」——但同报告服务端观测区自报命中率 77–80%，且后续标定与 r4（208k 末轮 TTFT 19.1s vs 冷 prefill ~86s）证明缓存实际开启。判定与数据自相矛盾。
-- 根因（gen_html_report.py `classify_cache`，约 :417）：双判据都失真。①斜率比值：分母（单发斜率）被同题 warm runs 的全缓存命中压扁（204k TTFT 也仅 ~2.4s → 0.009 ms/token），分母趋零 → 比值 727% 天文数字；代码注释自知此污染（"此时候比值失效、以绝对判据为准"），但 ②绝对阈值 0.05 ms/token 定得过紧：缓存**生效**时逐轮 TTFT = prefill(每轮新增 token)，增量大的多轮设计（如 13.5k/轮）下斜率天然不趋零（r1 实测 0.066，turn2→8 段仅 0.039）。启发式把「TTFT 随 ctx 缓涨」误等价于「历史重算」。
-- 正确判据应是反证式：若真全量重算，末轮 TTFT ≈ ctx×冷 prefill 斜率（r1 turn8 100k 应 ~40s，实测 6.8s ≈ 只算新增 12k）。即「末轮实测 TTFT / 冷算预估」比值远小于 1 ⇒ 生效。
-- 修法建议：① 优先用客户端每请求 `usage.prompt_tokens_details.cached_tokens`（需 bench 落盘 usage，一次改造永久权威）；② 无 usage 时用「末轮 TTFT vs 冷 prefill 预估」比值替代斜率比值/绝对阈值；③ 服务端 /metrics 累计命中率只能作旁证（被 warm runs 主导，不能证明多轮命中）。
+- 现象（r1 报告实锤）：斜率比值判据在单发参照系被缓存污染时给出 727% 天文数字，把「缓存实际生效」误判成「未命中」并触发错误建议。
+- 落地：`classify_cache` 重写为**反证式判据链**——①客户端 `cached_tokens`（多轮第 2 轮起、键存在才计）中位 >0 ⇒ 生效（服务端自报，最硬证据；键缺失 ≠ 0）；②末轮实测 TTFT ÷ 冷算预估（末轮 ctx × 单发斜率）<0.5 生效 / >0.8 未命中 / 之间部分命中——实测远快于全量重算 ⇒ 必有缓存，对参照系污染免疫；③服务端 /metrics 累计命中率只作旁证。分析表加「缓存证据」列，结论区按证据文本陈述。
 
 
 ## 1. probe 增加 tool-call 检测（默认开启，`--no-toolcall` 关闭）【已实现，2026-09-09】
@@ -590,36 +586,29 @@ thinking mode/levels 双轨（levels 优先已显式声明并告警）；api_key
 > （FP8 量化税、prefix caching 可用性、max_num_seqs 调参）归环境文档，不进本清单。
 > 逐项按指标冻结纪律指认层次（报告层 = 纯 Python / 诊断层 / 数据面）。
 
-**12.1 报告脚本版本握手**（报告层）
-- 现状：`gen_html_report.py` 在本仓库与测试工作区各一份拷贝——本次 CSS 修复两处各改一遍，漂移已实际发生。
-- 要做：落盘 JSON 已带 `tool` 版本号 → 脚本加载时校验与自身版本同源，不匹配打告警（不拒绝渲染）；
-  声明本仓库为官方源，工作区拷贝属派生。
+**12.1 报告脚本版本握手**【已实现，2026-09-16】（报告层）
+- 现状：`gen_html_report.py` 在本仓库与测试工作区各一份拷贝——CSS 修复两处各改一遍，漂移已实际发生。
+- 落地：`merge` 归集全部输入的 `tool` 字段 → 多版本混用或非 `llm-perf` 家族（`TOOL_FAMILY` 前缀）时第 2 节头部打 ⚠️ 告警（不拒绝渲染）；声明本仓库为官方源。
 
-**12.2 统计键去 omitempty**（数据面，小改）
+**12.2 统计键去 omitempty**【已实现，2026-09-16】（数据面，小改）
 - 实测发现：并发档 `slo_meet=0` 时键整体缺失（r2 的 CC=16/64 两档），消费方无法区分"0 达标"与"未统计"。
-- 要做：goodput / slo_meet 等统计键对齐 10.1 `Deviation` 先例——0 是有意义的结果，恒落盘。
+- 落地：`slo_meet`/`slo_total`/`goodput_rps`/`goodput_tps` 恒落盘（对齐 10.1 `Deviation` 先例）——`slo_total>0 且 slo_meet=0` = 整档 0 达标，`slo_total=0` = 未配置。
 
-**12.3 multiturn 深度实测校验**（诊断层）
-- 实测踩坑：`turn_tokens: 12000` 名义末轮 ≈108k，实测仅 89.8k/96.1k（filler 语料抽样去重/边界不足额），
-  调到 13500 两轮才达标——**名义外推系统性偏乐观 10–15%**。
-- 要做：`MultiturnRun` 落盘末轮 `usage.prompt_tokens`（数据已有，补出口）；报告"测试画像"区显示
-  实测深度 vs 名义深度，偏差 >10% 告警（复用 10.3"报告横轴 usage 实测分箱"的既有立场）。
+**12.3 multiturn 深度实测校验**【已实现，2026-09-16】（诊断层）
+- 实测踩坑：名义外推系统性偏乐观 10–15%（filler 语料抽样去重/边界不足额），两轮实测坐实。
+- 落地：`MultiturnRun` 落盘 `last_prompt_tokens`（最后一个非零 prompt 轮）与 `nominal_last_prompt`（Go 侧 filler 口径：`(system+tool_defs+turns×turn_tokens)×1.07`，trace 模式为 0）；报告多轮表加「深度画像对照」注记、结论区偏差 >10% 告警。
 
-**12.4 闭环并发拐点自动结论**（报告层，纯 Python）
+**12.4 闭环并发拐点自动结论**【已实现，2026-09-16】（报告层，纯 Python）
 - 实测：r2 各档聚合吞吐 264→391→420→405→330 tok/s，CC=8→16 边际增益仅 ~2%，人眼扫表才看出。
-- 要做：9.2 的拐点口径（≥0.9× 峰值 / goodput 达标上限）目前只覆盖开环速率维度，闭环 levels 补
-  同款自动结论 + "边际增益 <5% 首档"标注。
+- 落地：`gen_conclusions` 补闭环 levels 版拐点结论（只取 level>0 且无 request_rate 的档位）——0.9×峰值平台起点 + 「边际增益 <5% 首档」+ TTFT 膨胀倍数，与 9.2 开环口径对齐。
 
-**12.5 running_max 观测对偶**（诊断层，小改）
-- 教训：`max_num_seqs` 跨环境误沿用（120 实为 8）导致 r1 并发结论方向性误读；服务端参数 API 取不到，
-  靠人记录不可靠。
-- 要做：9.4 已落 `waiting_max`，对称补 `running_max`（`num_requests_running` 场景窗口峰值）——
-  "加并发吞吐不涨"时一眼看出服务端槽位天花板；报告并发表加一列。
+**12.5 running_max 观测对偶**【已实现，2026-09-16】（诊断层，小改）
+- 教训：`max_num_seqs` 跨环境误沿用（120 实为 8）导致 r1 并发结论方向性误读；服务端参数 API 取不到，靠人记录不可靠。
+- 落地：GaugePoller 泛化出 running 访问器对偶（`LatestRunning`/`RunningSampleCount`/`RunningSamplesSince`），`startSaturationWatch` 双峰值追踪（同款窗口内新样本口径），`ConcurrentLevel` 落盘 `running_max`；报告并发表加「running 峰值」列 + 注记（waiting 标定排队阈值，running 核对调度容量）。
 
-**12.6 报告脚本异常形状回归 fixture**（报告层）
+**12.6 报告脚本异常形状回归 fixture**【已实现，2026-09-16】（报告层）
 - 背景：ladder 结论生成对超时档（TTFT=None 桶）取下标崩溃，已修（2026-09-15）；smoke 只覆盖正常数据形状。
-- 要做：给 `gen_html_report.py` 补最小 fixture 断言——超时档 / 全 None / 零样本档 / `slo_meet` 缺失
-  四类异常形状下报告不崩、缺口如实显示（NA 不硬算，与 5.2 同语义）。
+- 落地：新增 `scripts/report_fixtures_test.py`——超时档 / 全 None / 零样本 / 旧 JSON（新字段缺失）/ 缓存判据四路 / 版本握手，六组形状断言不崩、缺口如实显示；落地过程顺带抓出并修复 3 个真实崩溃点（`rc_all` None 毒进中位数、纯多轮数据 baseline 段 KeyError、`ttft_ms=None` 除零）。
 
 ---
 
@@ -642,7 +631,7 @@ thinking mode/levels 双轨（levels 优先已显式声明并告警）；api_key
           + smoke 三类别回归）【2026-09-13】
 剩余：  10.5 稳定性 soak（5.7 会话续跑提级为 soak 原语 + 报告稳定性区）
         → 5.9 补样至 n≥20 后定起步值
-        → 12 自部署实测复盘清单（12.2/12.5 小改先行 → 12.3/12.4/12.6 报告与诊断层 → 12.1 版本握手）
+        → 12 自部署实测复盘清单 12.1–12.9 全部落地【2026-09-16】
 暂缓/条件触发：见文末「附：暂缓与条件触发」——按各自的复活条件启动，不排期。
 ```
 

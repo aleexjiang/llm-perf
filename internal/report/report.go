@@ -34,6 +34,26 @@ type MultiturnRun struct {
 	// 报告侧据此标爬坡窗口；0/空 = 该档位未启用爬坡（barrier 齐射）。
 	Batch        int     `json:"batch,omitempty"`
 	StartOffsetS float64 `json:"start_offset_s,omitempty"`
+
+	// 12.3 multiturn 深度实测校验：
+	// LastPromptTokens 末轮（最后一个 usage.prompt_tokens>0 的成功轮）实测 prompt_tokens——
+	//   名义外推（turn_tokens×turns）系统性偏乐观 10–15%（filler 语料抽样去重/边界不足额），
+	//   落盘实测值供报告侧画像区对照，偏差 >10% 告警。
+	// NominalLastPrompt 名义末轮上下文（filler 口径：基座+轮数×每轮增量，×1.07 模板开销）；
+	//   0 = trace 模式（轮次来自回放会话，名义值无意义，实测深度即原会话深度）。
+	LastPromptTokens  int `json:"last_prompt_tokens,omitempty"`
+	NominalLastPrompt int `json:"nominal_last_prompt,omitempty"`
+}
+
+// FillLastPromptTokens 12.3：从轮次数据回填末轮实测 prompt_tokens（倒序找第一个 >0 的成功轮，
+// 中途失败/截断的会话也能拿到最后一个可用深度）。
+func (r *MultiturnRun) FillLastPromptTokens() {
+	for i := len(r.Turns) - 1; i >= 0; i-- {
+		if r.Turns[i].PromptTokens > 0 {
+			r.LastPromptTokens = r.Turns[i].PromptTokens
+			return
+		}
+	}
 }
 
 // ConcurrentLevel：一个模型在一个并发档位 × 思考模式下的结果。
@@ -51,11 +71,14 @@ type ConcurrentLevel struct {
 	WallSeconds   float64               `json:"wall_seconds"`
 	ThroughputTPS float64               `json:"throughput_tps"` // 整体 completion tokens/s
 
-	// goodput（SLO 约束吞吐，配置了 goodput 时填充）：SLOMeet/SLOTotal 为达标/总请求数（多轮按 turn 计）
-	SLOMeet    int     `json:"slo_meet,omitempty"`
-	SLOTotal   int     `json:"slo_total,omitempty"`
-	GoodputRPS float64 `json:"goodput_rps,omitempty"` // 达标请求 / 墙钟
-	GoodputTPS float64 `json:"goodput_tps,omitempty"` // 达标请求的 completion tokens / 墙钟
+	// goodput（SLO 约束吞吐，配置了 goodput 时填充）：SLOMeet/SLOTotal 为达标/总请求数（多轮按 turn 计）。
+	// 刻意不带 omitempty（12.2）：0 是有意义的结果——slo_total>0 时 slo_meet=0 =「整档 0 达标」；
+	// slo_total=0 = 未配置 slo.goodput（未统计）。加 omitempty 后两种情况键都消失，
+	// 消费方无法区分「0 达标」与「没测」。对齐 SourceCheck.Deviation 的先例。
+	SLOMeet    int     `json:"slo_meet"`
+	SLOTotal   int     `json:"slo_total"`
+	GoodputRPS float64 `json:"goodput_rps"` // 达标请求 / 墙钟
+	GoodputTPS float64 `json:"goodput_tps"` // 达标请求的 completion tokens / 墙钟
 
 	// 混合负载形状分解（concurrent.mix，5.6）：按形状聚合的中位数统计；Requests 全量不动
 	Shapes []ShapeStat `json:"shapes,omitempty"`
@@ -64,6 +87,12 @@ type ConcurrentLevel struct {
 	// 不可用或未采样）。与饱和止损是否启用无关，常开记录——它是 saturation_guard.max_waiting
 	// 的标定数据源（建议阈值 = 峰值 × 3–5，报告侧会自动给出建议值）。
 	WaitingMax float64 `json:"waiting_max,omitempty"`
+
+	// RunningMax 本档位观测到的 running 并发执行数峰值（服务端 /metrics gauge；0 = 观测层
+	// 不可用或未采样）。与 WaitingMax 成对的观测对偶（12.5）：服务端参数 API 取不到
+	// max_num_seqs，靠人记录不可靠（实测踩坑：120 误沿用实为 8 造成方向性误读）——
+	// 「加并发吞吐不涨」时对照本值即可一眼看出服务端槽位天花板。
+	RunningMax float64 `json:"running_max,omitempty"`
 
 	// Aborted 非空 = 本档位被提前终止（5.7 爬坡发车的 fail-fast / 全局止损；
 	// saturation_guard 的饱和/墙钟 drain），值为终止原因；场景层据此停止后续档位。

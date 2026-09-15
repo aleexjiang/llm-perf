@@ -106,18 +106,19 @@ func (lr *levelRun) finish() {
 // startSaturationWatch 档位级 waiting 观测器。观测层可用（pol != nil）时**常开**：
 // 即便饱和判据未启用也记录本档 waiting 峰值（读场景级 GaugePoller 的采样缓存，
 // 不产生额外抓取请求）——这是 max_waiting 的标定数据源（lv.WaitingMax）。
+// 同时对称记录 running 执行数峰值（12.5 观测对偶，lv.RunningMax）。
 // 启用判据（MaxWaiting > 0）时，持续超阈达窗口 → lr.Trip。
 //
 // 峰值口径 = **本档窗口内新采到的样本**（起档时记下标，只累计之后的样本）：
 // 用 LatestWaiting 会把上一档的残留帧算进来（串档位），且采样 tick 比档位长时
 // 会整个漏掉本档观测段 —— 两者都让标定建议值失真。窗口结束时额外定格一次。
 //
-// 返回 waitMax（读本档峰值，档位结束后读取）与 wait（等 goroutine 退出）。
+// 返回 waitMax/runMax（读本档 waiting/running 峰值，档位结束后读取）与 wait（等 goroutine 退出）。
 func startSaturationWatch(ctx context.Context, sg *config.SaturationGuardCfg,
-	pol *smetrics.GaugePoller, lr *levelRun) (waitMax func() float64, wait func()) {
+	pol *smetrics.GaugePoller, lr *levelRun) (waitMax func() float64, runMax func() float64, wait func()) {
 
 	if pol == nil {
-		return func() float64 { return 0 }, func() {}
+		return func() float64 { return 0 }, func() float64 { return 0 }, func() {}
 	}
 	armed := sg != nil && sg.SatEnabled() && sg.MaxWaiting > 0
 	interval := 5 * time.Second
@@ -126,8 +127,10 @@ func startSaturationWatch(ctx context.Context, sg *config.SaturationGuardCfg,
 	}
 	var mu sync.Mutex
 	maxSeen := 0.0
+	runMaxSeen := 0.0
 	// 本档窗口起点：只统计此后新增的样本（档位开始前已有的帧属于上一档/预热期）
 	peakBase := pol.WaitingSampleCount()
+	runPeakBase := pol.RunningSampleCount()
 	done := make(chan struct{})
 	dec := &saturationDecider{
 		maxWaiting: float64(sg.GetMaxWaiting()),
@@ -135,16 +138,18 @@ func startSaturationWatch(ctx context.Context, sg *config.SaturationGuardCfg,
 	}
 	loggedOver := false // 超阈状态沿只提示一次（进饱和区说一声，别每个 tick 刷屏）
 	tripped := false    // 本判据是否已触发（仅 goroutine 内读写，无需加锁）
-	// refreshPeak 把本档窗口内新采到的样本并入峰值（不触发抓取，纯读缓存）
+	// refreshPeak 把本档窗口内新采到的样本并入峰值（waiting 判定用 + running 观测对偶 12.5；
+	// 不触发抓取，纯读缓存）
 	refreshPeak := func() {
-		xs := pol.WaitingSamplesSince(peakBase)
-		if len(xs) == 0 {
-			return // 本档尚无观测：maxSeen 只记真实观测，不造假数
-		}
 		mu.Lock()
-		for _, w := range xs {
+		for _, w := range pol.WaitingSamplesSince(peakBase) {
 			if w > maxSeen {
 				maxSeen = w
+			}
+		}
+		for _, r := range pol.RunningSamplesSince(runPeakBase) {
+			if r > runMaxSeen {
+				runMaxSeen = r
 			}
 		}
 		mu.Unlock()
@@ -160,6 +165,11 @@ func startSaturationWatch(ctx context.Context, sg *config.SaturationGuardCfg,
 		mu.Lock()
 		if w > maxSeen {
 			maxSeen = w
+		}
+		// running 对偶（12.5）：与 waiting 同样直读最新帧兜底——refreshPeak 只累计
+		// 窗口内新样本，起档早于轮询首采时窗口内可能暂时无新样本，直读保证不漏观测段
+		if r, rok := pol.LatestRunning(); rok && r > runMaxSeen {
+			runMaxSeen = r
 		}
 		mu.Unlock()
 		if !armed {
@@ -203,8 +213,12 @@ func startSaturationWatch(ctx context.Context, sg *config.SaturationGuardCfg,
 		}
 	}()
 	return func() float64 {
-		mu.Lock()
-		defer mu.Unlock()
-		return maxSeen
-	}, func() { <-done }
+			mu.Lock()
+			defer mu.Unlock()
+			return maxSeen
+		}, func() float64 {
+			mu.Lock()
+			defer mu.Unlock()
+			return runMaxSeen
+		}, func() { <-done }
 }
