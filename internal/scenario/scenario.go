@@ -278,13 +278,22 @@ func startWindow(ctx context.Context, e *env) (*smetrics.Sample, *smetrics.Gauge
 	return before, poller, start
 }
 
+// finalScrapeCtx 结束快照的独立 ctx（12.11）：场景 ctx 此时可能已被取消——运行中断
+// （SIGHUP/Ctrl+C）或降速熔断（scancel）——而结束快照恰恰是窗口差值的唯一来源。
+// r1-off S5 实测：中断场景 server_metrics.available=false、queue/prefill/decode 分解与
+// preemptions 差值整段丢失，只能靠实时 /metrics 手工回溯。独立限时 ctx 不被取消传播
+// 波及（正常路径无行为差异）；超时（5s 上限）如实记失败，不阻塞退出。
+func finalScrapeCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), 5*time.Second)
+}
+
 // finishWindow 汇总场景窗口的服务端观测。
 //
 // Available 的语义严格限定为「**窗口差值**（counter/hist）是否取到」：结束快照失败时窗口差值
 // 无从计算，此时 Available=false 并保留 Note 说明原因——已轮询到的 gauges 仍然有效，照常挂回。
 // 这样报告侧能如实区分「已采集 / 已启用但未取到 / 未提供」，不会把一次失败渲染成全零面板
 // （历史 bug：中断场景下 available=true 且计数器全空，报告输出一句「服务端观测（single）：。」）。
-func finishWindow(ctx context.Context, e *env, before *smetrics.Sample,
+func finishWindow(e *env, before *smetrics.Sample,
 	poller *smetrics.GaugePoller, start time.Time) *report.ServerMetricsSummary {
 	if e.srv == nil || before == nil {
 		if poller != nil {
@@ -301,7 +310,9 @@ func finishWindow(ctx context.Context, e *env, before *smetrics.Sample,
 				h.Samples, h.ConsecutiveFailures, h.LastError)
 		}
 	}
-	after, err := e.srv.Scrape(ctx)
+	sctx, cancel := finalScrapeCtx()
+	after, err := e.srv.Scrape(sctx)
+	cancel()
 	if err != nil {
 		summary.Note = "结束快照抓取失败（本场景无窗口差值）: " + err.Error()
 		return summary
@@ -328,7 +339,7 @@ func finishWindow(ctx context.Context, e *env, before *smetrics.Sample,
 //
 // 两边同分母：本场景各档位墙钟之和（客户端侧吞吐本就是这个口径），因此比较等价于 token 量比较。
 // 观测层缺失 / 引擎不暴露生成 token 数 / 无有效档位 → 只写 Note 记 NA，不改任何结论。
-func applySourceCheck(ctx context.Context, e *env, rep *report.Report, before *smetrics.Sample) {
+func applySourceCheck(e *env, rep *report.Report, before *smetrics.Sample) {
 	if rep == nil || len(rep.Concurrent) == 0 {
 		return // 非并发场景（single/multiturn 无聚合吞吐口径）不做该检查
 	}
@@ -352,7 +363,9 @@ func applySourceCheck(ctx context.Context, e *env, rep *report.Report, before *s
 		rep.SourceCheck = sc
 		return
 	}
-	after, err := e.srv.Scrape(ctx)
+	sctx, cancel := finalScrapeCtx() // 12.11：中断场景同样要保住两源一致性差值（独立 ctx）
+	after, err := e.srv.Scrape(sctx)
+	cancel()
 	if err != nil {
 		sc.Note = "末档位后快照抓取失败：" + err.Error()
 		rep.SourceCheck = sc
@@ -491,7 +504,7 @@ func Single(ctx context.Context, cfg *config.Config, client *engine.Client, mode
 	}
 	applySLO(e, rep)
 	before, poller, winStart := startWindow(ctx, e)
-	defer func() { rep.Server = finishWindow(ctx, e, before, poller, winStart) }()
+	defer func() { rep.Server = finishWindow(e, before, poller, winStart) }()
 
 	for _, model := range filterModels(cfg.ActiveModels(), modelFilter) {
 		_, mc := forModel(e, cfg, model) // 该模型生效配置（model_overrides 差异覆盖）
@@ -651,7 +664,7 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 	}
 	applySLO(e, rep)
 	before, poller, winStart := startWindow(ctx, e)
-	defer func() { rep.Server = finishWindow(ctx, e, before, poller, winStart) }()
+	defer func() { rep.Server = finishWindow(e, before, poller, winStart) }()
 
 	for _, model := range filterModels(cfg.ActiveModels(), modelFilter) {
 		_, mc := forModel(e, cfg, model) // 该模型生效配置（model_overrides 差异覆盖）
@@ -919,7 +932,7 @@ func Concurrent(ctx context.Context, cfg *config.Config, client *engine.Client, 
 	}
 	applySLO(e, rep)
 	before, poller, winStart := startWindow(ctx, e)
-	defer func() { rep.Server = finishWindow(ctx, e, before, poller, winStart) }()
+	defer func() { rep.Server = finishWindow(e, before, poller, winStart) }()
 	// 10.1 两源一致性：为交叉校验单开一对**更窄**的快照窗口——首个档位开始前 → 末个档位结束后。
 	// 刻意避开预热与金丝雀：场景窗口把它们算进服务端 token，而客户端侧的口径只含档位请求，
 	// 小数据集下这点偏差足以造出假告警（本轮观察窗口必须两侧同源）。
@@ -934,7 +947,7 @@ func Concurrent(ctx context.Context, cfg *config.Config, client *engine.Client, 
 			chkBefore, _ = e.srv.Scrape(ctx)
 		}
 	}
-	defer func() { applySourceCheck(ctx, e, rep, chkBefore) }()
+	defer func() { applySourceCheck(e, rep, chkBefore) }()
 	// 饱和止损判据一依赖 waiting 排队深度（场景级 GaugePoller）；观测层不可用时提前
 	// 说一声——waiting 判定不生效，墙钟上限（判据二）仍有效
 	if cfg.SaturationGuard.SatEnabled() && cfg.SaturationGuard.MaxWaiting > 0 && poller == nil {
@@ -1173,7 +1186,9 @@ func runClosedRound(ctx context.Context, e *env, cfg *config.Config,
 	waitingMax, runningMax, satWait := startSaturationWatch(roundCtx, sat, pol, lr)
 
 	ramp := cc.RampEnabled() && level > 1
-	// 失败语义（仅爬坡路径）：全局连续失败计数，达 2×level 止损终止本轮
+	// 失败语义（仅爬坡路径）：全局连续失败计数，达 2×level 止损终止本轮。
+	// 12.11：本轮被取消（运行中断/fail-fast/止损）**之后**产生的请求错误不计失败——
+	// 判别用 roundCtx.Err()（请求 ctx 即 roundCtx，取消先于错误浮出，时序上恒可靠）。
 	var firstTurnFail, stopLoss atomic.Bool
 	globalConsec := 0
 	markFail := func() {
@@ -1224,6 +1239,14 @@ func runClosedRound(ctx context.Context, e *env, cfg *config.Config,
 				if !ramp {
 					return true
 				}
+				// 12.11：本轮已被取消（运行中断 SIGHUP/Ctrl+C、fail-fast、止损）——取消
+				// 产生的错误是"我们取消的"而非"服务端失败"：不计失败、不触发止损，
+				// 避免人工中断被误报成「全局连续失败」（r1-off S5 的 aborted 误报根因）。
+				// 本会话到此为止，已完成轮次照常保留。
+				if roundCtx.Err() != nil {
+					markFirst()
+					return false
+				}
 				if turn == 0 {
 					markFirst()
 					if m.Error != "" {
@@ -1270,17 +1293,19 @@ func runClosedRound(ctx context.Context, e *env, cfg *config.Config,
 			seed := workerSeed(workerID, r, cfg.SeedSalt) // 每用户不同 prompt
 			msgs := []engine.Message{engine.UserMsg(promptTokens, seed, cfg.FillerLang)}
 			m := runOne(roundCtx, e, model, msgs, reqMaxTok, v)
+			// 12.11：取消产生的错误不计失败（同 multiturn hook 的 roundCtx.Err() 判别）
 			if r == 0 {
 				markFirst()
-				if ramp && m.Error != "" {
+				if ramp && m.Error != "" && roundCtx.Err() == nil {
 					firstTurnFail.Store(true)
 					roundCancel()
 				}
 			}
 			if ramp {
-				if m.Error != "" {
+				switch {
+				case m.Error != "" && roundCtx.Err() == nil:
 					markFail()
-				} else {
+				case m.Error == "":
 					markOK()
 				}
 			}
@@ -1333,9 +1358,12 @@ func runClosedRound(ctx context.Context, e *env, cfg *config.Config,
 		log.Printf("⛔ %s", lv.Aborted)
 	} else if stopLoss.Load() {
 		lv.Aborted = "全局连续失败达 2×level，止损终止（爬坡发车）"
-	} else {
-		// 饱和/墙钟触发的原因由 lr.Trip 记录并已打日志；正常跑完 Reason 为空
-		lv.Aborted = lr.Reason()
+	} else if r := lr.Reason(); r != "" {
+		lv.Aborted = r // 饱和/墙钟触发的原因（lr.Trip 记录时已打日志）
+	} else if ctx.Err() != nil {
+		// 12.11：运行中断（SIGHUP/Ctrl+C）——真实原因必须留痕，别让「没跑完」看起来像服务端问题
+		lv.Aborted = "运行中断（SIGHUP/Ctrl+C），场景未跑完（已完成数据照常保留）"
+		log.Printf("⛔ %s", lv.Aborted)
 	}
 	lv.Shapes = aggregateShapes(mp, lv.Requests, shapeIdxs)
 	finalizeLevel(e, lv, time.Since(start).Seconds())
@@ -1455,7 +1483,12 @@ func runOpenRound(ctx context.Context, e *env, cfg *config.Config,
 	satWait()
 	lv.WaitingMax = waitingMax()
 	lv.RunningMax = runningMax()
-	lv.Aborted = lr.Reason()
+	if r := lr.Reason(); r != "" {
+		lv.Aborted = r
+	} else if ctx.Err() != nil {
+		// 12.11：运行中断（SIGHUP/Ctrl+C）——真实原因留痕（同闭环口径）
+		lv.Aborted = "运行中断（SIGHUP/Ctrl+C），场景未跑完（已完成数据照常保留）"
+	}
 	lv.Shapes = aggregateShapes(mp, lv.Requests, shapeIdxs)
 	finalizeLevel(e, lv, time.Since(start).Seconds())
 	return *lv

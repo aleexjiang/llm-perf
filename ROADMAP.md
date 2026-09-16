@@ -2,7 +2,7 @@
 
 > 原「三件事」（probe tool-call 检测 / trace 回放增强 / 硬编码改造）已全部完成（第 1–3 节）。
 > 当前在途：**第 10 节体系收敛**的 10.5 稳定性 soak（`renew` + 时长制 + 报告稳定性区）；
-> 第 12 节 12.11 中断语义修正 + 12.12 KV 容量画像。
+> 第 12 节 12.12 KV 容量画像。
 > （5.9 起步值补样移出在途清单、不再跟踪——首轮取证结论已够用。）
 > 新增（2026-09-15）：**第 12 节 自部署实测复盘**——qwen3.8-27b 双环境四轮实测中工具硌手点清单。
 > 已完成（2026-09-13）：10.4 suite 层（`test:` 类别 + 报告按类别切结论区 + 基准套件预设）；
@@ -44,13 +44,12 @@
   - 验收：`stall_test.go` 补并发劣化用例（多流同降触发 / 单流偶发抖动不触发）、`scripts/stall-e2e` mockserver 加多并发慢流场景、smoke.sh 全绿。
 - 落地：`StallGuard` 退化为纯装配（阈值/窗口/采样 + 流集合），`NewStream()` 句柄制记账（`Tokens` 首个正增量即出首 token；`Done` 注销），判定 = 各流窗口增量速率取**中位**，流从**下一个采样窗**起参与（首窗不满窗不判）；client 接线改为 `m.onToken = st.Tokens` + `defer st.Done()`。`stall.csv` 列序 `t_s,agg_tps,med_tps,in_flight,emitting,phase`（agg 观测面恒记、med 判定面可判流不足时留空），`# tripped` 行含 `med_rate=… streams=N`；note/日志/CLI 文案全部改单流口径。验收：单测 12 个（含多流同降 / 单流异常不拖垮中位两个新用例）；smoke 12d 新增 8 路并发慢流（单流 5 < 20 触发、聚合 ≈40 ≥ 20 不触发——正是旧口径漏掉的形态）【2026-09-16】
 
-### 12.11 中断取消误差 → 失败语义误报「止损终止」+ 结束快照丢失【候选，2026-09-16】
+### 12.11 中断取消误差 → 失败语义误报「止损终止」+ 结束快照丢失【已实现，2026-09-16】
 
 - 现象（r1-off S5 实测，01:19:46 SIGHUP 优雅中断）：
   - 中断取消产生的 46 个 turn 错误（16×`stream broken: context canceled` + 30×POST `context canceled`）全部计入爬坡失败语义 `markFail`；连续链 46 ≥ 2×level=40 触发 `stopLoss`，档位 `aborted` 被写成「全局连续失败达 2×level，止损终止（爬坡发车）」——**真实原因（运行端人工中断）被覆盖，易被误读为服务端失败**。S5 全程零真实请求失败。
   - 同一取消 ctx 令结束快照失败：`server_metrics.available=false`、`source_check.note` 均为「结束快照抓取失败: context canceled」——场景级 counter/histogram 窗口差值全丢（queue/prefill/decode 分解、preemptions 差值[本次恰为真 0]）。本次靠实时 /metrics 累计值手工回溯补足，不可依赖。
-- 修复方向：hook 判 `roundCtx.Err() != nil`（或 `errors.Is(err, context.Canceled)`）时不计失败、不触发止损；`Aborted` 记因补「运行中断」优先级；结束快照用独立 ctx / 或在取消传播前执行。
-- 影响面：仅中断路径的产物真实性与可读性；正常跑完不受影响。但属「数据不真」类缺陷，按纪律优先处理。
+- 落地：判别用 `roundCtx.Err() != nil`（请求 ctx 即 roundCtx，取消先于错误浮出，时序上恒可靠）——取消产生的请求错误不计 `markFail`、不触发止损、不算首轮失败（爬坡 hook / 单发并发循环 / 开环三处入口统一；已取消且未出错的两不计数）；`Aborted` 记因补「运行中断（SIGHUP/Ctrl+C），场景未跑完（已完成数据照常保留）」分支，排在真实终止原因（首轮失败/止损/饱和墙钟）之后——同轮既有真实触发又有中断时以真实原因为准；`finishWindow` / `applySourceCheck` 结束快照改用独立限时 ctx（`finalScrapeCtx()`，5s 上限），取消不再传播到收尾抓取，超时如实记失败不阻塞退出。验收：单测补对偶用例（取消 ctx 后结束快照仍可用 / 真失败仍如实降级为 available=false）；smoke 12e 新增 SIGHUP × 并发多轮（aborted=运行中断、全文不含止损/首轮失败文案）【2026-09-16】
 
 ### 12.12 KV 静态容量画像进 probe / 报告（cache_config_info 消费）【候选，2026-09-16】
 
@@ -659,9 +658,8 @@ thinking mode/levels 双轨（levels 优先已显式声明并告警）；api_key
           probe filler_fidelity 自举校准 / 报告横轴 usage 实测分箱）【2026-09-12】
         → 10.4 suite 层（`test:` 类别 + 报告按类别切结论区 + 基准套件预设 configs/benchmark.yaml
           + smoke 三类别回归）【2026-09-13】
-剩余：  12.11 中断语义修正 → 12.12 KV 容量画像
-        → 10.5 稳定性 soak（5.7 会话续跑提级为 soak 原语 + 报告稳定性区）
-已清（2026-09-16）：12.1–12.10 全部落地；5.9 起步值补样移出在途、不再跟踪。
+剩余：  12.12 KV 容量画像 → 10.5 稳定性 soak（5.7 会话续跑提级为 soak 原语 + 报告稳定性区）
+已清（2026-09-16）：12.1–12.11 全部落地；5.9 起步值补样移出在途、不再跟踪。
 暂缓/条件触发：见文末「附：暂缓与条件触发」——按各自的复活条件启动，不排期。
 ```
 

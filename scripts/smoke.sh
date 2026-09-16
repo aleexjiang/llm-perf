@@ -14,7 +14,8 @@
 #   开环到达率（request_rate/num_prompts/max_concurrency）configs/smoke-openloop.yaml
 #   思考档位 levels 机制 + 档位名过滤       configs/smoke-levels.yaml
 #   -m 模型过滤 / --max-ctx 截断
-#   SIGHUP 优雅中断 / 降速熔断（两场景相继熔断续跑；12.10 单流判据·多并发慢流）+ stall_trace 落盘
+#   SIGHUP 优雅中断（单发多轮 + 12.11 中断语义·并发多轮）/ 降速熔断（两场景相继熔断续跑；
+#   12.10 单流判据·多并发慢流）+ stall_trace 落盘
 #   8.2 熔断恢复探针（未恢复停整轮 / 恢复后续跑）+ 5.7 闭环爬坡发车批次落盘
 #   参数错误路径（非法变体名 / levels 下用 on / 多场景 -o 单文件）
 #   报告管线（gen_html_report.py + validate_report.js）
@@ -220,6 +221,27 @@ MOCK_STALL_C_PID=""
 #      的 concurrent 段已设 ramp: false）——正是 r1-off S5 漏熔断的形态。
 run "多并发慢流（聚合高/单流低，单流判据必触发）" out-stall-conc -c "$TMP/smoke-stall.yaml" \
   --turns single --concurrency 8 --stall-tps 20
+
+# 12e) 12.11 中断语义：复用慢速 mock，并发多轮跑到一半发 SIGHUP——取消产生的请求错误
+#      不得计入「连续失败/首轮失败」，档位 aborted 必须写「运行中断」（r1-off S5 误报形态）。
+#      --no-stall-guard 隔离变量（慢流会先触发熔断）；turns 拉到 8 保证中断时都还在飞。
+sed 's/^  turns: 2$/  turns: 8/' "$TMP/smoke-stall.yaml" \
+  | awk '{print} /^concurrent:$/{print "  multiturn: true"}' >"$TMP/hup-conc.yaml"
+echo "==> bench(SIGHUP 中断·并发多轮): 12.11 中断语义验证"
+"$BENCH" -c "$TMP/hup-conc.yaml" --turns multi --concurrency 4 -o "$TMP/out-hup-conc" \
+  --no-stall-guard >"$TMP/out-hup-conc.log" 2>&1 &
+HUP2_PID=$!
+sleep 2
+kill -HUP "$HUP2_PID" 2>/dev/null || true
+HUP2_RC=0
+wait "$HUP2_PID" || HUP2_RC=$?
+if [ "$HUP2_RC" != 0 ]; then
+  echo "❌ SIGHUP（并发多轮）应优雅退出（rc=${HUP2_RC}）；日志:"; tail -20 "$TMP/out-hup-conc.log"; exit 1
+fi
+if [ -z "$(find "$TMP/out-hup-conc" -name '*.json' 2>/dev/null)" ]; then
+  echo "❌ SIGHUP（并发多轮）中断后没有 JSON 落盘；日志:"; tail -20 "$TMP/out-hup-conc.log"; exit 1
+fi
+echo "  ✅ SIGHUP（并发多轮）优雅退出且数据落盘"
 
 # ── 断言：校验输出 JSON 的模型×变体分布与指标完整性，不再靠目测 ──
 echo "==> 断言输出数据形状"
@@ -509,6 +531,16 @@ if ccsv:
           "conc: 聚合速度曾 ≥20（旧聚合口径不会触发——12.10 要修的正是这一形态）")
     check(any(f[2] and float(f[2]) < 20 for f in rows),
           "conc: 单流中位曾 <20（判定面捕捉到普遍劣化）")
+
+# 11e) 12.11 中断语义：SIGHUP × 并发多轮——取消产生的错误不计失败，aborted 必须写「运行中断」
+hc = load_all("out-hup-conc")
+check(len(hc) >= 1, f"SIGHUP（并发多轮）后 JSON 落盘（实际 {len(hc)} 份）")
+if hc:
+    lvs = hc[0].get("concurrent") or []
+    ab = lvs[0].get("aborted") if lvs else None
+    check(bool(ab) and "运行中断" in ab, f"档位 aborted=运行中断（实际 {ab!r}）")
+    check("止损终止" not in (ab or "") and "首轮失败" not in (ab or ""),
+          "取消错误未被误判成止损/首轮失败（r1-off S5 误报形态不回归）")
 
 if failures:
     print(f"\n❌ 冒烟断言失败 {len(failures)} 项")

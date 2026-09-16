@@ -596,15 +596,15 @@ func metricsStub(t *testing.T) *httptest.Server {
 // 报告据此走「未提供 /metrics」分支，而不是渲染一个全零面板。
 func TestFinishWindowNilWhenObservationOff(t *testing.T) {
 	e := &env{cfg: testCfg(t, "http://127.0.0.1:1"), perReqSrv: true} // srv == nil = 观测关闭
-	if got := finishWindow(context.Background(), e, nil, nil, time.Time{}); got != nil {
+	if got := finishWindow(e, nil, nil, time.Time{}); got != nil {
 		t.Fatalf("观测层关闭时应返回 nil，实际: %+v", got)
 	}
 }
 
-// 结束快照失败（用取消 ctx 模拟 SIGINT）时：Available 必须为 false 且保留原因。
-// 回归背景：旧实现写 available=true + 全零计数器，报告渲染出一句「服务端观测（single）：。」。
-// 窗口内已轮询到的 gauges 独立于结束快照，应照常挂回。
-func TestFinishWindowNoWindowDeltaOnFailedSnapshot(t *testing.T) {
+// 12.11：结束快照用独立 ctx——场景 ctx 被取消（SIGHUP/Ctrl+C 中断、降速熔断 scancel）
+// 时快照仍须抓取成功。中断场景的窗口差值是唯一的服务端数据来源；旧行为（取消传播导致
+// 抓取失败）会把 queue/prefill/decode 分解与 preemptions 差值整段丢掉（r1-off S5 实测）。
+func TestFinishWindowSnapshotSurvivesCancelledCtx(t *testing.T) {
 	stub := metricsStub(t)
 	e := &env{cfg: testCfg(t, stub.URL), perReqSrv: true}
 	e.srv = smetrics.NewScraperAt(stub.URL, "/metrics")
@@ -617,7 +617,40 @@ func TestFinishWindowNoWindowDeltaOnFailedSnapshot(t *testing.T) {
 		t.Fatalf("前置快照应抓取成功: %v", err)
 	}
 	e.provider = smetrics.DetectProvider(before)
-	winStart := time.Now() // 窗口起点：结束快照失败时窗口时长无意义，但签名要求（0 值亦可）
+	winStart := time.Now()
+
+	pctx, pcancel := context.WithCancel(context.Background())
+	poller := smetrics.StartGaugePoller(pctx, e.srv, 5*time.Millisecond, e.provider)
+	pcancel()
+	cancel() // 场景被取消（中断）：结束快照不得受其波及
+
+	sum := finishWindow(e, before, poller, winStart)
+	if sum == nil {
+		t.Fatal("应返回汇总而不是 nil")
+	}
+	if !sum.Available {
+		t.Fatalf("12.11：场景 ctx 已取消时结束快照仍应抓取成功（note=%q）", sum.Note)
+	}
+	if sum.Note != "" {
+		t.Errorf("快照成功不应带失败 note，实际 %q", sum.Note)
+	}
+}
+
+// 结束快照真失败（服务端不可达）时：Available 必须为 false 且保留原因。
+// 回归背景：旧实现写 available=true + 全零计数器，报告渲染出一句「服务端观测（single）：。」。
+// 窗口内已轮询到的 gauges 独立于结束快照，应照常挂回。
+func TestFinishWindowNoWindowDeltaOnFailedSnapshot(t *testing.T) {
+	stub := metricsStub(t)
+	e := &env{cfg: testCfg(t, stub.URL), perReqSrv: true}
+	e.srv = smetrics.NewScraperAt(stub.URL, "/metrics")
+	e.cfg.MetricsPath = "/metrics"
+
+	before, err := e.srv.Scrape(context.Background())
+	if err != nil || before == nil {
+		t.Fatalf("前置快照应抓取成功: %v", err)
+	}
+	e.provider = smetrics.DetectProvider(before)
+	winStart := time.Now()
 
 	pctx, pcancel := context.WithCancel(context.Background())
 	poller := smetrics.StartGaugePoller(pctx, e.srv, 5*time.Millisecond, e.provider)
@@ -627,9 +660,9 @@ func TestFinishWindowNoWindowDeltaOnFailedSnapshot(t *testing.T) {
 	}
 	gotSamples := poller.Health().Samples > 0
 	pcancel()
-	cancel() // 结束快照必然失败
+	stub.Close() // 服务端下线 → 结束快照必然失败
 
-	sum := finishWindow(live, e, before, poller, winStart)
+	sum := finishWindow(e, before, poller, winStart)
 	if sum == nil {
 		t.Fatal("应返回带失败原因的汇总而不是 nil——nil 会被报告误判成「未启用 /metrics」")
 	}

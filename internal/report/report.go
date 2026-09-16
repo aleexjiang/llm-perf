@@ -95,7 +95,8 @@ type ConcurrentLevel struct {
 	RunningMax float64 `json:"running_max,omitempty"`
 
 	// Aborted 非空 = 本档位被提前终止（5.7 爬坡发车的 fail-fast / 全局止损；
-	// saturation_guard 的饱和/墙钟 drain），值为终止原因；场景层据此停止后续档位。
+	// saturation_guard 的饱和/墙钟 drain；12.11 起补「运行中断（SIGHUP/Ctrl+C）」），
+	// 值为终止原因；场景层据此停止后续档位。
 	// drain 语义：已发出的请求全部保留完整数据，仅样本量少于配置值。
 	Aborted string `json:"aborted,omitempty"`
 }
