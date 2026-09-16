@@ -136,6 +136,7 @@ func planScenario(mc *config.Config, it PlanItem) *report.PlanScenario {
 	case "concurrent", "concurrent-multi":
 		cc := mc.Concurrent
 		mixN := len(cc.Mix)
+		profN := len(mc.Multiturn.Profiles)
 		// 开环（request_rate/rate_sweep）在场景层优先于 levels，画像必须同口径——否则会报出
 		// 一个永远不会执行的档位矩阵（默认 levels=[1,2,4,8,16] 在开环配置下仍在线上，
 		// 曾把小配置的请求量估到实际值的 7 倍以上）。
@@ -152,7 +153,11 @@ func planScenario(mc *config.Config, it PlanItem) *report.PlanScenario {
 			if it.MT {
 				// 开环多轮：num_prompts 是**会话数**，每会话跑满 turns 轮——请求量按轮计
 				// （与闭环 multiturn 的 level × turns 同口径，否则画像与执行量差一个 turns 倍数）
-				unit = fmt.Sprintf("%d 会话/档（每会话 %d 轮）", n, effectiveTurns(mc))
+				if profN > 0 {
+					unit = fmt.Sprintf("%d 会话/档（轮数按档位，混跑 %d 档）", n, profN)
+				} else {
+					unit = fmt.Sprintf("%d 会话/档（每会话 %d 轮）", n, effectiveTurns(mc))
+				}
 			}
 			total := 0
 			for _, v := range vs {
@@ -162,7 +167,7 @@ func planScenario(mc *config.Config, it PlanItem) *report.PlanScenario {
 				}
 				per := n
 				if it.MT {
-					per = n * effectiveTurns(mc)
+					per = effectiveTurnsSum(mc, n) // 混合档逐会话求和（均匀档与 n×turns 等价）
 				}
 				total += tiers * len(rates) * per
 			}
@@ -189,6 +194,11 @@ func planScenario(mc *config.Config, it PlanItem) *report.PlanScenario {
 		if it.MT {
 			if mixN > 0 {
 				mode = "多轮（mix 与 multiturn 互斥，此组合不会出现）"
+			} else if profN > 0 {
+				mode = fmt.Sprintf("每用户多轮会话 × turns 按档位（混跑 %d 档）", profN)
+				if dur > 0 {
+					mode += fmt.Sprintf(" × 每档跑满 %ds（时长制：请求数取决于吞吐）", dur)
+				}
 			} else if dur > 0 {
 				mode = fmt.Sprintf("每用户多轮会话 × turns=%d × 每档跑满 %ds（时长制：请求数取决于吞吐）",
 					effectiveTurns(mc), dur)
@@ -216,7 +226,7 @@ func planScenario(mc *config.Config, it PlanItem) *report.PlanScenario {
 				for _, level := range levels {
 					per := level * cc.RunsPerWorker
 					if it.MT {
-						per = level * effectiveTurns(mc)
+						per = effectiveTurnsSum(mc, level) // 混合档逐会话求和（均匀档等价 level×turns）
 					}
 					total += tiers * per
 				}
@@ -238,7 +248,32 @@ func planScenario(mc *config.Config, it PlanItem) *report.PlanScenario {
 
 // effectiveTurns 多轮会话的有效轮数（filler 口径：max_prompt_tokens 截止可能提前停轮）。
 func effectiveTurns(mc *config.Config) int {
+	return effTurnsOf(mc, mc.Multiturn)
+}
+
+// effectiveTurnsAt 会话 idx 的有效轮数（混合档按所属档位口径；无 profiles 时同 effectiveTurns）。
+func effectiveTurnsAt(mc *config.Config, sessionIdx int) int {
 	mt := mc.Multiturn
+	if p, ok := profileAt(mt, sessionIdx); ok {
+		mt.TurnTokens = p.TurnTokens
+		if p.Turns > 0 {
+			mt.Turns = p.Turns
+		}
+	}
+	return effTurnsOf(mc, mt)
+}
+
+// effectiveTurnsSum 前 n 个会话（序号 0..n-1，与发车序号一一对应）的有效轮数之和——
+// 混合档下各会话轮数不同，请求量须逐会话求和（均匀档下与 n×effectiveTurns 相等）。
+func effectiveTurnsSum(mc *config.Config, n int) int {
+	sum := 0
+	for idx := 0; idx < n; idx++ {
+		sum += effectiveTurnsAt(mc, idx)
+	}
+	return sum
+}
+
+func effTurnsOf(mc *config.Config, mt config.Multiturn) int {
 	if mt.TurnTokens <= 0 || mc.MaxPromptTokens <= 0 {
 		return mt.Turns
 	}

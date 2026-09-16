@@ -728,6 +728,13 @@ func TestNominalLastPrompt(t *testing.T) {
 	if got := nominalLastPrompt(false, config.Multiturn{Turns: 8}); got != 0 {
 		t.Fatalf("turn_tokens=0 应为 0，got %d", got)
 	}
+	// 5.11 混合档：名义末轮按会话所属档位（轮数/增量）计算
+	mtP := config.Multiturn{SystemTokens: 1000, ToolDefsTokens: 500, Turns: 8, TurnTokens: 4000,
+		Profiles: []config.MixProfile{{Weight: 1, TurnTokens: 1000, Turns: 2}}}
+	// (1000+500+2×1000)×1.07 = 3745
+	if got := nominalLastPromptAt(false, mtP, 0); got != 3745 {
+		t.Fatalf("混合档名义末轮应为 3745，got %d", got)
+	}
 }
 
 // FirstMatchedModel：与场景侧 filterModels 同一 -m 子串语义（恢复探针取首个匹配）。
@@ -749,5 +756,93 @@ func TestFirstMatchedModel(t *testing.T) {
 	}
 	if got := FirstMatchedModel(nil, ""); got != "" {
 		t.Fatalf("空列表应返回空串: %q", got)
+	}
+}
+
+// ── 5.11 混合档（multiturn.profiles）：SWRR 分配 / 分档求和 / 并发分档执行 ──
+
+// profileAt 平滑加权轮转（同 nginx smooth）：3:1 按周期 [A,A,B,A] 循环，
+// 一周期内精确覆盖权重比——确定性分配（同配置重跑一致，不引入随机）。
+func TestProfileAt(t *testing.T) {
+	mt := config.Multiturn{Profiles: []config.MixProfile{
+		{Weight: 3, Name: "real", TurnTokens: 5000, Turns: 32},
+		{Weight: 1, Name: "heavy", TurnTokens: 27500, Turns: 8},
+	}}
+	want := []string{"real", "real", "heavy", "real", "real", "real", "heavy", "real"}
+	for i, w := range want {
+		p, ok := profileAt(mt, i)
+		if !ok || p.Name != w {
+			t.Fatalf("idx %d = %q(ok=%v), want %q", i, p.Name, ok, w)
+		}
+	}
+	cnt := map[string]int{}
+	for i := 0; i < 4; i++ { // 一周期内精确 3:1
+		p, _ := profileAt(mt, i)
+		cnt[p.Name]++
+	}
+	if cnt["real"] != 3 || cnt["heavy"] != 1 {
+		t.Fatalf("一周期分布应 3:1，got %v", cnt)
+	}
+	if _, ok := profileAt(config.Multiturn{}, 0); ok {
+		t.Fatal("无 profiles 应 ok=false")
+	}
+}
+
+// effectiveTurnsSum：混合档逐会话求和（前 n 个会话与发车序号一一对应；均匀档等价 n×turns）。
+func TestEffectiveTurnsSum(t *testing.T) {
+	mc := &config.Config{Multiturn: config.Multiturn{Profiles: []config.MixProfile{
+		{Weight: 2, Name: "a", TurnTokens: 5000, Turns: 4},
+		{Weight: 1, Name: "b", TurnTokens: 5000, Turns: 2},
+	}}}
+	// 权重 2:1 前 3 会话 = a,b,a → 4+2+4 = 10
+	if got := effectiveTurnsSum(mc, 3); got != 10 {
+		t.Fatalf("混合档求和 = %d, want 10", got)
+	}
+	plain := &config.Config{Multiturn: config.Multiturn{Turns: 3, TurnTokens: 5000}}
+	if got := effectiveTurnsSum(plain, 5); got != 15 {
+		t.Fatalf("均匀档求和 = %d, want 15", got)
+	}
+}
+
+// TestConcurrentMultiturnProfiles 集成：并发多轮混合档——会话按所属档位决定轮数，
+// MultiturnRun 带档位标签（报告侧按档分组切体验的数据源）。
+func TestConcurrentMultiturnProfiles(t *testing.T) {
+	state := &stubState{}
+	srv := sseStub(t, state)
+
+	cfg := testCfg(t, srv.URL)
+	cfg.Multiturn = config.Multiturn{
+		Sessions: 2, Turns: 5, TurnTokens: 5000, MaxTokens: config.IntList{16}, KeepAssistant: true,
+		Profiles: []config.MixProfile{
+			{Weight: 1, Name: "light", TurnTokens: 100, Turns: 3},
+			{Weight: 1, Name: "heavy", TurnTokens: 200, Turns: 1},
+		},
+	}
+	cfg.Concurrent = config.Concurrent{Levels: []int{2}, Multiturn: true, RunsPerWorker: 1, MaxTokens: config.IntList{16}}
+
+	rep, err := Concurrent(context.Background(), cfg, engine.NewClient(srv.URL, "", 10*time.Second, true), "")
+	if err != nil {
+		t.Fatalf("Concurrent: %v", err)
+	}
+	sess := rep.Concurrent[0].Sessions
+	if len(sess) != 2 {
+		t.Fatalf("应有 2 会话（level×1 runs），得到 %d", len(sess))
+	}
+	byIdx := map[int]report.MultiturnRun{}
+	for _, s := range sess {
+		byIdx[s.Session] = s
+	}
+	// 权重 1:1 → 会话序号 0/1 分属 light/heavy（SWRR 交替）
+	light, heavy := byIdx[1], byIdx[2]
+	if light.Profile != "light" || heavy.Profile != "heavy" {
+		t.Fatalf("档位标签：%q / %q, want light/heavy", light.Profile, heavy.Profile)
+	}
+	if len(light.Turns) != 3 || len(heavy.Turns) != 1 {
+		t.Fatalf("逐档轮数：light=%d heavy=%d, want 3/1", len(light.Turns), len(heavy.Turns))
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.count != 4 { // 3 + 1 轮：档位轮数直接决定发车量
+		t.Fatalf("总请求 = %d, want 4", state.count)
 	}
 }

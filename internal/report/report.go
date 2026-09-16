@@ -24,11 +24,16 @@ type SingleRow struct {
 
 // MultiturnRun：一个模型的一次多轮会话（每 turn 均含思考时长）。
 type MultiturnRun struct {
-	Model     string                `json:"model"`
-	Thinking  string                `json:"thinking"` // "on" / "off"
-	Session   int                   `json:"session"`
-	MaxTokens int                   `json:"max_tokens"` // 输出长度（max_tokens 扫描维度；thinking=on 时已含 floor 抬高）
-	Turns     []*engine.TurnMetrics `json:"turns"`
+	Model     string `json:"model"`
+	Thinking  string `json:"thinking"` // "on" / "off"
+	Session   int    `json:"session"`
+	MaxTokens int    `json:"max_tokens"` // 输出长度（max_tokens 扫描维度；thinking=on 时已含 floor 抬高）
+
+	// 5.11 混合档：本会话所属档位名（multiturn.profiles.name）；空 = 未启用混合档。
+	// 报告/分析按此分组切各档位体验（TTFT、单流速度等）。
+	Profile string `json:"profile,omitempty"`
+
+	Turns []*engine.TurnMetrics `json:"turns"`
 
 	// 5.7 闭环错峰发车：批次号（1 起）与相对本档位开始的启动偏移（秒）。
 	// 报告侧据此标爬坡窗口；0/空 = 该档位未启用爬坡（barrier 齐射）。

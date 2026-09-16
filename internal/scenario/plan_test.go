@@ -166,3 +166,28 @@ func TestPlanSummaryDuration(t *testing.T) {
 		t.Fatalf("总行应说明不含时长制档位: %s", outs)
 	}
 }
+
+// 混合档（5.11 multiturn.profiles）：并发多轮请求量逐会话按档位求和，画像标档位数。
+func TestPlanSummaryProfiles(t *testing.T) {
+	cfg := &config.Config{
+		Endpoint: "http://x:1/v1",
+		Models:   []string{"m1"},
+		Multiturn: config.Multiturn{Sessions: 2, Turns: 4, SystemTokens: 100, ToolDefsTokens: 100,
+			TurnTokens: 200, MaxTokens: config.IntList{32},
+			Profiles: []config.MixProfile{
+				{Weight: 2, Name: "real", TurnTokens: 100, Turns: 4},
+				{Weight: 1, Name: "heavy", TurnTokens: 100, Turns: 2},
+			}},
+		Concurrent: config.Concurrent{Levels: []int{3}, RunsPerWorker: 1, MaxTokens: config.IntList{32}},
+	}
+	cfg.Thinking.Mode = "off"
+	p := PlanSummary(cfg, "", []PlanItem{{Name: "concurrent-multi", MT: true, Highs: []int{3}}})
+	got := p.Models[0].Scenarios[0]
+	// 权重 2:1 前 3 会话 = real,heavy,real → 4+2+4 = 10（load 后 level×turns 口径不再适用）
+	if got.Requests != 10 {
+		t.Fatalf("混合档估算 %d ≠ 10（%s）", got.Requests, got.Detail)
+	}
+	if !strings.Contains(got.Detail, "混跑 2 档") {
+		t.Fatalf("混合档画像应标档位数: %s", got.Detail)
+	}
+}

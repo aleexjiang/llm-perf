@@ -1111,3 +1111,104 @@ concurrent:
 		t.Fatalf("renew 非多轮应报错, got %v", err)
 	}
 }
+
+// ── 5.11 混合档（multiturn.profiles）：校验 + 告警 + 可达深度 ──
+
+func TestLoad_MultiturnProfiles(t *testing.T) {
+	// 合法：name 留空补 profileN；逐档位可达深度告警；标量 turn_tokens 并存 → 让位告警
+	p := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+multiturn:
+  turns: 32
+  system_tokens: 26000
+  tool_defs_tokens: 8000
+  turn_tokens: 5000
+  profiles:
+    - {weight: 3, turn_tokens: 5000, turns: 32}
+    - {weight: 1, name: heavy, turn_tokens: 27500, turns: 8}
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ps := cfg.Multiturn.Profiles
+	if len(ps) != 2 {
+		t.Fatalf("profiles 应解析 2 档，got %d", len(ps))
+	}
+	if ps[0].Name != "profile1" || ps[1].Name != "heavy" {
+		t.Errorf("name 留空应补 profileN：%q / %q", ps[0].Name, ps[1].Name)
+	}
+	joined := strings.Join(cfg.Warnings, "\n")
+	// profile1：base 34000 + 32 轮 × 5000 = 194000；heavy：34000 + 8 × 27500 = 254000
+	if !strings.Contains(joined, "混合档 profile1（权重 3）") || !strings.Contains(joined, "194000") {
+		t.Errorf("应逐档位打印可达深度，got: %v", cfg.Warnings)
+	}
+	if !strings.Contains(joined, "标量 turn_tokens 不再参与") {
+		t.Errorf("profiles 与标量并存应告警让位，got: %v", cfg.Warnings)
+	}
+	// MultiturnMaxDepth 取最深档位（heavy 254000 深于 profile1 194000）
+	if got := cfg.MultiturnMaxDepth(); got != 254000 {
+		t.Errorf("MultiturnMaxDepth 应取最深档位 254000，got %d", got)
+	}
+}
+
+func TestLoad_MultiturnProfilesRejected(t *testing.T) {
+	base := "endpoint: \"http://x:1/v1\"\nmodels: [\"m1\"]\nmultiturn:\n  profiles:\n"
+	cases := []struct {
+		name  string
+		block string
+		want  string
+	}{
+		{"weight=0", "    - {weight: 0, turn_tokens: 5000}\n", "必须为正整数"},
+		{"turn_tokens 缺失", "    - {weight: 1}\n", "turn_tokens"},
+		{"turn_tokens 过大", "    - {weight: 1, turn_tokens: 300000}\n", "过大"},
+		{"turns 为负", "    - {weight: 1, turn_tokens: 5000, turns: -1}\n", "不能为负"},
+		{"name 重复", "    - {weight: 1, name: x, turn_tokens: 5000}\n    - {weight: 1, name: x, turn_tokens: 5000}\n", "重复"},
+	}
+	for _, c := range cases {
+		if _, err := Load(writeTemp(t, base+c.block)); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: 应报含 %q 的错误, got %v", c.name, c.want, err)
+		}
+	}
+
+	// trace 互斥（filler 先行）：重放的会话形状来自数据，无法按权重分档
+	dir := t.TempDir()
+	tracePath := filepath.Join(dir, "trace.json")
+	if err := os.WriteFile(tracePath, []byte("[]"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+dataset:
+  mode: trace
+  path: `+tracePath+`
+multiturn:
+  profiles:
+    - {weight: 1, turn_tokens: 5000}
+`)
+	if _, err := Load(p); err == nil || !strings.Contains(err.Error(), "trace") {
+		t.Fatalf("profiles + trace 应互斥报错, got %v", err)
+	}
+}
+
+// MultiturnMaxDepth：均匀档 = base + turns×turn_tokens；混合档取最深；无增量 = 0。
+func TestMultiturnMaxDepth(t *testing.T) {
+	cfg := &Config{Multiturn: Multiturn{SystemTokens: 1000, ToolDefsTokens: 500, Turns: 8, TurnTokens: 4000}}
+	if got := cfg.MultiturnMaxDepth(); got != 33500 {
+		t.Errorf("均匀档 = %d, want 33500", got)
+	}
+	cfg.Multiturn.TurnTokens = 0
+	if got := cfg.MultiturnMaxDepth(); got != 0 {
+		t.Errorf("无增量 = %d, want 0", got)
+	}
+	cfg.Multiturn = Multiturn{SystemTokens: 100, Turns: 4, TurnTokens: 100,
+		Profiles: []MixProfile{
+			{Weight: 1, TurnTokens: 100, Turns: 4},
+			{Weight: 2, TurnTokens: 100, Turns: 8},
+		}}
+	if got := cfg.MultiturnMaxDepth(); got != 900 {
+		t.Errorf("混合档应取最深 = %d, want 900", got)
+	}
+}

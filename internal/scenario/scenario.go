@@ -621,6 +621,52 @@ func nominalLastPrompt(trace bool, mt config.Multiturn) int {
 	return int(float64(mt.SystemTokens+mt.ToolDefsTokens+mt.Turns*mt.TurnTokens) * 1.07)
 }
 
+// profileAt 混合档（5.11）：按平滑加权轮转把会话序号映射到档位；无 profiles 时 ok=false。
+// 与 5.6 mixPlan 同款算法（nginx smooth weighted round-robin）：确定性分配、
+// 同配置重跑结果一致（不引入随机）。返回的档位切片为浅拷贝，只读使用。
+func profileAt(mt config.Multiturn, sessionIdx int) (config.MixProfile, bool) {
+	n := len(mt.Profiles)
+	if n == 0 {
+		return config.MixProfile{}, false
+	}
+	total := 0
+	for _, p := range mt.Profiles {
+		total += p.Weight
+	}
+	if total <= 0 {
+		return config.MixProfile{}, false // Load 已拦（weight>0），兜底防除零
+	}
+	pos := sessionIdx % total // 序号 -1 的偏移落在首轮内，序号≥0 才是合法输入
+	if pos < 0 {
+		pos += total
+	}
+	cur := make([]int, n)
+	best := 0
+	for j := 0; j <= pos; j++ {
+		bestVal := -1
+		for i := 0; i < n; i++ {
+			cur[i] += mt.Profiles[i].Weight
+			if cur[i] > bestVal {
+				best, bestVal = i, cur[i]
+			}
+		}
+		cur[best] -= total
+	}
+	return mt.Profiles[best], true
+}
+
+// nominalLastPromptAt 混合档口径的名义末轮深度：按会话所属档位（增量/轮数）计算；
+// 无 profiles 时与 nominalLastPrompt 全等。
+func nominalLastPromptAt(trace bool, mt config.Multiturn, sessionIdx int) int {
+	if p, ok := profileAt(mt, sessionIdx); ok {
+		if p.Turns > 0 {
+			mt.Turns = p.Turns
+		}
+		mt.TurnTokens = p.TurnTokens
+	}
+	return nominalLastPrompt(trace, mt)
+}
+
 // sessionUserTurns 取会话的 user 消息序列：trace 模式来自回放会话，filler 模式返回 nil（走 token 填充）。
 func (e *env) sessionUserTurns(sessionIdx int) []string {
 	if e.trace == nil {
@@ -688,6 +734,9 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 	for _, model := range filterModels(cfg.ActiveModels(), modelFilter) {
 		_, mc := forModel(e, cfg, model) // 该模型生效配置（model_overrides 差异覆盖）
 		mt := mc.Multiturn               // 遮蔽外层通用值（Note 仍描述通用基线；覆盖差异见 thinkingNoteSuffix）
+		if len(mt.Profiles) > 0 {
+			log.Printf("⚠️ multiturn.profiles 仅并发多轮生效：本次单发多轮忽略档位，会话统一用 turn_tokens=%d（--concurrency 2,4,… 时按档位分配）", mt.TurnTokens)
+		}
 		th := mc.Thinking
 		if len(th.Variants()) == 0 { // thinking 过滤后无匹配变体：整模型跳过（不发 warmup）
 			log.Printf("  %s: 无匹配的思考变体，跳过", model)
@@ -836,6 +885,11 @@ func collectSessionTurns(ctx context.Context, e *env, cfg *config.Config,
 	hook sessionTurnHook) []*engine.TurnMetrics {
 
 	mt := cfg.Multiturn
+	prof, hasProf := profileAt(mt, sessionIdx) // 混合档（5.11）：按会话序号取档位（无配置则零值）
+	turnTokens := mt.TurnTokens
+	if hasProf {
+		turnTokens = prof.TurnTokens
+	}
 	baseSeed, turnSeed := sessionSeeds(cfg, sessionIdx)
 	msgs := []engine.Message{}
 	userTurns := e.sessionUserTurns(sessionIdx)
@@ -854,6 +908,9 @@ func collectSessionTurns(ctx context.Context, e *env, cfg *config.Config,
 	turns := turnLimit
 	if turns <= 0 {
 		turns = mt.Turns
+		if hasProf && prof.Turns > 0 {
+			turns = prof.Turns // 混合档：档位轮数覆盖全局（0 = 继承）
+		}
 	}
 	var out []*engine.TurnMetrics
 	lastPrompt := 0
@@ -870,7 +927,7 @@ func collectSessionTurns(ctx context.Context, e *env, cfg *config.Config,
 			}
 			msgs = append(msgs, engine.Message{Role: "user", Content: userTurns[turn]})
 		} else {
-			tt := nextTurnTokens(cfg, mt.TurnTokens, effPromptOf(lastPrompt, estPrompt))
+			tt := nextTurnTokens(cfg, turnTokens, effPromptOf(lastPrompt, estPrompt))
 			if tt <= 0 {
 				log.Printf("    worker 会话已达 max_prompt_tokens=%d 截止，提前结束（%d/%d 轮）", cfg.MaxPromptTokens, turn, turns)
 				break
@@ -931,6 +988,14 @@ func Concurrent(ctx context.Context, cfg *config.Config, client *engine.Client, 
 		labels := make([]string, len(cc.Mix))
 		for i, s := range cc.Mix {
 			labels[i] = fmt.Sprintf("%s×%d", s.Label, s.Weight)
+		}
+		loadModel += " 混跑[" + strings.Join(labels, " ") + "]"
+	}
+	if cc.Multiturn && len(cfg.Multiturn.Profiles) > 0 {
+		// 混合档（5.11）：会话按权重分属不同增量档
+		labels := make([]string, len(cfg.Multiturn.Profiles))
+		for i, p := range cfg.Multiturn.Profiles {
+			labels[i] = fmt.Sprintf("%s×%d", p.Name, p.Weight)
 		}
 		loadModel += " 混跑[" + strings.Join(labels, " ") + "]"
 	}
@@ -1254,6 +1319,9 @@ func runClosedRound(ctx context.Context, e *env, cfg *config.Config,
 			for sr := 0; ; sr++ {
 				idx := workerID + sr*level // 会话序号全局唯一（seed/Session 编号共用）
 				s := report.MultiturnRun{Model: model, Thinking: v.Name, Session: idx + 1, MaxTokens: maxTok}
+				if p, ok := profileAt(cfg.Multiturn, idx); ok {
+					s.Profile = p.Name // 混合档（5.11）：会话档位标签
+				}
 				if ramp || dur > 0 {
 					if ramp {
 						s.Batch = batchNo
@@ -1306,7 +1374,7 @@ func runClosedRound(ctx context.Context, e *env, cfg *config.Config,
 				}
 				s.Turns = collectSessionTurns(roundCtx, e, cfg, model, v, idx, 0, maxTok, hook)
 				s.FillLastPromptTokens() // 12.3：末轮实测深度
-				s.NominalLastPrompt = nominalLastPrompt(e.trace != nil, cfg.Multiturn)
+				s.NominalLastPrompt = nominalLastPromptAt(e.trace != nil, cfg.Multiturn, idx)
 				mu.Lock()
 				lv.Sessions = append(lv.Sessions, s)
 				mu.Unlock()
@@ -1473,11 +1541,14 @@ func runOpenRound(ctx context.Context, e *env, cfg *config.Config,
 			}
 			if cc.Multiturn {
 				s := report.MultiturnRun{Model: model, Thinking: v.Name, Session: i + 1, MaxTokens: maxTok}
+				if p, ok := profileAt(cfg.Multiturn, i); ok {
+					s.Profile = p.Name // 混合档（5.11）：会话档位标签
+				}
 				// drain 闸门要求会话中途也能停（已完成轮保留）
 				stopHook := sessionTurnHook(func(int, *engine.TurnMetrics) bool { return !lr.Stop() })
 				s.Turns = collectSessionTurns(roundCtx, e, cfg, model, v, i, 0, maxTok, stopHook)
 				s.FillLastPromptTokens() // 12.3：末轮实测深度
-				s.NominalLastPrompt = nominalLastPrompt(e.trace != nil, cfg.Multiturn)
+				s.NominalLastPrompt = nominalLastPromptAt(e.trace != nil, cfg.Multiturn, i)
 				mu.Lock()
 				lv.Sessions = append(lv.Sessions, s)
 				mu.Unlock()

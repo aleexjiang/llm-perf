@@ -169,6 +169,13 @@ multiturn:
   max_tokens: 256                 # 标量或列表，同 single（多轮列表会与 sessions 相乘，注意总时长）
   keep_assistant: true            # assistant 回复保留进 history（真实 agent 行为）
   max_reply_chars: 2000           # assistant 回复进 history 的截断长度（按字符计，中文安全；默认 2000）
+  # 混合档（5.11，跨会话混合）：并发多轮时（--turns multi --concurrency 2,4,…）按权重把会话
+  # 分属不同增量档——测"重度会话与轻量会话同场竞技"的容量与相互干扰（重度抢 KV 对轻量体验的
+  # 影响）。SWRR 确定性分配（与 5.6 mix 同源）；标量 turn_tokens 在并发多轮下让位于档位（并存
+  # 告警）；仅并发多轮生效，filler 专属（dataset.mode=trace 互斥）。示例：真实增量档 3 份 + 重度档 1 份：
+  # profiles:
+  #   - {weight: 3, name: real,  turn_tokens: 5000,  turns: 32}   # 对齐真实 agent 增量（AgentLens p50 +4k/轮）
+  #   - {weight: 1, name: heavy, turn_tokens: 27500, turns: 8}    # 重度注入轮（S2 口径）
 
 # 场景三：并发（单轮或多轮由 multiturn 决定；闭环 levels 与开环到达率二选一）
 concurrent:

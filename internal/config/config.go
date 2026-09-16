@@ -78,6 +78,22 @@ type Multiturn struct {
 	// 逐轮 user 内容**始终**按会话独立（与基座共享与否无关），否则会话之间会变成
 	// 逐字节相同，跨会话对比与 per-session 统计都失去意义。
 	SharedBase *bool `yaml:"shared_base"`
+
+	// Profiles 混合档（5.11）：非空时并发多轮的会话按权重分属不同增量档（跨会话混合）——
+	// 测"重度会话与轻量会话同场竞技"时的容量与相互干扰（重度抢 KV 对轻量体验的影响）。
+	// 会话增量/轮数由所属档位决定，标量 TurnTokens 在并发多轮下忽略（并存时告警）；
+	// 分配用平滑加权轮转（与 5.6 concurrent.mix 同源，确定性可复现）。
+	// 仅并发多轮生效（单发多轮忽略并提示）；filler 专属——dataset.mode=trace 时加载报错。
+	Profiles []MixProfile `yaml:"profiles"`
+}
+
+// MixProfile 混合档的会话档位（5.11）：并发多轮时按权重把会话分配到不同增量档。
+// 典型用法：真实增量档（+5k/轮）占多数 + 重度档（+27.5k/轮）占少数。
+type MixProfile struct {
+	Weight     int    `yaml:"weight"`      // 相对权重（正整数）
+	Name       string `yaml:"name"`        // 档位名（报告分组用，留空自动 profile1/profile2…不可重复）
+	TurnTokens int    `yaml:"turn_tokens"` // 该档每轮增量
+	Turns      int    `yaml:"turns"`       // 该档会话轮数（0 = 继承 multiturn.turns）
 }
 
 // GetSharedBase 基座是否跨会话共享（未配置默认 true）。
@@ -519,6 +535,9 @@ func (c *Config) ForModel(model string) *Config {
 		if s.MaxReplyChars > 0 {
 			m.MaxReplyChars = s.MaxReplyChars
 		}
+		if len(s.Profiles) > 0 {
+			m.Profiles = s.Profiles // 档位切片运行期只读，浅拷贝即可（同 Concurrent.Mix）
+		}
 		v.Multiturn = m
 	}
 	if s := ov.Concurrent; s != nil {
@@ -912,6 +931,7 @@ func Load(path string) (*Config, error) {
 	if len(cfg.Single.MaxTokens) == 0 {
 		cfg.Single.MaxTokens = IntList{512}
 	}
+	rawMultiturnTurnTokens := cfg.Multiturn.TurnTokens // 供 profiles 并存告警判别标量是否被显式填写
 	if cfg.Multiturn.Sessions <= 0 {
 		cfg.Multiturn.Sessions = 2
 	}
@@ -957,7 +977,7 @@ func Load(path string) (*Config, error) {
 	// 混合负载（5.6）：形状校验 + 与单值/扫描维度的冲突告警
 	if len(cfg.Concurrent.Mix) > 0 {
 		if cfg.Concurrent.Multiturn {
-			return nil, fmt.Errorf("concurrent.mix 与 multiturn: true 互斥：多轮会话的形状由 multiturn 配置（或 trace 数据）决定，无法按权重混跑")
+			return nil, fmt.Errorf("concurrent.mix 与 multiturn: true 互斥：多轮会话的形状由 multiturn 配置（或 trace 数据）决定，无法按权重混跑；跨会话混合请用 multiturn.profiles")
 		}
 		seen := map[string]bool{}
 		for i := range cfg.Concurrent.Mix {
@@ -1056,7 +1076,7 @@ func Load(path string) (*Config, error) {
 		cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
 			"multiturn.turns=%d 偏少：TTFT 逐轮斜率与前缀缓存判定至少需要 4 轮才可靠（建议 8–16 轮）", cfg.Multiturn.Turns))
 	}
-	if cfg.Multiturn.TurnTokens > 0 {
+	if cfg.Multiturn.TurnTokens > 0 && len(cfg.Multiturn.Profiles) == 0 {
 		base := cfg.Multiturn.SystemTokens + cfg.Multiturn.ToolDefsTokens
 		reach := base + cfg.Multiturn.Turns*cfg.Multiturn.TurnTokens
 		w := fmt.Sprintf("多轮可达深度：base %d + %d 轮 × %d ≈ 末轮 %d token",
@@ -1065,6 +1085,54 @@ func Load(path string) (*Config, error) {
 			w += fmt.Sprintf("（超过 max_prompt_tokens=%d，到顶后提前停轮）", cfg.MaxPromptTokens)
 		}
 		cfg.Warnings = append(cfg.Warnings, w)
+	}
+
+	// 混合档（5.11）：会话按权重分属不同增量档——校验 + 逐档位可达深度（标量深度行让位于此）
+	if len(cfg.Multiturn.Profiles) > 0 {
+		seenProf := map[string]bool{}
+		base := cfg.Multiturn.SystemTokens + cfg.Multiturn.ToolDefsTokens
+		for i := range cfg.Multiturn.Profiles {
+			p := &cfg.Multiturn.Profiles[i]
+			if p.Weight <= 0 {
+				return nil, fmt.Errorf("multiturn.profiles[%d].weight 必须为正整数（相对权重）", i)
+			}
+			if p.TurnTokens <= 0 {
+				return nil, fmt.Errorf("multiturn.profiles[%d].turn_tokens 必须为正（该档每轮增量）", i)
+			}
+			if p.TurnTokens > 200000 {
+				return nil, fmt.Errorf("multiturn.profiles[%d].turn_tokens=%d 过大：单条 user 消息大概率超过模型上下文上限（同 multiturn.turn_tokens 上限 200000）",
+					i, p.TurnTokens)
+			}
+			if p.Turns < 0 {
+				return nil, fmt.Errorf("multiturn.profiles[%d].turns 不能为负（0 = 继承 multiturn.turns）", i)
+			}
+			if p.Name == "" {
+				p.Name = fmt.Sprintf("profile%d", i+1)
+			}
+			if seenProf[p.Name] {
+				return nil, fmt.Errorf("multiturn.profiles name %q 重复（报告按 name 分组）", p.Name)
+			}
+			seenProf[p.Name] = true
+			effTurns := p.Turns
+			if effTurns <= 0 {
+				effTurns = cfg.Multiturn.Turns
+			}
+			reach := base + effTurns*p.TurnTokens
+			w := fmt.Sprintf("混合档 %s（权重 %d）：base %d + %d 轮 × %d ≈ 末轮 %d token",
+				p.Name, p.Weight, base, effTurns, p.TurnTokens, reach)
+			if cfg.MaxPromptTokens > 0 && reach > cfg.MaxPromptTokens {
+				w += fmt.Sprintf("（超过 max_prompt_tokens=%d，到顶后提前停轮）", cfg.MaxPromptTokens)
+			}
+			cfg.Warnings = append(cfg.Warnings, w)
+		}
+		if rawMultiturnTurnTokens > 0 {
+			cfg.Warnings = append(cfg.Warnings,
+				"multiturn.profiles 已配置：并发多轮的会话增量/轮数由各档位决定，标量 turn_tokens 不再参与（单发多轮不受影响）")
+		}
+		if cfg.Dataset.Mode == "trace" {
+			return nil, fmt.Errorf(
+				"multiturn.profiles 与 dataset.mode=trace 互斥：重放的会话形状（轮数/增量）来自 trace 数据，无法按权重分档；请去掉 profiles——trace 的跨会话差异天然来自真实会话")
+		}
 	}
 
 	// thinking levels：变体名唯一；levels 生效时提示 mode/extra_body 被覆盖
@@ -1132,10 +1200,8 @@ func Load(path string) (*Config, error) {
 	if n := len(cfg.Single.PromptTokens); n > 0 && cfg.Single.PromptTokens[n-1] >= 100000 {
 		deepCtx = true
 	}
-	if cfg.Multiturn.TurnTokens > 0 {
-		if reach := cfg.Multiturn.SystemTokens + cfg.Multiturn.ToolDefsTokens + cfg.Multiturn.Turns*cfg.Multiturn.TurnTokens; reach >= 100000 {
-			deepCtx = true
-		}
+	if cfg.MultiturnMaxDepth() >= 100000 {
+		deepCtx = true
 	}
 	if cfg.TimeoutSeconds > 3600 {
 		cfg.Warnings = append(cfg.Warnings, fmt.Sprintf("timeout_seconds=%d 超过 1 小时：确认不是把毫秒当秒填了", cfg.TimeoutSeconds))
@@ -1208,9 +1274,8 @@ func Load(path string) (*Config, error) {
 		}
 	}
 
-	// 多轮深度与单发档位的衔接
-	if cfg.Multiturn.TurnTokens > 0 && len(cfg.Single.PromptTokens) > 0 {
-		reach := cfg.Multiturn.SystemTokens + cfg.Multiturn.ToolDefsTokens + cfg.Multiturn.Turns*cfg.Multiturn.TurnTokens
+	// 多轮深度与单发档位的衔接（混合档取最深档位口径）
+	if reach := cfg.MultiturnMaxDepth(); reach > 0 && len(cfg.Single.PromptTokens) > 0 {
 		if top := cfg.Single.PromptTokens[len(cfg.Single.PromptTokens)-1]; reach < top {
 			cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
 				"多轮可达深度（~%d）低于单发最大档位（%d）：多轮曲线无法覆盖单发最深处，两场景在最深处的形态差异测不到", reach, top))
@@ -1557,6 +1622,30 @@ func (c *Config) ClampOne(tokens int) int {
 	return tokens
 }
 
+// MultiturnMaxDepth 多轮场景可达的最深上下文（混合档取最深档位；未配置返回 0）。
+// 口径与执行一致：档位 turns 覆盖时按该档位（base + turns×turn_tokens）计算。
+func (c *Config) MultiturnMaxDepth() int {
+	mt := c.Multiturn
+	base := mt.SystemTokens + mt.ToolDefsTokens
+	if len(mt.Profiles) > 0 {
+		mx := 0
+		for _, p := range mt.Profiles {
+			effTurns := p.Turns
+			if effTurns <= 0 {
+				effTurns = mt.Turns
+			}
+			if r := base + effTurns*p.TurnTokens; r > mx {
+				mx = r
+			}
+		}
+		return mx
+	}
+	if mt.TurnTokens > 0 {
+		return base + mt.Turns*mt.TurnTokens
+	}
+	return 0
+}
+
 // LargestPromptTokens 返回配置中最大的单请求 prompt 规模（三场景取最大，用于超时提示与 probe 对比）。
 func (c *Config) LargestPromptTokens() int {
 	mx := 0
@@ -1565,7 +1654,7 @@ func (c *Config) LargestPromptTokens() int {
 			mx = t
 		}
 	}
-	if est := c.Multiturn.SystemTokens + c.Multiturn.ToolDefsTokens + c.Multiturn.Turns*c.Multiturn.TurnTokens; est > mx {
+	if est := c.MultiturnMaxDepth(); est > mx {
 		mx = est
 	}
 	if c.Concurrent.PromptTokens > mx {

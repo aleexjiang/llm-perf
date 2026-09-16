@@ -31,7 +31,9 @@ Report
 │                  #   只决定报告的结论区口径（首屏先说哪件事），不影响测量与判据
 ├── slo            # 本次 goodput 约束（config 配置了才填）：{ttft_ms, tpot_ms}
 ├── single[]       # SingleRow: model, thinking, prompt_tokens, max_tokens, runs[]→TurnMetrics
-├── multiturn[]    # MultiturnRun: model, thinking, session, max_tokens, turns[]→TurnMetrics
+├── multiturn[]    # MultiturnRun: model, thinking, session, max_tokens,
+│                  #   profile（5.11 混合档位名，仅 multiturn.profiles 生效时出现——报告按档分组切体验）,
+│                  #   turns[]→TurnMetrics
 ├── concurrent[]   # ConcurrentLevel: model, thinking, level, request_rate(开环>0),
 │                  #   requests[]→TurnMetrics（单轮）或 sessions[]→MultiturnRun（多轮会话，逐 turn 计量）,
 │                  #   wall_seconds, throughput_tps, slo_meet/slo_total/goodput_rps/goodput_tps,

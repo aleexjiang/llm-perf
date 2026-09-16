@@ -18,6 +18,7 @@
 #   12.10 单流判据·多并发慢流）+ stall_trace 落盘
 #   8.2 熔断恢复探针（未恢复停整轮 / 恢复后续跑）+ 5.7 闭环爬坡发车批次落盘
 #   10.5 时长制 soak（duration_seconds + renew 会话续跑）configs/smoke-soak.yaml
+#   5.11 混合档（multiturn.profiles 跨会话分派；SWRR 3:1 + 档位轮数/标签落盘）configs/smoke-profiles.yaml
 #   参数错误路径（非法变体名 / levels 下用 on / 多场景 -o 单文件）
 #   报告管线（gen_html_report.py + validate_report.js）
 #
@@ -51,7 +52,7 @@ trap cleanup EXIT
 # 漏 output-smoke*/run.log。
 # dataset.path 同理：它相对配置文件所在目录解析，配置搬到 TMP 后会指向
 # $TMP/fixtures/ 落空，需一并改写为仓库内的绝对路径。
-for f in smoke smoke-all smoke-overrides smoke-openloop smoke-sweep smoke-levels smoke-stall smoke-soak; do
+for f in smoke smoke-all smoke-overrides smoke-openloop smoke-sweep smoke-levels smoke-stall smoke-soak smoke-profiles; do
   sed -e "s#^output_dir:.*#output_dir: $TMP/runlog#" \
       -e "s#\([[:space:]]*path:[[:space:]]*[\"']\{0,1\}\)fixtures/#\1$PWD/configs/fixtures/#" \
       "configs/$f.yaml" >"$TMP/$f.yaml"
@@ -249,6 +250,11 @@ echo "  ✅ SIGHUP（并发多轮）优雅退出且数据落盘"
 run "时长制 soak（duration+renew 会话续跑）" out-soak -c "$TMP/smoke-soak.yaml" \
   --turns multi --concurrency cfg
 
+# 5.11 混合档（跨会话 profiles）：并发多轮按权重分派档位（SWRR 3:1 → real×3+heavy×1），
+#      档位轮数（real 4 / heavy 2）与 profile 标签随 JSON 落盘。
+run "混合档（profiles 跨会话分派）" out-profiles -c "$TMP/smoke-profiles.yaml" \
+  --turns multi --concurrency cfg
+
 # ── 断言：校验输出 JSON 的模型×变体分布与指标完整性，不再靠目测 ──
 echo "==> 断言输出数据形状"
 python3 - "$TMP" <<'PYEOF'
@@ -388,6 +394,23 @@ check(soak_scs and all(s.get("duration_s") == 12 for s in soak_scs),
       f"时长制画像标记 duration_s（实际 {[s.get('duration_s') for s in soak_scs]}）")
 check(soak_scs and all(s.get("requests") == 0 for s in soak_scs),
       "时长制档位请求数不估算（requests=0，由墙钟决定）")
+# 5c) 5.11 混合档：会话按权重分派档位（SWRR 3:1）+ 档位轮数/profile 标签落盘 + 画像逐会话求和
+prof_lv = [lv for rep in load_all("out-profiles") for lv in rep.get("concurrent", [])]
+prof_sess = (prof_lv[0].get("sessions") or []) if prof_lv else []
+by_sess = {s.get("session"): s for s in prof_sess}
+check(len(prof_sess) == 4, f"混合档 4 会话落盘（实际 {len(prof_sess)}）")
+tags = [by_sess.get(i, {}).get("profile") for i in (1, 2, 3, 4)]
+check(tags == ["real", "real", "heavy", "real"],
+      f"混合档 SWRR 3:1 分派（实际 {tags}）")
+turns_n = {i: len(by_sess.get(i, {}).get("turns") or []) for i in (1, 2, 3, 4)}
+check(turns_n == {1: 4, 2: 4, 3: 2, 4: 4},
+      f"混合档档位轮数（real 4 轮 / heavy 2 轮，实际 {turns_n}）")
+prof_plan = [rep.get("plan") for rep in load_all("out-profiles") if rep.get("plan")]
+prof_scs = [s for p in prof_plan for m in (p.get("models") or []) for s in (m.get("scenarios") or [])]
+check(prof_scs and all(s.get("requests") == 14 for s in prof_scs),
+      f"混合档画像逐会话求和 = 14（实际 {[s.get('requests') for s in prof_scs]}）")
+check(prof_scs and all("混跑 2 档" in (s.get("detail") or "") for s in prof_scs),
+      "混合档画像标注「混跑 2 档」")
 mt = [r for rep in reps for r in rep.get("multiturn", [])]
 check(mt and all(len(r.get("turns") or []) == 3 for r in mt), "smoke-all trace 回放多轮 3 轮齐全")
 sg = [r for rep in reps for r in rep.get("single", []) if r.get("thinking") == "off"]
