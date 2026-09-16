@@ -99,6 +99,12 @@ type ConcurrentLevel struct {
 	// 值为终止原因；场景层据此停止后续档位。
 	// drain 语义：已发出的请求全部保留完整数据，仅样本量少于配置值。
 	Aborted string `json:"aborted,omitempty"`
+
+	// 10.5 时长制 soak 标记（闭环）：DurationSeconds>0 = 时长制档位（runs_per_worker 忽略，
+	// 各 worker 跑满墙钟）；Renew = 会话滚完换新重开（多轮）。报告侧据此标稳态窗口
+	// （首批会话滚完前的暂态剔除）与首末时段漂移分析。
+	DurationSeconds float64 `json:"duration_seconds,omitempty"`
+	Renew           bool    `json:"renew,omitempty"`
 }
 
 // ShapeStat 混跑单形状统计（中位数口径与并发表一致）。

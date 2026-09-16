@@ -117,6 +117,14 @@ type Concurrent struct {
 	// Ramp 显式 false 退回齐射；RampFactor 默认 2（1 = 逐个串行发车，无爬坡意义，报错）。
 	Ramp       *bool `yaml:"ramp"`
 	RampFactor int   `yaml:"ramp_factor"`
+
+	// 10.5 时长制 soak（闭环 levels 专属；与开环互斥）：
+	// DurationSeconds > 0 → 各档位跑满该时长为止（runs_per_worker 被忽略）——单轮 worker
+	// 循环发到时长满；多轮要求 Renew: true，会话滚完 turns 轮后换新 seed 重开。
+	// Renew 语义：会话滚完换新内容重开（上下文清零重涨），暂态后在途会话年龄铺满
+	// 0~turns 区间 = 稳态；报告侧据此标稳态窗口、做首末时段漂移分析。
+	DurationSeconds int  `yaml:"duration_seconds"`
+	Renew           bool `yaml:"renew"`
 }
 
 // RampEnabled 闭环错峰发车是否启用（nil = 默认开）。
@@ -1241,6 +1249,31 @@ func Load(path string) (*Config, error) {
 	} else if cfg.Concurrent.MaxConcurrency > 0 {
 		cfg.Warnings = append(cfg.Warnings,
 			"max_concurrency 仅在开环模式（request_rate/rate_sweep）下生效，闭环 levels 模式会忽略")
+	}
+	// 10.5 时长制 soak（duration_seconds + renew；闭环专属）。约束取严格口径（fail-fast）：
+	// 开环时长由 num_prompts × 到达率决定、不适用；多轮必须显式 renew 才能跑满时长。
+	if d := cfg.Concurrent.DurationSeconds; d > 0 {
+		if openLoop {
+			return nil, fmt.Errorf(
+				"duration_seconds 仅闭环 levels 模式：开环的时长由 num_prompts × 到达率决定（请去掉 request_rate/rate_sweep 或 duration_seconds）")
+		}
+		if cfg.Dataset.Mode == "trace" {
+			return nil, fmt.Errorf(
+				"duration_seconds 暂不支持 trace 回放（会话续跑 trace 侧暂缓，filler 先行——ROADMAP 10.5）；请改用 filler 数据源")
+		}
+		if cfg.Concurrent.Multiturn && !cfg.Concurrent.Renew {
+			return nil, fmt.Errorf(
+				"concurrent 多轮 + duration_seconds=%d 需 renew: true——会话滚完换新内容重开才能跑满时长（否则单会话跑完即结束，时长语义不成立）", d)
+		}
+		cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
+			"duration_seconds=%d 时长制生效：各档位按墙钟跑满（runs_per_worker 被忽略；在飞请求跑完保留）", d))
+	} else if cfg.Concurrent.Renew {
+		return nil, fmt.Errorf(
+			"concurrent.renew 需配合 duration_seconds>0——续跑要有时长边界，否则会话滚完换新重开将无限循环")
+	}
+	if cfg.Concurrent.Renew && !cfg.Concurrent.Multiturn {
+		return nil, fmt.Errorf(
+			"concurrent.renew 仅多轮会话（multiturn: true）有效——单轮请求天然每次都是新会话")
 	}
 	if !cfg.Concurrent.Multiturn && cfg.Concurrent.PromptTokens > 200000 {
 		return nil, fmt.Errorf(

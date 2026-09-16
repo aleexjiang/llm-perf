@@ -42,7 +42,10 @@
 
 并发场景支持两种负载模型（`concurrent` 段，互斥）：
 
-- **闭环并发**（默认，`levels: [1,2,4,...]`）：N 个虚拟用户同时发车，测容量上限下的衰减
+- **闭环并发**（默认，`levels: [1,2,4,...]`）：N 个虚拟用户同时发车，测容量上限下的衰减；
+  `duration_seconds` 改**时长制**（每档跑满墙钟秒数，`runs_per_worker` 忽略），配 `renew: true`
+  （需先开 `multiturn: true`）时会话滚完 `turns` 轮换新种子重开——在途会话年龄铺满 0~turns 区间，
+  测稳态吞吐与 KV 压力（soak 用，见[测试类别](#配置)）
 - **开环到达率**（`request_rate: 4` 或 `rate_sweep: [1,2,4,8]`）：请求按 Poisson 过程到达
   （对齐 vLLM bench serve / inference-perf），测排队-延迟曲线；`rate_sweep` 多档扫描找饱和点，
   `max_concurrency` 防止到达率超容量时无限堆积
@@ -315,7 +318,9 @@ node scripts/validate_report.js <报告.html>   # JS 端校验（占位符/图�
 **测试类别（`test:`）决定报告结论区问什么，不改测量**：`performance`（默认，留空即此）= 瓶颈在哪、
 容量边界多远；`benchmark` = 标准格上这台部署处于什么水平（跨部署可比，预设配置见
 `configs/benchmark.yaml`，格子即 [docs/scenario-guide.md](docs/scenario-guide.md) 的必测清单）；
-`soak` = 长时间跑会不会退化/出事故。三者共用同一套四个数与判据——换类别只换首屏口径，
+`soak` = 长时间跑会不会退化/出事故（结论区给稳定性三问：事故 / 正确性 / 漂移——漂移判据要求
+分时段长跑采样，用时长制 `concurrent.duration_seconds` + `renew`，见上文并发场景段）。
+三者共用同一套四个数与判据——换类别只换首屏口径，
 详细数据仍在折叠附录里一个不少。
 
 **配置组织：顶部通用 + 底部 `model_overrides`**。一份文件写所有模型共享的通用配置，
@@ -330,7 +335,7 @@ make build          # 本机二进制（-ldflags 注入 git describe 版本号�
 make test
 scripts/smoke.sh    # 自动化冒烟：mock 服务 + 多组合运行 + 输出数据形状断言
                     # （模型×变体分布/CLI 过滤回归/全能力 trace/开环/levels/-m/--max-ctx/
-                    #   错误路径/报告管线；mock 含 /models、/metrics 与 tool-call 好路径）
+                    #   时长制 soak/错误路径/报告管线；mock 含 /models、/metrics 与 tool-call 好路径）
                     # 运行产物全部落 /tmp 随脚本退出清理，不污染仓库
 scripts/mock_server.py   # 本地 mock OpenAI 兼容流式服务（smoke.sh 底层依赖）
                     # 环境变量 MOCK_TOKEN_DELAY 可调每 chunk 间隔（默认 0.05≈20 tok/s），用来构造降速现场

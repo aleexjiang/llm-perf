@@ -15,9 +15,11 @@
   E 12.9 缓存判据三路：①cached_tokens 生效；②冷算比值生效/未命中；两判据均不可用
   F 12.1 版本握手：混版与异源 tool 字段告警不拒绝渲染
   G 12.12 KV 容量画像：存在/缺失/畸形三态（结论区并列句与池÷拐点折算句）
+  H 10.5 分时段漂移（退化/稳定/renew 剔暂态/短跨度 NA）+ stall.csv 熔断时刻解析
 """
 
 import copy
+import datetime
 import json
 import os
 import subprocess
@@ -229,6 +231,88 @@ def shape_kv_capacity():
               "G③ 畸形 kv_capacity（{}）被忽略".format(bad))
 
 
+# ── H 10.5 分时段漂移 + 事故时间轴 ──
+def shape_soak_drift():
+    base_dt = datetime.datetime(2026, 9, 16, 0, 0, 0)
+
+    def mk_turn(i, step_s, ttft_ms, tpot_ms=50.0):
+        return {"error": "", "ttft_ms": ttft_ms, "tpot_ms": tpot_ms, "e2e_ms": 2000.0,
+                "prompt_tokens": 100, "completion_tokens": 32,
+                "sent_at": (base_dt + datetime.timedelta(seconds=i * step_s)).isoformat()}
+
+    def conc_lv(turns_or_reqs, multiturn=False, renew=False, **kw):
+        lv = {"model": "m", "thinking": "off", "max_tokens": 32, "level": 4,
+              "wall_seconds": 95.0, "throughput_tps": 100.0, **kw}
+        if multiturn:
+            lv["multiturn"] = True
+            lv["renew"] = renew
+            lv["duration_seconds"] = 95
+            lv["sessions"] = turns_or_reqs
+        else:
+            lv["requests"] = turns_or_reqs
+        return lv
+
+    def with_slo(rep):
+        rep["slo"] = {"ttft_ms": 500, "tpot_ms": 100000}
+        return rep
+
+    # ① 退化：64 请求 × 1.5s（span≈95s）；末段 TTFT 900ms 超阈值（500ms）→ goodput 掉 100%
+    reqs = [mk_turn(i, 1.5, 100.0 if i < 48 else 900.0) for i in range(64)]
+    _, _, A, _, _, _, _ = run_pipeline([with_slo(base_report("concurrent", [conc_lv(reqs)]))])
+    drift = A.get("soak_drift") or []
+    check(len(drift) == 1 and drift[0]["verdict"] == "degrade",
+          "H① 末段劣化 → 判退化（{}）".format((drift or [{}])[0].get("verdict")))
+    check(drift and drift[0]["goodput_delta"] == -1.0, "H① goodput 掉幅 -100%")
+    check(drift and drift[0]["first"]["goodput"] == 1.0 and drift[0]["last"]["goodput"] == 0.0,
+          "H① 首段达标 100% / 末段 0%")
+
+    # ② 稳定：全程 TTFT 100ms → 无退化
+    reqs2 = [mk_turn(i, 1.5, 100.0) for i in range(64)]
+    _, _, A2, _, _, _, _ = run_pipeline([with_slo(base_report("concurrent", [conc_lv(reqs2)]))])
+    drift2 = A2.get("soak_drift") or []
+    check(len(drift2) == 1 and drift2[0]["verdict"] == "stable",
+          "H② 全程一致 → 判稳定（{}）".format((drift2 or [{}])[0].get("verdict")))
+
+    # ③ renew 稳态剔除：4 会话 × 16 轮 × 1.5s（会话 24s，span≈95s）→ steady_off_s>0 且仍产出
+    sessions = []
+    for s in range(4):
+        turns = [mk_turn(s * 16 + i, 1.5, 100.0) for i in range(16)]
+        sessions.append({"model": "m", "thinking": "off", "max_tokens": 32, "session": s + 1,
+                         "start_offset_s": s * 24.0, "turns": turns})
+    _, _, A3, _, _, _, _ = run_pipeline(
+        [with_slo(base_report("concurrent", [conc_lv(sessions, multiturn=True, renew=True)]))])
+    drift3 = A3.get("soak_drift") or []
+    check(len(drift3) == 1 and drift3[0]["steady_off_s"] > 0,
+          "H③ renew 暂态剔除生效（steady_off_s={}）".format(
+              (drift3 or [{}])[0].get("steady_off_s")))
+
+    # ④ 短跨度（<30s）→ 不给趋势（NA，不硬给）
+    reqs4 = [mk_turn(i, 1.0, 100.0) for i in range(20)]  # span=19s
+    _, _, A4, _, _, _, _ = run_pipeline([with_slo(base_report("concurrent", [conc_lv(reqs4)]))])
+    check(not (A4.get("soak_drift") or []), "H④ 短跨度样本 → 不产出趋势")
+
+    # ⑤ 旧产物无 sent_at → 不产出（不崩）
+    old_reqs = [{"error": "", "ttft_ms": 100.0, "e2e_ms": 500.0}] * 32
+    _, _, A5, _, _, _, _ = run_pipeline([with_slo(base_report("concurrent", [conc_lv(old_reqs)]))])
+    check(not (A5.get("soak_drift") or []), "H⑤ 无 sent_at 旧产物 → 不产出趋势")
+
+
+def shape_stall_events():
+    with tempfile.TemporaryDirectory() as td:
+        os.makedirs(os.path.join(td, "sub"))
+        with open(os.path.join(td, "concurrent-1.stall.csv"), "w", encoding="utf-8") as fp:
+            fp.write("t_s,agg_tps,med_tps,in_flight,emitting,phase\n")
+            fp.write("0.5,100.0,98.0,8,8,emit\n")
+            fp.write("3.0,40.0,5.0,8,8,emit\n")
+            fp.write("# tripped: med_rate=5.00 tok/s streams=8 low_for=2.5s min_tps=20 in_flight=8 emitting=8\n")
+            fp.write("3.5,0.0,,8,0,prefill\n")
+        ev = g.collect_stall_events(td)
+        check(len(ev) == 1 and ev[0]["t_s"] == 3.0 and ev[0]["med_rate"] == 5.0
+              and ev[0]["streams"] == 8 and ev[0]["min_tps"] == 20,
+              "H⑤ stall.csv 熔断时刻解析（t_s=3.0, med=5.0）")
+        check(g.collect_stall_events(os.path.join(td, "sub")) == [], "H⑤ 空目录 → 无事件不崩")
+
+
 def main():
     shape_timeout_level()
     shape_none_and_empty()
@@ -236,6 +320,8 @@ def main():
     shape_cache_paths()
     shape_tool_handshake()
     shape_kv_capacity()
+    shape_soak_drift()
+    shape_stall_events()
     if FAILS:
         print("\n{} 项失败".format(len(FAILS)))
         sys.exit(1)

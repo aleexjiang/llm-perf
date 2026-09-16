@@ -1185,13 +1185,18 @@ func runClosedRound(ctx context.Context, e *env, cfg *config.Config,
 	if cc.Multiturn {
 		e.warnTraceWrap(level)
 	}
-	lv := &report.ConcurrentLevel{Model: model, Thinking: v.Name, MaxTokens: maxTok, Level: level}
+	lv := &report.ConcurrentLevel{Model: model, Thinking: v.Name, MaxTokens: maxTok, Level: level,
+		DurationSeconds: float64(cc.DurationSeconds), Renew: cc.Renew}
 	mp := newMixPlan(cfg, model, v)
 	if mp != nil {
 		lv.MaxTokens = 0 // 混跑：输出上限由各形状自带（Shapes 内逐形状记录）
 	}
 	var shapeIdxs []int // 与 Requests 一一对应的形状下标（-1 = 非混跑）
 	start := time.Now()
+	// 10.5 时长制 soak：dur>0 时各 worker 跑满墙钟（runs_per_worker 被忽略）；
+	// capped = 到点该收手（所有发新请求/新轮的入口都要查——drain 语义，在飞跑完保留）
+	dur := time.Duration(cc.DurationSeconds) * time.Second
+	capped := func() bool { return dur > 0 && time.Since(start) >= dur }
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	startBarrier := make(chan struct{})
@@ -1244,61 +1249,82 @@ func runClosedRound(ctx context.Context, e *env, cfg *config.Config,
 			<-startBarrier // 所有 worker 就绪后同时发车（旧行为）
 		}
 		if cc.Multiturn {
-			s := report.MultiturnRun{Model: model, Thinking: v.Name, Session: workerID + 1, MaxTokens: maxTok}
-			if ramp {
-				s.Batch = batchNo
-				s.StartOffsetS = time.Since(start).Seconds()
-			}
-			// hook 常开：drain 闸门要求会话中途也能停（已完成轮保留）；fail-fast/止损
-			// 仅爬坡路径启用（ramp=false 保持旧行为：失败只逐条记录）
-			consec := 0
-			hook := func(turn int, m *engine.TurnMetrics) bool {
-				if lr.Stop() {
-					return false // 饱和/墙钟触发：本会话到本轮为止，已发请求的数据全保留
-				}
-				if !ramp {
-					return true
-				}
-				// 12.11：本轮已被取消（运行中断 SIGHUP/Ctrl+C、fail-fast、止损）——取消
-				// 产生的错误是"我们取消的"而非"服务端失败"：不计失败、不触发止损，
-				// 避免人工中断被误报成「全局连续失败」（r1-off S5 的 aborted 误报根因）。
-				// 本会话到此为止，已完成轮次照常保留。
-				if roundCtx.Err() != nil {
-					markFirst()
-					return false
-				}
-				if turn == 0 {
-					markFirst()
-					if m.Error != "" {
-						// 首轮挂大概率模型服务有问题：fail-fast，取消本轮全部会话
-						firstTurnFail.Store(true)
-						roundCancel()
+			// 10.5 renew 时长制 soak：会话滚完 turns 轮后换新 seed 重开（序号递增——seed 与
+			// Session 编号同源，上下文清零重涨），直到时长满；非时长制保持原行为（单会话即终点）。
+			for sr := 0; ; sr++ {
+				idx := workerID + sr*level // 会话序号全局唯一（seed/Session 编号共用）
+				s := report.MultiturnRun{Model: model, Thinking: v.Name, Session: idx + 1, MaxTokens: maxTok}
+				if ramp || dur > 0 {
+					if ramp {
+						s.Batch = batchNo
 					}
+					// 时长制下偏移恒记（报告侧分时段/稳态窗口的数据源）；ramp 保持 5.7 行为
+					s.StartOffsetS = time.Since(start).Seconds()
 				}
-				if m.Error != "" {
-					consec++
-					markFail()
-					if consec >= 3 {
-						log.Printf("    会话 %d 连续 %d 轮失败，提前终止该会话（止损）", s.Session, consec)
+				// hook 常开：drain 闸门要求会话中途也能停（已完成轮保留）；fail-fast/止损
+				// 仅爬坡路径启用（ramp=false 保持旧行为：失败只逐条记录）
+				consec := 0
+				hook := func(turn int, m *engine.TurnMetrics) bool {
+					if lr.Stop() {
+						return false // 饱和/墙钟触发：本会话到本轮为止，已发请求的数据全保留
+					}
+					// 10.5 时长制：到点后不再发新轮（本会话到本轮为止，已完成轮保留）
+					if capped() {
 						return false
 					}
-				} else {
-					consec = 0
-					markOK()
+					if !ramp {
+						return true
+					}
+					// 12.11：本轮已被取消（运行中断 SIGHUP/Ctrl+C、fail-fast、止损）——取消
+					// 产生的错误是"我们取消的"而非"服务端失败"：不计失败、不触发止损，
+					// 避免人工中断被误报成「全局连续失败」（r1-off S5 的 aborted 误报根因）。
+					// 本会话到此为止，已完成轮次照常保留。
+					if roundCtx.Err() != nil {
+						markFirst()
+						return false
+					}
+					if turn == 0 {
+						markFirst()
+						if m.Error != "" {
+							// 首轮挂大概率模型服务有问题：fail-fast，取消本轮全部会话
+							firstTurnFail.Store(true)
+							roundCancel()
+						}
+					}
+					if m.Error != "" {
+						consec++
+						markFail()
+						if consec >= 3 {
+							log.Printf("    会话 %d 连续 %d 轮失败，提前终止该会话（止损）", s.Session, consec)
+							return false
+						}
+					} else {
+						consec = 0
+						markOK()
+					}
+					return true
 				}
-				return true
+				s.Turns = collectSessionTurns(roundCtx, e, cfg, model, v, idx, 0, maxTok, hook)
+				s.FillLastPromptTokens() // 12.3：末轮实测深度
+				s.NominalLastPrompt = nominalLastPrompt(e.trace != nil, cfg.Multiturn)
+				mu.Lock()
+				lv.Sessions = append(lv.Sessions, s)
+				mu.Unlock()
+				if dur <= 0 || !cc.Renew {
+					return // 次数制 / 非续跑：单会话即 worker 终点
+				}
+				if roundCtx.Err() != nil || lr.Stop() || capped() {
+					return // 取消 / drain / 到点：不再重开会话
+				}
 			}
-			s.Turns = collectSessionTurns(roundCtx, e, cfg, model, v, workerID, 0, maxTok, hook)
-			s.FillLastPromptTokens() // 12.3：末轮实测深度
-			s.NominalLastPrompt = nominalLastPrompt(e.trace != nil, cfg.Multiturn)
-			mu.Lock()
-			lv.Sessions = append(lv.Sessions, s)
-			mu.Unlock()
-			return
 		}
-		for r := 0; r < cc.RunsPerWorker; r++ {
-			if roundCtx.Err() != nil || lr.Stop() {
-				return // 本档位取消（fail-fast/止损）或 drain 触发：不再发新请求
+		for r := 0; ; r++ {
+			// 10.5 时长制：到点不再发新请求（drain——在飞跑完保留）；次数制按 runs_per_worker
+			if roundCtx.Err() != nil || lr.Stop() || capped() {
+				return // 本档位取消（fail-fast/止损）或 drain/时长到点：不再发新请求
+			}
+			if dur <= 0 && r >= cc.RunsPerWorker {
+				return
 			}
 			promptTokens := cfg.ClampOne(cc.PromptTokens)
 			reqMaxTok := maxTok

@@ -1012,3 +1012,102 @@ func TestThinkingForBackfillsExtraBodyOff(t *testing.T) {
 		t.Fatalf("无关闭档时 ExtraBodyOff 应保持 nil，got %v", got)
 	}
 }
+
+// ── 10.5 时长制 soak：duration_seconds + renew 校验（fail-fast 五态）──
+
+func TestLoad_SoakDurationEnablesAndWarns(t *testing.T) {
+	p := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+concurrent:
+  levels: [2]
+  duration_seconds: 30
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Concurrent.DurationSeconds != 30 || cfg.Concurrent.Renew {
+		t.Fatalf("duration_seconds=%d renew=%v, want 30/false",
+			cfg.Concurrent.DurationSeconds, cfg.Concurrent.Renew)
+	}
+	if !strings.Contains(strings.Join(cfg.Warnings, ";"), "时长制") {
+		t.Errorf("duration 生效应有 Warnings: %v", cfg.Warnings)
+	}
+}
+
+func TestLoad_SoakDurationOpenLoopRejected(t *testing.T) {
+	p := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+concurrent:
+  request_rate: 4
+  duration_seconds: 30
+`)
+	if _, err := Load(p); err == nil || !strings.Contains(err.Error(), "闭环") {
+		t.Fatalf("开环 + duration_seconds 应报闭环专属错误, got %v", err)
+	}
+}
+
+func TestLoad_SoakDurationTraceRejected(t *testing.T) {
+	dir := t.TempDir()
+	tracePath := filepath.Join(dir, "trace.json")
+	if err := os.WriteFile(tracePath, []byte("[]"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+dataset:
+  mode: trace
+  path: `+tracePath+`
+concurrent:
+  levels: [2]
+  duration_seconds: 30
+`)
+	if _, err := Load(p); err == nil || !strings.Contains(err.Error(), "trace") {
+		t.Fatalf("trace + duration_seconds 应报错（filler 先行）, got %v", err)
+	}
+}
+
+func TestLoad_SoakMultiturnDurationNeedsRenew(t *testing.T) {
+	p := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+concurrent:
+  multiturn: true
+  levels: [2]
+  duration_seconds: 30
+`)
+	if _, err := Load(p); err == nil || !strings.Contains(err.Error(), "renew") {
+		t.Fatalf("多轮 + duration_seconds 未开 renew 应报错, got %v", err)
+	}
+}
+
+func TestLoad_SoakRenewNeedsDuration(t *testing.T) {
+	p := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+concurrent:
+  multiturn: true
+  levels: [2]
+  renew: true
+`)
+	if _, err := Load(p); err == nil || !strings.Contains(err.Error(), "duration_seconds") {
+		t.Fatalf("renew 无 duration_seconds 应报错, got %v", err)
+	}
+}
+
+func TestLoad_SoakRenewNeedsMultiturn(t *testing.T) {
+	p := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+concurrent:
+  levels: [2]
+  duration_seconds: 30
+  renew: true
+`)
+	if _, err := Load(p); err == nil || !strings.Contains(err.Error(), "多轮") {
+		t.Fatalf("renew 非多轮应报错, got %v", err)
+	}
+}

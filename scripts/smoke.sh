@@ -17,6 +17,7 @@
 #   SIGHUP 优雅中断（单发多轮 + 12.11 中断语义·并发多轮）/ 降速熔断（两场景相继熔断续跑；
 #   12.10 单流判据·多并发慢流）+ stall_trace 落盘
 #   8.2 熔断恢复探针（未恢复停整轮 / 恢复后续跑）+ 5.7 闭环爬坡发车批次落盘
+#   10.5 时长制 soak（duration_seconds + renew 会话续跑）configs/smoke-soak.yaml
 #   参数错误路径（非法变体名 / levels 下用 on / 多场景 -o 单文件）
 #   报告管线（gen_html_report.py + validate_report.js）
 #
@@ -50,7 +51,7 @@ trap cleanup EXIT
 # 漏 output-smoke*/run.log。
 # dataset.path 同理：它相对配置文件所在目录解析，配置搬到 TMP 后会指向
 # $TMP/fixtures/ 落空，需一并改写为仓库内的绝对路径。
-for f in smoke smoke-all smoke-overrides smoke-openloop smoke-sweep smoke-levels smoke-stall; do
+for f in smoke smoke-all smoke-overrides smoke-openloop smoke-sweep smoke-levels smoke-stall smoke-soak; do
   sed -e "s#^output_dir:.*#output_dir: $TMP/runlog#" \
       -e "s#\([[:space:]]*path:[[:space:]]*[\"']\{0,1\}\)fixtures/#\1$PWD/configs/fixtures/#" \
       "configs/$f.yaml" >"$TMP/$f.yaml"
@@ -243,6 +244,11 @@ if [ -z "$(find "$TMP/out-hup-conc" -name '*.json' 2>/dev/null)" ]; then
 fi
 echo "  ✅ SIGHUP（并发多轮）优雅退出且数据落盘"
 
+# 10.5 时长制 soak：duration_seconds + renew 会话续跑（filler）——worker 跑满 12s，
+#      会话滚完 8 轮换新 seed 重开（Session 编号递增 = 重开发生）；报告侧稳定性区数据源。
+run "时长制 soak（duration+renew 会话续跑）" out-soak -c "$TMP/smoke-soak.yaml" \
+  --turns multi --concurrency cfg
+
 # ── 断言：校验输出 JSON 的模型×变体分布与指标完整性，不再靠目测 ──
 echo "==> 断言输出数据形状"
 python3 - "$TMP" <<'PYEOF'
@@ -351,6 +357,29 @@ kv = next((r.get("kv_capacity") for r in reps if r.get("kv_capacity")), None)
 check(kv is not None and kv.get("size_tokens") == 1505497 and kv.get("cache_dtype") == "fp8"
       and kv.get("max_concurrency") == 5.74 and kv.get("block_size") == 1600,
       f"smoke-all KV 容量画像落盘（vllm:cache_config_info 提取: {kv}）")
+
+# 5b) 10.5 时长制 soak：duration/renew 落盘 + 会话续跑（序号全局唯一 + 各 worker 偏移递增）
+soak_lv = [lv for rep in load_all("out-soak") for lv in rep.get("concurrent", [])]
+check(len(soak_lv) == 1 and soak_lv[0].get("duration_seconds") == 12
+      and soak_lv[0].get("renew") is True,
+      f"soak 档位 duration_seconds/renew 落盘（{len(soak_lv)} 档）")
+sk_sess = (soak_lv[0].get("sessions") or []) if soak_lv else []
+sk_lvl = (soak_lv[0].get("level") or 0) if soak_lv else 0
+seqs = [s.get("session") or 0 for s in sk_sess]
+check(len(sk_sess) > 1 and len(seqs) == len(set(seqs)) and all(
+    len(s.get("turns") or []) >= 1 for s in sk_sess),
+    f"renew 会话续跑发生（{len(sk_sess)} 会话，序号 {sorted(seqs)} 全局唯一）")
+# 重开判据：序号超出首发（首发 = 每 worker 一个 = level 个）
+check(bool(sk_lvl) and seqs and max(seqs) > sk_lvl,
+      f"续跑序号超出首发（max {max(seqs) if seqs else 0} > level {sk_lvl}）")
+# 同一 worker（(session-1) % level 同余）内起始偏移递增——重开时序正确
+grps = {}
+for s in sk_sess:
+    grps.setdefault(((s.get("session") or 1) - 1) % sk_lvl if sk_lvl else 0, []).append(
+        s.get("start_offset_s") or 0)
+check(bool(sk_lvl) and len(grps) == sk_lvl and all(off == sorted(off) for off in grps.values()),
+      "各 worker 会话起始偏移递增（{}）".format(
+          {k: [round(x, 1) for x in v] for k, v in sorted(grps.items())}))
 mt = [r for rep in reps for r in rep.get("multiturn", [])]
 check(mt and all(len(r.get("turns") or []) == 3 for r in mt), "smoke-all trace 回放多轮 3 轮齐全")
 sg = [r for rep in reps for r in rep.get("single", []) if r.get("thinking") == "off"]

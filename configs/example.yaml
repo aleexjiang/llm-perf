@@ -175,6 +175,8 @@ concurrent:
   multiturn: false                # false=每用户独立单轮请求；true=每用户各自跑完整多轮会话（filler=模拟对话，trace=真实会话重放）
   levels: [1, 2, 4, 8, 16]        # 闭环并发档位（request_rate/rate_sweep 未配置时生效）
   runs_per_worker: 2              # 单轮模式下每个虚拟用户连续发几次
+  # duration_seconds: 30          # 10.5 时长制 soak：每档跑满墙钟秒数（runs_per_worker 忽略），到点停发新请求、在途跑完（drain）
+  # renew: true                   # 10.5 会话续跑：会话滚完 turns 轮换新种子重开（需 multiturn: true + duration_seconds），在途会话年龄铺满 0~turns 测稳态
   prompt_tokens: 10000
   max_tokens: 256                 # 标量或列表，同 single（列表会与 levels 相乘，注意总请求量）
   # 5.7 闭环错峰发车（默认开）：首批发 1 路，等该批全部完成首轮后放下一批

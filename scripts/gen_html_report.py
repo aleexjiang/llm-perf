@@ -17,6 +17,7 @@
   - 报告末尾内嵌 <script type="application/json" id="perf-summary">：
     全部聚合数据 + 自动观察，可直接交给 AI 阅读并追加解读备注
 """
+import datetime
 import glob
 import html
 import json
@@ -588,6 +589,8 @@ def analyze(data, meta):
          # 保真度并告警），trace 模式下更只是估算——报告横轴与档位分箱一律以服务端 usage 为准，
          # 配置档位只在偏差 >5% 时并列标出。
          "usage_med": {}}
+    # 10.5 分时段漂移（soak 稳定性第三问）：档位内按 sent_at 分首末时段对比（renew 剔暂态）
+    A["soak_drift"] = soak_drift(c_lvls, (meta or {}).get("slo"))
 
     all_single_runs = [r for e in data["single"] for r in e["runs"]]
     all_mt_turns = [t for sess in data["multiturn"] for t in sess["turns"]]
@@ -1614,6 +1617,159 @@ def baseline_section(A):
     return concl + html_tbl + '<div class="note">' + notes + "</div>"
 
 
+# ── 10.5 稳定性 soak：分时段漂移 + 事故时间轴（纯报告侧） ──
+
+SOAK_SEG_FRACTION = 0.25  # 首/末时段各取时间窗 25%
+SOAK_MIN_TURNS = 16       # 全档位样本门槛：少于该数不给趋势（NA）
+SOAK_MIN_SPAN_S = 30      # 时间跨度门槛（秒）
+SOAK_DEGRADE_REL = -0.15  # goodput 相对掉幅 >15% 判退化（10.5 默认值，真机标定后调）
+
+
+def _iso_parse(ts):
+    """Go time.Time JSON（RFC3339）→ datetime；缺失/畸形返回 None。"""
+    if not isinstance(ts, str) or not ts:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _goodput_ok(t, g):
+    """per-turn SLO 达标（与 Go 侧 goodputOf 同口径：只判已配置的维度；全 0/缺失返回 None）。"""
+    if not isinstance(g, dict):
+        return None
+    ttft, tpot = g.get("ttft_ms") or 0, g.get("tpot_ms") or 0
+    if not ttft and not tpot:
+        return None
+    if t.get("error"):
+        return False
+    if ttft and not (0 < (t.get("ttft_ms") or 0) <= ttft):
+        return False
+    if tpot and not (0 < (t.get("tpot_ms") or 0) <= tpot):
+        return False
+    return True
+
+
+def soak_drift(c_lvls, slo_goodput=None):
+    """10.5 分时段漂移（soak 稳定性第三问的数据基础）：档位内全部轮按 sent_at 分首/末时段对比。
+
+    - 首段 = 时间窗前 25%、末段 = 后 25%（时间轴而非序号轴——爬坡/排队让序号与时间非线性）；
+    - renew 时长制：剔除首批会话滚完前的暂态（单会话时长中位数 W），漂移只在稳态窗内算；
+    - 退化判定用 goodput 相对掉幅（>15% 判退化）；未配置 slo.goodput 时只陈述 TTFT/速度数字；
+    - 样本不足（<16 轮 / 跨度 <30s）不产出——给不了趋势就不硬给（对齐「不编趋势」原则）。
+    """
+    out = []
+    for lv in c_lvls:
+        if lv.get("request_rate"):
+            continue  # 开环（到达率维度）的稳定性另由速率扫描覆盖
+        if lv.get("multiturn") or lv.get("sessions"):
+            turns = [t for s in lv.get("sessions", []) for t in s.get("turns", [])]
+        else:
+            turns = list(lv.get("requests", []))
+        objs = []
+        for t in turns:
+            if t.get("error"):
+                continue
+            dt = _iso_parse(t.get("sent_at"))
+            if dt is not None:
+                objs.append((dt, t))
+        if len(objs) < SOAK_MIN_TURNS:
+            continue
+        objs.sort(key=lambda x: x[0])
+        t0, t1 = objs[0][0], objs[-1][0]
+        span = (t1 - t0).total_seconds()
+        if span < SOAK_MIN_SPAN_S:
+            continue
+        # renew 稳态起点：首批会话来滚完前的暂态（W = 单会话时长中位数；上限半程防吃光窗口）
+        steady_off = 0.0
+        if lv.get("renew"):
+            sess_len = [sum((t.get("e2e_ms") or 0) for t in s.get("turns", [])) / 1000.0
+                        for s in lv.get("sessions", [])]
+            sess_len = [x for x in sess_len if x > 0]
+            if sess_len:
+                steady_off = min(float(st.median(sess_len)), span * 0.5)
+        win0 = t0 + datetime.timedelta(seconds=steady_off)
+        win_span = (t1 - win0).total_seconds()
+        if win_span < SOAK_MIN_SPAN_S * 0.75:
+            continue
+        seg_w = win_span * SOAK_SEG_FRACTION
+        first = [t for (dt, t) in objs if win0 <= dt <= win0 + datetime.timedelta(seconds=seg_w)]
+        last = [t for (dt, t) in objs if t1 - datetime.timedelta(seconds=seg_w) <= dt]
+
+        def seg_stat(seg):
+            ttfts = [t["ttft_ms"] for t in seg if t.get("ttft_ms")]
+            sps = [t.get("tokens_per_sec") for t in seg if t.get("tokens_per_sec")]
+            gp = None
+            if slo_goodput:
+                flags = [f for f in (_goodput_ok(t, slo_goodput) for t in seg) if f is not None]
+                gp = (sum(1 for f in flags if f) / len(flags)) if flags else None
+            return {"n": len(seg),
+                    "ttft": round(st.median(ttfts) / 1000, 2) if ttfts else None,
+                    "tps": round(st.median(sps)) if sps else None,
+                    "goodput": round(gp, 3) if gp is not None else None}
+
+        f_stat, l_stat = seg_stat(first), seg_stat(last)
+        if f_stat["n"] < 8 or l_stat["n"] < 8:
+            continue  # 段样本太小，趋势无意义
+        delta = verdict = None
+        if f_stat["goodput"] is not None and l_stat["goodput"] is not None and f_stat["goodput"] > 0:
+            delta = (l_stat["goodput"] - f_stat["goodput"]) / f_stat["goodput"]
+            verdict = "degrade" if delta < SOAK_DEGRADE_REL else "stable"
+        out.append({
+            "model": lv["model"], "thinking": lv.get("thinking", "off"),
+            "level": lv.get("level", 0), "mt": lv.get("max_tokens", 0),
+            "renew": bool(lv.get("renew")),
+            "n": len(objs), "span_s": round(span), "steady_off_s": round(steady_off),
+            "first": f_stat, "last": l_stat,
+            "goodput_delta": round(delta, 3) if delta is not None else None,
+            "verdict": verdict,
+        })
+    return out
+
+
+def collect_stall_events(out_dir):
+    """10.5 事故时间轴：扫输入目录的 *.stall.csv（降速采样序列），摘熔断时刻。
+
+    表头 `t_s,agg_tps,med_tps,in_flight,emitting,phase` + 数据行 +
+    `# tripped: med_rate=… streams=… low_for=… min_tps=… …`（tripped 行无时间列——
+    熔断时刻取此前最后一条数据行的 t_s，误差 = 一个采样窗）。
+    """
+    events = []
+    if not out_dir or not os.path.isdir(out_dir):
+        return events
+    for p in sorted(glob.glob(os.path.join(out_dir, "**", "*.stall.csv"), recursive=True)):
+        last_t = None
+        try:
+            with open(p, encoding="utf-8") as fp:
+                for line in fp:
+                    s = line.strip()
+                    if not s or s.startswith("t_s,"):
+                        continue
+                    if s.startswith("#"):
+                        if s.startswith("# tripped") and last_t is not None:
+                            m = re.search(
+                                r"med_rate=([\d.]+).*?streams=(\d+).*?low_for=(\S+).*?min_tps=([\d.]+)", s)
+                            events.append({
+                                "file": os.path.basename(p).replace(".stall.csv", ""),
+                                "t_s": last_t,
+                                "med_rate": float(m.group(1)) if m else None,
+                                "streams": int(m.group(2)) if m else None,
+                                "low_for": m.group(3) if m else None,
+                                "min_tps": float(m.group(4)) if m else None,
+                                "detail": s.lstrip("# ").strip(),
+                            })
+                        continue
+                    parts = s.split(",")
+                    try:
+                        last_t = float(parts[0])
+                    except (ValueError, IndexError):
+                        pass
+        except OSError:
+            continue
+    return events
+
+
 def kv_capacity_note(kv, knee=None, max_len=None):
     """12.12 KV 容量画像并列句（容量/拐点结论用）。
 
@@ -2184,15 +2340,49 @@ def onepager(data, A, meta):
         n_stall = len([1 for _, n in meta.get("notes", []) if "熔断" in (n or "")])
         c_tot = sum(t for _, t in corpus.values())
         c_ok = sum(p for p, _ in corpus.values())
+        # 10.5 事故时间轴：stall.csv 熔断时刻（首个时间点 + 次数）——「什么时候出的」
+        sev = meta.get("stall_events") or []
+        stall_txt = ""
+        if sev:
+            ev0 = sev[0]
+            stall_txt = "；首次熔断 t≈{:,.0f}s（单流中位 {:,.1f} < {:,.0f} tok/s{}）".format(
+                ev0.get("t_s") or 0, ev0.get("med_rate") or 0, ev0.get("min_tps") or 0,
+                "，共 {} 次".format(len(sev)) if len(sev) > 1 else "")
+        # 10.5 分时段漂移（第三问）：有数据给趋势，没有如实 NA——不为了"看起来完整"编趋势
+        drift = A.get("soak_drift") or []
+        if drift:
+            bits, any_bad, steady_max = [], False, 0.0
+            for d in drift:
+                f_, l_ = d["first"], d["last"]
+                any_bad = any_bad or d.get("verdict") == "degrade"
+                steady_max = max(steady_max, d.get("steady_off_s") or 0)
+                segs = []
+                if f_.get("goodput") is not None and l_.get("goodput") is not None:
+                    segs.append("goodput {:,.0f}%→{:,.0f}%（{:+.0f}%）".format(
+                        f_["goodput"] * 100, l_["goodput"] * 100,
+                        (l_["goodput"] - f_["goodput"]) * 100))
+                if f_.get("ttft") and l_.get("ttft"):
+                    segs.append("TTFT {:.2f}→{:.2f}s".format(f_["ttft"], l_["ttft"]))
+                if f_.get("tps") and l_.get("tps"):
+                    segs.append("速度 {:,.0f}→{:,.0f} tok/s".format(f_["tps"], l_["tps"]))
+                bits.append("{}·L{}{}：{}".format(
+                    esc(short(d["model"])), d["level"], "·renew" if d["renew"] else "",
+                    "，".join(segs) or "—"))
+            trend_item = "是否随时间退化：<b>{}</b>——首/末时段对比{}：{}".format(
+                "是 ❌（goodput 掉幅 >15%）" if any_bad else "否",
+                "（renew 暂态 {:,.0f}s 已剔除）".format(steady_max) if steady_max > 0 else "",
+                "；".join(bits))
+        else:
+            trend_item = ("是否随时间退化：<b>NA</b>——需分时段的长跑采样（时长制 soak："
+                          "concurrent.duration_seconds + renew）；本轮样本不足以给趋势。")
         items = [
             "是否出事故：{}".format(
-                "<b>是</b>（降速熔断留痕 {} 条、档位提前终止 {} 个）".format(n_stall, ab)
+                "<b>是</b>（降速熔断留痕 {} 条、档位提前终止 {} 个{}）".format(n_stall, ab, stall_txt)
                 if (n_stall or ab) else "未见（无熔断留痕、无档位提前终止）"),
             "正确性是否保持：{}".format(
                 "canary {}/{}（{}）".format(c_ok, c_tot, "全部通过" if c_ok == c_tot else "有失败项")
                 if c_tot else "本轮未跑 canary（<b>NA</b>）"),
-            "是否随时间退化：<b>NA</b>——需分时段的长跑采样；本轮为定长跑，"
-            "只能给当前健康度，给不了趋势。",
+            trend_item,
         ]
         kind_html = '<div class="kn"><b>稳定性口径</b>（三问）<br>' + "<br>".join(items) + "</div>"
 
@@ -2436,6 +2626,8 @@ def summary_json(data, A, meta, conclusions, recommendations, limits):
 def main():
     reports, title, out_dir, scenarios = load_inputs(sys.argv[1:])
     data, meta = merge(reports)
+    # 10.5 事故时间轴：扫输入目录的 *.stall.csv（降速采样序列），摘熔断时刻
+    meta["stall_events"] = collect_stall_events(out_dir)
     data = filter_scenarios(data, scenarios)
     if not any(data[k] for k in SCENARIOS):
         sys.exit("输入中没有可用场景数据（过滤条件 --scenarios={}）".format("+".join(sorted(scenarios))))
