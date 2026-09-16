@@ -14,7 +14,7 @@
 #   开环到达率（request_rate/num_prompts/max_concurrency）configs/smoke-openloop.yaml
 #   思考档位 levels 机制 + 档位名过滤       configs/smoke-levels.yaml
 #   -m 模型过滤 / --max-ctx 截断
-#   SIGHUP 优雅中断 / 降速熔断（两场景相继熔断续跑）+ stall_trace 落盘
+#   SIGHUP 优雅中断 / 降速熔断（两场景相继熔断续跑；12.10 单流判据·多并发慢流）+ stall_trace 落盘
 #   8.2 熔断恢复探针（未恢复停整轮 / 恢复后续跑）+ 5.7 闭环爬坡发车批次落盘
 #   参数错误路径（非法变体名 / levels 下用 on / 多场景 -o 单文件）
 #   报告管线（gen_html_report.py + validate_report.js）
@@ -213,6 +213,13 @@ run "熔断探针恢复后续跑" out-stall-recover -c "$TMP/smoke-stall-c.yaml"
   --stall-tps 50 --stall-window 1 --stall-cooldown 3 --stall-probe-factor 2
 kill "$MOCK_STALL_C_PID" 2>/dev/null || true
 MOCK_STALL_C_PID=""
+
+# 12d) 12.10 单流判据：多并发慢流——单流 5 tok/s、聚合 ≈40 tok/s。
+#      聚合口径（历史）不会触发（40 ≥ min_tps=20）；单流中位口径必须触发（5 < 20）。
+#      复用 12) 的慢速 mock（PORT_STALL，此时仍在运行），8 路齐射（smoke-stall.yaml
+#      的 concurrent 段已设 ramp: false）——正是 r1-off S5 漏熔断的形态。
+run "多并发慢流（聚合高/单流低，单流判据必触发）" out-stall-conc -c "$TMP/smoke-stall.yaml" \
+  --turns single --concurrency 8 --stall-tps 20
 
 # ── 断言：校验输出 JSON 的模型×变体分布与指标完整性，不再靠目测 ──
 echo "==> 断言输出数据形状"
@@ -439,15 +446,15 @@ check(len(csvs) == 2, f"两场景各落一个 .stall.csv（实际 {len(csvs)} �
 for csvp in csvs:
     base = os.path.basename(csvp)
     lines = open(csvp, encoding="utf-8").read().splitlines()
-    check(lines[0] == "t_s,agg_tps,in_flight,emitting,phase", f"{base}: 表头正确")
+    check(lines[0] == "t_s,agg_tps,med_tps,in_flight,emitting,phase", f"{base}: 表头正确")
     data = [l for l in lines[1:] if l and not l.startswith("#")]
     check(len(data) >= 2, f"{base}: 采样行 {len(data)} 行")
     ts = [float(l.split(",")[0]) for l in data]
     check(all(b > a for a, b in zip(ts, ts[1:])), f"{base}: t_s 单调递增")
     check(any(l.startswith("# tripped:") for l in lines), f"{base}: 熔断原因已留痕")
-    phases = {l.split(",")[4] for l in data}
+    phases = {l.split(",")[5] for l in data}
     check("emit" in phases, f"{base}: 有 emit 相位记录（正常段也落盘）")
-    check(all(("-1" not in l.split(',')[2]) and l.split(',')[3] != "-1" for l in data),
+    check(all(("-1" not in l.split(',')[3]) and l.split(',')[4] != "-1" for l in data),
           f"{base}: in_flight/emitting 无负值")
 # --no-stall-trace：字段与文件都不落
 nt = load_all("out-stall-notrace")
@@ -475,6 +482,33 @@ check(mt_reps and "降速熔断" not in (mt_reps[0].get("note") or ""),
 with open(os.path.join(tmp, "out-stall-recover.log"), encoding="utf-8") as fp:
     rlog = fp.read()
 check("服务端已恢复" in rlog, "探针通过日志留痕")
+
+# 11d) 12.10 单流判据：8 路并发慢流——聚合 ≈40 ≥ min_tps=20（旧聚合口径不会触发）、
+#      单流中位 ≈5 < 20（新单流口径必须触发）。r1-off S5 漏熔断形态的回归夹具。
+import re as _re
+cc = load_all("out-stall-conc")
+check(len(cc) == 1 and "降速熔断" in (cc[0].get("note") or ""),
+      f"多并发慢流触发单流熔断（实际 {[r.get('note') for r in cc]}）")
+ccsv = sorted(glob.glob(os.path.join(tmp, "out-stall-conc", "*.stall.csv")))
+check(len(ccsv) == 1, f"落一份 .stall.csv（实际 {len(ccsv)} 个）")
+if ccsv:
+    lines = open(ccsv[0], encoding="utf-8").read().splitlines()
+    check(lines[0] == "t_s,agg_tps,med_tps,in_flight,emitting,phase", "conc: 表头含 med_tps")
+    trip = [l for l in lines if l.startswith("# tripped:")]
+    check(bool(trip), "conc: 熔断原因留痕")
+    if trip:
+        m = _re.search(r"med_rate=([\d.]+) tok/s streams=(\d+)", trip[0])
+        check(bool(m), f"conc: 触发行含速率与流数（{trip[0]}）")
+        if m:
+            check(float(m.group(1)) < 20, f"conc: 触发时单流中位 {m.group(1)} < min_tps=20")
+            check(int(m.group(2)) >= 6,
+                  f"conc: 多流参与判定（{m.group(2)} 路；8 路齐射，容忍个别连接抖动）")
+    rows = [l.split(",") for l in lines[1:] if l and not l.startswith("#")]
+    rows = [f for f in rows if len(f) == 6 and f[5] == "emit"]
+    check(any(f[1] and float(f[1]) >= 20 for f in rows),
+          "conc: 聚合速度曾 ≥20（旧聚合口径不会触发——12.10 要修的正是这一形态）")
+    check(any(f[2] and float(f[2]) < 20 for f in rows),
+          "conc: 单流中位曾 <20（判定面捕捉到普遍劣化）")
 
 if failures:
     print(f"\n❌ 冒烟断言失败 {len(failures)} 项")

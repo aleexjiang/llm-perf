@@ -198,7 +198,7 @@ func main() {
 	corpusFlag := fs.String("corpus", "", "填充语料：en/zh（内置公版书）或自定义文件路径（.txt/.txt.gz）；覆盖配置 filler_corpus")
 	maxCtxFlag := fs.Int("max-ctx", 0, "上下文截止（tokens）：>0 时所有请求 prompt 不超过该值；覆盖配置 max_prompt_tokens")
 	saltFlag := fs.Int("seed-salt", 0, "种子盐值：隔离测试（服务端 prefix cache 未清空时重测用）；覆盖配置 seed_salt")
-	stallTPSFlag := fs.Float64("stall-tps", 0, "降速熔断阈值（tok/s，聚合输出速度）：>0 时开启并覆盖 stall_guard.min_tps（默认 10）")
+	stallTPSFlag := fs.Float64("stall-tps", 0, "降速熔断阈值（tok/s，单流 decode 速度中位）：>0 时开启并覆盖 stall_guard.min_tps（默认 10）")
 	stallWindowFlag := fs.Int("stall-window", 0, "降速熔断判定窗口（秒）：覆盖 stall_guard.window_seconds（默认 600）")
 	stallCooldownFlag := fs.Int("stall-cooldown", 0, "熔断后到下一个场景的冷却（秒）：覆盖 stall_guard.cooldown_seconds（默认 300；0 表示用配置值）")
 	stallProbeFlag := fs.Float64("stall-probe-factor", 0, "熔断冷却后的恢复探针倍数：探针实测 tok/s ≥ 倍数×min_tps 才继续下一场景，否则停止整轮；>0 覆盖 stall_guard.probe_factor（默认 2，0=关闭退回纯计时；关闭只能走配置）")
@@ -282,7 +282,7 @@ func main() {
 		if sg.SampleSeconds <= 0 {
 			sg.SampleSeconds = 2
 		}
-		log.Printf("降速熔断（CLI 覆盖）: 聚合输出速度持续低于 %.0f tok/s 达 %ds 即中止当前场景，冷却 %ds 后探针（×%.0f）决定续跑或停整轮",
+		log.Printf("降速熔断（CLI 覆盖）: 单流 decode 速度中位持续低于 %.0f tok/s 达 %ds 即中止当前场景，冷却 %ds 后探针（×%.0f）决定续跑或停整轮",
 			sg.MinTPS, sg.WindowSeconds, sg.CooldownSeconds, sg.EffProbeFactor())
 	}
 	// 饱和止损：CLI 覆盖配置（与降速熔断同一覆盖口径：flag >0 才写，默认值在 Load 已填）
@@ -760,8 +760,8 @@ func main() {
 			rep, err := it.sc.Run(sctx, &cc, client, *modelFilter)
 			if guard != nil && guard.Tripped() {
 				ev, _ := guard.Event()
-				lastAbort = fmt.Sprintf("降速熔断: 聚合输出速度 %.1f tok/s 持续 %s 低于阈值 %.0f tok/s",
-					ev.Rate, ev.LowFor.Round(time.Second), ev.MinTPS)
+				lastAbort = fmt.Sprintf("降速熔断: 单流 decode 速度中位 %.1f tok/s（%d 流参与判定）持续 %s 低于阈值 %.0f tok/s",
+					ev.Rate, ev.Streams, ev.LowFor.Round(time.Second), ev.MinTPS)
 				if rep != nil {
 					// 报告留痕：几周后回看这份 JSON 时，"为什么数据是半截的"必须有据可查
 					n := lastAbort
@@ -822,8 +822,9 @@ func main() {
 }
 
 // recoveryProbe 8.2 恢复探针：发 3 条短请求（4k prompt / 256 输出，thinking 关）实测服务端
-// decode 速度，取中位——单发串行下聚合速度即单请求速度。探针发生在场景之间，此时
-// client.Stall 已置 nil，探针自身不会触发二次熔断。
+// decode 速度，取中位——探针是逐条串行的单流请求，与 12.10 的单流 min_tps 口径天然同轨
+// （无并发时聚合与单流同值）。探针发生在场景之间，此时 client.Stall 已置 nil，
+// 探针自身不会触发二次熔断。
 func recoveryProbe(ctx context.Context, client *engine.Client, cfg *config.Config, model string) (float64, error) {
 	msgs := []engine.Message{engine.UserMsg(cfg.ClampOne(4000), int64(cfg.SeedSalt+99001), cfg.FillerLang)}
 	vOff := config.ThinkingVariant{Name: "off"} // 配置未启用 off 变体时退化为默认（无思考参数）

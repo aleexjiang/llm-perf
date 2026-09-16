@@ -230,18 +230,21 @@ type RetryCfg struct {
 	BackoffMS   int `yaml:"backoff_ms"`   // 退避基数，默认 300ms，指数退避封顶 5s
 }
 
-// StallGuardCfg 降速熔断（2026-09-11 新增，默认关闭）：按「聚合输出速度」判定服务端
-// 是否已退化到不值得继续跑——长窗口下低产出会白白烧掉几小时。
+// StallGuardCfg 降速熔断（2026-09-11 新增，默认关闭；2026-09-16 判据改单流）：
+// 按「单流 decode 速度中位」判定服务端是否已退化到不值得继续跑——长窗口下低产出
+// 会白白烧掉几小时。
 //
-// 口径：窗口内所有在飞请求的输出 token 之和 / 窗口时长（不是单请求速度）。
-// 判定：速度连续低于 min_tps 达 window_seconds 即触发；任一次采样回升到阈值以上即重置计时。
-// 空闲与纯 prefill 阶段不参与判定，避免误触发（细节见 internal/engine/stall.go）。
+// 口径：各在飞流窗口内输出增量 / 窗口时长，取中位数（抗单流偶发抖动、反映普遍劣化；
+// r1-off S5 实测聚合 ~113 tok/s 掩盖了单流 6–16 tok/s 的劣化，故弃用聚合判据）。
+// 判定：中位速度连续低于 min_tps 达 window_seconds 即触发；任一次采样回升到阈值
+// 以上即重置计时。空闲与纯 prefill（未出首 token）不参与判定，避免误触发
+// （细节见 internal/engine/stall.go）。
 //
 // 触发后只中止**当前场景**（不是整轮），冷却 cooldown_seconds 后继续下一个场景；
 // 已完成的数据照常落盘，报告 note 与 run.log 里标注熔断原因与现场速度。
 type StallGuardCfg struct {
 	Enabled         *bool   `yaml:"enabled"`          // 默认 true（写了该段即生效）；false = 保留配置但不启用
-	MinTPS          float64 `yaml:"min_tps"`          // 阈值（tok/s），默认 10——熔断兜底（防接近死机白烧长跑），不是 UX 评级；评级线见 docs/latency-baselines.md §8
+	MinTPS          float64 `yaml:"min_tps"`          // 阈值（tok/s，单流 decode 速度中位），默认 10——熔断兜底（防接近死机白烧长跑），不是 UX 评级；评级线见 docs/latency-baselines.md §8
 	WindowSeconds   int     `yaml:"window_seconds"`   // 连续低于阈值多久触发，默认 600（10 分钟）
 	CooldownSeconds int     `yaml:"cooldown_seconds"` // 触发后到下一个场景的冷却，默认 300（5 分钟）；0 = 不等
 	SampleSeconds   float64 `yaml:"sample_seconds"`   // 采样周期（秒），默认 2；支持亚秒（熔断回归用 0.5）
@@ -1354,7 +1357,7 @@ func Load(path string) (*Config, error) {
 				sg.CooldownSeconds = 300
 			}
 			cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
-				"降速熔断已启用：聚合输出速度持续低于 %.0f tok/s 达 %ds 即中止当前场景，冷却 %ds 后继续下一个场景",
+				"降速熔断已启用：单流 decode 速度中位持续低于 %.0f tok/s 达 %ds 即中止当前场景，冷却 %ds 后继续下一个场景",
 				sg.MinTPS, sg.WindowSeconds, sg.CooldownSeconds))
 			// 10.1 多模型标定提醒：一个阈值套所有模型会误杀更慢的模型（同一份配置逐模型
 			// 跑就已踩此口径）。提示按模型覆盖，但不阻止运行。

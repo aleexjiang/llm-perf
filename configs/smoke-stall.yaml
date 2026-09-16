@@ -4,6 +4,8 @@
 # 见 mockserver.py 的 PROMPT_CHARS_THRESHOLD）的流式请求持续 6s+ 低于 min_tps=50 →
 # 每个场景都在窗口后熔断中止，用来验证「熔断 → 只中止当前场景 → 冷却 → 续跑下一场景」
 # 与 note / stall_trace 留痕。
+# 12d 段复用同一 mock 验证单流判据（12.10）：--turns single --concurrency 8 --stall-tps 20——
+# 8 路齐射各 5 tok/s，单流中位 ≈5 < 20（必须触发）、聚合 ≈40 ≥ 20（旧聚合口径不会触发）。
 # ⚠️ 档位与阈值耦合：改 filler 的长度口径（chars/token）时必须复核各档位生成的字符数
 # 仍 > 阈值——single.prompt_tokens=32 → ≈130 字符、multiturn turn1 ≈346 字符，目前都有裕量。
 # （不用主 mock_server.py：它每请求只吐 3 个 content chunk，单请求不足判定窗口，
@@ -49,3 +51,11 @@ multiturn:
   tool_defs_tokens: 16
   turn_tokens: 16
   max_tokens: 32
+
+concurrent:
+  # 12d 单流判据用例（smoke.sh 以 --turns single --concurrency 8 --stall-tps 20 调用）：
+  # 8 路齐射、每路 5 tok/s → 单流中位 ≈5 < 20 触发；聚合 ≈40 ≥ 20（旧聚合口径不会触发）。
+  ramp: false           # 齐射：默认爬坡发车会让并发数上不去，测不出"多流同时劣化"
+  runs_per_worker: 1
+  prompt_tokens: 32     # ≈130 字符 > mockserver 压测阈值 80（被判为压测请求，走慢速路径）
+  max_tokens: [32]      # 32tk @5tok/s = 6.4s > 2s 熔断窗口（sed 改写 max_tokens 时不会误伤此行）

@@ -438,24 +438,12 @@ func (c *Client) attempt(ctx context.Context, o ChatOptions) (m *TurnMetrics, er
 	}
 
 	m = &TurnMetrics{Model: o.Model, Stream: o.Stream, Thinking: o.Thinking}
-	// 降速熔断接线：请求在飞 + "已开始输出"两个状态。defer 保证任何返回路径都归位
-	// （含早退的错误分支）；retry 时每次 attempt 各自计一次，退避等待期间不占在飞数。
+	// 降速熔断接线：本请求注册为一条在飞流（12.10 per-stream 记账）。defer 保证任何返回
+	// 路径都归位（含早退的错误分支）；retry 时每次 attempt 各注册一条，退避期间不占在飞数。
 	if c.Stall != nil {
-		c.Stall.Enter()
-		defer c.Stall.Exit()
-		decoding := false // 只被本请求的流式回调读写，与 attempt 同 goroutine
-		m.onToken = func(n int) {
-			if !decoding {
-				decoding = true
-				c.Stall.DecodeStart()
-			}
-			c.Stall.Tokens(n)
-		}
-		defer func() {
-			if decoding {
-				c.Stall.DecodeStop()
-			}
-		}()
+		st := c.Stall.NewStream()
+		defer st.Done()
+		m.onToken = st.Tokens // 首个增量即「出首 token」（decode 起点），流式回调与 attempt 同 goroutine
 	}
 	m.appendRaw(string(payload) + "\n--- RESPONSE ---\n")
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.ChatURL(), bytes.NewReader(payload))

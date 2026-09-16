@@ -11,6 +11,9 @@
 用法: mockserver.py [PORT] [SLOW_TPS] [RECOVER_AFTER]
   RECOVER_AFTER：启动多少秒后"恢复"（长 prompt 也转快吐），模拟服务端中途修复；
   0/缺省 = 永不恢复（8.2 恢复探针回归用：恢复 → 探针通过 → 继续下一场景）。
+多并发（12.10 单流判据回归，smoke.sh 12d 用）：同一实例天然支持并发连接，每连接
+  独立按 SLOW_TPS 限速——8 路 × 5 tok/s 时单流远低于阈值、聚合 ≈40 tok/s，
+  用来验证"聚合口径不会触发、单流中位口径必须触发"。
 """
 import json
 import os
