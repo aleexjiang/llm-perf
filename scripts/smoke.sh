@@ -8,7 +8,7 @@
 # 覆盖面（每项都带数据形状断言，不再靠目测）：
 #   基础三场景 × 两模型 × both 变体         configs/smoke.yaml
 #   CLI 优先级回归（踩坑形状）              configs/smoke-overrides.yaml
-#   全能力：trace 回放/观测层/warmup/goodput/correctness/max_tokens 列表  configs/smoke-all.yaml
+#   全能力：trace 回放/观测层（含 12.12 KV 容量画像）/warmup/goodput/correctness/max_tokens 列表  configs/smoke-all.yaml
 #   probe 兼容性探测（mock 含 /models + tool-call 好路径）
 #   非流式路径（临时配置 stream: false + thinking on）
 #   开环到达率（request_rate/num_prompts/max_concurrency）configs/smoke-openloop.yaml
@@ -346,6 +346,11 @@ check(allrep is not None and len(allrep["correctness"]) >= 1
       "smoke-all correctness 金丝雀有结果")
 sm = next((r.get("server_metrics") for r in reps if r.get("server_metrics")), None)
 check(sm is not None and sm.get("available") is True, "smoke-all 观测层走真路径（available=true）")
+# 12.12 KV 容量画像：mock /metrics 的 cache_config_info（info 型，配置在 label）→ JSON 落盘
+kv = next((r.get("kv_capacity") for r in reps if r.get("kv_capacity")), None)
+check(kv is not None and kv.get("size_tokens") == 1505497 and kv.get("cache_dtype") == "fp8"
+      and kv.get("max_concurrency") == 5.74 and kv.get("block_size") == 1600,
+      f"smoke-all KV 容量画像落盘（vllm:cache_config_info 提取: {kv}）")
 mt = [r for rep in reps for r in rep.get("multiturn", [])]
 check(mt and all(len(r.get("turns") or []) == 3 for r in mt), "smoke-all trace 回放多轮 3 轮齐全")
 sg = [r for rep in reps for r in rep.get("single", []) if r.get("thinking") == "off"]
@@ -372,6 +377,10 @@ check(ff is not None and ff.get("ok") and not ff.get("na"),
       f"probe 填充保真度检查通过（{(ff or {}).get('detail', '缺 filler_fidelity 检查项')}）")
 cpt = probe.get("filler_cpt") or 0
 check(abs(cpt - 4.0) < 0.2, f"probe 实测 chars/token ≈4.0（实际 {cpt}）")
+# 12.12 KV 容量画像：probe 的 /metrics 可用性检查顺带提取（cache_config_info 消费）
+kvp = probe.get("kv_capacity") or {}
+check(kvp.get("size_tokens") == 1505497 and kvp.get("cache_dtype") == "fp8",
+      f"probe KV 容量画像提取（12.12）")
 
 # probe 证据分级：扩展面（/metrics、max_model_len 等）服务端未提供时记 na，绝不判失败；
 # 汇总行必须区分标准面与扩展面，避免可选端点的缺失拉低通过率
@@ -655,6 +664,7 @@ need = {
     "两源一致性（客户端": "10.1 两源一致性判定",
     "waiting 峰值": "9.4 waiting 排队峰值列",
     "max_waiting": "9.4 阈值标定建议",
+    "KV 容量参照": "12.12 KV 容量画像并列（开环静态句）",
     "≥300": "slo.baseline 阈值覆盖生效（档位标签跟随 JSON 阈值）",
 }
 missing = [why for key, why in need.items() if key not in t]

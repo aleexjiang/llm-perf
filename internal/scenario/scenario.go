@@ -76,7 +76,10 @@ type env struct {
 	client   *engine.Client
 	srv      *smetrics.Scraper        // nil = 观测层关闭/不可用
 	provider smetrics.MetricsProvider // 观测层指标命名（按服务端指标前缀自动识别）
-	trace    *engine.TraceSet         // nil = filler 模式
+	// kv 是场景开始快照提取的 KV 容量画像（12.12）：nil = 观测层不可用或引擎未暴露
+	// vllm:cache_config_info。仅作容量归因的并列参照，不影响任何结论口径。
+	kv    *smetrics.KVCapacity
+	trace *engine.TraceSet // nil = filler 模式
 	// perReqSrv 逐请求 /metrics 前后抓取（SrvDelta）开关：仅单发/串行多轮启用。
 	// 并发/开环下每请求抓取落在计时窗口内（压低 wall_seconds 口径的吞吐）、
 	// 各请求差值窗口互相重叠无归因意义，且给服务端叠加可观测负载——
@@ -112,8 +115,13 @@ func newEnv(ctx context.Context, cfg *config.Config, client *engine.Client) (*en
 				}
 				e.srv = s
 				e.provider = smetrics.DetectProvider(sample)
+				e.kv = smetrics.ExtractKVCapacity(sample) // 12.12：KV 容量画像（未暴露则 nil）
 				n := len(sample.Counters) + len(sample.Gauges) + len(sample.Hists)
 				log.Printf("ℹ️ 服务端观测 %s 可用（%d 项指标，%s 命名）——额外采集一份作辅助，结论基线仍是客户端实测", cfg.MetricsPath, n, name)
+				if e.kv != nil {
+					// 容量归因的静态参照：报告会把「实测拐点 vs KV 上界」并列
+					log.Printf("ℹ️ %s", e.kv.Describe())
+				}
 			}
 		}
 	}
@@ -413,6 +421,15 @@ func applySLO(e *env, rep *report.Report) {
 	}
 }
 
+// attachKVCapacity 把 KV 容量画像挂到 Report（12.12）：观测层可用且引擎暴露
+// vllm:cache_config_info 时填充，其余情况省略（报告侧并列项自然消失）。
+// 与 applySLO 同为「env → rep 的横切挂载」，三个场景统一。
+func attachKVCapacity(e *env, rep *report.Report) {
+	if e.kv != nil {
+		rep.KVCapacity = e.kv
+	}
+}
+
 // goodputOf 请求是否满足 SLO。对齐 vLLM goodput 语义：只判定"已配置的"SLO 子集
 // （阈值为 0 的维度不参与）；配置了 TTFT 阈值时要求 TTFT 可测（>0）——非流式
 // TTFT 不可测（N/A），不应凭 0 值白拿达标。非流式在配置了 TPOT 阈值时天然不达标。
@@ -503,6 +520,7 @@ func Single(ctx context.Context, cfg *config.Config, client *engine.Client, mode
 			cfg.Single.Runs, cfg.Single.FixedSeed, cfg.StreamEnabled(), cfg.Thinking.Mode, cfg.Thinking.MaxTokensFloor, cfg.Dataset.Mode, thinkingNoteSuffix(cfg)),
 	}
 	applySLO(e, rep)
+	attachKVCapacity(e, rep)
 	before, poller, winStart := startWindow(ctx, e)
 	defer func() { rep.Server = finishWindow(e, before, poller, winStart) }()
 
@@ -663,6 +681,7 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 			baseSharingDesc(mt), thinkingNoteSuffix(cfg)),
 	}
 	applySLO(e, rep)
+	attachKVCapacity(e, rep)
 	before, poller, winStart := startWindow(ctx, e)
 	defer func() { rep.Server = finishWindow(e, before, poller, winStart) }()
 
@@ -931,6 +950,7 @@ func Concurrent(ctx context.Context, cfg *config.Config, client *engine.Client, 
 			mode, loadModel, cc.PromptTokens, cfg.StreamEnabled(), cfg.Thinking.Mode, perUser, thinkingNoteSuffix(cfg)),
 	}
 	applySLO(e, rep)
+	attachKVCapacity(e, rep)
 	before, poller, winStart := startWindow(ctx, e)
 	defer func() { rep.Server = finishWindow(e, before, poller, winStart) }()
 	// 10.1 两源一致性：为交叉校验单开一对**更窄**的快照窗口——首个档位开始前 → 末个档位结束后。

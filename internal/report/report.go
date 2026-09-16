@@ -275,6 +275,10 @@ type Report struct {
 	Concurrent  []ConcurrentLevel     `json:"concurrent,omitempty"`
 	Correctness []CorrectnessRow      `json:"correctness,omitempty"`
 	Server      *ServerMetricsSummary `json:"server_metrics,omitempty"`
+	// KVCapacity 服务端 KV 容量画像（12.12，vllm:cache_config_info；场景开始时快照一次）。
+	// 用途单一：报告侧在容量/拐点结论里并列「实测拐点 vs KV 上界」，先回答「是不是
+	// KV 内存先满」。同为可选第二数据源——缺失（引擎未暴露/观测层关闭）不影响任何结论。
+	KVCapacity *smetrics.KVCapacity `json:"kv_capacity,omitempty"`
 	// SourceCheck 两源一致性（10.1，仅并发场景计算）：客户端 vs 服务端生成吞吐。
 	SourceCheck *SourceCheck `json:"source_check,omitempty"`
 
@@ -335,6 +339,7 @@ func (r *Report) PartitionByModel() []*Report {
 			SLOBaseline:    r.SLOBaseline,
 			Plan:           r.Plan,
 			Server:         r.Server,
+			KVCapacity:     r.KVCapacity,
 			SourceCheck:    r.SourceCheck,
 			Environment:    r.Environment,
 			ConfigRaw:      r.ConfigRaw,

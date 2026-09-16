@@ -43,6 +43,11 @@ type Sample struct {
 	Counters map[string]float64 // 归一化名（去 _total）→ 跨 label 系列求和
 	Gauges   map[string]float64
 	Hists    map[string]*Hist // family 名（无 _bucket/_sum/_count 后缀）
+
+	// Info 是 info 型指标（_info 后缀：值恒 1、元数据在 label）的 label 快照：
+	// family 名 → label 键值（多系列时取首个）。12.12 起消费 vllm:cache_config_info
+	// （KV 容量画像）——常规 counter/gauge 的 label 仍不保留（内存友好）。
+	Info map[string]map[string]string
 }
 
 // Scraper 面向一个服务端 /metrics 端点。
@@ -138,6 +143,7 @@ func Parse(text string) *Sample {
 		Counters: map[string]float64{},
 		Gauges:   map[string]float64{},
 		Hists:    map[string]*Hist{},
+		Info:     map[string]map[string]string{},
 	}
 	for _, line := range strings.Split(text, "\n") {
 		line = strings.TrimSpace(line)
@@ -188,6 +194,13 @@ func Parse(text string) *Sample {
 			norm := strings.TrimSuffix(name, "_total")
 			s.Counters[norm] += val
 			s.Gauges[name] = val
+			// info 型指标（值恒 1，配置在 label）：单开一份 label 快照供提取
+			// （12.12 vllm:cache_config_info）。多系列时取首个——引擎级配置各系列相同。
+			if strings.HasSuffix(name, "_info") && len(labels) > 0 {
+				if _, ok := s.Info[name]; !ok {
+					s.Info[name] = labels
+				}
+			}
 		}
 	}
 	for _, h := range s.Hists {
@@ -366,6 +379,91 @@ func DetectProviderName(sample *Sample) string {
 		return "vllm"
 	}
 	return ""
+}
+
+// ── KV 容量画像（12.12） ──
+
+// KVCapacity 是 vLLM cache_config_info 提取出的 KV 容量画像（静态配置，场景开始快照一次）。
+//
+// vLLM 把 KV 池几何配置发布为 info 型指标 vllm:cache_config_info（值恒 1，配置在 label）：
+// kv_cache_size_tokens（池总容量）/ kv_cache_max_concurrency（@max_model_len 满上下文
+// 口径最大并发，group-aware）/ block_size / cache_dtype / gpu_memory_utilization。
+// 用途单一：容量归因的**静态上界参照**——「并发没到 max_num_seqs 为什么排队」先对照
+// KV 池上界回答「是不是内存先满」。不参与任何评测指标；缺失时消费方直接省略并列项。
+type KVCapacity struct {
+	SizeTokens     float64 `json:"size_tokens,omitempty"`     // KV 池总容量（tokens，per-DP-engine）
+	MaxConcurrency float64 `json:"max_concurrency,omitempty"` // 满上下文口径最大并发（@max_model_len）
+	BlockSize      float64 `json:"block_size,omitempty"`
+	CacheDtype     string  `json:"cache_dtype,omitempty"`
+	GPUUtil        float64 `json:"gpu_memory_utilization,omitempty"`
+}
+
+// ExtractKVCapacity 从抓取样本提取 KV 容量画像；引擎未暴露 vllm:cache_config_info
+// （旧版本 / 非 vLLM）时返回 nil——宽容缺失，消费方据此省略并列项。
+func ExtractKVCapacity(sample *Sample) *KVCapacity {
+	if sample == nil {
+		return nil
+	}
+	labels := sample.Info["vllm:cache_config_info"]
+	if len(labels) == 0 {
+		return nil
+	}
+	c := &KVCapacity{
+		SizeTokens:     labelFloat(labels, "kv_cache_size_tokens", "size_tokens"),
+		MaxConcurrency: labelFloat(labels, "kv_cache_max_concurrency", "max_concurrency"),
+		BlockSize:      labelFloat(labels, "block_size"),
+		CacheDtype:     labels["cache_dtype"],
+		GPUUtil:        labelFloat(labels, "gpu_memory_utilization"),
+	}
+	if c.SizeTokens == 0 && c.MaxConcurrency == 0 && c.BlockSize == 0 {
+		return nil // label 命名不符（未来版本改名等）——不当画像，避免给出空壳
+	}
+	return c
+}
+
+// labelFloat 按候选键取 label 数值（label 值恒为字符串；缺键/解析失败 = 0）。
+func labelFloat(labels map[string]string, keys ...string) float64 {
+	for _, k := range keys {
+		v, ok := labels[k]
+		if !ok {
+			continue
+		}
+		if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+			return f
+		}
+	}
+	return 0
+}
+
+// Describe 一句话画像（CLI / 日志 / probe 检查项用）。
+func (c *KVCapacity) Describe() string {
+	if c == nil {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("KV 容量画像：")
+	if c.SizeTokens > 0 {
+		fmt.Fprintf(&b, "池 %.2fM tokens", c.SizeTokens/1e6)
+	} else {
+		b.WriteString("池规模未知")
+	}
+	var meta []string
+	if c.CacheDtype != "" {
+		meta = append(meta, c.CacheDtype)
+	}
+	if c.BlockSize > 0 {
+		meta = append(meta, fmt.Sprintf("block=%d", int(c.BlockSize)))
+	}
+	if c.GPUUtil > 0 {
+		meta = append(meta, fmt.Sprintf("gpu_util=%.2f", c.GPUUtil))
+	}
+	if len(meta) > 0 {
+		fmt.Fprintf(&b, "（%s）", strings.Join(meta, "·"))
+	}
+	if c.MaxConcurrency > 0 {
+		fmt.Fprintf(&b, "，满上下文口径上界 ≈%.1f 路", c.MaxConcurrency)
+	}
+	return b.String()
 }
 
 // CounterDelta 是两次快照之间关心的 counter 增量（tokens / 次）。

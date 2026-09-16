@@ -1,8 +1,7 @@
 # ROADMAP
 
 > 原「三件事」（probe tool-call 检测 / trace 回放增强 / 硬编码改造）已全部完成（第 1–3 节）。
-> 当前在途：**第 10 节体系收敛**的 10.5 稳定性 soak（`renew` + 时长制 + 报告稳定性区）；
-> 第 12 节 12.12 KV 容量画像。
+> 当前在途：**第 10 节体系收敛**的 10.5 稳定性 soak（`renew` + 时长制 + 报告稳定性区）。
 > （5.9 起步值补样移出在途清单、不再跟踪——首轮取证结论已够用。）
 > 新增（2026-09-15）：**第 12 节 自部署实测复盘**——qwen3.8-27b 双环境四轮实测中工具硌手点清单。
 > 已完成（2026-09-13）：10.4 suite 层（`test:` 类别 + 报告按类别切结论区 + 基准套件预设）；
@@ -51,10 +50,12 @@
   - 同一取消 ctx 令结束快照失败：`server_metrics.available=false`、`source_check.note` 均为「结束快照抓取失败: context canceled」——场景级 counter/histogram 窗口差值全丢（queue/prefill/decode 分解、preemptions 差值[本次恰为真 0]）。本次靠实时 /metrics 累计值手工回溯补足，不可依赖。
 - 落地：判别用 `roundCtx.Err() != nil`（请求 ctx 即 roundCtx，取消先于错误浮出，时序上恒可靠）——取消产生的请求错误不计 `markFail`、不触发止损、不算首轮失败（爬坡 hook / 单发并发循环 / 开环三处入口统一；已取消且未出错的两不计数）；`Aborted` 记因补「运行中断（SIGHUP/Ctrl+C），场景未跑完（已完成数据照常保留）」分支，排在真实终止原因（首轮失败/止损/饱和墙钟）之后——同轮既有真实触发又有中断时以真实原因为准；`finishWindow` / `applySourceCheck` 结束快照改用独立限时 ctx（`finalScrapeCtx()`，5s 上限），取消不再传播到收尾抓取，超时如实记失败不阻塞退出。验收：单测补对偶用例（取消 ctx 后结束快照仍可用 / 真失败仍如实降级为 available=false）；smoke 12e 新增 SIGHUP × 并发多轮（aborted=运行中断、全文不含止损/首轮失败文案）【2026-09-16】
 
-### 12.12 KV 静态容量画像进 probe / 报告（cache_config_info 消费）【候选，2026-09-16】
+### 12.12 KV 静态容量画像进 probe / 报告（cache_config_info 消费）【已实现，2026-09-16】
 
 - 背景（S5 复盘）：回答「并发没到 max_num_seqs 为什么排队」的主因是 KV 池容量——`vllm:cache_config_info` 已结构化暴露 `kv_cache_size_tokens=1505497`、`kv_cache_max_concurrency=5.74`（256k 满上下文口径）、`block_size=1600`、`cache_dtype=fp8`、`gpu_memory_utilization=0.9`，但工具链零消费（smetrics 白名单未含该 metric），容量归因只能手工拉取。
-- 方向：probe（或场景开始快照）落盘 KV 容量三件套（size_tokens / max_concurrency / block_size + kv dtype）；报告容量/拐点区并列「实测拐点 vs KV 上界 vs max_num_seqs」，一句话回答「内存先满还是槽位先满」。
+- 落地：`smetrics.Sample` 新增 `Info` 屉（`_info` 后缀系列的 label 快照，多系列取首——info 型值恒 1、配置在 label）+ `KVCapacity` / `ExtractKVCapacity`（候选键宽容；缺指标/改名返回 nil，非 vLLM 或旧版本静默省略、产物无痕）；probe 的 /metrics 可用性检查顺带提取（JSON `kv_capacity` + 检查项 detail 附一句话画像），场景开始快照零成本复用（`Report.KVCapacity`，三场景统一挂载 + 启动日志一行画像）。
+- 报告侧并列：9.2 开环 / 12.4 闭环两处拐点结论加「KV 容量参照：池 X tokens（dtype·block），满上下文口径上界 ≈Y 路」；闭环额外折算「池÷拐点 = 等效会话深度」（折算深度超出模型上限时改判「拐点在内存上界之前出现，约束在槽位/带宽侧」）。max_num_seqs 沿 12.5 口径（参数 API 取不到、以 running 峰值为准）不做数字并列。
+- 验收：smetrics 单测（Parse info 提取 / 多系列取首 / 提取三态）+ fixtures G 组（存在/缺失/畸形）+ smoke（probe、out-all 落盘断言 + sweep 报告并列句）【2026-09-16】
 - 参考实测：28.42.48.98 部署 ~17 路 × ~80k 深度混合 ≈ 91% 池占用；等效并发上界 ≈ 池 ÷ 平均深度。
 
 ## 1. probe 增加 tool-call 检测（默认开启，`--no-toolcall` 关闭）【已实现，2026-09-09】
@@ -658,8 +659,8 @@ thinking mode/levels 双轨（levels 优先已显式声明并告警）；api_key
           probe filler_fidelity 自举校准 / 报告横轴 usage 实测分箱）【2026-09-12】
         → 10.4 suite 层（`test:` 类别 + 报告按类别切结论区 + 基准套件预设 configs/benchmark.yaml
           + smoke 三类别回归）【2026-09-13】
-剩余：  12.12 KV 容量画像 → 10.5 稳定性 soak（5.7 会话续跑提级为 soak 原语 + 报告稳定性区）
-已清（2026-09-16）：12.1–12.11 全部落地；5.9 起步值补样移出在途、不再跟踪。
+剩余：  10.5 稳定性 soak（5.7 会话续跑提级为 soak 原语 + 报告稳定性区）
+已清（2026-09-16）：12.1–12.12 全部落地；5.9 起步值补样移出在途、不再跟踪。
 暂缓/条件触发：见文末「附：暂缓与条件触发」——按各自的复活条件启动，不排期。
 ```
 

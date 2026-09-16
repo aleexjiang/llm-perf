@@ -224,6 +224,10 @@ gauge 轮询自带健康度：从未成功或连续失败 ≥5 时 JSON 标记 `
   MTP 投机解码 draft/accepted（接受率）；串行时精确归因到单请求
 - **gauge 高频轮询**：running/waiting 排队深度、KV 池占用的峰值/均值
 - **histogram 场景窗口差值**：服务端口径的 queue/prefill/decode/TTFT/ITL 延迟分解（P50/P99 桶估算）
+- **KV 容量画像**（12.12）：从 `vllm:cache_config_info`（info 型指标、配置在 label）提取 KV 池
+  容量 / 满上下文口径并发上界 / block / dtype，落盘 `kv_capacity`——报告在容量拐点结论里并列
+  「实测拐点 vs KV 上界」，先回答「是不是 KV 内存先满」再谈槽位；probe 的 /metrics 可用性检查
+  也顺带提取（跑压测前就能拿到）
 - 结果进 JSON（`server_metrics` 汇总 + 逐请求 `server_counter_delta`）与报告「服务端观测」章节
 
 典型用法：TTFT 高时看命中率（低=缓存没生效）与 queue 时间（高=排队）、preemptions>0（KV 压力）。

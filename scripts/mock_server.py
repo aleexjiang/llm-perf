@@ -63,6 +63,11 @@ class H(BaseHTTPRequestHandler):
                 # 建议值需要真实的非零观测才走得到（恒 0 会让该列整片不渲染，路径测试不到）
                 f'vllm:num_requests_waiting{{engine="0"}} {(nc // 2) % 3}\n'
                 f'vllm:gpu_cache_usage_perc{{engine="0"}} 0.31\n'
+                # 12.12 KV 容量画像：info 型指标（值恒 1、配置在 label）——报告侧据此并列
+                # 「实测拐点 vs KV 上界」。取值对齐用户实测形态（fp8 / block 1600 / 池 1.5M tk）
+                f'vllm:cache_config_info{{block_size="1600",cache_dtype="fp8",'
+                f'gpu_memory_utilization="0.9",kv_cache_max_concurrency="5.74",'
+                f'kv_cache_size_tokens="1505497"}} 1\n'
             ).encode() + "".join(
                 hist_family(name, nc, avg) for name, avg in (
                     ("vllm:request_queue_time_seconds", 0.005),

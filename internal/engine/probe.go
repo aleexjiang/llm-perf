@@ -116,6 +116,10 @@ type ProbeResult struct {
 	Suggested     string       `json:"suggested_config,omitempty"` // 可直接粘回配置文件的 YAML 片段
 	CrossChecks   []CrossCheck `json:"cross_checks,omitempty"`     // 交叉验证建议（引擎→原生 perf 工具）
 	ServerMetrics string       `json:"server_metrics,omitempty"`   // /metrics 可用性（观测层前置条件，扩展面）
+	// KVCapacity 是 /metrics 可用时提取的 KV 容量画像（12.12，vllm:cache_config_info）：
+	// 容量归因的静态上界参照——「并发没到 max_num_seqs 为什么排队」先看是不是 KV 内存先满。
+	// nil = 引擎未暴露该指标（旧版本 / 非 vLLM / /metrics 不可用）。
+	KVCapacity *smetrics.KVCapacity `json:"kv_capacity,omitempty"`
 	// DecodeSpeedTPS 实测流式输出速度（含思考，保守值）：本机健康基线，
 	// stall_guard.min_tps 的部署级建议依据（建议取其 10-20%，熔断兜"接近死机"）。
 	// 多模型配置下取**最慢被测模型**的值（统一阈值必须照顾最慢的那个）。
@@ -800,6 +804,7 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 				cand.APIKey = o.APIKey
 				if ok2, d2 := cand.Available(ctx); ok2 {
 					ok, detail, metricsPath = true, d2, p
+					s = cand // 后续 KV 画像从实际挂载点抓（原逻辑只记录路径，不做二次抓取）
 					res.Verdicts = append(res.Verdicts, "/metrics 实际挂在 "+p+"——该端点非标准面，只用于增强采集")
 					break
 				}
@@ -807,8 +812,17 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 		}
 		metricsOK = ok
 		if ok {
+			// 12.12：KV 容量画像——探测成功后补抓一次拿样本（probe 是一次性诊断，
+			// 多一次 GET 成本可忽略；不为此改 Available 的签名），提取不到静默省略。
+			if sample, err := s.Scrape(ctx); err == nil {
+				res.KVCapacity = smetrics.ExtractKVCapacity(sample)
+			}
+			kvTxt := ""
+			if res.KVCapacity != nil {
+				kvTxt = "；" + res.KVCapacity.Describe()
+			}
 			res.ServerMetrics = "available: " + detail
-			checkExt("server_metrics", true, metricsPath+" 可用（"+detail+"）→ 配置 server_metrics: true 可开启观测层（缓存命中率/排队/prefill-decode 分解）")
+			checkExt("server_metrics", true, metricsPath+" 可用（"+detail+"）→ 配置 server_metrics: true 可开启观测层（缓存命中率/排队/prefill-decode 分解）"+kvTxt)
 		} else {
 			res.ServerMetrics = "unavailable: " + detail
 			checkExtNA("server_metrics", fmt.Sprintf("未提供（%s 及 %d 个常见挂载点均不可用：%s）——非标准端点，压测自动降级为纯客户端计时，结论不受影响",

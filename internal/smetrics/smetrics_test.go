@@ -78,6 +78,65 @@ vllm:time_to_first_token_seconds_count 20
 	}
 }
 
+func TestParseInfoLabels(t *testing.T) {
+	// 12.12：info 型指标（值恒 1、配置在 label）单开 label 快照——vllm:cache_config_info
+	text := `noise_total 5
+vllm:cache_config_info{block_size="1600",cache_dtype="fp8",gpu_memory_utilization="0.9",kv_cache_max_concurrency="5.74",kv_cache_size_tokens="1505497"} 1
+`
+	s := Parse(text)
+	got := s.Info["vllm:cache_config_info"]
+	if got == nil {
+		t.Fatal("cache_config_info label 快照未提取")
+	}
+	if got["kv_cache_size_tokens"] != "1505497" || got["block_size"] != "1600" {
+		t.Fatalf("label 值错误: %+v", got)
+	}
+	// 常规面行为不变：info 值照常进 gauges（无消费方，仅保持解析口径一致）
+	if s.Gauges["vllm:cache_config_info"] != 1 {
+		t.Fatalf("info 值应照常进 gauges，实际 %v", s.Gauges["vllm:cache_config_info"])
+	}
+}
+
+func TestParseInfoLabelsKeepsFirstSeries(t *testing.T) {
+	// 多系列（如多 engine label）取首个：引擎级配置各系列相同
+	text := `vllm:cache_config_info{engine="0",kv_cache_size_tokens="100"} 1
+vllm:cache_config_info{engine="1",kv_cache_size_tokens="200"} 1
+`
+	s := Parse(text)
+	if got := s.Info["vllm:cache_config_info"]["kv_cache_size_tokens"]; got != "100" {
+		t.Fatalf("多系列应取首个，实际 %v", got)
+	}
+}
+
+func TestExtractKVCapacity(t *testing.T) {
+	text := `vllm:cache_config_info{block_size="1600",cache_dtype="fp8",gpu_memory_utilization="0.9",kv_cache_max_concurrency="5.74",kv_cache_size_tokens="1505497"} 1
+`
+	c := ExtractKVCapacity(Parse(text))
+	if c == nil {
+		t.Fatal("画像未提取")
+	}
+	if c.SizeTokens != 1505497 || c.MaxConcurrency != 5.74 || c.BlockSize != 1600 ||
+		c.CacheDtype != "fp8" || c.GPUUtil != 0.9 {
+		t.Fatalf("画像字段错误: %+v", c)
+	}
+	if c.Describe() == "" {
+		t.Fatal("Describe 不应为空")
+	}
+
+	// 引擎未暴露该指标（非 vLLM / 旧版本）→ nil 宽容
+	if got := ExtractKVCapacity(Parse("vllm:num_requests_running 1\n")); got != nil {
+		t.Fatalf("未暴露时应返回 nil，实际 %+v", got)
+	}
+	// label 命名不符（未来版本改名）→ nil（避免空壳画像）
+	if got := ExtractKVCapacity(Parse(`vllm:cache_config_info{something_else="1"} 1`)); got != nil {
+		t.Fatalf("命名不符时应返回 nil，实际 %+v", got)
+	}
+	// nil sample 安全（观测层关闭路径）
+	if got := ExtractKVCapacity(nil); got != nil {
+		t.Fatalf("nil sample 应返回 nil")
+	}
+}
+
 func TestCounterDelta(t *testing.T) {
 	before := Parse(sampleText)
 	afterText := strings.NewReplacer(

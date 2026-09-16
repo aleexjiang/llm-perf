@@ -276,7 +276,7 @@ def merge(reports):
     data = {k: [] for k in SCENARIOS}
     meta = {"endpoint": "?", "tool": "?", "notes": [], "generated": [], "slo": None,
             "slo_baseline": None, "source_check": None, "server": {}, "correctness": {},
-            "test": None, "tools": []}
+            "kv_capacity": None, "test": None, "tools": []}
     tools_seen = []
     for p, d in reports:
         scen = d.get("scenario")
@@ -299,6 +299,10 @@ def merge(reports):
         meta["slo_baseline"] = d.get("slo_baseline") or meta["slo_baseline"]
         # 10.1 两源一致性（客户端实测 vs 服务端 /metrics 生成吞吐）判定结果，由 Go 侧算好落盘
         meta["source_check"] = d.get("source_check") or meta["source_check"]
+        # 12.12 KV 容量画像（vllm:cache_config_info 提取，场景开始快照）：多份产物取首份非空。
+        # 报告侧在容量/拐点结论里并列「实测拐点 vs KV 上界」；缺失时并列句自然消失。
+        if isinstance(d.get("kv_capacity"), dict) and meta["kv_capacity"] is None:
+            meta["kv_capacity"] = d["kv_capacity"]
         # 10.4 测试类别（benchmark|performance|soak）：报告据此切换结论区口径。
         # 同一次运行的多份产物应当同类别；若拼了不同轮次的产物，取首份并标记混用——
         # 静默按某一类渲染会让读者以为看到的是统一口径的结论。
@@ -575,6 +579,10 @@ def analyze(data, meta):
     A = {"models": models, "per_model": OrderedDict(), "coverage": {}, "events": [],
          "tiers": tiers, "baseline_enabled": baseline_enabled(meta),
          "slo": (meta or {}).get("slo"), "source_check": (meta or {}).get("source_check"),
+         # 12.12 KV 容量画像（vllm:cache_config_info）：容量/拐点结论并列「实测拐点 vs KV 上界」
+         "kv_capacity": (meta or {}).get("kv_capacity"),
+         # 模型上下文上限（环境存档 probe 提供）：KV 折算句判断「拐点是否在内存上界之前出现」
+         "max_model_len": ((meta or {}).get("environment") or {}).get("model_max_len"),
          # 10.3 横轴实测分箱：{(model, thinking, max_tokens, 标称档位): 实测 usage 中位数}。
          # 构造 filler 的 chars/token 是近似系数（bench probe 的 filler_fidelity 检查实测本部署
          # 保真度并告警），trace 模式下更只是估算——报告横轴与档位分箱一律以服务端 usage 为准，
@@ -1606,6 +1614,41 @@ def baseline_section(A):
     return concl + html_tbl + '<div class="note">' + notes + "</div>"
 
 
+def kv_capacity_note(kv, knee=None, max_len=None):
+    """12.12 KV 容量画像并列句（容量/拐点结论用）。
+
+    kv 来自 JSON 的 kv_capacity（Go 侧从 vllm:cache_config_info 提取）；空/缺则返回 ""，
+    调用方拼接后并列句自然消失。knee 为闭环并发拐点（路数）——折算「池÷拐点 = 等效会话
+    深度」后与 max_num_seqs（参数 API 取不到、以 running 峰值为准）对照，回答「内存先满
+    还是槽位先满」。开环拐点是到达率口径（req/s），与路数不可直接折算——调用方不传 knee。
+    """
+    if not isinstance(kv, dict) or not (kv.get("size_tokens") or kv.get("max_concurrency")):
+        return ""
+    if kv.get("size_tokens"):
+        meta = "·".join(x for x in (
+            str(kv.get("cache_dtype") or "").strip(),
+            "block={}".format(int(kv["block_size"])) if kv.get("block_size") else "",
+        ) if x)
+        s = "KV 容量参照：池 {:,} tokens{}".format(
+            int(kv["size_tokens"]), "（{}）".format(meta) if meta else "")
+    else:
+        s = "KV 容量参照"
+    if kv.get("max_concurrency"):
+        s += "，满上下文口径上界 ≈{:.1f} 路".format(kv["max_concurrency"])
+    if knee and kv.get("size_tokens"):
+        eff = kv["size_tokens"] / knee
+        eff_txt = "{:.0f}k".format(eff / 1000) if eff >= 1000 else "{:.0f}".format(eff)
+        if max_len and eff > max_len * 1.1:
+            s += ("；实测拐点 {} 路 ⇒ 池÷拐点 ≈{} tk/路（> 模型上限 {}k）——拐点在内存上界"
+                  "之前出现，约束在槽位/带宽/调度侧，不在 KV 池。").format(
+                knee, eff_txt, max_len // 1000)
+        else:
+            s += ("；实测拐点 {} 路 ⇒ 池÷拐点 ≈{} tk/路（等效会话深度，内存口径可比）"
+                  "——若加并发吞吐不涨而 running 峰值远小于 max_num_seqs，优先查 KV 内存水位而非槽位。").format(
+                knee, eff_txt)
+    return s
+
+
 def gen_conclusions(A):
     cs = []
     # 1 prefill 扩展性（斜率取自最大输出档组 ladder_top，避免多输出档混线）
@@ -1767,11 +1810,13 @@ def gen_conclusions(A):
             ttft_txt = ""
             if len(p99l) >= 2:
                 ttft_txt = "，TTFT p99 由 {:.2f}s 升到 {:.2f}s".format(p99l[0], p99l[-1])
+            # 12.12：KV 容量画像并列（静态口径——开环拐点是 req/s，不能与路数折算）
+            kv_note = kv_capacity_note(A.get("kv_capacity"))
             cs.append("<b>{}</b>（{}·thinking={}）：开环速率扫描峰值吞吐 {:.0f} tok/s"
                       "（到达率 {:g}/s 起进入 0.9×峰值平台{}）——再提高到达率只会排队，"
-                      "该点即容量边界。".format(
+                      "该点即容量边界。{}".format(
                           esc(short(m)), qname, th, peak, knee if knee else es[-1]["request_rate"],
-                          ttft_txt))
+                          ttft_txt, ("　" + kv_note) if kv_note else ""))
             slo_ok = [e for e in es if e.get("slo_total")]
             if slo_ok:
                 hit = [e["request_rate"] for e in slo_ok if e["slo_meet"] / e["slo_total"] >= 0.95]
@@ -1817,9 +1862,13 @@ def gen_conclusions(A):
                 bits.append("并发 {} 起相对上一档吞吐增益不足 5%".format(marg))
             if not bits:
                 continue
+            # 12.12：KV 容量并列 + 折算（闭环拐点是路数口径，可与池折算）——
+            # 「内存先满还是槽位先满」对照 max_num_seqs（API 取不到、以 running 峰值为准）
+            kv_note = kv_capacity_note(A.get("kv_capacity"), knee, A.get("max_model_len"))
             cs.append("<b>{}（{}·thinking={}·out={}tk）</b>：闭环并发爬坡——{}{}。"
-                      "该点之后再加并发只会拉长排队，容量规划取平台起点口径。".format(
-                          esc(short(m)), qname, th, mt, "；".join(bits), ttft_txt))
+                      "该点之后再加并发只会拉长排队，容量规划取平台起点口径。{}".format(
+                          esc(short(m)), qname, th, mt, "；".join(bits), ttft_txt,
+                          ("　" + kv_note) if kv_note else ""))
     # 12.3 multiturn 深度实测校验：名义外推 vs 末轮实测，偏差 >10% 告警
     # （filler 语料抽样去重/边界不足额会让名义口径系统性偏乐观 10–15%，r3/r4 实测坐实）
     for m, P in A["per_model"].items():

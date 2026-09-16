@@ -14,6 +14,7 @@
     （12.2 恒落盘之前的产物）→ 列缺省渲染 — 不崩
   E 12.9 缓存判据三路：①cached_tokens 生效；②冷算比值生效/未命中；两判据均不可用
   F 12.1 版本握手：混版与异源 tool 字段告警不拒绝渲染
+  G 12.12 KV 容量画像：存在/缺失/畸形三态（结论区并列句与池÷拐点折算句）
 """
 
 import copy
@@ -192,12 +193,49 @@ def shape_tool_handshake():
     check(meta2["tools"] == ["other-tool/9"], "F 异源：tool 字段原样收集")
 
 
+# ── G 12.12 KV 容量画像：存在 / 缺失 / 畸形三态 ──
+def shape_kv_capacity():
+    def conc_entries():
+        # 两档闭环 levels（无 request_rate）→ 12.4 拐点结论必渲染（knee=2）
+        def mk(lvl, tps):
+            return {"model": "m", "thinking": "off", "max_tokens": 16, "level": lvl,
+                    "wall_seconds": 5.0, "throughput_tps": tps,
+                    "requests": [{"error": "", "ttft_ms": 100.0, "e2e_ms": 500.0,
+                                  "prompt_tokens": 100, "completion_tokens": 32}] * 4}
+        return [mk(1, 100.0), mk(2, 98.0)]
+
+    # ① 有画像：结论区并列「KV 容量参照」+ 折算句（闭环拐点路数口径）
+    kv = {"size_tokens": 1505497, "max_concurrency": 5.74, "block_size": 1600,
+          "cache_dtype": "fp8", "gpu_memory_utilization": 0.9}
+    rep = base_report("concurrent", conc_entries())
+    rep["kv_capacity"] = kv
+    _, meta, _, concl, _, _, _ = run_pipeline([rep])
+    check(meta["kv_capacity"] == kv, "G① kv_capacity 归集进 meta")
+    check(any("KV 容量参照" in c and "1,505,497" in c for c in concl),
+          "G① 结论区并列 KV 池容量与满上下文上界")
+    check(any("池÷拐点" in c for c in concl), "G① 池÷拐点折算句渲染（拐点 2 路）")
+
+    # ② 无画像（12.12 之前的旧产物）：并列句消失、不崩
+    _, meta2, _, concl2, _, _, _ = run_pipeline([base_report("concurrent", conc_entries())])
+    check(meta2["kv_capacity"] is None, "G② 旧产物无 kv_capacity → None")
+    check(all("KV 容量参照" not in c for c in concl2), "G② 无画像时并列句消失")
+
+    # ③ 畸形（字符串 / 空 dict / 全空字段）：宽容忽略不崩
+    for bad in ("not-a-dict", {}, {"size_tokens": 0}):
+        rep3 = base_report("concurrent", conc_entries())
+        rep3["kv_capacity"] = bad
+        _, _, _, concl3, _, _, _ = run_pipeline([rep3])
+        check(all("KV 容量参照" not in c for c in concl3),
+              "G③ 畸形 kv_capacity（{}）被忽略".format(bad))
+
+
 def main():
     shape_timeout_level()
     shape_none_and_empty()
     shape_legacy_json()
     shape_cache_paths()
     shape_tool_handshake()
+    shape_kv_capacity()
     if FAILS:
         print("\n{} 项失败".format(len(FAILS)))
         sys.exit(1)
