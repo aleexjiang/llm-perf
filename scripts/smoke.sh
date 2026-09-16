@@ -380,6 +380,14 @@ for s in sk_sess:
 check(bool(sk_lvl) and len(grps) == sk_lvl and all(off == sorted(off) for off in grps.values()),
       "各 worker 会话起始偏移递增（{}）".format(
           {k: [round(x, 1) for x in v] for k, v in sorted(grps.items())}))
+# P3-1 时长制画像：duration_s 标记 + 请求数不估算（渲染层以 — 呈现，不得当 0 个请求读）
+soak_plan = [rep.get("plan") for rep in load_all("out-soak") if rep.get("plan")]
+soak_scs = [s for p in soak_plan for m in (p.get("models") or []) for s in (m.get("scenarios") or [])
+            if s.get("name") == "concurrent"]
+check(soak_scs and all(s.get("duration_s") == 12 for s in soak_scs),
+      f"时长制画像标记 duration_s（实际 {[s.get('duration_s') for s in soak_scs]}）")
+check(soak_scs and all(s.get("requests") == 0 for s in soak_scs),
+      "时长制档位请求数不估算（requests=0，由墙钟决定）")
 mt = [r for rep in reps for r in rep.get("multiturn", [])]
 check(mt and all(len(r.get("turns") or []) == 3 for r in mt), "smoke-all trace 回放多轮 3 轮齐全")
 sg = [r for rep in reps for r in rep.get("single", []) if r.get("thinking") == "off"]

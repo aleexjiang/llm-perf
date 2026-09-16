@@ -131,3 +131,38 @@ func TestPlanSummaryMix(t *testing.T) {
 		t.Fatalf("mix 估算 %d ≠ 8", got.Requests)
 	}
 }
+
+// 时长制（10.5 duration_seconds）：请求量由墙钟决定，画像不报数——Requests=0 +
+// DurationS 标记（渲染层以「—」呈现），Detail 说明时长制口径。回归背景：时长制下
+// runs_per_worker 被场景层忽略，画像曾仍按它估算，日志/JSON 给出不会执行的请求数。
+func TestPlanSummaryDuration(t *testing.T) {
+	cfg := &config.Config{
+		Endpoint: "http://x:1/v1",
+		Models:   []string{"m1"},
+		Multiturn: config.Multiturn{Sessions: 2, Turns: 8, SystemTokens: 100, ToolDefsTokens: 100,
+			TurnTokens: 200, MaxTokens: config.IntList{32}},
+		Concurrent: config.Concurrent{Levels: []int{2}, RunsPerWorker: 2, DurationSeconds: 60,
+			Renew: true, MaxTokens: config.IntList{32}},
+	}
+	cfg.Thinking.Mode = "off"
+	p := PlanSummary(cfg, "", []PlanItem{{Name: "concurrent-multi", MT: true, Highs: []int{2}}})
+	got := p.Models[0].Scenarios[0]
+	if got.DurationS != 60 || got.Requests != 0 {
+		t.Fatalf("时长制画像应 Requests=0 + DurationS=60，实际 %d/%d（%s）",
+			got.Requests, got.DurationS, got.Detail)
+	}
+	if !strings.Contains(got.Detail, "时长制") {
+		t.Fatalf("时长制画像明细应说明口径: %s", got.Detail)
+	}
+	if p.TotalRequests != 0 {
+		t.Fatalf("总请求不应计入时长制档位: %d", p.TotalRequests)
+	}
+	// Render：时长制行不带「≈ N 请求」，总行说明不含时长制档位（数字不可估 ≠ 0 个请求）
+	outs := strings.Join(p.Render(), "\n")
+	if strings.Contains(outs, "≈ 0 请求") {
+		t.Fatalf("时长制行不应渲染「≈ 0 请求」: %s", outs)
+	}
+	if !strings.Contains(outs, "不含时长制档位") {
+		t.Fatalf("总行应说明不含时长制档位: %s", outs)
+	}
+}

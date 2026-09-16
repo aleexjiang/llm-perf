@@ -697,14 +697,9 @@ func main() {
 		}
 	}
 
-	// 8.2 恢复探针用的模型：与场景同源（ActiveModels 按 -m 过滤后取第一个）
-	probeModel := ""
-	for _, m := range cfg.ActiveModels() {
-		if *modelFilter == "" || m == *modelFilter {
-			probeModel = m
-			break
-		}
-	}
+	// 8.2 恢复探针用的模型：与场景同源（filterModels 的 -m 子串语义取首个匹配；
+	// 无匹配返回空串——此时场景侧同样无请求，探针不会触发）
+	probeModel := scenario.FirstMatchedModel(cfg.ActiveModels(), *modelFilter)
 
 	for idx, it := range items {
 		it := it

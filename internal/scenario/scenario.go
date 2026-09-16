@@ -1670,3 +1670,12 @@ func filterModels(models []string, filter string) []string {
 	}
 	return out
 }
+
+// FirstMatchedModel 返回按 -m 子串语义过滤后的首个模型（恢复探针等 main 侧消费）；
+// 无匹配（或列表为空）返回空串。与 filterModels 同一语义，避免过滤口径两处漂移。
+func FirstMatchedModel(models []string, filter string) string {
+	for _, m := range filterModels(models, filter) {
+		return m
+	}
+	return ""
+}

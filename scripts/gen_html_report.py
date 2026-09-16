@@ -625,13 +625,21 @@ def analyze(data, meta):
         ok_turns = [t for t in turns if not t.get("error")]
         n_fails = len(turns) - len(ok_turns)
         src = ok_turns
-        # 5.7 爬坡发车窗口：批次号 >1 才算出窗口（齐射/单批次不标），span 取首批→末批的启动偏移差
+        # 5.7 爬坡发车窗口：批次号 >1 才算出窗口（齐射/单批次不标）。span 取**各批次首次启动
+        # 时刻**的差——10.5 renew 续跑的会话同样记偏移（batch 固定为首批归属），直接取全局
+        # min/max 会被续跑会话撑到整场时长，把整场 soak 误标成"暂态爬坡窗"。
         ramp = None
         if lv.get("sessions"):
-            offs = [s.get("start_offset_s", 0) or 0 for s in lv["sessions"]]
-            batches = sorted({s.get("batch", 0) or 0 for s in lv["sessions"]})
-            if len(batches) > 1:
-                ramp = {"batches": len(batches), "span_s": round(max(offs) - min(offs), 1)}
+            first_by_batch = {}
+            for s in lv["sessions"]:
+                b = s.get("batch", 0) or 0
+                off = s.get("start_offset_s", 0) or 0
+                if b not in first_by_batch or off < first_by_batch[b]:
+                    first_by_batch[b] = off
+            if len(first_by_batch) > 1:
+                offs = list(first_by_batch.values())
+                ramp = {"batches": len(first_by_batch),
+                        "span_s": round(max(offs) - min(offs), 1)}
         A[quad].append({
             "model": lv["model"],
             "thinking": lv.get("thinking", "off"),
@@ -840,16 +848,6 @@ def analyze(data, meta):
         u = A["usage_med"].get((m, th, mt, size))
         return u if u else size
 
-    def axis_lbl(m, th, mt, size):
-        """档位标签：实测与配置偏差 >5% 时并列标出配置值（构造系数只影响近似程度，
-        判读必须锚在服务端真实看到的规模上）。"""
-        u = A["usage_med"].get((m, th, mt, size))
-        if not u or not size:
-            return "{:,}".format(size)
-        if abs(u - size) / float(size) > 0.05:
-            return "{:,}<span class='rng'>（配置 {:,}）</span>".format(u, size)
-        return "{:,}".format(size)
-
     def mk_unit(scene, model, th, bkt, lbl, ttfts, tpots, tpss, n):
         ttfts = [v for v in ttfts if v]
         tpots = [v for v in tpots if v]
@@ -983,6 +981,14 @@ def color_of(models, m, variant=0):
     return PALETTE[(models.index(m) * 2 + variant) % len(PALETTE)]
 
 
+def single_ttft_median(runs):
+    """单发 TTFT 图中位数：失败 run（无 ttft）与测不出的计时先剔除再统计——
+    与表格/并发图/四象限同口径；全部不可用返回 None（图不出点，不按 0 参与）。"""
+    ts = [r.get("ttft_ms") for r in runs
+          if not r.get("error") and r.get("ttft_ms") is not None]
+    return round(st.median(ts)) if ts else None
+
+
 def build_charts(data, A):
     s_by, m_by, c_lvls, models = organize(data)
     stmts, canvases = [], []
@@ -1009,7 +1015,7 @@ def build_charts(data, A):
                 ys = []
                 for size in sizes:
                     e = s_by[(m, th, mt)].get(size)
-                    ys.append(round(st.median([r.get("ttft_ms", 0) for r in e["runs"]])) if e else None)
+                    ys.append(single_ttft_median(e["runs"]) if e else None)
                 lbl = "{} (thinking={})".format(short(m), th)
                 if len(mts) > 1:
                     lbl += " out={}".format(mt)
@@ -1232,9 +1238,7 @@ def load_cell(e):
 
 
 def concurrent_table(A, quad):
-    qname = "并发·多轮" if quad == "conc_multi" else "并发·单轮"
     items = A[quad]
-    has_think = any(e["thinking"] != "off" or (e["think"] and e["think"][0] > 0) for e in items)
     has_slo = any(e.get("slo_total") for e in items)      # 未配置 slo.goodput 时不出这两列
     has_wait = any(e.get("waiting_max") for e in items)   # 观测层不可用时不出
     has_run = any(e.get("running_max") for e in items)    # 12.5 观测对偶：执行数峰值（同上）
@@ -2186,20 +2190,15 @@ def onepager(data, A, meta):
     rows, per_model = [], {}
     for m in models:
         u = _ttft_unit(base, m)
-        # ① TTFT：样本不足退回中位（与 5.8 同口径），标出实际输入与口径
+        # ① TTFT：样本不足退回中位（与 5.8 同口径）
         t_val = t_lv = None
-        t_note = "本轮未测单发（无 TTFT 判据单元）"
         if u:
             t_val = u["ttft_p99"] if u["ttft_p99"] is not None else u["ttft_med"]
-            t_kind = "p99" if u["ttft_p99"] is not None else "中位"
             if u["bucket"] == "long":
                 t_lv = _level_of(t_val, tiers["long_good_ttft"], tiers["long_pass_ttft"])
             elif u["bucket"] == "short":
                 t_lv = _level_of(t_val, tiers["short_good_ttft"], tiers["short_pass_ttft"])
             # mid 档两档之间无权威锚点 → 只报数不打徽章（与第 8 节同规则）
-            t_note = "{} 输入 {}（{}·n={}）{}".format(
-                u["scene"], u["prompt"], t_kind, u["n"],
-                "" if t_lv is not None else "；区间无权威锚点，不判级")
         # ② decode 速度：TPOT（真实 per-token 间隔）+ 输出吞吐，同一单元取值
         tp_val = u["tpot_med"] if u else None
         ts_val = u["tps"] if u else None
@@ -2649,7 +2648,7 @@ def main():
     kpis = []
     for m, P in A["per_model"].items():
         if "off" in P and P["off"].get("ladder_top"):
-            l0, l1 = P["off"]["ladder_top"][0], P["off"]["ladder_top"][-1]
+            l1 = P["off"]["ladder_top"][-1]
             kpis.append(("单发 TTFT @{}k ({})".format(l1["size"] // 1000, short(m)),
                          "{:.2f} s".format(l1["ttft"][0]) if l1["ttft"] else "—"))
         if P.get("decode_tps"):

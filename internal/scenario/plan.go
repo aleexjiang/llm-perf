@@ -181,11 +181,24 @@ func planScenario(mc *config.Config, it PlanItem) *report.PlanScenario {
 		if len(levels) == 0 {
 			levels = cc.Levels
 		}
+		// 10.5 时长制（duration_seconds）：各档位跑满墙钟，runs_per_worker 被场景层忽略——
+		// 请求量由吞吐决定、不可预先估算。画像此时不报数（Requests=0 + DurationS 标记，
+		// 渲染层以「—」呈现），避免给出一个按已忽略配置算出来的假估算。
+		dur := cc.DurationSeconds
 		var mode string
 		if it.MT {
-			mode = fmt.Sprintf("每用户多轮会话 × turns=%d", effectiveTurns(mc))
 			if mixN > 0 {
 				mode = "多轮（mix 与 multiturn 互斥，此组合不会出现）"
+			} else if dur > 0 {
+				mode = fmt.Sprintf("每用户多轮会话 × turns=%d × 每档跑满 %ds（时长制：请求数取决于吞吐）",
+					effectiveTurns(mc), dur)
+			} else {
+				mode = fmt.Sprintf("每用户多轮会话 × turns=%d", effectiveTurns(mc))
+			}
+		} else if dur > 0 {
+			mode = fmt.Sprintf("每档跑满 %ds（时长制：runs/worker 忽略，请求数取决于吞吐）", dur)
+			if mixN > 0 {
+				mode += fmt.Sprintf(" × 混跑 %d 形状", mixN)
 			}
 		} else {
 			mode = fmt.Sprintf("单轮 × runs/worker=%d", cc.RunsPerWorker)
@@ -194,17 +207,19 @@ func planScenario(mc *config.Config, it PlanItem) *report.PlanScenario {
 			}
 		}
 		total := 0
-		for _, v := range vs {
-			tiers := 1 // 混跑不走外层输出扫描（与场景层 tiers=[0] 对应）
-			if mixN == 0 {
-				tiers = len(th.MaxTokensList(cc.MaxTokens, v))
-			}
-			for _, level := range levels {
-				per := level * cc.RunsPerWorker
-				if it.MT {
-					per = level * effectiveTurns(mc)
+		if dur <= 0 {
+			for _, v := range vs {
+				tiers := 1 // 混跑不走外层输出扫描（与场景层 tiers=[0] 对应）
+				if mixN == 0 {
+					tiers = len(th.MaxTokensList(cc.MaxTokens, v))
 				}
-				total += tiers * per
+				for _, level := range levels {
+					per := level * cc.RunsPerWorker
+					if it.MT {
+						per = level * effectiveTurns(mc)
+					}
+					total += tiers * per
+				}
 			}
 		}
 		name := it.Name
@@ -212,9 +227,10 @@ func planScenario(mc *config.Config, it PlanItem) *report.PlanScenario {
 			name = "concurrent"
 		}
 		return &report.PlanScenario{
-			Name:     name,
-			Detail:   fmt.Sprintf("levels %v × %s × thinking %s", levels, mode, thDesc),
-			Requests: total,
+			Name:      name,
+			Detail:    fmt.Sprintf("levels %v × %s × thinking %s", levels, mode, thDesc),
+			Requests:  total,
+			DurationS: dur,
 		}
 	}
 	return nil

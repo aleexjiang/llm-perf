@@ -83,6 +83,7 @@ Report
 12. **content_chars/reasoning_chars 是字符数（rune）**：2026-09 起按字符计（此前是 UTF-8 字节数，中文单字被计为 3）；报告"思考字符"列、日志"N 字"同步。
 13. **think_ms / decode_ms 缺失 ≠ 0 秒**（2026-09-10 起）：两者都带 omitempty，`thinking=off` 时 `think_ms` 缺失代表真实的 0（该保留）；但 `thinking=on` 且 `thinking_no_content=true`（思考吃光输出预算、正文 0 字符）时思考段终点无从界定，缺失是**"测不出"而不是 0**。消费方不得把后者当 0 参与中位数——报告侧 `think_sec()` 统一返回 None 并整体剔除（单发阶梯、并发、多轮逐轮、think_all 四处同一口径）。否则一个档位里只要有部分 run 测不出，中位数就塌成 0：实测曾把 100k 档渲染成"思考 0.0s / 占比 0%"，而该档真实思考为 142s。
     **`decode_ms` 同理且已由采集端清 0**：全程无 content 时它本会被填成 `first_chunk→end`，那是整段 reasoning 的生成时长、不是 content 解码时长——留着会让报告 decode 列出一个像样的错数。故 `thinking_no_content=true` 时采集端直接清 0，键随 omitempty 消失，与日志侧打的「—」一致。
+14. **`server_counter_delta` 是逐请求排障证据，无报告消费方**：仅单发 / 串行多轮启用（并发恒缺——避免把共享计数器增量错记到单请求头上）；值 = 该请求抓取窗口内的服务端 counter 增量，窗口可能含周期性抓取或其他流量（近似对账，非精确归属）。与 `content_preview` / `itl_p90+` 等同类，属设计内原始存档（ROADMAP §11.3），报告与 smoke 均不按键名消费——不是待接线的搁置字段。
 
 ## 主流口径对照（2026-09，对齐 GenAI-Perf/AIPerf、vLLM bench serve、LLMPerf、Inference-Perf）
 

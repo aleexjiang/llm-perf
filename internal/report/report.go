@@ -163,10 +163,13 @@ type PlanModel struct {
 }
 
 // PlanScenario 单场景估算：Detail 为人读明细行，Requests 为该模型该场景的请求估算。
+// DurationS > 0 = 10.5 时长制档位（跑满墙钟）：请求数由吞吐决定、无法预先估算——
+// Requests 记 0 且渲染层以「—」呈现（不得当「0 个请求」读）。
 type PlanScenario struct {
-	Name     string `json:"name"` // single | multiturn | concurrent | concurrent-multi
-	Detail   string `json:"detail"`
-	Requests int    `json:"requests"`
+	Name      string `json:"name"` // single | multiturn | concurrent | concurrent-multi
+	Detail    string `json:"detail"`
+	Requests  int    `json:"requests"`
+	DurationS int    `json:"duration_s,omitempty"`
 }
 
 // Render 输出人读总览行（bench 启动时逐行打印；HTML 报告另按结构渲染）。
@@ -174,12 +177,23 @@ func (p *Plan) Render() []string {
 	lines := []string{fmt.Sprintf(
 		"测试画像：端点 %s ｜ 模型 %d 个 ｜ 认证 %s ｜ 超时 %ds ｜ 预热 %d/场景 ｜ 金丝雀 %d/模型",
 		p.Endpoint, p.NumModels, p.Auth, p.TimeoutS, p.Warmup, p.Correctness)}
+	hasDur := false
 	for _, m := range p.Models {
 		for _, s := range m.Scenarios {
+			if s.DurationS > 0 {
+				hasDur = true
+				lines = append(lines, fmt.Sprintf("  [%s] %s", s.Name, s.Detail))
+				continue
+			}
 			lines = append(lines, fmt.Sprintf("  [%s] %s ≈ %d 请求", s.Name, s.Detail, s.Requests))
 		}
 	}
-	lines = append(lines, fmt.Sprintf("总请求估算（不含预热与金丝雀）≈ %d", p.TotalRequests))
+	if hasDur {
+		lines = append(lines, fmt.Sprintf(
+			"总请求估算（不含预热与金丝雀；不含时长制档位——其请求数取决于吞吐）≈ %d", p.TotalRequests))
+	} else {
+		lines = append(lines, fmt.Sprintf("总请求估算（不含预热与金丝雀）≈ %d", p.TotalRequests))
+	}
 	return lines
 }
 

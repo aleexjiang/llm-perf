@@ -16,13 +16,11 @@
   F 12.1 版本握手：混版与异源 tool 字段告警不拒绝渲染
   G 12.12 KV 容量画像：存在/缺失/畸形三态（结论区并列句与池÷拐点折算句）
   H 10.5 分时段漂移（退化/稳定/renew 剔暂态/短跨度 NA）+ stall.csv 熔断时刻解析
+  I 沙盘推演修复回归：单发 TTFT 图失败剔除（P2-1）/ 发车窗口首批口径（P3-2）
 """
 
-import copy
 import datetime
-import json
 import os
-import subprocess
 import sys
 import tempfile
 
@@ -46,7 +44,7 @@ def base_report(scen, entries, tool="llm-perf/dev"):
             "tool": tool, "generated_at": "2026-09-16T00:00:00Z"}
 
 
-def run_pipeline(reports, quad_entries=None):
+def run_pipeline(reports):
     """merge → analyze → 结论/建议/局限/各表，任何异常直接算失败。"""
     reports = [("fake-{}.json".format(i), d) for i, d in enumerate(reports)]
     data, meta = g.merge(reports)
@@ -147,7 +145,7 @@ def shape_cache_paths():
                  "turns": [t0, t1],
                  "last_prompt_tokens": last_prompt, "nominal_last_prompt": 320}]
 
-    def single_entries(slope_target=False):
+    def single_entries():
         # 两档构造单发斜率 0.5 ms/tk（TTFT 0.2s@100 → 0.35s@400）
         return [
             {"model": "m", "thinking": "off", "max_tokens": 16, "prompt_tokens": 100,
@@ -297,6 +295,40 @@ def shape_soak_drift():
     check(not (A5.get("soak_drift") or []), "H⑤ 无 sent_at 旧产物 → 不产出趋势")
 
 
+# ── I 沙盘推演修复回归：P2-1 单发图失败剔除 / P3-2 发车窗口首批口径 ──
+def shape_sandbox_fixes():
+    """沙盘推演修复回归：P2-1 单发 TTFT 图剔除失败 run；P3-2 发车 span 取各批次首次启动。"""
+    # P2-1：失败 run 与 None 计时剔除后取中位（修复前失败 run 按 0 计入、图中位被拉低）
+    runs = [{"error": "", "ttft_ms": 200.0, "e2e_ms": 500.0},
+            {"error": "timeout", "ttft_ms": None, "e2e_ms": None},
+            {"error": "", "ttft_ms": None, "e2e_ms": 500.0}]
+    check(g.single_ttft_median(runs) == 200, "P2-1 失败/None 剔除后中位 = 200（不塌向 0）")
+    check(g.single_ttft_median([{"error": "timeout", "ttft_ms": 1.0}]) is None,
+          "P2-1 整档失败 → None 不出点")
+    check(g.single_ttft_median([]) is None, "P2-1 空 runs → None")
+    check(g.single_ttft_median([{"error": "", "ttft_ms": 100.0},
+                                {"error": "", "ttft_ms": 300.0}]) == 200,
+          "P2-1 无失败时中位口径不变（200）")
+
+    # P3-2：renew 续跑会话同样记偏移，不得把整场 soak 撑成"暂态爬坡窗"
+    def sess(sid, batch, off):
+        return {"model": "m", "thinking": "off", "max_tokens": 32, "session": sid,
+                "batch": batch, "start_offset_s": off,
+                "turns": [{"error": "", "ttft_ms": 100.0, "e2e_ms": 500.0,
+                           "prompt_tokens": 100, "new_tokens": 32}]}
+    sessions = [sess(1, 1, 0.2), sess(2, 1, 0.5), sess(3, 1, 80.0),  # 3 号 = 批次 1 的续跑
+                sess(4, 2, 10.0), sess(5, 2, 10.4)]
+    lv = {"model": "m", "thinking": "off", "max_tokens": 32, "level": 2,
+          "wall_seconds": 95.0, "throughput_tps": 100.0,
+          "multiturn": True, "renew": True, "duration_seconds": 95, "sessions": sessions}
+    _, _, A, _, _, _, _ = run_pipeline([base_report("concurrent", [lv])])
+    ramp = (A.get("conc_multi") or [{}])[0].get("ramp")
+    check(ramp is not None and ramp["batches"] == 2,
+          "P3-2 发车窗口：2 个批次（{}）".format(ramp))
+    check(ramp is not None and abs(ramp["span_s"] - 9.8) < 1e-6,
+          "P3-2 span 取各批次首次启动差（10.0−0.2=9.8；修复前被续跑撑到 79.8）（{}）".format(ramp))
+
+
 def shape_stall_events():
     with tempfile.TemporaryDirectory() as td:
         os.makedirs(os.path.join(td, "sub"))
@@ -321,6 +353,7 @@ def main():
     shape_tool_handshake()
     shape_kv_capacity()
     shape_soak_drift()
+    shape_sandbox_fixes()
     shape_stall_events()
     if FAILS:
         print("\n{} 项失败".format(len(FAILS)))

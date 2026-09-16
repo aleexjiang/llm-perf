@@ -729,3 +729,25 @@ func TestNominalLastPrompt(t *testing.T) {
 		t.Fatalf("turn_tokens=0 应为 0，got %d", got)
 	}
 }
+
+// FirstMatchedModel：与场景侧 filterModels 同一 -m 子串语义（恢复探针取首个匹配）。
+// 回归背景：恢复探针曾用精确相等 m == filter——`-m mock` 命中 mock-model-a 时探针恒空，
+// 熔断冷却后误判「服务端未恢复」并停掉剩余场景。
+func TestFirstMatchedModel(t *testing.T) {
+	models := []string{"mock-model-a", "mock-model-b"}
+	if got := FirstMatchedModel(models, ""); got != "mock-model-a" {
+		t.Fatalf("空 filter 应取首个: %q", got)
+	}
+	if got := FirstMatchedModel(models, "model-b"); got != "mock-model-b" {
+		t.Fatalf("子串匹配应取命中: %q", got)
+	}
+	if got := FirstMatchedModel(models, "mock"); got != "mock-model-a" {
+		t.Fatalf("宽子串应取首个命中: %q", got)
+	}
+	if got := FirstMatchedModel(models, "nope"); got != "" {
+		t.Fatalf("无匹配应返回空串: %q", got)
+	}
+	if got := FirstMatchedModel(nil, ""); got != "" {
+		t.Fatalf("空列表应返回空串: %q", got)
+	}
+}
