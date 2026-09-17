@@ -26,19 +26,6 @@ server_metrics: true              # 服务端观测层：抓推理服务原生 /
                                   # 排队深度、prefill/decode 分解、MTP 接受率；不可达时自动降级纯客户端计时
 warmup_requests: 0                # 每场景开始前的预热请求数（不计入统计，唯一内容不污染缓存对照）
 
-# 降速熔断 stall_guard（可选，默认关闭；写了即生效）：聚合输出速度持续低于 min_tps 达
-# window_seconds 只中止当前场景，已完成数据照常落盘。min_tps 必须按实例稳态 decode
-# 速率标定（实测 16.6 tok/s 的实例用默认 20 会在正常运行时误触发）。
-# stall_guard:
-#   enabled: true
-#   min_tps: 10                    # 阈值（tok/s，聚合输出速度），默认 10（熔断兜底非 UX 评级；部署建议值由 bench probe 输出）
-#   window_seconds: 600            # 持续低于阈值多久触发，默认 600（10 分钟）
-#   cooldown_seconds: 300          # 熔断后到下一场景的冷却，默认 300；只给恢复留时间窗
-#   sample_seconds: 2              # 采样周期（秒），默认 2；支持亚秒（回归用 0.5）
-#   probe_factor: 2                # 8.2 恢复探针倍数，默认 2：冷却结束发 4k/256×3 短探针取中位，
-#                                  #   实测 ≥ probe_factor×min_tps 才继续下一场景，否则停止整轮；
-#                                  #   显式 0 = 关闭探针退回纯计时冷却
-
 # 数据源：filler（默认）= token 精确填充，用于缓存对照/上下文深度等变量控制实验；
 #         trace = 真实会话回放（ShareGPT/自定义），贴近实际流量分布，token 以服务端 usage 为准
 dataset:
@@ -78,11 +65,10 @@ dataset:
 #     good_tpot: 40             # ms
 #     pass_tpot: 200            # ms
 
-# 饱和止损（默认关闭）：负载饱和时停止加压，与降速熔断互补（stall_guard 管「服务端变慢」，
-# 本段管「负载积压」）。任一判据触发即**停止向当前档位发新请求**（drain：在飞跑完，已发出
-# 的请求全部保留完整数据）并停止后续档位，aborted 留痕。
-# max_waiting 标定：首轮关着 guard 跑，各档 waiting 峰值会落盘（waiting_max），
-# 报告建议区自动给建议值（≈4× 峰值）——阈值低于正常水位会把正常排队当饱和误切。
+# 饱和止损（默认关闭）：负载饱和时停止继续发压；任一判据触发即**停止向当前档位发新请求**
+# （drain：在飞跑完，已发出的请求全部保留完整数据）并停止后续档位，aborted 留痕。
+# max_waiting 标定：各档 waiting 峰值会落盘（waiting_max）；外部分析据此标定阈值，
+# 阈值低于正常水位会把正常排队当饱和误切。
 # CLI 覆盖：--sat-waiting / --sat-window / --sat-max-wall；--no-sat-guard 关闭。
 # saturation_guard:
 #   max_waiting: 32           # waiting 排队深度阈值（需 server_metrics: true；0=不启用）
@@ -103,20 +89,6 @@ dataset:
 # retry:
 #   max_attempts: 2     # 总尝试次数
 #   backoff_ms: 300     # 退避基数（指数退避，封顶 5s）
-
-# 降速熔断（默认关闭）：长测下服务端退化会白白烧掉几小时——聚合输出速度持续低于阈值
-# 就中止**当前场景**（不是整轮），冷却后续跑下一个场景。已完成数据照常落盘，报告的
-# note 与 run.log 里标注熔断原因与现场速度。
-# 口径：窗口内**所有在飞请求输出 token 之和 / 窗口时长**（非单请求速度——并发下单请求慢
-# 可能只是排队）；每个场景独立计时，空闲与纯 prefill（首个 token 之前）不参与判定，
-# 避免长上下文档位误触发。速度回升即重置计时（"持续不升"才算降速）。
-# CLI 覆盖：--stall-tps / --stall-window / --stall-cooldown；--no-stall-guard 直接关闭。
-# stall_guard:
-#   enabled: true               # 默认 true（写了该段即生效）
-#   min_tps: 20                 # 阈值（tok/s）
-#   window_seconds: 600         # 连续低于阈值多久触发（10 分钟）
-#   cooldown_seconds: 300       # 触发后到下一个场景的冷却（5 分钟；0 = 立即继续）
-#   sample_seconds: 2           # 采样周期；须小于 window_seconds
 
 models:
   - "/models/DeepSeek-V4-Flash-0731"
@@ -164,7 +136,7 @@ multiturn:
   max_reply_chars: 2000           # assistant 回复进 history 的截断长度（按字符计，中文安全；默认 2000）
   # 混合档（5.11，跨会话混合）：并发多轮时（--turns multi --concurrency 2,4,…）按权重把会话
   # 分属不同增量档——测"重度会话与轻量会话同场竞技"的容量与相互干扰（重度抢 KV 对轻量体验的
-  # 影响）。SWRR 确定性分配（与 5.6 mix 同源）；标量 turn_tokens 在并发多轮下让位于档位（并存
+  # 影响）。SWRR 确定性分配；标量 turn_tokens 在并发多轮下让位于档位（并存
   # 告警）；仅并发多轮生效，filler 专属（dataset.mode=trace 互斥）。示例：真实增量档 3 份 + 重度档 1 份：
   # profiles:
   #   - {weight: 3, name: real,  turn_tokens: 5000,  turns: 32}   # 对齐真实 agent 增量（AgentLens p50 +4k/轮）
@@ -177,19 +149,11 @@ concurrent:
   # rate_sweep: [0.1, 0.25, 0.5, 1, 2]  # 多档 RPS 扫描
   num_prompts: 32                 # 总会话数；multiturn 下 RPS 是会话到达率
   max_concurrency: 0              # 客户端安全上限，0=不限
-  prompt_tokens: 10000             # 仅 mix/单轮兼容字段；多轮使用 multiturn 形状
+  prompt_tokens: 10000             # 闭环单轮兼容字段；多轮使用 multiturn 形状
   max_tokens: 256                 # 每轮输出上限
   burstiness: 1                   # 1=标准泊松；<1 更突发；>1 趋向均匀
   # duration_seconds: 300          # soak：跑满墙钟，到点停发新会话、在途跑完
   # renew: true                    # soak 多轮续跑：会话滚完后换新内容重开
-  # 混合负载（5.6）：按权重确定性混跑长短请求（平滑加权轮转，小请求数下低权重形状不饿死）。
-  # 线上流量从不均匀——均匀负载测出的吞吐/p99 系统性偏乐观，混跑才能测出容量折扣与真实尾延迟。
-  # 与 multiturn: true 互斥；配置后本场景形状由 mix 各项决定，上方 prompt_tokens/max_tokens
-  # 单值与 max_tokens 输出扫描失效（配置告警提示）。可与开环 request_rate/rate_sweep 组合，
-  # 开环混跑更贴近线上到达模式。报告附形状分解表 + 混跑 vs 均匀对照（<85% 标 ⚠️）。
-  # mix:
-  #   - {weight: 7, label: short, prompt_tokens: 1000,  max_tokens: 128}
-  #   - {weight: 3, label: long,  prompt_tokens: 20000, max_tokens: 1024}
 
 # ─────────────────────────────────────────────────────────────
 # 按模型覆盖（可选，配置组织的推荐方式）：顶部通用 + 底部差异

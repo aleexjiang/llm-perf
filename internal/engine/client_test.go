@@ -258,7 +258,7 @@ func TestThinkMSNegativeClamped(t *testing.T) {
 func ptrTime(t time.Time) *time.Time { return &t }
 
 // 回归点：percentile 曾用 floor 索引，偶数样本 P50 系统性偏低半步，
-// 与报告侧 st.median / scenario 层 aggregateShapes 口径不一致
+// 与外部分析的中位数口径不一致
 func TestPercentileMedianParity(t *testing.T) {
 	if got := percentile([]float64{1, 2}, 50); got != 1.5 {
 		t.Fatalf("偶数样本 P50 应取两中值平均=1.5，实际 %v", got)

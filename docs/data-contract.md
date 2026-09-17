@@ -9,7 +9,7 @@
 
 ## 版本
 
-每份场景 JSON 顶层带 `schema_version`（当前 **3**，常量 `report.SchemaVersionCurrent`）。
+每份场景 JSON 顶层带 `schema_version`（当前 **4**，常量 `report.SchemaVersionCurrent`）。
 结构变更时递增，消费方据此做兼容判断；schema 不保向后兼容（拍板见 AGENTS.md），大版本升级可能直接改字段类型。
 
 ## 数据流与落盘组织
@@ -20,7 +20,6 @@ bench -c config.yaml --turns X --concurrency Y
      <output_dir>/<模型>/<场景>-<时间戳>.json   # 多模型：PartitionByModel 按模型分区
      <output_dir>/run.log                       # 测试级追加日志（跨场景共享）
      <output_dir>/raw/*.log                     # debug:true 时的原始请求/响应转储
-     <output_dir>/*.stall.csv                   # stall_guard 降速采样序列（侧文件，见下）
   └─ bench probe -c config.yaml -o probe.json
      └─ probe 结果是独立结构（ProbeResult），不与场景 Report 同构
 ```
@@ -38,14 +37,13 @@ Report
 ├── plan           # 测试画像：开跑前的场景×模型估算（展示口径=执行口径）
 ├── multiturn[]    # MultiturnRun: model, thinking, session, max_tokens,
 │                  #   profile（混合档位名，仅 multiturn.profiles 生效时出现）,
-│                  #   turns[]→TurnMetrics, batch/start_offset_s（5.7 爬坡发车）,
+│                  #   turns[]→TurnMetrics, start_offset_s（soak 时段分析）,
 │                  #   last_prompt_tokens/nominal_last_prompt（12.3 深度实测对照）
 ├── concurrent[]   # ConcurrentLevel: model, thinking, level, request_rate(开环>0),
 │                  #   sessions[]→MultiturnRun（多轮会话，逐 turn 计量）,
 │                  #   wall_seconds, throughput_tps（完整成功请求）, completed/failed/cancelled_requests,
 │                  #   slo_meet/slo_total/goodput_rps/goodput_tps,
-│                  #   waiting_max/running_max（观测峰值）, aborted（提前终止原因）,
-│                  #   shapes[]→ShapeStat（concurrent.mix 形状分解，中位数）
+│                  #   waiting_max/running_max（观测峰值）, aborted（提前终止原因）
 ├── correctness[]  # 金丝雀判定：{model, number, reply, match, e2e_ms, error}
 ├── auxiliary_requests[] # 不进入 benchmark KPI 但完整留存：phase=warmup/correctness，
 │                  #   metrics=完整 TurnMetrics（含失败、取消、warnings、usage、原始时序）
@@ -62,14 +60,11 @@ Report
 ├── source_check   # 两源一致性（仅 benchmark 并发/RPS 窗口）：client_tps/server_tps/deviation
 │                  #   warmup/correctness 已排除；多模型时是端点级合计参考，不是单模型精确归因
 │                  #   deviation 恒出现：0 = 两源完全一致，是最有意义的好结果
-├── environment    # 引擎识别存档（ProbeResult 轻量版）
-├── config_raw     # 配置原文
-└── stall_trace    # .stall.csv 侧文件相对路径（--no-stall-trace 或未触发熔断时缺失）
+├── environment    # 可选环境存档；普通 bench 不自动 probe，显式 probe 结果独立落盘
+└── config_raw     # 配置原文
 ```
 
 注意：`RequestRate>0` 即开环模式（Level=0）；`Level>0` 为闭环并发档位。
-`.stall.csv` 列序 `t_s,agg_tps,med_tps,in_flight,emitting,phase`（phase ∈ emit/prefill/idle，
-非 emit 相位速度留空——"测不出"≠0；`# tripped:` 注释行留熔断原因）。
 
 ## TurnMetrics 字段要点（client.go `TurnMetrics`）
 
@@ -93,7 +88,7 @@ Report
 2. **失败判定唯一依据 `error` 字段**：断流（stream_broken）也写 error（"stream broken: …"）；`stream_broken` 只作补充标记。只看 stream_broken 会漏、只看 err 返回值会漏（attempt 返回 err=nil + 指标里的 Error）。
 3. **吞吐是完整成功请求口径**：ThroughputTPS = `error==""` 且未主动取消请求的 completion_tokens 之和 ÷ 墙钟。失败/取消请求的完整原始指标仍落盘，但失败响应可能只有部分 usage，不能把不完整 token 混入主吞吐；档位同时落盘 completed/failed/cancelled 计数。
 4. **SLOTotal 含服务端失败、不含主动取消**：已发出但服务端/网络失败的请求计入 SLO 分母（失败=不达标）；工具主动取消属于控制行为，不计入完成数或 SLO 分母。非流式模式下 TPOT 不可测 → 配置 goodput 时非流式全不达标。
-5. **分位统一为线性插值**（2026-09-10 起）：ITL 分位（Go 侧 `percentile`）由最近秩 floor 取值改为线性插值，P50 偶数样本等于两中值平均——与分析侧 `median`、scenario 层 `aggregateShapes` 口径一致。此前同一报告内两者都叫 p99 但口径不同，现可比；与改动前的历史数据对比时 ITL 分位数会略升。
+5. **分位统一为线性插值**（2026-09-10 起）：ITL 分位（Go 侧 `percentile`）由最近秩 floor 取值改为线性插值，P50 偶数样本等于两中值平均——与外部分析的 `median` 口径一致。与改动前的历史数据对比时 ITL 分位数会略升。
 6. **think_ms 保证 ≥ 0**：reasoning 首包晚于 content 首包（引擎时序异常）时钳 0 并记 `think_ms_negative` 告警，原始时序在 first_*_at 时间戳可核查。
 7. **usage 缺失的连锁**：服务端不回 usage 时 prompt/completion=0 + `usage_missing` 告警 → tokens_per_sec=0、TPOT 缺失、new_tokens 不更新（下轮会显示完整 prompt 而非增量）。有 usage_missing 告警的行，token 类指标全部不可信。
 8. **服务端 counter 差分保证 ≥ 0**：负增量（服务端重启归零）钳 0——该窗口的命中率等指标可信度下降，应结合 preemptions/重启时间解读。NaN/±Inf 指标行在解析层直接丢弃（防 JSON 序列化失败）。

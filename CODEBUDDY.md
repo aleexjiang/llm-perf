@@ -50,7 +50,6 @@ scripts/smoke.sh
 
 - 场景 JSON：`multiturn[]`、`concurrent[]`、`correctness[]`、`auxiliary_requests[]`；
 - probe JSON：独立的引擎和能力探测结果；
-- `*.stall.csv`：降速控制层采样序列；
 - `run.log`：测试级日志；
 - `raw/`：开启 `debug` 或请求失败时的原始响应证据。
 

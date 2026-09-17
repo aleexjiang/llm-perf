@@ -59,7 +59,7 @@ E2E = 排队等待 + prefill(全部输入) + N输出 × decode(逐token)
 | 输出 | SLO 徽章基线 | 容量曲线、饱和点、goodput@SLO、瓶颈归属 | 退化曲线、正确性时间线、事故留痕 |
 | 退出码 | 有 | 无（探索性） | 有（不达标即红） |
 
-现有能力归位：**基准** = probe 标定 + 多轮 filler/trace + fixed_seed + plan 画像 + SLO 原始数据；**性能** = 闭环/开环 RPS/mix/goodput/速率容量原始数据 + saturation_guard；**稳定性** = stall_guard、saturation、canary、恢复探针与时长制续跑。报告聚合已移出本工具，统一由外部分析完成。
+现有能力归位：**基准** = probe 标定 + 多轮 filler/trace + fixed_seed + plan 画像 + SLO 原始数据；**性能** = 闭环/开环 RPS/mix/goodput/速率容量原始数据 + saturation_guard；**稳定性** = saturation、canary 与时长制续跑。报告聚合和容量判定已移出本工具，统一由外部分析完成。
 
 【已拍板】suite 形态 = 配置顶层 `test: benchmark|performance|soak` + 单二进制不动（改动面小、smoke 兜得住）；子命令入口方案否决（CLI 改动面大）。suite 落地前以"预设配置 + 报告标注模式"过渡。
 
@@ -105,7 +105,7 @@ E2E = 排队等待 + prefill(全部输入) + N输出 × decode(逐token)
 
 **默认路径 = 隔离优先 + 组合预测**。依据就是 scenario-guide §0 的总原则：GPU 独占 ⇒ 交互效应弱 ⇒ 叠加预测成立 ⇒ 混合回放的边际信息接近零，不该预支测它。混合回放降级为诊断器，**复活条件：组合预测与客户线上体感失配，且已排除客户端/网络因素**（届时才做 trace per-call model 字段 + 路由 driver + per-model guard 聚合）。
 
-多模型下必须的小修（与混合回放无关，现在逐模型跑同一份配置就已踩口径）：probe `decode_speed` 建议值按单模型实测，全局 `min_tps` 套用到更慢的模型会误杀 → per-model `stall_guard` 覆盖，或规则定为"按最慢被测模型标定"。
+多模型下必须的小修（与混合回放无关）：probe `decode_speed` 按模型分别落盘，外部分析不要把最慢模型的参考速度误当成所有模型的实际性能。
 
 trace 画像器（离线、不发包：per-model 流量画像 + 每轮调用链序列）是外部数据分析的输入；当前压测只负责 full trace 多轮原始回放，不把线上历史耗时当判定线。
 

@@ -83,7 +83,7 @@ type Multiturn struct {
 	// Profiles 混合档（5.11）：非空时并发多轮的会话按权重分属不同增量档（跨会话混合）——
 	// 测"重度会话与轻量会话同场竞技"时的容量与相互干扰（重度抢 KV 对轻量体验的影响）。
 	// 会话增量/轮数由所属档位决定，标量 TurnTokens 在并发多轮下忽略（并存时告警）；
-	// 分配用平滑加权轮转（与 5.6 concurrent.mix 同源，确定性可复现）。
+	// 分配用平滑加权轮转，确定性可复现。
 	// 仅并发多轮生效（单发多轮忽略并提示）；filler 专属——dataset.mode=trace 时加载报错。
 	Profiles []MixProfile `yaml:"profiles"`
 }
@@ -103,23 +103,12 @@ func (m Multiturn) GetSharedBase() bool { return m.SharedBase == nil || *m.Share
 // SetSharedBaseFalse 供测试与模型覆盖使用。
 func (m *Multiturn) SetSharedBaseFalse() { f := false; m.SharedBase = &f }
 
-// MixShape 混合负载的请求形状（5.6）：并发场景按 weight 确定性混跑长短请求。
-// 线上流量从不均匀——均匀负载测出的吞吐/p99 系统性偏乐观，混跑才能测出容量折扣与真实尾延迟。
-type MixShape struct {
-	Weight       int    `yaml:"weight"`        // 相对权重（正整数），按平滑加权轮转展开成确定性序列
-	Label        string `yaml:"label"`         // 形状名（报告分组用，留空自动 shape1/shape2…不可重复）
-	PromptTokens int    `yaml:"prompt_tokens"` // 该形状输入长度
-	MaxTokens    int    `yaml:"max_tokens"`    // 该形状输出上限（标量；与输出长度扫描正交，不做列表）
-}
-
 type Concurrent struct {
-	Levels        []int      `yaml:"levels"`
-	RunsPerWorker int        `yaml:"runs_per_worker"`
-	PromptTokens  int        `yaml:"prompt_tokens"`
-	MaxTokens     IntList    `yaml:"max_tokens"` // 标量或列表（列表 = 输出长度扫描）
-	Multiturn     bool       `yaml:"multiturn"`  // true=每个虚拟用户各自跑完整多轮会话（filler=模拟对话，trace=真实会话重放）
-	Mix           []MixShape `yaml:"mix"`        // 混合负载：非空时按权重混跑各形状（与 multiturn 互斥，
-	// prompt_tokens/max_tokens 单值与 max_tokens 扫描失效）
+	Levels        []int   `yaml:"levels"`
+	RunsPerWorker int     `yaml:"runs_per_worker"`
+	PromptTokens  int     `yaml:"prompt_tokens"`
+	MaxTokens     IntList `yaml:"max_tokens"` // 标量或列表（列表 = 输出长度扫描）
+	Multiturn     bool    `yaml:"multiturn"`  // true=每个虚拟用户各自跑完整多轮会话（filler=模拟对话，trace=真实会话重放）
 
 	// 开环到达率模式（对齐 vLLM bench serve / inference-perf）：request_rate>0 或 rate_sweep
 	// 非空时替代 levels 闭环——请求按 Poisson 过程到达，能测出排队-延迟曲线
@@ -133,13 +122,6 @@ type Concurrent struct {
 	// 采样后按理论总量 (n-1)/rate 整体重整——跨 seed 到达总量严格一致，吞吐跨 run 可比。
 	Burstiness float64 `yaml:"burstiness"`
 
-	// 5.7 闭环错峰发车（默认开，仅闭环 levels 生效）：首批发 1 个会话/worker，等该批
-	// 全部完成首轮后放下一批 min(上批×RampFactor, 剩余)——批次节奏由服务端首轮实际
-	// 耗时决定（自适应，无需按端点调参），替代 barrier 齐射对服务端的瞬间满额冲击。
-	// Ramp 显式 false 退回齐射；RampFactor 默认 2（1 = 逐个串行发车，无爬坡意义，报错）。
-	Ramp       *bool `yaml:"ramp"`
-	RampFactor int   `yaml:"ramp_factor"`
-
 	// 10.5 时长制 soak（闭环 levels 专属；与开环互斥）：
 	// DurationSeconds > 0 → 各档位跑满该时长为止（runs_per_worker 被忽略）——单轮 worker
 	// 循环发到时长满；多轮要求 Renew: true，会话滚完 turns 轮后换新 seed 重开。
@@ -149,23 +131,12 @@ type Concurrent struct {
 	Renew           bool `yaml:"renew"`
 }
 
-// RampEnabled 闭环错峰发车是否启用（nil = 默认开）。
-func (c Concurrent) RampEnabled() bool { return c.Ramp == nil || *c.Ramp }
-
 // EffBurstiness 生效的开环到达突发度（<=0 回落 1 = 标准泊松）。
 func (c Concurrent) EffBurstiness() float64 {
 	if c.Burstiness <= 0 {
 		return 1
 	}
 	return c.Burstiness
-}
-
-// EffRampFactor 生效的批次放大系数（<2 回落 2）。
-func (c Concurrent) EffRampFactor() int {
-	if c.RampFactor < 2 {
-		return 2
-	}
-	return c.RampFactor
 }
 
 // DatasetCfg 数据源：filler（默认，token 精确的合成/语料填充，用于变量控制实验）
@@ -223,7 +194,7 @@ func (b *SLOBaselineCfg) BaselineEnabled() bool {
 }
 
 // SaturationGuardCfg 饱和止损（默认关闭）：负载已饱和时停止加压，别把时间烧在
-// 注定全错的深饱和区（stall_guard 管「服务端变慢」，本段管「负载积压」——互补）。
+// 注定全错的深饱和区（本段管「负载积压」）。
 //
 // 两个独立判据，任一触发即**停止向当前档位发新请求**（drain 语义：在飞请求自然跑完，
 // 已发出的每个请求都保留完整数据——被截断的档位是干净的前缀样本而非残缺数据；
@@ -266,48 +237,6 @@ func (s *SaturationGuardCfg) GetWindowSeconds() int {
 type RetryCfg struct {
 	MaxAttempts int `yaml:"max_attempts"` // 总尝试次数；0/1 = 不重试
 	BackoffMS   int `yaml:"backoff_ms"`   // 退避基数，默认 300ms，指数退避封顶 5s
-}
-
-// StallGuardCfg 降速熔断（2026-09-11 新增，默认关闭；2026-09-16 判据改单流）：
-// 按「单流 decode 速度中位」判定服务端是否已退化到不值得继续跑——长窗口下低产出
-// 会白白烧掉几小时。
-//
-// 口径：各在飞流窗口内输出增量 / 窗口时长，取中位数（抗单流偶发抖动、反映普遍劣化；
-// r1-off S5 实测聚合 ~113 tok/s 掩盖了单流 6–16 tok/s 的劣化，故弃用聚合判据）。
-// 判定：中位速度连续低于 min_tps 达 window_seconds 即触发；任一次采样回升到阈值
-// 以上即重置计时。空闲与纯 prefill（未出首 token）不参与判定，避免误触发
-// （细节见 internal/engine/stall.go）。
-//
-// 触发后只中止**当前场景**（不是整轮），冷却 cooldown_seconds 后继续下一个场景；
-// 已完成的数据照常落盘，报告 note 与 run.log 里标注熔断原因与现场速度。
-type StallGuardCfg struct {
-	Enabled         *bool   `yaml:"enabled"`          // 默认 true（写了该段即生效）；false = 保留配置但不启用
-	MinTPS          float64 `yaml:"min_tps"`          // 阈值（tok/s，单流 decode 速度中位），默认 10——熔断兜底（防接近死机白烧长跑），不是 UX 评级；评级线见 docs/latency-baselines.md §8
-	WindowSeconds   int     `yaml:"window_seconds"`   // 连续低于阈值多久触发，默认 600（10 分钟）
-	CooldownSeconds int     `yaml:"cooldown_seconds"` // 触发后到下一个场景的冷却，默认 300（5 分钟）；0 = 不等
-	SampleSeconds   float64 `yaml:"sample_seconds"`   // 采样周期（秒），默认 2；支持亚秒（熔断回归用 0.5）
-
-	// 8.2 冷却+探针：冷却只给恢复留时间窗，续跑与否由探针实测决定——冷却结束后发短探针
-	// （4k prompt / 256 输出 ×3 取中位），实测 tok/s ≥ ProbeFactor×min_tps 才继续下一个
-	// 场景，否则停止整轮。默认 2；显式 0 = 关闭探针、退回纯计时冷却（旧行为）。
-	// 指针类型是为了区分「未配置」（默认 2）与「显式 0」（关闭）。
-	ProbeFactor *float64 `yaml:"probe_factor"`
-}
-
-// EffProbeFactor 生效的探针倍数（nil = 默认 2；负数视作 0 = 关闭）。
-func (sg *StallGuardCfg) EffProbeFactor() float64 {
-	if sg == nil || sg.ProbeFactor == nil {
-		return 2
-	}
-	if *sg.ProbeFactor < 0 {
-		return 0
-	}
-	return *sg.ProbeFactor
-}
-
-// StallEnabled 该配置段是否生效（未配置或 enabled:false 都返回 false）。
-func (s *StallGuardCfg) StallEnabled() bool {
-	return s != nil && (s.Enabled == nil || *s.Enabled)
 }
 
 // CorrectnessCfg 正确性抽查（llmperf 式防"假成功"）：向服务发数字转写金丝雀请求，
@@ -550,7 +479,7 @@ func (c *Config) ForModel(model string) *Config {
 			m.MaxReplyChars = s.MaxReplyChars
 		}
 		if len(s.Profiles) > 0 {
-			m.Profiles = s.Profiles // 档位切片运行期只读，浅拷贝即可（同 Concurrent.Mix）
+			m.Profiles = s.Profiles // 档位切片运行期只读，浅拷贝即可
 		}
 		v.Multiturn = m
 	}
@@ -567,9 +496,6 @@ func (c *Config) ForModel(model string) *Config {
 		}
 		if len(s.MaxTokens) > 0 {
 			m.MaxTokens = s.MaxTokens
-		}
-		if len(s.Mix) > 0 {
-			m.Mix = s.Mix // 形状切片运行期只读，浅拷贝即可
 		}
 		if s.Multiturn {
 			m.Multiturn = true
@@ -597,33 +523,6 @@ func (c *Config) ForModel(model string) *Config {
 	if ov.Stream != nil {
 		v.Stream = ov.Stream
 	}
-	// 10.1 per-model 熔断标定：单模型标定值套全模型会误杀更慢的模型（同一份配置逐模型跑
-	// 就已踩此口径）——此处按字段级覆盖，未写的键继承顶层（顶层已做过默认值归一）。
-	if sg := ov.StallGuard; sg != nil {
-		m := StallGuardCfg{}
-		if c.StallGuard != nil {
-			m = *c.StallGuard
-		}
-		if sg.Enabled != nil {
-			m.Enabled = sg.Enabled
-		}
-		if sg.MinTPS > 0 {
-			m.MinTPS = sg.MinTPS
-		}
-		if sg.WindowSeconds > 0 {
-			m.WindowSeconds = sg.WindowSeconds
-		}
-		if sg.CooldownSeconds > 0 {
-			m.CooldownSeconds = sg.CooldownSeconds
-		}
-		if sg.SampleSeconds > 0 {
-			m.SampleSeconds = sg.SampleSeconds
-		}
-		if sg.ProbeFactor != nil {
-			m.ProbeFactor = sg.ProbeFactor
-		}
-		v.StallGuard = &m
-	}
 	return &v
 }
 
@@ -632,15 +531,11 @@ func (c *Config) ForModel(model string) *Config {
 // （fixed_seed、keep_assistant、concurrent.multiturn 等）无法在模型层显式改回 false，
 // 这类全局形状请保持各模型一致或拆分配置。端点级配置（endpoint/认证/timeout_seconds/
 // server_metrics）不在此覆盖——一个测试一个端点，超时由 client 统一持有。
-// 例外：stall_guard.enabled 是指针，故可在模型层显式关掉该模型的熔断。
 type ModelOverride struct {
 	Thinking   *Thinking   `yaml:"thinking"` // 覆盖全局 thinking（字段级，未写的继承）
 	Single     *Single     `yaml:"single"`
 	Multiturn  *Multiturn  `yaml:"multiturn"`
 	Concurrent *Concurrent `yaml:"concurrent"`
-	// StallGuard 按模型覆盖降速熔断阈值（字段级）：各模型 decode 速度不同——用同一个 min_tps
-	// 会把更慢的模型误熔断（或对更快的模型形同虚设）。建议取该模型 probe 实测速度的 10–20%。
-	StallGuard *StallGuardCfg `yaml:"stall_guard"`
 	// MaxPromptTokens 模型上下文截止：0 = 未写（继承顶层）；指针区分"未写"与"显式写 0（解除上限）"
 	MaxPromptTokens *int `yaml:"max_prompt_tokens"`
 	// Enabled 本次是否测试该模型：分批重测/单模型对照时临时关掉其他模型用。
@@ -707,7 +602,7 @@ type Config struct {
 	MaxPromptTokens int `yaml:"max_prompt_tokens"`
 
 	// ServerMetrics 服务端观测层：抓取推理服务原生 /metrics（vLLM 默认暴露），
-	// 补充前缀缓存命中率、排队深度、prefill/decode 分解、MTP 接受率（不可达时自动降级并告警）
+	// 补充前缀缓存命中率、排队深度、prefill/decode 分解、MTP 接受率（不可达时自动记录并继续客户端采集）
 	ServerMetrics     bool `yaml:"server_metrics"`
 	MetricsIntervalMS int  `yaml:"metrics_interval_ms"` // gauge 轮询间隔，默认 500
 
@@ -727,7 +622,6 @@ type Config struct {
 	Dataset         DatasetCfg          `yaml:"dataset"`
 	SLO             *SLOCfg             `yaml:"slo"` // SLO 口径：goodput 判定 + 基线评估阈值（原顶层 goodput 已合流）
 	Retry           *RetryCfg           `yaml:"retry"`
-	StallGuard      *StallGuardCfg      `yaml:"stall_guard"`      // 降速熔断（默认关闭）
 	SaturationGuard *SaturationGuardCfg `yaml:"saturation_guard"` // 饱和止损（默认关闭）
 	Correctness     *CorrectnessCfg     `yaml:"correctness"`
 
@@ -914,15 +808,6 @@ func Load(path string) (*Config, error) {
 			}
 			ov.Single.PromptTokens = normalized
 		}
-		if ov.StallGuard != nil {
-			sg := ov.StallGuard
-			if sg.MinTPS < 0 || sg.WindowSeconds < 0 || sg.CooldownSeconds < 0 || sg.SampleSeconds < 0 {
-				return nil, fmt.Errorf("model_overrides[%s].stall_guard 的 min_tps/window_seconds/cooldown_seconds/sample_seconds 不能为负", name)
-			}
-			if sg.ProbeFactor != nil && *sg.ProbeFactor < 0 {
-				return nil, fmt.Errorf("model_overrides[%s].stall_guard.probe_factor=%.3g 不能为负（0 = 关闭探针）", name, *sg.ProbeFactor)
-			}
-		}
 	}
 	// enabled 开关联动：全禁用直接拒绝（跑了个寂寞）；部分禁用提示跳过名单
 	for _, m := range cfg.Models {
@@ -995,34 +880,6 @@ func Load(path string) (*Config, error) {
 	if len(cfg.Concurrent.MaxTokens) == 0 {
 		cfg.Concurrent.MaxTokens = IntList{256}
 	}
-	// 混合负载（5.6）：形状校验 + 与单值/扫描维度的冲突告警
-	if len(cfg.Concurrent.Mix) > 0 {
-		if cfg.Concurrent.Multiturn {
-			return nil, fmt.Errorf("concurrent.mix 与 multiturn: true 互斥：多轮会话的形状由 multiturn 配置（或 trace 数据）决定，无法按权重混跑；跨会话混合请用 multiturn.profiles")
-		}
-		seen := map[string]bool{}
-		for i := range cfg.Concurrent.Mix {
-			s := &cfg.Concurrent.Mix[i]
-			if s.Weight <= 0 {
-				return nil, fmt.Errorf("concurrent.mix[%d].weight 必须为正整数（相对权重）", i)
-			}
-			if s.PromptTokens <= 0 {
-				return nil, fmt.Errorf("concurrent.mix[%d].prompt_tokens 必须为正（该形状输入长度）", i)
-			}
-			if s.MaxTokens <= 0 {
-				return nil, fmt.Errorf("concurrent.mix[%d].max_tokens 必须为正（该形状输出上限，标量）", i)
-			}
-			if s.Label == "" {
-				s.Label = fmt.Sprintf("shape%d", i+1)
-			}
-			if seen[s.Label] {
-				return nil, fmt.Errorf("concurrent.mix label %q 重复（报告按 label 分组）", s.Label)
-			}
-			seen[s.Label] = true
-		}
-		cfg.Warnings = append(cfg.Warnings,
-			"concurrent.mix 已配置：该场景下请求形状由 mix 各项决定，prompt_tokens/max_tokens 单值与 max_tokens 输出扫描失效")
-	}
 	// 新增能力默认值与校验
 	if cfg.MetricsIntervalMS <= 0 {
 		cfg.MetricsIntervalMS = 500
@@ -1067,14 +924,6 @@ func Load(path string) (*Config, error) {
 	if cfg.Concurrent.Burstiness < 0 || math.IsNaN(cfg.Concurrent.Burstiness) || math.IsInf(cfg.Concurrent.Burstiness, 0) {
 		return nil, fmt.Errorf("concurrent.burstiness 必须是有限非负数（1=标准泊松；<1 更突发；>1 趋向均匀）")
 	}
-	if cfg.Concurrent.RampFactor < 0 {
-		return nil, fmt.Errorf("concurrent.ramp_factor 不能为负（默认 2；1 = 逐个串行发车，无爬坡意义）")
-	}
-	if cfg.Concurrent.RampFactor == 1 {
-		cfg.Warnings = append(cfg.Warnings,
-			"concurrent.ramp_factor=1 相当于逐个串行发车：爬坡期被拉到整个场景长度，通常不是想要的效果")
-	}
-
 	// ── 输入合理性校验：错误在开跑前暴露，而不是跑完才发现 ──
 
 	// single 结构暂保留用于读取旧配置/旧内部测试，但公共 bench 入口不再执行；
@@ -1258,11 +1107,8 @@ func Load(path string) (*Config, error) {
 	for _, mt := range cfg.Multiturn.MaxTokens {
 		guardShortOutput("multiturn", mt)
 	}
-	// mix 模式下 concurrent 的输出上限由各形状自带，单值守卫不适用
-	if len(cfg.Concurrent.Mix) == 0 {
-		for _, mt := range cfg.Concurrent.MaxTokens {
-			guardShortOutput("concurrent", mt)
-		}
+	for _, mt := range cfg.Concurrent.MaxTokens {
+		guardShortOutput("concurrent", mt)
 	}
 	// 输入扫了多档但输出只有一档：prefill/decode 效应混在一起，斜率结论归因不清
 	if len(cfg.Single.PromptTokens) > 1 && len(cfg.Single.MaxTokens) == 1 {
@@ -1460,53 +1306,6 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Correctness != nil && cfg.Correctness.Samples < 0 {
 		return nil, fmt.Errorf("correctness.samples 不能为负")
-	}
-	if cfg.StallGuard != nil {
-		sg := cfg.StallGuard
-		if sg.MinTPS < 0 || sg.WindowSeconds < 0 || sg.CooldownSeconds < 0 || sg.SampleSeconds < 0 {
-			return nil, fmt.Errorf("stall_guard 的 min_tps/window_seconds/cooldown_seconds/sample_seconds 不能为负")
-		}
-		if sg.ProbeFactor != nil && *sg.ProbeFactor < 0 {
-			return nil, fmt.Errorf("stall_guard.probe_factor=%.3g 不能为负（0 = 关闭探针，退回纯计时冷却）", *sg.ProbeFactor)
-		}
-		if sg.StallEnabled() {
-			if sg.MinTPS == 0 {
-				sg.MinTPS = 10 // 默认阈值 10 tok/s（跨机器安全下限；部署级建议值由 bench probe 实测输出）
-			}
-			if sg.WindowSeconds == 0 {
-				sg.WindowSeconds = 600 // 默认持续 10 分钟
-			}
-			if sg.SampleSeconds == 0 {
-				sg.SampleSeconds = 2
-			}
-			if sg.SampleSeconds > float64(sg.WindowSeconds) {
-				return nil, fmt.Errorf("stall_guard.sample_seconds=%.3g 大于 window_seconds=%d：采样间隔比判定窗口还长，永远判不出持续降速",
-					sg.SampleSeconds, sg.WindowSeconds)
-			}
-			// 冷却默认 5 分钟：由 main 在场景之间执行；0 表示触发后立即继续下一个场景。
-			if sg.CooldownSeconds == 0 {
-				sg.CooldownSeconds = 300
-			}
-			cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
-				"降速熔断已启用：单流 decode 速度中位持续低于 %.0f tok/s 达 %ds 即中止当前场景，冷却 %ds 后继续下一个场景",
-				sg.MinTPS, sg.WindowSeconds, sg.CooldownSeconds))
-			// 10.1 多模型标定提醒：一个阈值套所有模型会误杀更慢的模型（同一份配置逐模型
-			// 跑就已踩此口径）。提示按模型覆盖，但不阻止运行。
-			if active := cfg.ActiveModels(); len(active) > 1 {
-				var missing []string
-				for _, m := range active {
-					if ov := cfg.ModelOverrides[m]; ov == nil || ov.StallGuard == nil {
-						missing = append(missing, m)
-					}
-				}
-				if len(missing) > 0 {
-					cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
-						"多模型共用同一 min_tps=%.0f：各模型 decode 速度差异大时会把更慢的模型误熔断——"+
-							"建议按模型标定 model_overrides.<模型>.stall_guard.min_tps（取该模型 probe 实测速度的 10–20%%）；未单独标定: %s",
-						sg.MinTPS, strings.Join(missing, "、")))
-				}
-			}
-		}
 	}
 	if cfg.WarmupRequests < 0 {
 		return nil, fmt.Errorf("warmup_requests 不能为负")

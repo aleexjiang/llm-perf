@@ -13,8 +13,7 @@ import json, os, time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # TOKEN_DELAY：每个输出 chunk 的间隔秒数，默认 0.05（≈20 tok/s）。
-# 调大可构造"服务端降速"现场，用于验证降速熔断（stall_guard）——
-# 见 scripts/stall-e2e/ 的完整回归用例。
+# 调大可构造服务端慢速现场，用于观察客户端原始计时和 RPS/并发数据。
 TOKEN_DELAY = float(os.environ.get("MOCK_TOKEN_DELAY", "0.05"))
 
 # 直方图桶分布：确定性（越小的桶装越多），便于冒烟断言分位落在预期区间。

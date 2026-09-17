@@ -19,11 +19,9 @@ import (
 	"math"
 	"math/rand"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/aleexjiang/llm-perf/internal/auth"
@@ -300,7 +298,7 @@ func startWindow(ctx context.Context, e *env) (*smetrics.Sample, *smetrics.Gauge
 }
 
 // finalScrapeCtx 结束快照的独立 ctx（12.11）：场景 ctx 此时可能已被取消——运行中断
-// （SIGHUP/Ctrl+C）或降速熔断（scancel）——而结束快照恰恰是窗口差值的唯一来源。
+// （SIGHUP/Ctrl+C）或场景控制停止——而结束快照恰恰是窗口差值的唯一来源。
 // r1-off S5 实测：中断场景 server_metrics.available=false、queue/prefill/decode 分解与
 // preemptions 差值整段丢失，只能靠实时 /metrics 手工回溯。独立限时 ctx 不被取消传播
 // 波及（正常路径无行为差异）；超时（5s 上限）如实记失败，不阻塞退出。
@@ -627,7 +625,7 @@ func Single(ctx context.Context, cfg *config.Config, client *engine.Client, mode
 					}
 					rep.Single = append(rep.Single, row)
 					if interrupted(ctx) {
-						log.Printf("🛑 已中止（中断或降速熔断）——停止新请求，已完成数据全部保留")
+						log.Printf("🛑 已中止（中断或场景停止）——停止新请求，已完成数据全部保留")
 						return rep, nil
 					}
 					if ctxAborted {
@@ -656,7 +654,7 @@ func nominalLastPrompt(trace bool, mt config.Multiturn) int {
 }
 
 // profileAt 混合档（5.11）：按平滑加权轮转把会话序号映射到档位；无 profiles 时 ok=false。
-// 与 5.6 mixPlan 同款算法（nginx smooth weighted round-robin）：确定性分配、
+// 使用 nginx smooth weighted round-robin：确定性分配、
 // 同配置重跑结果一致（不引入随机）。返回的档位切片为浅拷贝，只读使用。
 func profileAt(mt config.Multiturn, sessionIdx int) (config.MixProfile, bool) {
 	n := len(mt.Profiles)
@@ -878,7 +876,7 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 							if dropped > 0 {
 								extra = fmt.Sprintf("，另 %d 轮被中断作废（error 非空，未计入）", dropped)
 							}
-							log.Printf("    🛑 已中止（中断或降速熔断）——提前结束会话（有效 %d/%d 轮保留%s）",
+							log.Printf("    🛑 已中止（中断或场景停止）——提前结束会话（有效 %d/%d 轮保留%s）",
 								done, mt.Turns, extra)
 							break
 						}
@@ -893,7 +891,7 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 					run.NominalLastPrompt = nominalLastPrompt(e.trace != nil, mt)
 					rep.Multiturn = append(rep.Multiturn, run)
 					if interrupted(ctx) {
-						log.Printf("🛑 已中止（中断或降速熔断）——停止新请求，已完成会话全部保留")
+						log.Printf("🛑 已中止（中断或场景停止）——停止新请求，已完成会话全部保留")
 						return rep, nil
 					}
 					if ctxAborted {
@@ -983,7 +981,7 @@ func gammaSample(rng *rand.Rand, shape float64) float64 {
 	}
 }
 
-// sessionTurnHook 每轮完成后的回调（5.7 止损用）：turn 为 0 基轮次、m 为该轮指标；
+// sessionTurnHook 每轮完成后的回调（drain/soak 截止用）：turn 为 0 基轮次、m 为该轮指标；
 // 返回 false = 提前终止该会话（已完成轮保留）。nil = 无钩子。
 type sessionTurnHook func(turn int, m *engine.TurnMetrics) bool
 
@@ -1091,15 +1089,6 @@ func Concurrent(ctx context.Context, cfg *config.Config, client *engine.Client, 
 	loadModel := "闭环并发"
 	if rates != nil {
 		loadModel = fmt.Sprintf("开环到达率 %v req/s", rates)
-	} else if cc.RampEnabled() {
-		loadModel += fmt.Sprintf(" 爬坡发车×%d", cc.EffRampFactor()) // 5.7 错峰启动
-	}
-	if len(cc.Mix) > 0 {
-		labels := make([]string, len(cc.Mix))
-		for i, s := range cc.Mix {
-			labels[i] = fmt.Sprintf("%s×%d", s.Label, s.Weight)
-		}
-		loadModel += " 混跑[" + strings.Join(labels, " ") + "]"
 	}
 	if cc.Multiturn && len(cfg.Multiturn.Profiles) > 0 {
 		// 混合档（5.11）：会话按权重分属不同增量档
@@ -1175,9 +1164,6 @@ func Concurrent(ctx context.Context, cfg *config.Config, client *engine.Client, 
 		}
 		for _, v := range th.Variants() {
 			tiers := th.MaxTokensList(cc.MaxTokens, v)
-			if len(cc.Mix) > 0 {
-				tiers = []int{0} // 混跑：输出上限由各形状自带（floor 在 plan 内逐形状应用），不走外层扫描
-			}
 			for _, maxTok := range tiers {
 				if rates != nil {
 					for _, rate := range rates {
@@ -1191,7 +1177,7 @@ func Concurrent(ctx context.Context, cfg *config.Config, client *engine.Client, 
 							return rep, nil
 						}
 						if interrupted(ctx) {
-							log.Printf("🛑 已中止（中断或降速熔断）——停止新请求，已完成档位全部保留")
+							log.Printf("🛑 已中止（中断或场景停止）——停止新请求，已完成档位全部保留")
 							finishSourceCheck()
 							return rep, nil
 						}
@@ -1203,13 +1189,13 @@ func Concurrent(ctx context.Context, cfg *config.Config, client *engine.Client, 
 					logConcurrent(&lv)
 					rep.Concurrent = append(rep.Concurrent, lv)
 					if lv.Aborted != "" {
-						// 5.7 fail-fast / 止损：首轮挂大概率模型服务有问题，后续档位不必再跑
+						// saturation/drain 或外部中断：后续档位不再发压，已采集数据照常保留
 						log.Printf("🛑 %s——停止后续档位与场景，已完成数据全部保留", lv.Aborted)
 						finishSourceCheck()
 						return rep, nil
 					}
 					if interrupted(ctx) {
-						log.Printf("🛑 已中止（中断或降速熔断）——停止新请求，已完成档位全部保留")
+						log.Printf("🛑 已中止（中断或场景停止）——停止新请求，已完成档位全部保留")
 						finishSourceCheck()
 						return rep, nil
 					}
@@ -1238,9 +1224,6 @@ func logConcurrent(lv *report.ConcurrentLevel) {
 		extra = fmt.Sprintf(" rate=%.1f/s", lv.RequestRate)
 	}
 	outDesc := fmt.Sprintf("out=%dtk", lv.MaxTokens)
-	if len(lv.Shapes) > 0 {
-		outDesc = "mix"
-	}
 	log.Printf("[concurrent] %s thinking=%s %s level%d%s: wall=%.1fs throughput=%.0f tok/s%s",
 		lv.Model, lv.Thinking, outDesc, lv.Level, extra, lv.WallSeconds, lv.ThroughputTPS, goodputLog(lv))
 }
@@ -1252,131 +1235,9 @@ func goodputLog(lv *report.ConcurrentLevel) string {
 	return fmt.Sprintf(" goodput=%d/%d", lv.SLOMeet, lv.SLOTotal)
 }
 
-// mixPlan 混合负载（concurrent.mix，5.6）的每轮形状计划。
-// 平滑加权轮转（nginx 同款算法）把权重展开成确定性交错序列：请求按发射序取模对号入座
-// （闭环=发车序，开环=到达序），不引入随机——同配置重跑形状分布一致，run 间可复现。
-type mixPlan struct {
-	shapes  []config.MixShape
-	maxToks []int // 每形状已过思考 floor 的输出上限
-	seq     []int // 展开的形状下标序列（长度 = 权重之和）
-}
-
-func newMixPlan(cfg *config.Config, model string, v config.ThinkingVariant) *mixPlan {
-	shapes := cfg.Concurrent.Mix
-	if len(shapes) == 0 {
-		return nil
-	}
-	total := 0
-	for _, s := range shapes {
-		total += s.Weight
-	}
-	maxToks := make([]int, len(shapes))
-	for i, s := range shapes {
-		maxToks[i] = cfg.ThinkingFor(model).MaxTokens(s.MaxTokens, v)
-	}
-	cur := make([]int, len(shapes))
-	seq := make([]int, 0, total)
-	for j := 0; j < total; j++ {
-		best, bestVal := 0, -1
-		for i := range shapes {
-			cur[i] += shapes[i].Weight
-			if cur[i] > bestVal {
-				best, bestVal = i, cur[i]
-			}
-		}
-		cur[best] -= total
-		seq = append(seq, best)
-	}
-	return &mixPlan{shapes: shapes, maxToks: maxToks, seq: seq}
-}
-
-// at 返回第 i 个发射请求的形状与输出上限（已含 floor）。
-func (p *mixPlan) at(i int) (config.MixShape, int) {
-	k := p.seq[i%len(p.seq)]
-	return p.shapes[k], p.maxToks[k]
-}
-
-// aggregateShapes 把本轮请求按形状聚合出中位数统计（idxs 与 Requests 一一对应，混跑时记录形状下标）。
-func aggregateShapes(mp *mixPlan, reqs []*engine.TurnMetrics, idxs []int) []report.ShapeStat {
-	if mp == nil {
-		return nil
-	}
-	by := map[int][]*engine.TurnMetrics{}
-	for i, m := range reqs {
-		if i < len(idxs) && idxs[i] >= 0 {
-			by[idxs[i]] = append(by[idxs[i]], m)
-		}
-	}
-	out := make([]report.ShapeStat, 0, len(mp.shapes))
-	for i, sh := range mp.shapes {
-		ms := by[i]
-		if len(ms) == 0 {
-			continue
-		}
-		med := func(get func(*engine.TurnMetrics) float64) float64 {
-			vals := make([]float64, 0, len(ms))
-			for _, m := range ms {
-				if m.Error != "" {
-					continue // 失败请求的 0/残值不进中位（与报告侧失败剔除口径一致）
-				}
-				vals = append(vals, get(m))
-			}
-			if len(vals) == 0 {
-				return 0 // 全失败形状：中位无意义，Count 仍反映请求总数
-			}
-			sort.Float64s(vals)
-			// 偶数样本取两中值平均（与报告侧 Python st.median 口径一致，
-			// 否则小样本混跑下形状中位系统性偏高半步）
-			n := len(vals)
-			if n%2 == 0 {
-				return (vals[n/2-1] + vals[n/2]) / 2
-			}
-			return vals[n/2]
-		}
-		out = append(out, report.ShapeStat{
-			Label:        sh.Label,
-			Weight:       sh.Weight,
-			PromptTokens: sh.PromptTokens,
-			MaxTokens:    mp.maxToks[i],
-			Count:        len(ms),
-			TTFTS:        med(func(m *engine.TurnMetrics) float64 { return m.TTFT / 1000 }),
-			E2ES:         med(func(m *engine.TurnMetrics) float64 { return m.E2EMS / 1000 }),
-			TokPS:        med(func(m *engine.TurnMetrics) float64 { return m.TokensPerSec }),
-		})
-	}
-	return out
-}
-
-// rampBatches 5.7 爬坡发车的批次计划：首批 1，之后每批 min(上批×factor, 剩余)。
-// 例：level=4,factor=2 → [1 2 1]；level=8,factor=2 → [1 2 4 1]；level=1 → [1]。
-func rampBatches(level, factor int) []int {
-	if factor < 2 {
-		factor = 2
-	}
-	var sizes []int
-	remaining, batch := level, 1
-	for remaining > 0 {
-		b := batch
-		if b > remaining {
-			b = remaining
-		}
-		sizes = append(sizes, b)
-		remaining -= b
-		batch *= factor
-	}
-	return sizes
-}
-
 // runClosedRound 闭环并发档位：level 个 worker 各自跑 runs_per_worker 次请求（或一次完整会话）。
 // maxTok 输出长度由调用方传入（输出长度扫描维度，已含思考 floor 抬高）。
 // pol 为场景级 gauge 轮询器（饱和止损判据一的观测源；nil = 观测层不可用）。
-//
-// 5.7 错峰发车（concurrent.ramp，默认开，ramp=false 退回 barrier 齐射旧行为）：worker 按
-// 指数批次发放（1→2→4→…），每批等「该批全部完成首轮」再放下一批——批次节奏由服务端首轮
-// 实际耗时决定（自适应，无需按端点调参），替代齐射对服务端的瞬间满额冲击。
-// 爬坡启用时叠加失败语义（ramp=false 时保持旧行为：失败只逐条记录，不取消兄弟会话）：
-//   - fail-fast：任一 worker 首轮失败 → 取消本轮，场景层终止后续档位（首轮挂大概率服务有问题）；
-//   - 双止损：会话内连续失败 3 轮提前弃会话；全局连续失败 ≥ 2×level 终止本轮。
 //
 // saturation_guard（2026-09-12，drain 语义）：waiting 持续超阈或墙钟到点 → 停止发新
 // 请求（在飞跑完保留全量），Aborted 留痕，场景层停止后续档位（饱和之后更高档只会更糟）。
@@ -1389,11 +1250,6 @@ func runClosedRound(ctx context.Context, e *env, cfg *config.Config,
 	}
 	lv := &report.ConcurrentLevel{Model: model, Thinking: v.Name, MaxTokens: maxTok, Level: level,
 		DurationSeconds: float64(cc.DurationSeconds), Renew: cc.Renew}
-	mp := newMixPlan(cfg, model, v)
-	if mp != nil {
-		lv.MaxTokens = 0 // 混跑：输出上限由各形状自带（Shapes 内逐形状记录）
-	}
-	var shapeIdxs []int // 与 Requests 一一对应的形状下标（-1 = 非混跑）
 	start := time.Now()
 	// 10.5 时长制 soak：dur>0 时各 worker 跑满墙钟（runs_per_worker 被忽略）；
 	// capped = 到点该收手（所有发新请求/新轮的入口都要查——drain 语义，在飞跑完保留）
@@ -1402,7 +1258,6 @@ func runClosedRound(ctx context.Context, e *env, cfg *config.Config,
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	startBarrier := make(chan struct{})
-	var reqSeq atomic.Int64
 
 	// 档位控制器：饱和/墙钟触发 = 关发射闸门（drain），不取消在飞
 	sat := cfg.SaturationGuard
@@ -1412,44 +1267,9 @@ func runClosedRound(ctx context.Context, e *env, cfg *config.Config,
 	defer roundCancel()
 	waitingMax, runningMax, satWait := startSaturationWatch(roundCtx, sat, pol, lr)
 
-	ramp := cc.RampEnabled() && level > 1
-	// 失败语义（仅爬坡路径）：全局连续失败计数，达 2×level 止损终止本轮。
-	// 12.11：本轮被取消（运行中断/fail-fast/止损）**之后**产生的请求错误不计失败——
-	// 判别用 roundCtx.Err()（请求 ctx 即 roundCtx，取消先于错误浮出，时序上恒可靠）。
-	var firstTurnFail, stopLoss atomic.Bool
-	globalConsec := 0
-	markFail := func() {
-		mu.Lock()
-		globalConsec++
-		gc := globalConsec
-		mu.Unlock()
-		if gc >= 2*level && stopLoss.CompareAndSwap(false, true) {
-			log.Printf("🛑 全局连续失败 %d 轮（≥ 2×level=%d）——止损终止本档位", gc, 2*level)
-			roundCancel()
-		}
-	}
-	markOK := func() {
-		mu.Lock()
-		globalConsec = 0
-		mu.Unlock()
-	}
-
-	worker := func(workerID, batchNo int, firstDone chan struct{}) {
+	worker := func(workerID int) {
 		defer wg.Done()
-		var once sync.Once
-		// 首轮完成信号：爬坡批次门放行用。首轮完成处显式发、defer 兜底（会话 0 轮结束
-		// 等边角不挂死批次门）；非爬坡路径 firstDone 为 nil，markFirst 是空操作。
-		markFirst := func() {
-			once.Do(func() {
-				if firstDone != nil {
-					firstDone <- struct{}{}
-				}
-			})
-		}
-		defer markFirst()
-		if !ramp {
-			<-startBarrier // 所有 worker 就绪后同时发车（旧行为）
-		}
+		<-startBarrier // 所有 worker 就绪后同时发车
 		if cc.Multiturn {
 			// 10.5 renew 时长制 soak：会话滚完 turns 轮后换新 seed 重开（序号递增——seed 与
 			// Session 编号同源，上下文清零重涨），直到时长满；非时长制保持原行为（单会话即终点）。
@@ -1459,55 +1279,14 @@ func runClosedRound(ctx context.Context, e *env, cfg *config.Config,
 				if p, ok := profileAt(cfg.Multiturn, idx); ok {
 					s.Profile = p.Name // 混合档（5.11）：会话档位标签
 				}
-				if ramp || dur > 0 {
-					if ramp {
-						s.Batch = batchNo
-					}
-					// 时长制下偏移恒记（报告侧分时段/稳态窗口的数据源）；ramp 保持 5.7 行为
+				if dur > 0 {
+					// 时长制记录会话启动偏移，供外部分析首末时段漂移。
 					s.StartOffsetS = time.Since(start).Seconds()
 				}
-				// hook 常开：drain 闸门要求会话中途也能停（已完成轮保留）；fail-fast/止损
-				// 仅爬坡路径启用（ramp=false 保持旧行为：失败只逐条记录）
-				consec := 0
-				hook := func(turn int, m *engine.TurnMetrics) bool {
-					if lr.Stop() {
-						return false // 饱和/墙钟触发：本会话到本轮为止，已发请求的数据全保留
-					}
-					// 10.5 时长制：到点后不再发新轮（本会话到本轮为止，已完成轮保留）
-					if capped() {
-						return false
-					}
-					if !ramp {
-						return true
-					}
-					// 12.11：本轮已被取消（运行中断 SIGHUP/Ctrl+C、fail-fast、止损）——取消
-					// 产生的错误是"我们取消的"而非"服务端失败"：不计失败、不触发止损，
-					// 避免人工中断被误报成「全局连续失败」（r1-off S5 的 aborted 误报根因）。
-					// 本会话到此为止，已完成轮次照常保留。
-					if roundCtx.Err() != nil {
-						markFirst()
-						return false
-					}
-					if turn == 0 {
-						markFirst()
-						if m.Error != "" {
-							// 首轮挂大概率模型服务有问题：fail-fast，取消本轮全部会话
-							firstTurnFail.Store(true)
-							roundCancel()
-						}
-					}
-					if m.Error != "" {
-						consec++
-						markFail()
-						if consec >= 3 {
-							log.Printf("    会话 %d 连续 %d 轮失败，提前终止该会话（止损）", s.Session, consec)
-							return false
-						}
-					} else {
-						consec = 0
-						markOK()
-					}
-					return true
+				// hook 只负责 saturation/drain 与 soak 截止；服务端失败不提前终止会话，
+				// 每一轮的失败指标都完整留存。
+				hook := func(int, *engine.TurnMetrics) bool {
+					return !lr.Stop() && !capped()
 				}
 				s.Turns = collectSessionTurns(roundCtx, e, cfg, model, v, idx, 0, maxTok, hook)
 				s.FillLastPromptTokens() // 12.3：末轮实测深度
@@ -1526,97 +1305,39 @@ func runClosedRound(ctx context.Context, e *env, cfg *config.Config,
 		for r := 0; ; r++ {
 			// 10.5 时长制：到点不再发新请求（drain——在飞跑完保留）；次数制按 runs_per_worker
 			if roundCtx.Err() != nil || lr.Stop() || capped() {
-				return // 本档位取消（fail-fast/止损）或 drain/时长到点：不再发新请求
+				return // 外部中断、saturation drain 或时长到点：不再发新请求
 			}
 			if dur <= 0 && r >= cc.RunsPerWorker {
 				return
 			}
 			promptTokens := cfg.ClampOne(cc.PromptTokens)
-			reqMaxTok := maxTok
-			si := -1
-			if mp != nil {
-				seqNo := int(reqSeq.Add(1)) - 1
-				sh, mt := mp.at(seqNo)
-				promptTokens = cfg.ClampOne(sh.PromptTokens)
-				reqMaxTok = mt
-				si = mp.seq[seqNo%len(mp.seq)]
-			}
 			seed := workerSeed(workerID, r, cfg.SeedSalt) // 每用户不同 prompt
 			msgs := []engine.Message{engine.UserMsg(promptTokens, seed, cfg.FillerLang)}
-			m := runOne(roundCtx, e, model, msgs, reqMaxTok, v)
-			// 12.11：取消产生的错误不计失败（同 multiturn hook 的 roundCtx.Err() 判别）
-			if r == 0 {
-				markFirst()
-				if ramp && m.Error != "" && roundCtx.Err() == nil {
-					firstTurnFail.Store(true)
-					roundCancel()
-				}
-			}
-			if ramp {
-				switch {
-				case m.Error != "" && roundCtx.Err() == nil:
-					markFail()
-				case m.Error == "":
-					markOK()
-				}
-			}
+			m := runOne(roundCtx, e, model, msgs, maxTok, v)
 			mu.Lock()
 			lv.Requests = append(lv.Requests, m)
-			shapeIdxs = append(shapeIdxs, si)
 			mu.Unlock()
 		}
 	}
 
-	if ramp {
-		launched := 0
-		for bi, size := range rampBatches(level, cc.EffRampFactor()) {
-			if roundCtx.Err() != nil || firstTurnFail.Load() || lr.Stop() {
-				break
-			}
-			firstDone := make(chan struct{}, size)
-			for w := launched; w < launched+size; w++ {
-				wg.Add(1)
-				go worker(w, bi+1, firstDone)
-			}
-			launched += size
-			log.Printf("    爬坡发车批次 %d：发放 %d 路（累计 %d/%d，偏移 %.1fs）",
-				bi+1, size, launched, level, time.Since(start).Seconds())
-			// 等本批全部完成首轮（或本轮被取消/首轮失败），再决定放不放下一批
-		gate:
-			for i := 0; i < size; i++ {
-				select {
-				case <-firstDone:
-				case <-roundCtx.Done():
-					break gate
-				}
-			}
-		}
-	} else {
-		for w := 0; w < level; w++ {
-			wg.Add(1)
-			go worker(w, 0, nil)
-		}
-		close(startBarrier)
+	for w := 0; w < level; w++ {
+		wg.Add(1)
+		go worker(w)
 	}
+	close(startBarrier)
 	wg.Wait()
 	// 本档位已结束：停观测器、收 waiting/running 峰值（标定数据），再组装终止原因
 	roundCancel()
 	satWait()
 	lv.WaitingMax = waitingMax()
 	lv.RunningMax = runningMax()
-	if firstTurnFail.Load() {
-		lv.Aborted = "首轮失败，fail-fast 终止（爬坡发车）"
-		log.Printf("⛔ %s", lv.Aborted)
-	} else if stopLoss.Load() {
-		lv.Aborted = "全局连续失败达 2×level，止损终止（爬坡发车）"
-	} else if r := lr.Reason(); r != "" {
+	if r := lr.Reason(); r != "" {
 		lv.Aborted = r // 饱和/墙钟触发的原因（lr.Trip 记录时已打日志）
 	} else if ctx.Err() != nil {
 		// 12.11：运行中断（SIGHUP/Ctrl+C）——真实原因必须留痕，别让「没跑完」看起来像服务端问题
 		lv.Aborted = "运行中断（SIGHUP/Ctrl+C），场景未跑完（已完成数据照常保留）"
 		log.Printf("⛔ %s", lv.Aborted)
 	}
-	lv.Shapes = aggregateShapes(mp, lv.Requests, shapeIdxs)
 	finalizeLevel(e, lv, time.Since(start).Seconds())
 	return *lv
 }
@@ -1631,11 +1352,6 @@ func runOpenRound(ctx context.Context, e *env, cfg *config.Config,
 
 	cc := cfg.Concurrent
 	lv := &report.ConcurrentLevel{Model: model, Thinking: v.Name, MaxTokens: maxTok, Level: 0, RequestRate: rate}
-	mp := newMixPlan(cfg, model, v)
-	if mp != nil {
-		lv.MaxTokens = 0
-	}
-	var shapeIdxs []int
 	n := cc.NumPrompts
 	if n <= 0 {
 		n = 32
@@ -1692,20 +1408,11 @@ func runOpenRound(ctx context.Context, e *env, cfg *config.Config,
 				return
 			}
 			promptTokens := cfg.ClampOne(cc.PromptTokens)
-			reqMaxTok := maxTok
-			si := -1
-			if mp != nil {
-				sh, mt := mp.at(i)
-				promptTokens = cfg.ClampOne(sh.PromptTokens)
-				reqMaxTok = mt
-				si = mp.seq[i%len(mp.seq)]
-			}
 			seed := openWorkerSeed(i, cfg.SeedSalt)
 			msgs := []engine.Message{engine.UserMsg(promptTokens, seed, cfg.FillerLang)}
-			m := runOne(roundCtx, e, model, msgs, reqMaxTok, v)
+			m := runOne(roundCtx, e, model, msgs, maxTok, v)
 			mu.Lock()
 			lv.Requests = append(lv.Requests, m)
-			shapeIdxs = append(shapeIdxs, si)
 			mu.Unlock()
 		}(i)
 	}
@@ -1741,7 +1448,6 @@ func runOpenRound(ctx context.Context, e *env, cfg *config.Config,
 		// 12.11：运行中断（SIGHUP/Ctrl+C）——真实原因留痕（同闭环口径）
 		lv.Aborted = "运行中断（SIGHUP/Ctrl+C），场景未跑完（已完成数据照常保留）"
 	}
-	lv.Shapes = aggregateShapes(mp, lv.Requests, shapeIdxs)
 	finalizeLevel(e, lv, time.Since(start).Seconds())
 	return *lv
 }

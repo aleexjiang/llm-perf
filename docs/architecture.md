@@ -25,10 +25,10 @@ engine 层（internal/engine）── Client.Chat：逐 chunk 计时 → TurnMet
 report 层（internal/report）── Report 结构落盘 JSON（按模型分区 PartitionByModel）
   │
   ▼  （离线，非本工具职责）
-外部数据分析（pandas / notebook / 客户 BI）── 读场景 JSON + probe JSON + *.stall.csv 自行聚合
+外部数据分析（pandas / notebook / 客户 BI）── 读场景 JSON + probe JSON 自行聚合
 ```
 
-契约一句话：**Go 只产出原始数据（per-request/per-turn JSON + probe + stall.csv），所有聚合、判级、呈现都在工具之外**（分析侧能算的不碰 Go；2026-09-17 报告层已整体剥离，数据契约即对外接口，见 [data-contract.md](data-contract.md)）。
+契约一句话：**Go 只产出原始数据（per-request/per-turn JSON + probe），所有聚合、判级、呈现都在工具之外**（分析侧能算的不碰 Go；2026-09-17 报告层已整体剥离，数据契约即对外接口，见 [data-contract.md](data-contract.md)）。
 
 ## 包职责
 
@@ -57,7 +57,7 @@ report 层（internal/report）── Report 结构落盘 JSON（按模型分区
 - **`engine.TurnMetrics`**（client.go）：单请求全量计时+token 统计，是所有场景行和 `auxiliary_requests` 的叶子单元。`phase` 标记 benchmark/warmup/correctness，主动取消用 `cancelled` 标记。注意两类字段的区别：
   - 带 `json:"-"` 的字段**不进压测数据**（`ToolCalls` 只被 probe 消费）——给 TurnMetrics 加字段时先想清楚是否污染压测 JSON；
   - `omitempty` 派生指标在非流式/无思考时缺省——报告侧必须容忍缺失。
-- **`report.Report`**（report.go）：单场景单文件。主压测请求位于场景数组，warmup/correctness 完整指标位于 `AuxiliaryRequests`；`Environment`（引擎识别存档）与 `ConfigRaw`（配置原文）随每份 JSON 落盘——回看数据时"当时什么引擎什么配置"有据可查。
+- **`report.Report`**（report.go）：单场景单文件。主压测请求位于场景数组，warmup/correctness 完整指标位于 `AuxiliaryRequests`；`ConfigRaw`（配置原文）随每份 JSON 落盘。普通 bench 不隐式发送 probe，环境能力结果由独立 `bench probe` JSON 提供。
 - **`smetrics.Sample`**：一次 /metrics 抓取快照；场景层 `startWindow/finishWindow` 取窗口差值挂到 Report.Server。
 
 ## 扩展点指引

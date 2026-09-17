@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"sort"
 	"strings"
@@ -121,11 +120,9 @@ type ProbeResult struct {
 	// nil = 引擎未暴露该指标（旧版本 / 非 vLLM / /metrics 不可用）。
 	KVCapacity *smetrics.KVCapacity `json:"kv_capacity,omitempty"`
 	// DecodeSpeedTPS 实测流式输出速度（含思考，保守值）：本机健康基线，
-	// stall_guard.min_tps 的部署级建议依据（建议取其 10-20%，熔断兜"接近死机"）。
-	// 多模型配置下取**最慢被测模型**的值（统一阈值必须照顾最慢的那个）。
+	// 用于外部容量分析与多模型数量级对照。多模型配置下取**最慢被测模型**的值。
 	DecodeSpeedTPS float64 `json:"decode_speed_tps,omitempty"`
-	// DecodeSpeeds 逐模型实测输出速度（多模型配置时填充）：各模型 decode 速度差异大时，
-	// 按 model_overrides.<模型>.stall_guard.min_tps 分别标定，避免误熔断更慢的模型。
+	// DecodeSpeeds 逐模型实测输出速度（多模型配置时填充），供外部分析保留模型间差异。
 	DecodeSpeeds map[string]float64 `json:"decode_speeds,omitempty"`
 	// FillerCPT 实测字符/token（填充保真度，自举校准）：发一条已知标称 token 数的填充样本，
 	// 用服务端 usage.prompt_tokens 反推本部署真实的 chars/token，与构造侧系数
@@ -656,15 +653,9 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 		}
 	}
 
-	// ── 5.5 输出速度基线：stall_guard.min_tps 的部署级建议值 ──
-	// 2 条短请求（256 输出、思考按配置关闭）取保守值。口径与 StallGuard 一致：
-	// 速度含思考增量（TTFT→结束），流式熔断计 reasoning chunk 也算服务端产出。
-	// 短 prompt 的 decode 速度 ≈ 本机健康上限——熔断下限取其 10-20%，任何机器都不会误触发；
-	// 这把"真机标定"自动化进 probe（换部署重跑一次即可），UX 评级线见 docs/latency-baselines.md §8。
-	//
-	// 10.1 多模型：逐模型实测（各测 1 条即可，串行短请求），取值按**最慢被测模型**给部署级
-	// 保守值（一个 min_tps 套全模型时，阈值要照顾最慢的那个）；同时逐模型给出建议值，
-	// 供 model_overrides.<模型>.stall_guard 分别标定。
+	// ── 5.5 输出速度基线：作为外部分析的健康参考数据 ──
+	// 短请求串行测量流式输出速度，保留逐模型结果与最慢模型保守值；不参与压测判定，
+	// 也不自动生成任何阈值配置。
 	{
 		cli := NewClient(origin, o.APIKey, 120*time.Second, o.IncludeUsage)
 		cli.Auth = effAuth
@@ -708,8 +699,7 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 				}
 			}
 			res.DecodeSpeedTPS = slow // 部署级保守值 = 最慢被测模型
-			detail := fmt.Sprintf("输出速度 ≈ %.0f tok/s（最慢模型 %s，含思考）——本机健康基线；"+
-				"stall_guard.min_tps 建议取该值 10–20%%", slow, slowest)
+			detail := fmt.Sprintf("输出速度 ≈ %.0f tok/s（最慢模型 %s，含思考）——本机健康参考基线", slow, slowest)
 			if len(perModel) > 1 {
 				names := make([]string, 0, len(perModel))
 				for m2 := range perModel {
@@ -720,8 +710,7 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 				for _, m2 := range names {
 					parts = append(parts, fmt.Sprintf("%s=%.0f", m2, perModel[m2]))
 				}
-				detail += "；逐模型建议 min_tps（基线 × 10–20%）：" + strings.Join(parts, " / ") +
-					"，配置到 model_overrides.<模型>.stall_guard.min_tps（各模型 decode 速度不同，统一阈值会误熔断更慢的那个）"
+				detail += "；逐模型输出速度：" + strings.Join(parts, " / ")
 			}
 			checkExt("decode_speed", true, detail)
 		} else {
@@ -943,25 +932,6 @@ func buildSuggestedConfig(res *ProbeResult, o ProbeOptions, effAuth auth.Auth, o
 		fmt.Fprintf(&sb, "# thinking:  # 思考等级可控（参数=%s），按需定义 levels 变体做多档对比\n", res.ThinkingLevelParam)
 	} else {
 		sb.WriteString("# thinking:  # 未探测到可控的思考等级参数，建议按 thinking.on/off 两态压测\n")
-	}
-	// 10.1 多模型：各模型 decode 速度差异大时，统一 min_tps 会误熔断更慢的模型——
-	// 逐模型给出建议值（基线 × 10–20%），按 model_overrides.<模型>.stall_guard 覆盖。
-	if len(res.DecodeSpeeds) > 1 {
-		names := make([]string, 0, len(res.DecodeSpeeds))
-		for m := range res.DecodeSpeeds {
-			names = append(names, m)
-		}
-		sort.Strings(names)
-		sb.WriteString("# 多模型 decode 速度不同：建议按下表逐模型标定 stall_guard.min_tps（统一阈值会误熔断更慢的模型）\n")
-		for _, m := range names {
-			fmt.Fprintf(&sb, "#   %s: 实测 %.0f tok/s → min_tps 建议 %.0f\n",
-				m, res.DecodeSpeeds[m], math.Max(1, res.DecodeSpeeds[m]*0.15))
-		}
-		sb.WriteString("# model_overrides:\n")
-		for _, m := range names {
-			fmt.Fprintf(&sb, "#   %s:\n#     stall_guard:\n#       min_tps: %.0f\n",
-				m, math.Max(1, res.DecodeSpeeds[m]*0.15))
-		}
 	}
 	return sb.String()
 }

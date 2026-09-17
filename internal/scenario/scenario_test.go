@@ -519,38 +519,6 @@ func TestCtxLimitHit(t *testing.T) {
 	}
 }
 
-// ── 对抗式审查回归：形状中位剔除失败请求（与报告侧口径一致） ──
-
-func TestAggregateShapesExcludesFailed(t *testing.T) {
-	mp := &mixPlan{
-		shapes:  []config.MixShape{{Weight: 2, Label: "a", PromptTokens: 1000, MaxTokens: 32}},
-		maxToks: []int{32},
-		seq:     []int{0, 0},
-	}
-	reqs := []*engine.TurnMetrics{
-		{TTFT: 1000, E2EMS: 2000, TokensPerSec: 50, CompletionTokens: 100},
-		{TTFT: 0, E2EMS: 500, TokensPerSec: 0, CompletionTokens: 0, Error: "HTTP 504: gateway timeout"},
-	}
-	out := aggregateShapes(mp, reqs, []int{0, 0})
-	if len(out) != 1 {
-		t.Fatalf("应聚出 1 个形状, got %d", len(out))
-	}
-	sh := out[0]
-	if sh.Count != 2 {
-		t.Fatalf("Count 应反映请求总数 2, got %d", sh.Count)
-	}
-	if sh.TTFTS != 1.0 || sh.E2ES != 2.0 || sh.TokPS != 50 {
-		t.Fatalf("中位应只用成功请求: ttft=%v e2e=%v tokps=%v", sh.TTFTS, sh.E2ES, sh.TokPS)
-	}
-	// 全失败形状：中位为 0（无意义），Count 仍如实
-	allFailed := aggregateShapes(mp, []*engine.TurnMetrics{
-		{Error: "x"}, {Error: "y"},
-	}, []int{0, 0})
-	if allFailed[0].Count != 2 || allFailed[0].TTFTS != 0 {
-		t.Fatalf("全失败形状应 Count=2 且中位 0: %+v", allFailed[0])
-	}
-}
-
 // ── 主流口径对齐回归：goodput 只判定"已配置的"SLO 子集（vLLM 语义）──
 // 修复前：goodputOf 无条件检查 TPOT>0 与 TTFT>阈值，只配 ttft_ms（或只配 tpot_ms）
 // 时所有请求都被判不达标——配置校验只拦两项均为 0，单配一项是合法用法。
@@ -617,7 +585,7 @@ func TestFinishWindowNilWhenObservationOff(t *testing.T) {
 	}
 }
 
-// 12.11：结束快照用独立 ctx——场景 ctx 被取消（SIGHUP/Ctrl+C 中断、降速熔断 scancel）
+// 12.11：结束快照用独立 ctx——场景 ctx 被取消（SIGHUP/Ctrl+C 或场景控制停止）
 // 时快照仍须抓取成功。中断场景的窗口差值是唯一的服务端数据来源；旧行为（取消传播导致
 // 抓取失败）会把 queue/prefill/decode 分解与 preemptions 差值整段丢掉（r1-off S5 实测）。
 func TestFinishWindowSnapshotSurvivesCancelledCtx(t *testing.T) {
@@ -690,40 +658,6 @@ func TestFinishWindowNoWindowDeltaOnFailedSnapshot(t *testing.T) {
 	}
 	if gotSamples && len(sum.Gauges) == 0 {
 		t.Error("窗口内已轮询到的 gauges 与结束快照无关，应照常挂回")
-	}
-}
-
-// 5.7 爬坡发车的批次计划：首批 1，指数放大，尾批收剩余
-func TestRampBatches(t *testing.T) {
-	cases := []struct {
-		level, factor int
-		want          []int
-	}{
-		{1, 2, []int{1}},
-		{4, 2, []int{1, 2, 1}},
-		{8, 2, []int{1, 2, 4, 1}},
-		{7, 2, []int{1, 2, 4}},
-		{6, 3, []int{1, 3, 2}},
-		{5, 2, []int{1, 2, 2}},
-	}
-	for _, c := range cases {
-		got := rampBatches(c.level, c.factor)
-		if len(got) != len(c.want) {
-			t.Fatalf("rampBatches(%d,%d) = %v, want %v", c.level, c.factor, got, c.want)
-		}
-		sum := 0
-		for i, v := range got {
-			if v != c.want[i] {
-				t.Fatalf("rampBatches(%d,%d) = %v, want %v", c.level, c.factor, got, c.want)
-			}
-			if v <= 0 {
-				t.Fatalf("rampBatches(%d,%d) 含非正批次: %v", c.level, c.factor, got)
-			}
-			sum += v
-		}
-		if sum != c.level {
-			t.Fatalf("rampBatches(%d,%d) 批次之和 %d != level", c.level, c.factor, sum)
-		}
 	}
 }
 

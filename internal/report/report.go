@@ -35,9 +35,7 @@ type MultiturnRun struct {
 
 	Turns []*engine.TurnMetrics `json:"turns"`
 
-	// 5.7 闭环错峰发车：批次号（1 起）与相对本档位开始的启动偏移（秒）。
-	// 报告侧据此标爬坡窗口；0/空 = 该档位未启用爬坡（barrier 齐射）。
-	Batch        int     `json:"batch,omitempty"`
+	// soak 时会话启动时刻相对档位开始的偏移（秒），供外部分析首末时段漂移。
 	StartOffsetS float64 `json:"start_offset_s,omitempty"`
 
 	// 12.3 multiturn 深度实测校验：
@@ -88,9 +86,6 @@ type ConcurrentLevel struct {
 	GoodputRPS float64 `json:"goodput_rps"` // 达标请求 / 墙钟
 	GoodputTPS float64 `json:"goodput_tps"` // 达标请求的 completion tokens / 墙钟
 
-	// 混合负载形状分解（concurrent.mix，5.6）：按形状聚合的中位数统计；Requests 全量不动
-	Shapes []ShapeStat `json:"shapes,omitempty"`
-
 	// WaitingMax 本档位观测到的 waiting 排队深度峰值（服务端 /metrics gauge；0 = 观测层
 	// 不可用或未采样）。与饱和止损是否启用无关，常开记录——它是 saturation_guard.max_waiting
 	// 的标定数据源（建议阈值 = 峰值 × 3–5，报告侧会自动给出建议值）。
@@ -102,8 +97,8 @@ type ConcurrentLevel struct {
 	// 「加并发吞吐不涨」时对照本值即可一眼看出服务端槽位天花板。
 	RunningMax float64 `json:"running_max,omitempty"`
 
-	// Aborted 非空 = 本档位被提前终止（5.7 爬坡发车的 fail-fast / 全局止损；
-	// saturation_guard 的饱和/墙钟 drain；12.11 起补「运行中断（SIGHUP/Ctrl+C）」），
+	// Aborted 非空 = 本档位被提前终止（saturation_guard 的饱和/墙钟 drain；
+	// 运行中断（SIGHUP/Ctrl+C）），
 	// 值为终止原因；场景层据此停止后续档位。
 	// drain 语义：已发出的请求全部保留完整数据，仅样本量少于配置值。
 	Aborted string `json:"aborted,omitempty"`
@@ -113,18 +108,6 @@ type ConcurrentLevel struct {
 	// （首批会话滚完前的暂态剔除）与首末时段漂移分析。
 	DurationSeconds float64 `json:"duration_seconds,omitempty"`
 	Renew           bool    `json:"renew,omitempty"`
-}
-
-// ShapeStat 混跑单形状统计（中位数口径与并发表一致）。
-type ShapeStat struct {
-	Label        string  `json:"label"`
-	Weight       int     `json:"weight"`
-	PromptTokens int     `json:"prompt_tokens"`
-	MaxTokens    int     `json:"max_tokens"` // 已过思考 floor 抬高
-	Count        int     `json:"count"`      // 本轮实际发出的该形状请求数
-	TTFTS        float64 `json:"ttft_s"`     // 中位
-	E2ES         float64 `json:"e2e_s"`      // 中位
-	TokPS        float64 `json:"tok_s"`      // 中位
 }
 
 // SLO 记录本次评测的 goodput 约束（报告侧据此计算达标口径）。
@@ -297,7 +280,7 @@ var Version = "llm-perf/dev"
 // SchemaVersionCurrent 数据契约版本：JSON 结构变更时递增，外部消费方据此做兼容判断。
 // 契约唯一权威文档 docs/data-contract.md，与本值同步维护（2026-09-17 报告层剥离后，
 // 这份 JSON 契约就是工具的对外接口）。
-const SchemaVersionCurrent = 3
+const SchemaVersionCurrent = 4
 
 // Report 是一次场景执行的完整数据，整体落盘为单个 JSON 文件。
 type Report struct {
@@ -320,9 +303,9 @@ type Report struct {
 	Correctness       []CorrectnessRow      `json:"correctness,omitempty"`
 	AuxiliaryRequests []AuxiliaryRequest    `json:"auxiliary_requests,omitempty"`
 	Server            *ServerMetricsSummary `json:"server_metrics,omitempty"`
-	// KVCapacity 服务端 KV 容量画像（12.12，vllm:cache_config_info；场景开始时快照一次）。
-	// 用途单一：报告侧在容量/拐点结论里并列「实测拐点 vs KV 上界」，先回答「是不是
-	// KV 内存先满」。同为可选第二数据源——缺失（引擎未暴露/观测层关闭）不影响任何结论。
+	// KVCapacity 服务端 KV 容量画像（vllm:cache_config_info；场景开始时快照一次）。
+	// 用途单一：外部分析并列「实测负载行为 vs KV 上界」，先回答「是不是 KV 内存先满」。
+	// 同为可选第二数据源——缺失（引擎未暴露/观测层关闭）不影响客户端采集。
 	KVCapacity *smetrics.KVCapacity `json:"kv_capacity,omitempty"`
 	// SourceCheck 两源一致性（10.1，仅并发场景计算）：客户端 vs 服务端生成吞吐。
 	SourceCheck *SourceCheck `json:"source_check,omitempty"`
@@ -330,10 +313,6 @@ type Report struct {
 	// 环境存档：几周后回看数据时"当时是什么引擎/什么配置跑的"必须有据可查。
 	Environment *engine.ProbeResult `json:"environment,omitempty"`
 	ConfigRaw   string              `json:"config_raw,omitempty"`
-
-	// StallTrace 降速采样序列侧文件（<结果 JSON 同名>.stall.csv，相对本 JSON 所在目录）。
-	// 仅 stall_guard 启用且未 --no-stall-trace 时存在；字段缺失 = 未启用或已关闭。
-	StallTrace string `json:"stall_trace,omitempty"`
 
 	// PartitionModel 按模型分区时该分区归属的模型名（不落盘）：main 据此拼 <output_dir>/<模型>/ 子目录
 	PartitionModel string `json:"-"`

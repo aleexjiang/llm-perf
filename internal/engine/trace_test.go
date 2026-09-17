@@ -113,7 +113,7 @@ func TestTracePickWrap(t *testing.T) {
 	}
 }
 
-// ── full 回放保真度（ROADMAP P0）──
+// ── full 回放保真度 ──
 
 const fullSample = `[
   {"conversations": [

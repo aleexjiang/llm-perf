@@ -240,7 +240,6 @@ func satCfg(t *testing.T, endpoint string, sg *config.SaturationGuardCfg) *confi
 		RunsPerWorker: 4,
 		PromptTokens:  100,
 		MaxTokens:     config.IntList{16},
-		Ramp:          &[]bool{false}[0], // 齐射：发车行为确定，便于断言
 	}
 	cfg.SaturationGuard = sg
 	return cfg

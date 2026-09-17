@@ -135,7 +135,6 @@ func planScenario(mc *config.Config, it PlanItem) *report.PlanScenario {
 
 	case "concurrent", "concurrent-multi":
 		cc := mc.Concurrent
-		mixN := len(cc.Mix)
 		profN := len(mc.Multiturn.Profiles)
 		// 开环（request_rate/rate_sweep）在场景层优先于 levels，画像必须同口径——否则会报出
 		// 一个永远不会执行的档位矩阵（默认 levels=[1,2,4,8,16] 在开环配置下仍在线上，
@@ -161,10 +160,7 @@ func planScenario(mc *config.Config, it PlanItem) *report.PlanScenario {
 			}
 			total := 0
 			for _, v := range vs {
-				tiers := 1 // 混跑不走外层输出扫描（与场景层 tiers=[0] 对应）
-				if mixN == 0 {
-					tiers = len(th.MaxTokensList(cc.MaxTokens, v))
-				}
+				tiers := len(th.MaxTokensList(cc.MaxTokens, v))
 				per := n
 				if it.MT {
 					per = effectiveTurnsSum(mc, n) // 混合档逐会话求和（均匀档与 n×turns 等价）
@@ -192,9 +188,7 @@ func planScenario(mc *config.Config, it PlanItem) *report.PlanScenario {
 		dur := cc.DurationSeconds
 		var mode string
 		if it.MT {
-			if mixN > 0 {
-				mode = "多轮（mix 与 multiturn 互斥，此组合不会出现）"
-			} else if profN > 0 {
+			if profN > 0 {
 				mode = fmt.Sprintf("每用户多轮会话 × turns 按档位（混跑 %d 档）", profN)
 				if dur > 0 {
 					mode += fmt.Sprintf(" × 每档跑满 %ds（时长制：请求数取决于吞吐）", dur)
@@ -207,22 +201,13 @@ func planScenario(mc *config.Config, it PlanItem) *report.PlanScenario {
 			}
 		} else if dur > 0 {
 			mode = fmt.Sprintf("每档跑满 %ds（时长制：runs/worker 忽略，请求数取决于吞吐）", dur)
-			if mixN > 0 {
-				mode += fmt.Sprintf(" × 混跑 %d 形状", mixN)
-			}
 		} else {
 			mode = fmt.Sprintf("单轮 × runs/worker=%d", cc.RunsPerWorker)
-			if mixN > 0 {
-				mode += fmt.Sprintf(" × 混跑 %d 形状", mixN)
-			}
 		}
 		total := 0
 		if dur <= 0 {
 			for _, v := range vs {
-				tiers := 1 // 混跑不走外层输出扫描（与场景层 tiers=[0] 对应）
-				if mixN == 0 {
-					tiers = len(th.MaxTokensList(cc.MaxTokens, v))
-				}
+				tiers := len(th.MaxTokensList(cc.MaxTokens, v))
 				for _, level := range levels {
 					per := level * cc.RunsPerWorker
 					if it.MT {

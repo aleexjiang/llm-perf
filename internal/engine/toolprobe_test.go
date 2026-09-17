@@ -1,4 +1,4 @@
-// toolprobe_test.go：tool-call 判据的 fixture 回放单测（ROADMAP A.6 的 L1 判据正确性层）。
+// toolprobe_test.go：tool-call 判据的 fixture 回放单测。
 // 覆盖 A.3 六种失败形态 + 正常形态 + 流式聚合对照。
 // fixture 是手写的 SSE / JSON 响应——判据函数是纯确定性逻辑，fixture 验证比真机更严格。
 package engine

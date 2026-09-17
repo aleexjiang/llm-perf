@@ -111,27 +111,6 @@ func TestPlanSummaryOpenLoop(t *testing.T) {
 	}
 }
 
-// 混跑：不走外层输出扫描，请求数 = levels × runs/worker（tiers=1）。
-func TestPlanSummaryMix(t *testing.T) {
-	cfg := &config.Config{
-		Endpoint: "http://x:1/v1",
-		Models:   []string{"m1"},
-		Single:   config.Single{Runs: 1, PromptTokens: []int{4000}, MaxTokens: config.IntList{64}},
-		Concurrent: config.Concurrent{Levels: []int{4}, RunsPerWorker: 2, PromptTokens: 10000,
-			MaxTokens: config.IntList{256},
-			Mix: []config.MixShape{
-				{Weight: 7, Label: "short", PromptTokens: 1000, MaxTokens: 128},
-				{Weight: 3, Label: "long", PromptTokens: 8000, MaxTokens: 256},
-			}},
-	}
-	cfg.Thinking.Mode = "on"
-	p := PlanSummary(cfg, "", []PlanItem{{Name: "concurrent", Highs: []int{4}}})
-	got := p.Models[0].Scenarios[0]
-	if got.Requests != 8 { // 1 变体 × level4 × runs2（mix 下输出档不乘）
-		t.Fatalf("mix 估算 %d ≠ 8", got.Requests)
-	}
-}
-
 // 时长制（10.5 duration_seconds）：请求量由墙钟决定，画像不报数——Requests=0 +
 // DurationS 标记（渲染层以「—」呈现），Detail 说明时长制口径。回归背景：时长制下
 // runs_per_worker 被场景层忽略，画像曾仍按它估算，日志/JSON 给出不会执行的请求数。

@@ -67,20 +67,10 @@ concurrent:
   max_tokens: 256                 # 每轮固定输出
   burstiness: 1                   # 标准泊松到达
 
-# 降速熔断：基准跑 5 档含 200k，服务端退化会白烧几小时窗口。
-# min_tps 必须按本部署稳态标定——用 bench probe 输出的建议值覆盖下面的 10（实测 16.6 tok/s
-# 的实例用默认 20 会在正常运行时误触发）。
-stall_guard:
-  enabled: true
-  min_tps: 10
-  window_seconds: 600
-  cooldown_seconds: 300
-
 correctness:
   samples: 8                      # 四个数之一：防"HTTP 200 但内容异常"的假成功
 
 # ── 基准不测（改这些等于换了一套基准，横比失效）──
 # saturation_guard     饱和止损属容量探索 → performance 类别
-# concurrent.mix       混合负载属容量折扣探索 → performance 类别
 # rate_sweep           开环到达率扫描＝找饱和点 → performance 类别
 # single.max_tokens    输出长度扫描 → performance 类别

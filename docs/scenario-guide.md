@@ -10,15 +10,15 @@
 |---|---|---|
 | 单发多轮 | 观察 history 变深、prefix cache、每轮 TTFT/TPOT 变化 | `--concurrency 1` |
 | 多用户多轮 RPS | 主容量采集；RPS 是新会话到达率，观察排队、失败、drain 和用户体验 | `--concurrency cfg` + `request_rate/rate_sweep` |
-| 多用户多轮闭环 | 辅助诊断并发槽位和单流退化 | `--concurrency 2,4,8` |
-| probe | 引擎、usage、thinking、tool-call、/metrics 能力检查 | `bench probe` |
+| 多用户多轮闭环 | 辅助诊断并发槽位和单流退化；统一 barrier 齐射 | `--concurrency 2,4,8` |
+| probe | 引擎、usage、thinking、tool-call、/metrics 能力检查（显式执行） | `bench probe` |
 
 **不再支持单发单轮。** 普通对话的单轮阶梯不能代表 agent 的长前缀、多轮 history 和缓存形状；需要短请求健康检查时使用 `probe`，不要恢复一个独立 benchmark 场景。
 
 ## 2. 推荐执行顺序
 
 ```text
-probe（逐模型确认能力）
+显式 probe（逐模型确认能力，可选，不计入 bench 请求）
 → 单发多轮 off（确认 history/cache 基线）
 → 单发多轮 on 或 thinking.levels（确认思考成本）
 → RPS 多用户多轮 off（主容量曲线）

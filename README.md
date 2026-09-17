@@ -244,7 +244,7 @@ gauge 轮询自带健康度：从未成功或连续失败 ≥5 时 JSON 标记 `
   或重启服务端清缓存（二选一）
 - **预热**：`warmup_requests: N` 每场景开始前发 N 条小请求暖连接；完整 `TurnMetrics` 落在 JSON 的 `auxiliary_requests[]`（phase=`warmup`），不进入 benchmark KPI
 - **连接层重试**：`retry: {max_attempts: 2, backoff_ms: 300}` 对瞬时失败（reset/5xx/429）重试，默认关闭；重试留痕 warnings/retry_count；失败/取消原始请求均保留
-- **降速熔断**：`stall_guard: {min_tps: 10, window_seconds: 600, cooldown_seconds: 300}` 按**单流流式增量速率近似值中位**；该值按 chunk 计数，是控制层止损信号，不等同于 usage 精确 token/s
+- **渐进加压**：RPS/并发档位按低到高执行；“慢”和排队增长都是需要保留的采集数据，外部分析根据 timeout、completed/failed/cancelled、waiting、TTFT 和 drain 时间判断容量
   （各在飞流窗口内输出增量 / 时长，取中位——并发劣化时聚合值会掩盖单流卡顿）判定服务端退化，持续低于阈值
   即中止**当前场景**（不是整轮），冷却后继续下一个场景；已完成数据照常落盘，报告 note 标注熔断原因与现场速度。
   空闲与纯 prefill（未出首 token）不参与判定。CLI `--stall-tps/--stall-window/--stall-cooldown`、`--no-stall-guard`
@@ -297,7 +297,7 @@ JSON 结构见 `internal/report/report.go` 与 [docs/data-contract.md](docs/data
 每条主压测请求是 `engine.TurnMetrics`（含 `phase=benchmark`；流式含原始 chunk 序列 `content_times_ms`，
 供 chunk 间隔和抖动等外部分析）；warmup/correctness/失败/取消请求也完整保留，辅助请求位于
 `auxiliary_requests[]`。观测层开启时附 `server_metrics` 汇总（缓存命中率/排队/prefill-decode 分解）
-与逐请求 `server_counter_delta`。降速采样序列落旁文件 `*.stall.csv`。
+与逐请求 `server_counter_delta`。
 
 **分析在工具之外**：聚合、判级、画图由消费方完成。体验基线三档阈值（`slo_baseline`）随 JSON
 透出，判级不要内置自己的常量；报告判据的方法论依据见 [docs/latency-baselines.md](docs/latency-baselines.md)。
@@ -331,8 +331,6 @@ scripts/smoke.sh    # 自动化冒烟：mock 服务 + 多组合运行 + 输出�
                     # 运行产物全部落 /tmp 随脚本退出清理，不污染仓库
 scripts/mock_server.py   # 本地 mock OpenAI 兼容流式服务（smoke.sh 底层依赖）
                     # 环境变量 MOCK_TOKEN_DELAY 可调每 chunk 间隔（默认 0.05≈20 tok/s），用来构造降速现场
-scripts/stall-e2e/  # 降速熔断端到端回归：假慢速服务端 + 配置，验证
-                    # 「单流降速 → 中止当前场景 → 冷却 → 续跑下一场景 → 报告 note 留痕」整条链路
                     # （与 smoke.sh 分开：这里的 mock 需要按请求区分快慢，探针必须秒回）
 deploy/             # 推理服务 compose 存档：vLLM 基线 + SGLang / TensorRT-LLM / llama.cpp / TGI
                     # 引擎横评（各文件头部含与基线的逐参数对照与 bench 侧注意点）
