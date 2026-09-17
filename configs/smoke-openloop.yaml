@@ -1,5 +1,6 @@
 # 开环到达率冒烟（原 smoke-open 变体独立成文件，配 scripts/smoke.sh 自动跑）：
-# Poisson 到达 + 并发上限 + num_prompts 尊重，断言 RequestRate 落盘与请求总数
+# Poisson 到达 + 并发上限 + num_prompts 尊重，断言 RequestRate 落盘与请求总数；
+# burstiness=0.5（比泊松突发）顺带覆盖 gamma 采样 + 延迟重整路径
 endpoint: "http://127.0.0.1:18099/router/v1"
 api_key_env: ""
 output_dir: "output-smoke-openloop"
@@ -31,6 +32,7 @@ multiturn:
 concurrent:
   multiturn: false
   request_rate: 4          # 到达率 req/s（开环；levels 未配置不生效）
+  burstiness: 0.5          # 到达突发度（gamma shape；<1 比泊松更突发；重整保证到达总量 = n/rate）
   num_prompts: 6
   max_concurrency: 2
   prompt_tokens: 300

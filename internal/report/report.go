@@ -282,11 +282,18 @@ type SourceCheck struct {
 // 默认 dev；Makefile 构建时用 -ldflags 注入 git describe 版本号。
 var Version = "llm-perf/dev"
 
+// SchemaVersionCurrent 数据契约版本：JSON 结构变更时递增，外部消费方据此做兼容判断。
+// 契约唯一权威文档 docs/data-contract.md，与本值同步维护（2026-09-17 报告层剥离后，
+// 这份 JSON 契约就是工具的对外接口）。
+const SchemaVersionCurrent = 2
+
 // Report 是一次场景执行的完整数据，整体落盘为单个 JSON 文件。
 type Report struct {
-	Tool        string    `json:"tool"`
-	Scenario    string    `json:"scenario"`
-	GeneratedAt time.Time `json:"generated_at"`
+	Tool string `json:"tool"`
+	// SchemaVersion 数据契约版本（落盘时由 SaveJSON 兜底填充，见 SchemaVersionCurrent）
+	SchemaVersion int       `json:"schema_version"`
+	Scenario      string    `json:"scenario"`
+	GeneratedAt   time.Time `json:"generated_at"`
 	// Test 测试类别（benchmark | performance | soak）：报告据其切换结论区口径。
 	// 恒有值且**不带 omitempty**——JSON 自描述，读者不必猜"缺键 = 默认还是旧产物"。
 	Test        string                `json:"test"`
@@ -321,6 +328,9 @@ type Report struct {
 
 // SaveJSON 将报告写入单个 JSON 文件（自动创建父目录）。
 func (r *Report) SaveJSON(path string) error {
+	if r.SchemaVersion == 0 {
+		r.SchemaVersion = SchemaVersionCurrent // 兜底填充：场景层构造处无需逐点赋值
+	}
 	return SaveJSONAny(r, path)
 }
 

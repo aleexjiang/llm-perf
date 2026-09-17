@@ -58,6 +58,11 @@ type Client struct {
 	DebugDir     string       // 非空时留存每个请求的原始响应到该目录（排查魔改引擎）；请求失败时即使为空也会留存
 	Retry        *RetryPolicy // nil = 不重试（压测默认）
 
+	// RawTimings 原始 chunk 序列落盘：流式请求把每个含 token chunk 的时刻记进
+	// content_times_ms（相对 sent_at 的毫秒偏移）。峰值秒桶吞吐、ITL 抖动等外部分析
+	// 都依赖这份原始序列；体积随输出 token 数线性增长，超长 soak 可关。
+	RawTimings bool
+
 	// Stall 降速熔断（nil = 关闭）：按聚合输出速度判定服务端是否退化，
 	// 触发后由场景层取消该场景。计数在流式增量处接线，见 stall.go。
 	Stall *StallGuard
@@ -155,6 +160,11 @@ type TurnMetrics struct {
 	ITLP95        float64 `json:"itl_p95_ms,omitempty"`
 	ITLP99        float64 `json:"itl_p99_ms,omitempty"`
 	ITLMax        float64 `json:"itl_max_ms,omitempty"`
+
+	// ContentTimesMS 每个 content chunk 相对 sent_at 的毫秒偏移（原始序列，raw_timings
+	// 开启时落盘）：外部分析据此重建逐 token 时刻（峰值秒桶吞吐、抖动）。
+	// ITL 分位数之外的抖动信息只在这里有；非流式/关闭时缺键。
+	ContentTimesMS []float64 `json:"content_times_ms,omitempty"`
 	// TPOT 每 output token 时间（GenAI-Perf 口径：(E2E−TTFT)/(completion−1)，含思考 token），
 	// 横评常用；与 ITL（仅 content chunk 间隔）互补
 	TPOTMS       float64 `json:"tpot_ms,omitempty"`
@@ -184,6 +194,9 @@ type TurnMetrics struct {
 	toolCallBuckets map[int]*ToolCall // 流式按 index 分桶的聚合状态
 
 	contentTimes []time.Time
+	// rawTimings 原始 chunk 序列开关（Client.RawTimings 透传）：Finalize 据此把
+	// contentTimes 换算进 ContentTimesMS
+	rawTimings bool
 	// 解析状态（sse.go 的 ingest 逻辑使用；probe 也读它们做兼容性判定）
 	seenDeltaKeys  map[string]bool // 流中出现过的全部 delta 键名
 	unknownKeys    map[string]bool // 非标 delta 键名
@@ -309,6 +322,15 @@ func (m *TurnMetrics) Finalize() {
 		m.ITLP95 = percentile(itl, 95)
 		m.ITLP99 = percentile(itl, 99)
 		m.ITLMax = itl[len(itl)-1]
+	}
+
+	// 原始 chunk 序列（raw_timings 开启时落盘）：ITL 分位数之外的抖动/峰值信息
+	// 只在这里有。在 ITL 排序之前换算不受影响（用原始 contentTimes）。
+	if m.rawTimings && len(m.contentTimes) > 0 {
+		m.ContentTimesMS = make([]float64, len(m.contentTimes))
+		for i, t := range m.contentTimes {
+			m.ContentTimesMS[i] = ms(m.SentAt, t)
+		}
 	}
 
 	// TPOT（GenAI-Perf 口径）：含思考 token 在内的每个 output token 平均耗时
@@ -437,7 +459,7 @@ func (c *Client) attempt(ctx context.Context, o ChatOptions) (m *TurnMetrics, er
 		return nil, err, false
 	}
 
-	m = &TurnMetrics{Model: o.Model, Stream: o.Stream, Thinking: o.Thinking}
+	m = &TurnMetrics{Model: o.Model, Stream: o.Stream, Thinking: o.Thinking, rawTimings: c.RawTimings}
 	// 降速熔断接线：本请求注册为一条在飞流（12.10 per-stream 记账）。defer 保证任何返回
 	// 路径都归位（含早退的错误分支）；retry 时每次 attempt 各注册一条，退避期间不占在飞数。
 	if c.Stall != nil {

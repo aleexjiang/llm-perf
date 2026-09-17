@@ -24,11 +24,11 @@ engine 层（internal/engine）── Client.Chat：逐 chunk 计时 → TurnMet
   ▼
 report 层（internal/report）── Report 结构落盘 JSON（按模型分区 PartitionByModel）
   │
-  ▼  （离线，非 Go 职责）
-scripts/gen_html_report.py ── 读多份 JSON → merge/analyze → 自包含 HTML + perf-summary
+  ▼  （离线，非本工具职责）
+外部数据分析（pandas / notebook / 客户 BI）── 读场景 JSON + probe JSON + *.stall.csv 自行聚合
 ```
 
-契约一句话：**Go 只产出原始 JSON；所有聚合、判级、报告呈现都在 Python 报告侧**（报告侧能算的不碰 Go）。
+契约一句话：**Go 只产出原始数据（per-request/per-turn JSON + probe + stall.csv），所有聚合、判级、呈现都在工具之外**（分析侧能算的不碰 Go；2026-09-17 报告层已整体剥离，数据契约即对外接口，见 [data-contract.md](data-contract.md)）。
 
 ## 包职责
 
@@ -64,14 +64,12 @@ scripts/gen_html_report.py ── 读多份 JSON → merge/analyze → 自包含
 
 | 要加什么 | 改哪里 |
 |---|---|
-| 新的请求级指标 | `TurnMetrics` 加字段 + `Finalize` 计算（注意 json:"-/omitempty 语义）→ 报告侧 gen_html_report.py 的 `analyze()` 消费 |
+| 新的请求级指标 | `TurnMetrics` 加字段 + `Finalize` 计算（注意 json:"-/omitempty 语义）；新增字段必须指认四个数（TTFT/decode 速度/goodput/canary）之一，否则 `json:"-"` 只进诊断面；同步更新 data-contract.md 并递增 `SchemaVersionCurrent` |
 | 新的 probe 检查项 | `engine.ProbeOptions` + `probe.go` 的 ProbeCheck 列表（或 toolprobe.go 模式：独立文件 + verdict 分级）。**先判定证据来源**：只用标准面就选 `check`（核心），沾了引擎扩展面就选 `checkExt`/`checkExtNA`——别让可选端点拖累通过率 |
 | 新场景/新负载模式 | scenario.go 注册新 Scenario 或扩展 Concurrent（闭环 runClosedRound / 开环 runOpenRound 已是两条成熟路径） |
 | 配置新字段 | config.go 对应子结构 + Load 默认值；**不做向后兼容双轨** |
-| 报告新章节 | gen_html_report.py：analyze() 出数据 → 新 render 函数 → main() 组装；判级常量收敛到 SLO_TIERS(150) |
 | 服务端新指标 | smetrics.go 指标名表加归一化名；未知引擎命名差异优先考虑告警而不是静默回落 |
-| 报告要用 Report 的**顶层字段** | 先改 `merge()`：它只 extend 三个场景数组，顶层字段（如 `server_metrics`）不显式取就会**静默丢弃**——历史上服务端观测就这么被扔掉的。按场景收进 `meta["server"]` → `main()` 挂到 `A["server"]` → render 函数读 `A["server"]` |
-| 任何依赖 /metrics 的新渲染 | `/metrics` 是**可选**第二数据源，只能增强不能成为前提：判定用 `metrics_provenance()`（它按"窗口差值是否真取到"分拣，而且兼容旧产物的 `available=true`+`note`），三种状态都必须能出完整报告 |
+| 数据契约结构变更 | report.go / TurnMetrics 改结构 → data-contract.md 同步 → `SchemaVersionCurrent` 递增；外部消费方按 schema_version 做兼容判断 |
 
 ## 已知坑位（改代码前先看）
 

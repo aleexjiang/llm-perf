@@ -20,7 +20,7 @@
 #   10.5 时长制 soak（duration_seconds + renew 会话续跑）configs/smoke-soak.yaml
 #   5.11 混合档（multiturn.profiles 跨会话分派；SWRR 3:1 + 档位轮数/标签落盘）configs/smoke-profiles.yaml
 #   参数错误路径（非法变体名 / levels 下用 on / 多场景 -o 单文件）
-#   报告管线（gen_html_report.py + validate_report.js）
+#   数据契约（schema_version / raw_timings 原始 chunk 序列 / 开环 burstiness）
 #
 # 用法:
 #   scripts/smoke.sh                          # 自动 go build 临时二进制（GO_BIN 可指定 go 路径）
@@ -125,8 +125,7 @@ run "非流式 thinking on" out-nostream -c "$TMP/nostream.yaml" --turns single 
 run "开环到达率" out-openloop -c "$TMP/smoke-openloop.yaml" --turns single --concurrency cfg
 
 # 7b) 速率扫描（rate_sweep 多档）+ 观测层 + goodput + slo.baseline：
-#     报告侧「速率扫描」表与图、拐点/goodput 上限、测试画像、服务端延迟分解、两源一致性
-#     都以这份产物为数据源（报告断言见文末报告管线段）
+#     拐点/容量分析的外部数据源（数据形状断言见下方 Python 断言块）
 run "速率扫描（rate_sweep）" out-sweep -c "$TMP/smoke-sweep.yaml" --turns both --concurrency cfg
 
 # 8) 思考档位 levels：全档 + 档位名过滤
@@ -312,6 +311,16 @@ check(basic_m and all(x.get("ttft_ms", 0) > 0 and x.get("e2e_ms", 0) > 0
                       and x.get("prompt_tokens", 0) > 0 and x.get("completion_tokens", 0) > 0
                       and not x.get("error") for x in basic_m),
       f"基础冒烟指标完整（{len(basic_m)} 条: ttft/e2e/tokens>0 且无 error）")
+
+# 1a) 数据契约：schema_version 自描述；raw_timings 原始 chunk 序列（峰值秒桶/抖动分析
+#     的原料）——流式成功请求必落盘、单调不减、不超出请求结束时刻
+check(all(r.get("schema_version") == 2 for r in load_all("out-basic")),
+      "全部 JSON 带 schema_version=2（数据契约自描述）")
+check(all(
+    x.get("content_times_ms") and all(b >= a for a, b in zip(x["content_times_ms"], x["content_times_ms"][1:]))
+    and x["content_times_ms"][-1] <= x.get("e2e_ms", 0) + 1e-6
+    for x in basic_m if x.get("ttft_ms", 0) > 0 and not x.get("error")),
+    f"流式成功请求 content_times_ms 落盘且单调（{sum(1 for x in basic_m if x.get('content_times_ms'))} 条）")
 
 # 1b) 5.7 爬坡发车（闭环默认启用）：批次号与启动偏移落盘，首批 1 路、批次递增。
 #     注意挂 out-all：基础冒烟默认 concurrency=[1]，1 不组成并发场景，闭环档只在
@@ -615,123 +624,6 @@ if failures:
     print(f"\n❌ 冒烟断言失败 {len(failures)} 项")
     sys.exit(1)
 print("\n✅ 全部断言通过")
-PYEOF
-
-# ── 报告管线：合并 → HTML 生成 → JS 校验（node 缺失时降级为提示）──
-echo "==> 报告管线冒烟（gen_html_report + validate_report）"
-# 保留模型分区子目录：多模型产物的文件名相同（scenario-时间戳），平铺 cp 会互相覆盖，
-# 只留一个模型 → 多模型落地页/切换器路径根本进不到。
-flat_copy() { # flat_copy <源目录> <目标目录>
-  local src="$1" dst="$2"
-  mkdir -p "$dst"
-  for f in $(find "$src" -name '*.json'); do
-    local out="$dst/${f#$src/}"
-    mkdir -p "$(dirname "$out")"
-    cp "$f" "$out"
-  done
-}
-flat_copy "$TMP/out-basic" "$TMP/flat"
-python3 scripts/gen_html_report.py "$TMP/flat" >"$TMP/report.log" 2>&1 \
-  || { echo "❌ gen_html_report 失败（日志: $TMP/report.log）"; tail -20 "$TMP/report.log"; exit 1; }
-HTML="$TMP/flat/llm-perf-报告.html"
-[ -f "$HTML" ] || { echo "❌ 报告 HTML 未生成"; exit 1; }
-echo "  ✅ 报告 HTML 已生成（$(wc -c <"$HTML" | tr -d ' ') bytes）"
-python3 - "$HTML" <<'PYEOF'
-import sys, re, html
-raw = open(sys.argv[1], encoding="utf-8").read()
-t = html.unescape(re.sub(r"<[^>]+>", " ", raw))
-assert "数据来源" in t, "报告缺少『数据来源』声明（/metrics 是可选数据源，口径必须在报告里标注）"
-bad = re.findall(r"服务端观测（\w+）：。", t)
-assert not bad, "报告出现空的服务端观测面板: {}".format(bad)
-# 10.2 一页纸：顶层 = 四个数 + 三分归因；详细区降级为折叠附录（能力不砍）
-assert 'id="onepager"' in raw, "报告缺少一页纸区块"
-assert "一页纸结论" in t and "三分归因" in t, "一页纸未渲染标题/三分归因说明"
-for nm in ("① TTFT", "② decode 速度", "③ goodput@SLO", "④ 正确性"):
-    assert nm in t, "一页纸缺少四个数之一: {}".format(nm)
-for nm in ("服务端推理", "客户端与网络", "负载层（测试设计）"):
-    assert nm in t, "三分归因缺少: {}".format(nm)
-assert 'id="appendix"' in raw, "详细数据未降级为附录"
-assert 'id="appendix" open' not in raw, "附录默认不应展开（顶层只留一页纸）"
-# 多模型：一页纸表格必须两个模型都在（平铺 cp 覆盖文件曾导致只剩一个模型）
-assert "mock-model-a" in t and "mock-model-b" in t, "多模型报告缺模型"
-# 原章节仍在附录里（能力不砍）：抽查几个只可能来自详细区的字样
-for nm in ("指标口径", "缓存判定", "数据质量"):
-    assert nm in t, "附录缺少原章节内容: {}".format(nm)
-assert raw.find("const grid=") < raw.find('class="foot"'), "图表应随详细数据一起收进附录"
-print("  ✅ 数据来源已标注；无空的服务端观测面板")
-print("  ✅ 一页纸（四个数 + 三分归因）就位；详细区降级为折叠附录")
-PYEOF
-
-# 10.4 测试类别（test: benchmark|performance|soak）：结论区按类别切换。
-# 复用上面那份 flat 产物改 test 键重渲染——类别只改表达层（Go 侧测量路径与类别无关，
-# 配置校验由 go test 覆盖），所以这里零额外压测即可端到端锁住三套口径。
-for K in benchmark soak; do
-  rm -rf "$TMP/kind-$K"
-  cp -r "$TMP/flat" "$TMP/kind-$K"
-  python3 - "$TMP/kind-$K" "$K" <<'KINDEOF'
-import json, os, sys, glob
-d, k = sys.argv[1], sys.argv[2]
-for f in glob.glob(os.path.join(d, "**", "*.json"), recursive=True):
-    j = json.load(open(f, encoding="utf-8"))
-    j["test"] = k
-    json.dump(j, open(f, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-KINDEOF
-  python3 scripts/gen_html_report.py "$TMP/kind-$K" >"$TMP/kind-$K.log" 2>&1 \
-    || { echo "❌ 类别 $K 渲染失败（日志: $TMP/kind-$K.log）"; tail -20 "$TMP/kind-$K.log"; exit 1; }
-done
-python3 - "$TMP/flat/llm-perf-报告.html" "$TMP/kind-benchmark/llm-perf-报告.html" "$TMP/kind-soak/llm-perf-报告.html" <<'PYEOF'
-import sys
-perf, bench, soak = (open(p, encoding="utf-8").read() for p in sys.argv[1:4])
-# performance 是默认类别：其 HTML 必须与历史产物逐字同形（无类别块），否则老产物重渲染会漂移
-assert "class=\"kn\"" not in perf, "performance（默认）不该有类别块"
-assert "顶层只有四个数" in perf, "performance 一页纸口径说明缺失"
-assert "基准口径" in bench and "class=\"kn\"" in bench, "benchmark 未渲染基准口径块"
-assert "稳定性口径" in soak and "是否随时间退化" in soak, "soak 未渲染稳定性三问块"
-for nm, h in (("benchmark", bench), ("soak", soak)):
-    assert "id=\"onepager\"" in h and "id=\"appendix\"" in h, "{} 的一页纸/折叠附录缺失".format(nm)
-# 类别只换首屏口径，四个数一个不少
-for nm, h in (("benchmark", bench), ("soak", soak)):
-    for k in ("① TTFT", "② decode 速度", "③ goodput@SLO", "④ 正确性"):
-        assert k in h, "{} 缺少四个数之一: {}".format(nm, k)
-print("  ✅ 类别切换：performance（默认）无类别块 / benchmark 基准口径 / soak 稳定性三问，四数俱在")
-PYEOF
-
-if command -v node >/dev/null 2>&1; then
-  node scripts/validate_report.js "$HTML" >"$TMP/validate.log" 2>&1 \
-    || { echo "❌ validate_report 校验失败（日志: $TMP/validate.log）"; tail -20 "$TMP/validate.log"; exit 1; }
-  echo "  ✅ validate_report.js 校验通过"
-else
-  echo "  ⚠️ 无 node，跳过 validate_report.js（报告 JS 校验未执行）"
-fi
-
-# ── 报告侧：速率扫描（9.2）+ 测试画像（5.10）+ 服务端延迟分解（11.2）+ 两源一致性（10.1）──
-echo "==> 报告管线冒烟（速率扫描 / 画像 / 直方图 / 两源一致性）"
-mkdir -p "$TMP/sweepflat"
-find "$TMP/out-sweep" -name '*.json' -exec cp {} "$TMP/sweepflat/" \;
-python3 scripts/gen_html_report.py "$TMP/sweepflat" >"$TMP/report-sweep.log" 2>&1 \
-  || { echo "❌ gen_html_report 失败（速率扫描；日志: $TMP/report-sweep.log）"; tail -20 "$TMP/report-sweep.log"; exit 1; }
-HTML2="$TMP/sweepflat/llm-perf-报告.html"
-[ -f "$HTML2" ] || { echo "❌ 速率扫描报告 HTML 未生成"; exit 1; }
-python3 - "$HTML2" <<'PYEOF'
-import sys, re, html
-t = html.unescape(re.sub(r"<[^>]+>", " ", open(sys.argv[1], encoding="utf-8").read()))
-need = {
-    "速率扫描（开环到达率）": "9.2 速率扫描表",
-    "吞吐拐点": "吞吐拐点结论",
-    "goodput 达标上限": "goodput 上限结论",
-    "测试画像": "5.10 测试画像表渲染（此前落盘无人读）",
-    "服务端延迟分解": "11.2 直方图窗口差值表",
-    "两源一致性（客户端": "10.1 两源一致性判定",
-    "waiting 峰值": "9.4 waiting 排队峰值列",
-    "max_waiting": "9.4 阈值标定建议",
-    "KV 容量参照": "12.12 KV 容量画像并列（开环静态句）",
-    "≥300": "slo.baseline 阈值覆盖生效（档位标签跟随 JSON 阈值）",
-}
-missing = [why for key, why in need.items() if key not in t]
-assert not missing, "报告缺少: {}".format("、".join(missing))
-# 画像表必须列出开环到达率（而不是被忽略的 levels 矩阵）
-assert "开环到达率" in t, "测试画像未按开环口径渲染"
-print("  ✅ 速率扫描 / 画像 / 直方图 / 两源一致性 全部渲染")
 PYEOF
 
 echo "==> 冒烟完成（运行目录已清理；详细日志见上方各步输出）"

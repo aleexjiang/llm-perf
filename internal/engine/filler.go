@@ -37,8 +37,8 @@ var zhSentences = []string{
 // （同一档位切语料会得到长度差 2.5× 的负载，受控变量失效）。
 //
 // 该系数仍是近似值（随 tokenizer/内容形状波动）：probe 的 filler_fidelity 检查会实测
-// 本部署的真实偏差并告警；报告横轴一律以服务端 usage.prompt_tokens 实测中位为准，
-// 不信构造侧的标称值（见 scripts/gen_html_report.py 的实测分箱）。
+// 本部署的真实偏差并告警；消费方一律以服务端 usage.prompt_tokens 实测值为准，
+// 不信构造侧的标称值（横轴分箱在数据分析侧做）。
 func Filler(targetTokens int, seed int64, lang string) string {
 	if w := corpusWindow(targetTokens, seed, lang); w != "" {
 		return w

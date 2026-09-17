@@ -2,9 +2,10 @@
 
 客户自部署 LLM 推理服务性能评测工具（Go，单二进制，无运行时依赖）。
 
-**契约：输入 YAML 配置，输出 JSON 原始数据。** Go 工具本身不做报告渲染——JSON 拿回来
-用 `scripts/gen_html_report.py`（仓库自带，离线自包含 HTML，见[报告](#输出)）或 WorkBuddy
-等工具二次加工。
+**契约：输入 YAML 配置，输出 JSON 原始数据。** 工具专注数据采集，不做报告渲染（2026-09-17
+报告层已整体剥离）——JSON 拿回来用 pandas / notebook / WorkBuddy 等外部工具二次加工，
+数据结构与口径见 [docs/data-contract.md](docs/data-contract.md)（契约版本随每份 JSON 的
+`schema_version` 落盘）。
 
 面向堡垒机/内网交付场景：本机交叉编译出 linux/amd64 二进制，连同配置文件
 （`bench` + `config.yaml`，端点与认证直接写进配置）拷贝到客户环境执行，跑完把 JSON 拉回来分析。
@@ -291,24 +292,14 @@ output/
 
 多模型 + `-o xxx.json` 会报错（一个文件装不下多个分区），请给目录。
 
-JSON 结构见 `internal/report/report.go`：`single` / `multiturn` / `concurrent` 三个数组，
-元素分别为档位 / 会话 / 并发档位，每条请求是 `engine.TurnMetrics`；观测层开启时附
-`server_metrics` 汇总（缓存命中率/排队/prefill-decode 分解）与逐请求 `server_counter_delta`。
+JSON 结构见 `internal/report/report.go` 与 [docs/data-contract.md](docs/data-contract.md)：
+`single` / `multiturn` / `concurrent` 三个数组，元素分别为档位 / 会话 / 并发档位，
+每条请求是 `engine.TurnMetrics`（流式含原始 chunk 序列 `content_times_ms`，供峰值秒桶吞吐、
+ITL 抖动等外部分析）；观测层开启时附 `server_metrics` 汇总（缓存命中率/排队/prefill-decode 分解）
+与逐请求 `server_counter_delta`。降速采样序列落旁文件 `*.stall.csv`。
 
-JSON → HTML 分析报告（自包含、Chart.js 内嵌离线可用）。自动合并多份 JSON（含 thinking off/on 分离的测试）、
-数据驱动生成结论与建议（prefill 斜率、前缀缓存判定、decode 吞吐、思考行为分类），报告末尾内嵌
-`perf-summary` JSON 数据块——把整份 HTML 交给 AI 即可让它追加通俗解读备注：
-
-```bash
-python3 scripts/gen_html_report.py output/                    # 目录模式：递归合并目录下全部场景 JSON
-python3 scripts/gen_html_report.py a.json b.json [标题]        # 文件模式：显式指定一份或多份报告
-# 四象限报告：--scenarios 选场景，缺省 = 四象限合并报告
-#   single=单发·单轮  multiturn=单发·多轮  conc-single=多发·单轮  conc-multi=多发·多轮
-#   支持中文别名与 + 分隔：--scenarios 单发单轮+多发多轮
-python3 scripts/gen_html_report.py output/ 标题 --scenarios conc-multi      # 只出并发多轮报告
-python3 scripts/gen_html_report.py output/ 标题 --scenarios 单发单轮,多发单轮  # 任意组合
-node scripts/validate_report.js <报告.html>   # JS 端校验（占位符/图表可执行）
-```
+**分析在工具之外**：聚合、判级、画图由消费方完成。体验基线三档阈值（`slo_baseline`）随 JSON
+透出，判级不要内置自己的常量；报告判据的方法论依据见 [docs/latency-baselines.md](docs/latency-baselines.md)。
 
 ## 配置
 
@@ -335,15 +326,13 @@ make build          # 本机二进制（-ldflags 注入 git describe 版本号�
 make test
 scripts/smoke.sh    # 自动化冒烟：mock 服务 + 多组合运行 + 输出数据形状断言
                     # （模型×变体分布/CLI 过滤回归/全能力 trace/开环/levels/-m/--max-ctx/
-                    #   时长制 soak/错误路径/报告管线；mock 含 /models、/metrics 与 tool-call 好路径）
+                    #   时长制 soak/错误路径/数据契约 schema_version+raw_timings；mock 含 /models、/metrics 与 tool-call 好路径）
                     # 运行产物全部落 /tmp 随脚本退出清理，不污染仓库
 scripts/mock_server.py   # 本地 mock OpenAI 兼容流式服务（smoke.sh 底层依赖）
                     # 环境变量 MOCK_TOKEN_DELAY 可调每 chunk 间隔（默认 0.05≈20 tok/s），用来构造降速现场
 scripts/stall-e2e/  # 降速熔断端到端回归：假慢速服务端 + 配置，验证
                     # 「单流降速 → 中止当前场景 → 冷却 → 续跑下一场景 → 报告 note 留痕」整条链路
                     # （与 smoke.sh 分开：这里的 mock 需要按请求区分快慢，探针必须秒回）
-scripts/gen_html_report.py  # JSON → 自包含 HTML 分析报告（多文件合并 + 自动结论 + 内嵌 AI 摘要）
-scripts/validate_report.js  # 报告 JS 校验（占位符/图表可执行）
 deploy/             # 推理服务 compose 存档：vLLM 基线 + SGLang / TensorRT-LLM / llama.cpp / TGI
                     # 引擎横评（各文件头部含与基线的逐参数对照与 bench 侧注意点）
 ```

@@ -127,6 +127,11 @@ type Concurrent struct {
 	NumPrompts     int       `yaml:"num_prompts"`     // 开环模式总请求数（multiturn 时为总会话数）
 	MaxConcurrency int       `yaml:"max_concurrency"` // 开环模式并发上限（0=不限）
 
+	// Burstiness 开环到达的突发度（gamma 采样 shape，对齐 vLLM bench serve 的 burstiness）：
+	// 1 = 标准泊松（指数间隔，默认）；<1 比泊松更突发；>1 趋向恒定间隔（均匀到达）。
+	// 采样后按理论总量 (n-1)/rate 整体重整——跨 seed 到达总量严格一致，吞吐跨 run 可比。
+	Burstiness float64 `yaml:"burstiness"`
+
 	// 5.7 闭环错峰发车（默认开，仅闭环 levels 生效）：首批发 1 个会话/worker，等该批
 	// 全部完成首轮后放下一批 min(上批×RampFactor, 剩余)——批次节奏由服务端首轮实际
 	// 耗时决定（自适应，无需按端点调参），替代 barrier 齐射对服务端的瞬间满额冲击。
@@ -145,6 +150,14 @@ type Concurrent struct {
 
 // RampEnabled 闭环错峰发车是否启用（nil = 默认开）。
 func (c Concurrent) RampEnabled() bool { return c.Ramp == nil || *c.Ramp }
+
+// EffBurstiness 生效的开环到达突发度（<=0 回落 1 = 标准泊松）。
+func (c Concurrent) EffBurstiness() float64 {
+	if c.Burstiness <= 0 {
+		return 1
+	}
+	return c.Burstiness
+}
 
 // EffRampFactor 生效的批次放大系数（<2 回落 2）。
 func (c Concurrent) EffRampFactor() int {
@@ -655,23 +668,27 @@ func (c *Config) ActiveModels() []string {
 type Config struct {
 	// Raw 配置文件原文（Load 时填充）：随报告存档，保证几周后能复现"当时是什么配置跑的"。
 	// 注释、键序、书写习惯都只有原文能保留——结构化字段回放不出这些信息。
-	Raw            string   `yaml:"-"`
-	Endpoint       string   `yaml:"endpoint"`
-	APIKeyLiteral  string   `yaml:"api_key"`     // 字面量 key，直接写配置文件（该配置文件应避免入库）；环境变量 LLM_PERF_API_KEY 优先级更高
-	APIKeyEnv      string   `yaml:"api_key_env"` // 从哪个环境变量读 key（留空则跳过）；字面量 api_key 与环境变量都未提供时不带认证头
-	AuthScheme     string   `yaml:"auth_scheme"` // bearer（默认）| raw（裸 key 无 Bearer 前缀）| none（不带认证头）
-	AuthHeader     string   `yaml:"auth_header"` // 自定义认证 header 名（如 X-API-Key）；空 = Authorization
-	OutputDir      string   `yaml:"output_dir"`
-	TimeoutSeconds int      `yaml:"timeout_seconds"`
-	ChatPath       string   `yaml:"chat_path"`    // 接口路径（默认 /chat/completions）；客户 router 路径不同时配置
-	MetricsPath    string   `yaml:"metrics_path"` // 服务端 metrics 路径（默认 /metrics）；如 /actuator/prometheus
-	ModelsPath     string   `yaml:"models_path"`  // 模型列表路径（默认 /models）；probe 用，个别网关路径不同
-	IncludeUsage   *bool    `yaml:"include_usage"`
-	FillerLang     string   `yaml:"filler_lang"`
-	FillerCorpus   string   `yaml:"filler_corpus"` // "":合成词表 | "en"/"zh":内置公版书语料 | 文件路径(.txt/.txt.gz):自定义语料
-	Stream         *bool    `yaml:"stream"`        // 默认 true；false 时 TTFT/ITL/思考拆分不可测（N/A）
-	Debug          bool     `yaml:"debug"`         // true: 每个请求的原始响应留存到 <output_dir>/raw/，日志同步写 run.log（排查魔改引擎用）
-	Models         []string `yaml:"models"`
+	Raw            string `yaml:"-"`
+	Endpoint       string `yaml:"endpoint"`
+	APIKeyLiteral  string `yaml:"api_key"`     // 字面量 key，直接写配置文件（该配置文件应避免入库）；环境变量 LLM_PERF_API_KEY 优先级更高
+	APIKeyEnv      string `yaml:"api_key_env"` // 从哪个环境变量读 key（留空则跳过）；字面量 api_key 与环境变量都未提供时不带认证头
+	AuthScheme     string `yaml:"auth_scheme"` // bearer（默认）| raw（裸 key 无 Bearer 前缀）| none（不带认证头）
+	AuthHeader     string `yaml:"auth_header"` // 自定义认证 header 名（如 X-API-Key）；空 = Authorization
+	OutputDir      string `yaml:"output_dir"`
+	TimeoutSeconds int    `yaml:"timeout_seconds"`
+	ChatPath       string `yaml:"chat_path"`    // 接口路径（默认 /chat/completions）；客户 router 路径不同时配置
+	MetricsPath    string `yaml:"metrics_path"` // 服务端 metrics 路径（默认 /metrics）；如 /actuator/prometheus
+	ModelsPath     string `yaml:"models_path"`  // 模型列表路径（默认 /models）；probe 用，个别网关路径不同
+	IncludeUsage   *bool  `yaml:"include_usage"`
+	FillerLang     string `yaml:"filler_lang"`
+	FillerCorpus   string `yaml:"filler_corpus"` // "":合成词表 | "en"/"zh":内置公版书语料 | 文件路径(.txt/.txt.gz):自定义语料
+	Stream         *bool  `yaml:"stream"`        // 默认 true；false 时 TTFT/ITL/思考拆分不可测（N/A）
+	Debug          bool   `yaml:"debug"`         // true: 每个请求的原始响应留存到 <output_dir>/raw/，日志同步写 run.log（排查魔改引擎用）
+	// RawTimings 原始 chunk 序列落盘（nil = 默认开）：流式请求把每个含 token chunk 的时刻
+	// 记入 content_times_ms（相对 sent_at 的毫秒偏移）。峰值秒桶吞吐、ITL 抖动等外部分析
+	// 都依赖这份原始序列；体积随输出 token 数线性增长，超长 soak 可置 false 关闭。
+	RawTimings *bool    `yaml:"raw_timings"`
+	Models     []string `yaml:"models"`
 
 	// Test 本轮测试类别（benchmark | performance | soak，留空 = performance）。
 	// 只切换报告的**结论区口径**，不改测量本身：三者共用同一套数据与判据
@@ -1043,6 +1060,9 @@ func Load(path string) (*Config, error) {
 	if cfg.Concurrent.RequestRate < 0 {
 		return nil, fmt.Errorf("concurrent.request_rate 不能为负")
 	}
+	if cfg.Concurrent.Burstiness < 0 {
+		return nil, fmt.Errorf("concurrent.burstiness 不能为负（1=标准泊松；<1 更突发；>1 趋向均匀）")
+	}
 	if cfg.Concurrent.RampFactor < 0 {
 		return nil, fmt.Errorf("concurrent.ramp_factor 不能为负（默认 2；1 = 逐个串行发车，无爬坡意义）")
 	}
@@ -1314,6 +1334,9 @@ func Load(path string) (*Config, error) {
 	} else if cfg.Concurrent.MaxConcurrency > 0 {
 		cfg.Warnings = append(cfg.Warnings,
 			"max_concurrency 仅在开环模式（request_rate/rate_sweep）下生效，闭环 levels 模式会忽略")
+	} else if b := cfg.Concurrent.Burstiness; b > 0 && b != 1 {
+		cfg.Warnings = append(cfg.Warnings,
+			"concurrent.burstiness 仅在开环模式（request_rate/rate_sweep）下生效，闭环 levels 模式会忽略")
 	}
 	// 10.5 时长制 soak（duration_seconds + renew；闭环专属）。约束取严格口径（fail-fast）：
 	// 开环时长由 num_prompts × 到达率决定、不适用；多轮必须显式 renew 才能跑满时长。
@@ -1591,6 +1614,10 @@ func (c *Config) EffBaseline() *SLOBaselineCfg {
 
 // StreamEnabled 返回是否使用流式请求。
 func (c *Config) StreamEnabled() bool { return *c.Stream }
+
+// RawTimingsEnabled 原始 chunk 序列是否落盘（nil = 默认开）。关掉可显著减小长 soak
+// 的 JSON 体积，但分位数之外的抖动/峰值信息随之不可复原。
+func (c *Config) RawTimingsEnabled() bool { return c.RawTimings == nil || *c.RawTimings }
 
 // ClampLadder 将 token 档位截到 MaxPromptTokens（>0 时生效）：超限档位收敛到上限，去重保序。
 // 返回 (截断后档位, 是否发生了截断)。

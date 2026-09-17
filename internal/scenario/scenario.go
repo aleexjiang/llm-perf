@@ -873,6 +873,59 @@ func openRates(cc config.Concurrent) []float64 {
 	return nil
 }
 
+// poissonDelays 生成开环到达的累计时刻序列（秒，[0]=0，共 n 项）：请求 i 应在
+// start + ts[i] 发射。间隔 ~ Gamma(shape=burstiness, scale=1/(rate·burstiness))，
+// burstiness=1 退化为指数分布（标准泊松）；<1 更突发；>1 趋向恒定间隔（均匀到达）。
+// 采样后按理论总量 (n-1)/rate **整体重整**——随机抽样的间隔总和天然有 1-2% 偏差，
+// 不重整则不同 seed 的到达总量不同，吞吐数据跨 run 不可比（对齐 vLLM bench serve
+// 的 normalize_factor，方法论唯一"必抄"项）。
+func poissonDelays(n int, rate, burstiness float64, rng *rand.Rand) []float64 {
+	ts := make([]float64, n)
+	if n <= 1 || rate <= 0 {
+		return ts // rate<=0（等效满并发）＝零间隔齐射
+	}
+	sum := 0.0
+	for i := 1; i < n; i++ {
+		d := gammaSample(rng, burstiness) / (rate * burstiness)
+		ts[i] = ts[i-1] + d
+		sum += d
+	}
+	if sum > 0 {
+		k := float64(n-1) / rate / sum
+		for i := 1; i < n; i++ {
+			ts[i] *= k
+		}
+	}
+	return ts
+}
+
+// gammaSample Marsaglia-Tsang (2000) gamma(shape) 随机数（scale=1）；shape<1 用
+// boost 法 G(shape) = G(shape+1)·U^(1/shape)。仅开环到达调度使用。
+func gammaSample(rng *rand.Rand, shape float64) float64 {
+	if shape < 1 {
+		return gammaSample(rng, shape+1) * math.Pow(rng.Float64(), 1/shape)
+	}
+	d := shape - 1.0/3
+	c := 1 / math.Sqrt(9*d)
+	for {
+		var x, v float64
+		for {
+			x = rng.NormFloat64()
+			if v = 1 + c*x; v > 0 {
+				break
+			}
+		}
+		v = v * v * v
+		u := rng.Float64()
+		if u < 1-0.0331*x*x*x*x {
+			return d * v
+		}
+		if math.Log(u) < 0.5*x*x+d*(1-v+math.Log(v)) {
+			return d * v
+		}
+	}
+}
+
 // sessionTurnHook 每轮完成后的回调（5.7 止损用）：turn 为 0 基轮次、m 为该轮指标；
 // 返回 false = 提前终止该会话（已完成轮保留）。nil = 无钩子。
 type sessionTurnHook func(turn int, m *engine.TurnMetrics) bool
@@ -1573,14 +1626,12 @@ func runOpenRound(ctx context.Context, e *env, cfg *config.Config,
 		}(i)
 	}
 	schedDone := make(chan struct{})
-	go func() { // Poisson 调度：指数分布到达间隔
+	go func() { // Poisson 调度：预生成到达时刻线，逐请求睡到绝对时刻（补偿发射循环自身滞后）
 		defer close(schedDone)
+		delays := poissonDelays(n, rate, cfg.Concurrent.EffBurstiness(), rng)
+		startAt := time.Now()
 		for i := 0; i < n; i++ {
-			if lr.Stop() || roundCtx.Err() != nil {
-				return // drain 触发或本档位取消：停止发新到达
-			}
-			if i > 0 {
-				d := time.Duration(rng.ExpFloat64() / rate * float64(time.Second))
+			if d := time.Duration(delays[i]*float64(time.Second)) - time.Since(startAt); d > 0 {
 				select {
 				case <-roundCtx.Done():
 					return // 本档位已取消（场景中止）：停止发新到达
@@ -1588,7 +1639,7 @@ func runOpenRound(ctx context.Context, e *env, cfg *config.Config,
 				}
 			}
 			if lr.Stop() {
-				return // 睡眠期间触发：尚未发出的到达不再发射
+				return // drain 触发或本档位取消：尚未发出的到达不再发射
 			}
 			launch(i)
 		}

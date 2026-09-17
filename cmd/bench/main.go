@@ -355,6 +355,7 @@ func main() {
 	client := engine.NewClient(cfg.Endpoint, cfg.APIKey, cfg.Timeout(), *cfg.IncludeUsage)
 	client.Auth = auth.Auth{Scheme: cfg.AuthScheme, Header: cfg.AuthHeader}
 	client.ChatPath = cfg.ChatPath
+	client.RawTimings = cfg.RawTimingsEnabled() // 原始 chunk 序列落盘（raw_timings，默认开）
 	if cfg.AuthScheme != "" && cfg.AuthScheme != "bearer" || cfg.AuthHeader != "" {
 		log.Printf("认证方案: %s", client.Auth.Describe())
 	}

@@ -737,7 +737,7 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 	// 这里发一条已知构造的样本、用服务端 usage 反推真实 chars/token，把系数的可信度
 	// 变成每次 probe 都能复测的事实（复用 decode_speed 的"实测→可见偏差"模式，零新依赖）。
 	// 只告警不判失败：构造近似不是服务端问题；报告横轴一律以服务端 usage 为准
-	// （gen_html_report.py 的实测分箱），偏差大时改用语料即得真实文本形状。
+	// （外部分析按 usage.prompt_tokens 实测分箱），偏差大时改用语料即得真实文本形状。
 	{
 		lang := o.FillerLang
 		if lang == "" {

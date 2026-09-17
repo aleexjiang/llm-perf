@@ -16,6 +16,30 @@
 
 ---
 
+## 13. 报告层剥离：工具专注数据采集（2026-09-17）【已实现】
+
+> 拍板见 AGENTS.md。gen_html_report.py（3010 行）+ report_fixtures_test.py + validate_report.js +
+> vendor/chart.umd.min.js 整体移除；交付物 = 场景 JSON + probe JSON + `*.stall.csv` + 数据契约文档。
+> 分析（聚合/判级/画图）全部外移。随同落地三件数据面能力：
+
+- **泊松延迟重整 + `concurrent.burstiness`**（方法论唯一"必抄"项）：开环到达间隔改 gamma 采样
+  （Marsaglia-Tsang，`scenario.go poissonDelays`），burstiness=1（默认）= 标准泊松、<1 更突发、>1 趋向均匀；
+  采样后按理论总量 (n−1)/rate **整体重整**——跨 seed 到达总量严格一致，吞吐跨 run 可比的前提；
+  发射改预生成绝对时刻线（补偿发射循环滞后）。验收：poisson_test.go（重整误差 <1e-9 / 单调 /
+  三种突发度形态）+ config 单测（默认/负值报错/闭环作用域告警）+ smoke-openloop 配 burstiness=0.5 全链路。
+- **`raw_timings` 原始 chunk 序列落盘**（默认开）：`TurnMetrics.content_times_ms` = 每个 content
+  chunk 相对 sent_at 的毫秒偏移——峰值秒桶吞吐、ITL 抖动、逐 token 重建在采集端留原料
+  （此前只有分位数，抖动信息落盘即失）；体积随输出 token 数线性增长，超长 soak 可 `raw_timings: false` 关闭。
+  验收：sse_test.go 开/关两态单测 + smoke 断言（流式成功请求必落盘、单调、不超出 e2e）。
+- **数据契约固化为对外接口**：`Report.schema_version`（恒落盘，`SchemaVersionCurrent=2`，
+  SaveJSON 兜底填充）；`docs/data-contract.md` 重写（删报告侧聚合/perf-summary 章节，补
+  schema_version / content_times_ms / 开环重整说明）；smoke 报告管线段整体替换为数据契约断言。
+  演进纪律：契约变更必须同步 data-contract.md 并递增版本号——契约漂移比代码 bug 更伤。
+- 连带：`internal/report` 保留（数据结构即契约本体）；`plan`/`slo_baseline`/`kv_capacity` 等
+  落盘字段语义不变，消费方改为外部工具。
+
+---
+
 ### 12.7 levels 档位名保留字校验【已实现，2026-09-16】
 
 - 现象（r4 踩坑）：`thinking.levels` 配置后，CLI `--thinking on/off` 被拒（`cmd/bench/main.go:148`）；若用户恰好把档位命名为 `off`，则**该档位无法通过 CLI 过滤**——运行时才发现、且无解。

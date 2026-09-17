@@ -1,9 +1,16 @@
-# 数据契约：YAML → JSON → 报告
+# 数据契约：YAML → JSON（工具的对外接口）
 
-> 面向报告侧开发者与数据分析者：Go 产出的 JSON 结构、报告侧聚合口径、两边如何对齐不漂移。
-> 模块与代码组织见 [architecture.md](architecture.md)；判级阈值的来源依据见 [latency-baselines.md](latency-baselines.md)。
+> 面向数据分析者与下游工具：本工具产出的 JSON/CSV 结构与口径。
+> **2026-09-17 拍板：工具专注数据采集，报告层已整体剥离**（原 gen_html_report.py 移除）——
+> 这份契约就是本工具的对外接口，分析（聚合/判级/呈现）由外部完成（pandas/notebook/客户 BI）。
+> 模块与代码组织见 [architecture.md](architecture.md)；判级阈值的方法论依据见 [latency-baselines.md](latency-baselines.md)。
 >
 > **本文不写行号**——行号随每次提交漂移（历史教训），定位一律用函数/类型名 grep。
+
+## 版本
+
+每份场景 JSON 顶层带 `schema_version`（当前 **2**，常量 `report.SchemaVersionCurrent`）。
+结构变更时递增，消费方据此做兼容判断；schema 不保向后兼容（拍板见 AGENTS.md），大版本升级可能直接改字段类型。
 
 ## 数据流与落盘组织
 
@@ -13,129 +20,114 @@ bench -c config.yaml --turns X --concurrency Y
      <output_dir>/<模型>/<场景>-<时间戳>.json   # 多模型：PartitionByModel 按模型分区
      <output_dir>/run.log                       # 测试级追加日志（跨场景共享）
      <output_dir>/raw/*.log                     # debug:true 时的原始请求/响应转储
-  ▼
-gen_html_report.py f1.json f2.json ... [标题]
-  ├─ <output_dir>/report.html                   # 自包含 HTML（图表内嵌）
-  └─ <output_dir>/perf-summary.json             # 聚合数据 + 结论，供 AI/下游消费
+     <output_dir>/*.stall.csv                   # stall_guard 降速采样序列（侧文件，见下）
+  └─ bench probe -c config.yaml -o probe.json
+     └─ probe 结果是独立结构（ProbeResult），不与场景 Report 同构
 ```
-
-- 一次调用可传多份 JSON（merge 逻辑按模型×场景×思考模式分桶合并 runs）；同名键冲突时合并而非覆盖。
-- probe 结果是独立结构（ProbeResult），不与场景 Report 同构，落 `<模型>/probe-*.json`。
 
 ## Go 侧输出：Report 顶层结构（report.go `Report`）
 
 ```
 Report
+├── schema_version  # 数据契约版本（恒落盘，见上）
 ├── tool / scenario / generated_at / test / endpoint / note
-│                  #   test = 测试类别（benchmark | performance | soak），恒有值不带 omitempty；
-│                  #   只决定报告的结论区口径（首屏先说哪件事），不影响测量与判据
+│                  #   test = 测试类别（benchmark | performance | soak），恒有值不带 omitempty
 ├── slo            # 本次 goodput 约束（config 配置了才填）：{ttft_ms, tpot_ms}
+├── slo_baseline   # 体验基线三档阈值（配置了才填）：外部判级直接消费这份阈值，
+│                  #   不要内置自己的常量（阈值随部署走，单一来源在配置/JSON）
+├── plan           # 测试画像：开跑前的场景×模型估算（展示口径=执行口径）
 ├── single[]       # SingleRow: model, thinking, prompt_tokens, max_tokens, runs[]→TurnMetrics
 ├── multiturn[]    # MultiturnRun: model, thinking, session, max_tokens,
-│                  #   profile（5.11 混合档位名，仅 multiturn.profiles 生效时出现——报告按档分组切体验）,
-│                  #   turns[]→TurnMetrics
+│                  #   profile（5.11 混合档位名，仅 multiturn.profiles 生效时出现）,
+│                  #   turns[]→TurnMetrics, batch/start_offset_s（5.7 爬坡发车）,
+│                  #   last_prompt_tokens/nominal_last_prompt（12.3 深度实测对照）
 ├── concurrent[]   # ConcurrentLevel: model, thinking, level, request_rate(开环>0),
 │                  #   requests[]→TurnMetrics（单轮）或 sessions[]→MultiturnRun（多轮会话，逐 turn 计量）,
 │                  #   wall_seconds, throughput_tps, slo_meet/slo_total/goodput_rps/goodput_tps,
+│                  #   waiting_max/running_max（观测峰值）, aborted（提前终止原因）,
 │                  #   shapes[]→ShapeStat（concurrent.mix 形状分解，中位数）
 ├── correctness[]  # 金丝雀：{model, number, reply, match, e2e_ms, error}
 ├── server_metrics # 可选第二数据源（客户端实测才是基线）。窗口差值/轮询聚合：
 │                  #   available（**仅指窗口差值 counter/hist 是否取到**）,
 │                  #   note（取不到时的原因；全仓只有"结束快照失败"会写它）,
 │                  #   cache_hit/query, spec_drafts/accepted,
-│                  #   preemptions（**恒出现，刻意不带 omitempty**：0 = 窗口内没有发生抢占，
+│                  #   preemptions（**恒出现，刻意不带 omitempty**：0 = 窗口内没有发生抢占,
 │                  #     这本身是有意义的好结果；键一消失就会被读成"这项没采到"）,
 │                  #   gauges{}（轮询独立于结束快照，available=false 时仍可能有效）,
 │                  #   histograms{}, observation_degraded（观测失效须醒目标注）
-│                  #   缺失/取不到不得导致少结论、漏档位或改变判定
+│                  #   缺失/取不到不得导致分析端少档位或改变判定
+├── kv_capacity    # KV 静态容量画像（12.12，vllm:cache_config_info；缺失静默省略）
+├── source_check   # 两源一致性（10.1，仅并发场景）：client_tps/server_tps/deviation
+│                  #   （deviation 恒出现：0 = 两源完全一致，是最有意义的好结果）
 ├── environment    # 引擎识别存档（ProbeResult 轻量版）
-└── config_raw     # 配置原文
+├── config_raw     # 配置原文
+└── stall_trace    # .stall.csv 侧文件相对路径（--no-stall-trace 或未触发熔断时缺失）
 ```
 
 注意：`RequestRate>0` 即开环模式（Level=0）；`Level>0` 为闭环并发档位。
+`.stall.csv` 列序 `t_s,agg_tps,med_tps,in_flight,emitting,phase`（phase ∈ emit/prefill/idle，
+非 emit 相位速度留空——"测不出"≠0；`# tripped:` 注释行留熔断原因）。
 
 ## TurnMetrics 字段要点（client.go `TurnMetrics`）
 
-所有场景行的叶子单元。三类字段语义不同，消费时必须区分：
+所有场景行的叶子单元。四类字段语义不同，消费时必须区分：
 
 | 类别 | 字段 | 消费规则 |
 |---|---|---|
 | 恒有 | model, stream, thinking, sent_at, end_at, e2e_ms, prompt_tokens, completion_tokens, total_tokens, tokens_per_sec | 直接用 |
-| 流式才有（omitempty） | ttft_ms, ttft_reasoning_ms, ttft_content_ms, think_ms, decode_ms, itl_*(p50/p90/p95/p99/max), tpot_ms, reasoning_tokens, cached_tokens, finish_reason, reasoning_field, new_tokens(多轮) | 非流式缺失；TTFT 徽章判级前先判存在 |
-| 不进 JSON（json:"-"） | ToolCalls（probe 专用） | 报告侧永远看不到，别指望 |
+| 流式才有（omitempty） | ttft_ms, ttft_reasoning_ms, ttft_content_ms, think_ms, decode_ms, itl_*(p50/p90/p95/p99/max), tpot_ms, reasoning_tokens, cached_tokens, finish_reason, reasoning_field, new_tokens(多轮) | 非流式缺失；判级前先判存在 |
+| 原始序列（raw_timings 开，默认开） | content_times_ms[]：每个 content chunk 相对 sent_at 的毫秒偏移 | **单调不减**；峰值秒桶吞吐、ITL 抖动、逐 token 时刻重建只靠这份原始序列（分位数之外的抖动信息不落盘就无法复原）。体积随输出 token 数线性增长，超长 soak 可 `raw_timings: false` 关闭 |
+| 不进 JSON（json:"-"） | ToolCalls（probe 专用） | 压测数据永远看不到 |
 | 质量标记 | thinking_no_content（思考吃光预算，剔除或调 max_tokens）、stream_broken（响应不完整）、retry_count、warnings[] | 分析前先过滤 |
 
-口径提醒：TPOT = (E2E−TTFT)/(completion−1) **含思考 token**（GenAI-Perf 横评口径）；ITL 只算 content chunk 间隔——**ITL 是 chunk 间隔、不是 token 间隔**：投机解码（MTP）会把多个 token 合进同一个 SSE chunk，此时 chunk 间隔 ≈ N × token 间隔（vLLM+MTP 实测约 2.66×），拿 ITL 分位当 TPOT 会把延迟判高约 2.6 倍、把并发各档成片判成"未达标"。**判级一律用 `tpot_ms`，不用 ITL 分位**；`new_tokens` 是本轮相对上一轮新增 prompt tokens，配合 TTFT 得增量 prefill 速率。
+口径提醒：TPOT = (E2E−TTFT)/(completion−1) **含思考 token**（GenAI-Perf 横评口径）；ITL 只算 content chunk 间隔——**ITL 是 chunk 间隔、不是 token 间隔**：投机解码（MTP）会把多个 token 合进同一个 SSE chunk，此时 chunk 间隔 ≈ N × token 间隔（vLLM+MTP 实测约 2.66×），拿 ITL 分位当 TPOT 会把延迟判高约 2.6 倍。**判级一律用 `tpot_ms`，不用 ITL 分位**；`new_tokens` 是本轮相对上一轮新增 prompt tokens，配合 TTFT 得增量 prefill 速率。
 
 ## 指标口径细则（对抗式审查沉淀，2026-09）
 
 以下口径来自全链路审查后的拍板，消费数据前先读：
 
-1. **tokens_per_sec 是双口径字段**：流式 = completion/(E2E−TTFT)——首 token 后的全部生成时段，**含思考段**，与 TPOT 同窗互逆（≈1000/TPOT；2026-09 修正：此前分母是 decode_ms 仅覆盖 content 时段，而 completion 含 reasoning token，思考模型 tok/s 被显著虚高）；非流式 = completion/e2e_ms（含 prefill+排队，天然偏低）。**两者不可横向比较**；非流式行的 ttft/think/itl 缺失即提示口径。
+1. **tokens_per_sec 是双口径字段**：流式 = completion/(E2E−TTFT)——首 token 后的全部生成时段，**含思考段**，与 TPOT 同窗互逆（≈1000/TPOT）；非流式 = completion/e2e_ms（含 prefill+排队，天然偏低）。**两者不可横向比较**；非流式行的 ttft/think/itl 缺失即提示口径。
 2. **失败判定唯一依据 `error` 字段**：断流（stream_broken）也写 error（"stream broken: …"）；`stream_broken` 只作补充标记。只看 stream_broken 会漏、只看 err 返回值会漏（attempt 返回 err=nil + 指标里的 Error）。
 3. **吞吐是物理口径**：ThroughputTPS = 全部请求（含失败）的 completion_tokens 之和 ÷ 墙钟。失败请求 0 产出但占墙钟——吞吐低可能是失败拖累而非 decode 慢，解读时先看失败数。Goodput ≤ Throughput 恒成立。
 4. **SLOTotal 含失败请求**：达标率分母 = 全部请求（失败=不达标）。非流式模式下 TPOT 不可测 → 配置 goodput 时非流式全不达标（设计如此，别用非流式测 goodput）。
-5. **分位统一为线性插值**（2026-09-10 起）：ITL 分位（Go 侧 `percentile`）由最近秩 floor 取值改为线性插值，P50 偶数样本等于两中值平均——与报告侧 `st.median`、scenario 层 `aggregateShapes` 口径一致。此前同一报告内两者都叫 p99 但口径不同，现可比；与改动前的历史报告对比时 ITL 分位数会略升。
+5. **分位统一为线性插值**（2026-09-10 起）：ITL 分位（Go 侧 `percentile`）由最近秩 floor 取值改为线性插值，P50 偶数样本等于两中值平均——与分析侧 `median`、scenario 层 `aggregateShapes` 口径一致。此前同一报告内两者都叫 p99 但口径不同，现可比；与改动前的历史数据对比时 ITL 分位数会略升。
 6. **think_ms 保证 ≥ 0**：reasoning 首包晚于 content 首包（引擎时序异常）时钳 0 并记 `think_ms_negative` 告警，原始时序在 first_*_at 时间戳可核查。
 7. **usage 缺失的连锁**：服务端不回 usage 时 prompt/completion=0 + `usage_missing` 告警 → tokens_per_sec=0、TPOT 缺失、new_tokens 不更新（下轮会显示完整 prompt 而非增量）。有 usage_missing 告警的行，token 类指标全部不可信。
 8. **服务端 counter 差分保证 ≥ 0**：负增量（服务端重启归零）钳 0——该窗口的命中率等指标可信度下降，应结合 preemptions/重启时间解读。NaN/±Inf 指标行在解析层直接丢弃（防 JSON 序列化失败）。
 9. **直方图多 label 合并近似**：同 family 多 label（如按模型拆分）的 bucket 会合并计数，多模型共署引擎的直方图分位是粗估。
 10. **TTFT 是"首个含 token chunk"口径**（2026-09 对齐主流）：role-only 空 content 首 chunk（OpenAI 兼容服务标配）不计入 TTFT，取 reasoning/content 首包较早者；原始首 chunk 时刻保留在 `first_chunk_at` 供核查。此版本前的落盘数据是"任意首 chunk"口径，数值略偏小（差 1 个空帧）。
 11. **goodput 只判定已配置的 SLO 子集**（vLLM 语义）：阈值为 0 的维度不参与判定；配置了 TTFT 阈值时要求 TTFT 可测（>0，非流式不白拿达标）。
-12. **content_chars/reasoning_chars 是字符数（rune）**：2026-09 起按字符计（此前是 UTF-8 字节数，中文单字被计为 3）；报告"思考字符"列、日志"N 字"同步。
-13. **think_ms / decode_ms 缺失 ≠ 0 秒**（2026-09-10 起）：两者都带 omitempty，`thinking=off` 时 `think_ms` 缺失代表真实的 0（该保留）；但 `thinking=on` 且 `thinking_no_content=true`（思考吃光输出预算、正文 0 字符）时思考段终点无从界定，缺失是**"测不出"而不是 0**。消费方不得把后者当 0 参与中位数——报告侧 `think_sec()` 统一返回 None 并整体剔除（单发阶梯、并发、多轮逐轮、think_all 四处同一口径）。否则一个档位里只要有部分 run 测不出，中位数就塌成 0：实测曾把 100k 档渲染成"思考 0.0s / 占比 0%"，而该档真实思考为 142s。
-    **`decode_ms` 同理且已由采集端清 0**：全程无 content 时它本会被填成 `first_chunk→end`，那是整段 reasoning 的生成时长、不是 content 解码时长——留着会让报告 decode 列出一个像样的错数。故 `thinking_no_content=true` 时采集端直接清 0，键随 omitempty 消失，与日志侧打的「—」一致。
-14. **`server_counter_delta` 是逐请求排障证据，无报告消费方**：仅单发 / 串行多轮启用（并发恒缺——避免把共享计数器增量错记到单请求头上）；值 = 该请求抓取窗口内的服务端 counter 增量，窗口可能含周期性抓取或其他流量（近似对账，非精确归属）。与 `content_preview` / `itl_p90+` 等同类，属设计内原始存档（ROADMAP §11.3），报告与 smoke 均不按键名消费——不是待接线的搁置字段。
+12. **content_chars/reasoning_chars 是字符数（rune）**：2026-09 起按字符计（此前是 UTF-8 字节数，中文单字被计为 3）。
+13. **think_ms / decode_ms 缺失 ≠ 0 秒**（2026-09-10 起）：两者都带 omitempty。`thinking=on` 且 `thinking_no_content=true`（思考吃光输出预算）时思考段终点无从界定，缺失是**"测不出"而不是 0**，消费方不得当 0 参与中位数——否则一个档位里只要有部分 run 测不出，中位数就塌成 0（实测曾把 100k 档算成"思考 0.0s"，该档真实思考 142s）。`decode_ms` 在该情形下由采集端清 0（键消失），同一口径。
+14. **`server_counter_delta` 是逐请求排障证据**：仅单发 / 串行多轮启用（并发恒缺——避免把共享计数器增量错记到单请求头上）；值 = 该请求抓取窗口内的服务端 counter 增量，窗口可能含周期性抓取或其他流量（近似对账，非精确归属）。属设计内原始存档。
+
+## 开环到达（burstiness 与重整）
+
+开环模式（`request_rate`/`rate_sweep`）的到达调度（scenario.go `poissonDelays`）：
+
+- 间隔 ~ Gamma(shape=`concurrent.burstiness`, scale=1/(rate·burstiness))：默认 1 = 标准泊松；<1 更突发；>1 趋向恒定间隔。
+- **延迟重整**：采样后按理论总量 (n−1)/rate 整体缩放——不同 seed 的到达总量严格一致，吞吐数据跨 run 可比的前提（对齐 vLLM bench serve 的 normalize_factor）。
+- 发射按**预生成的绝对时刻线**逐请求睡到点（补偿发射循环自身滞后），非"睡随机数再发"。
+- 消费 side：开环档位的负载口径 = 到达率 × 墙钟内的请求数；分析容量拐点时先核对完成数 ≈ 应到数（积压时完成率 < 到达率，此时吞吐数字不可直接当容量）。
 
 ## 主流口径对照（2026-09，对齐 GenAI-Perf/AIPerf、vLLM bench serve、LLMPerf、Inference-Perf）
 
 | 指标 | 本工具 | 主流口径 | 结论 |
 |---|---|---|---|
 | TTFT | 首个含 token chunk（首 reasoning/content 较早者） | GenAI-Perf/LLMPerf/AIPerf/Inference-Perf 均"忽略空首响应"；vLLM 为首个流式输出 | ✅ 已对齐（空首 chunk 不算）；`first_chunk_at` 保留任意首帧 |
-| TPOT | (E2E−TTFT)/(completion−1)，含思考 token | GenAI-Perf/vLLM/AIPerf/Inference-Perf 同式；LLMPerf 原生含 TTFT（历史差异，AWS 也要打 patch 修掉） | ✅ 一致 |
-| ITL | 相邻 content chunk 间隔，per-request 分位，报告层对请求取中位 | vLLM 池化所有请求 gap 后取分位；GenAI-Perf 为 per-response 值再聚合 | ⚠️ 有意差异：本工具是"单用户体验"视角（median-of-p99），与 vLLM 池化数值不可直接互比 |
+| TPOT | (E2E−TTFT)/(completion−1)，含思考 token | GenAI-Perf/vLLM/AIPerf/Inference-Perf 同式；LLMPerf 原生含 TTFT（历史差异） | ✅ 一致 |
+| ITL | 相邻 content chunk 间隔，per-request 分位 | vLLM 池化所有请求 gap 后取分位；GenAI-Perf 为 per-response 值再聚合 | ⚠️ 有意差异：本工具是"单用户体验"视角（median-of-p99），与 vLLM 池化数值不可直接互比 |
 | E2E | 发出 → 流读完（含 [DONE]/usage 尾帧到达） | GenAI-Perf 剔除末尾 [DONE] | ⚠️ 偏差 ≤1 个尾帧（毫秒级），本工具略偏保守，不改 |
-| tokens_per_sec（per 请求） | 流式 = completion/(E2E−TTFT)，含思考段、不含 prefill；非流式 = completion/e2e | 行业 per-user TPS = output_tokens/e2e_latency（含 prefill） | ✅ 口径已贴近（2026-09 修正思考模型虚高问题）；与行业差一段 prefill，横评时行业值 ≈ completion/e2e_ms×1000 |
-| 吞吐 ThroughputTPS | 全部请求 completion 之和 ÷ 墙钟（首请求发射前 → 全部完成；warmup 不计入） | vLLM/LLMPerf 同；GenAI-Perf 用 Ty−Tx（首请求→末响应，略窄）；Inference-Perf 滑窗剔除 warmup/cooldown | ✅ 一致（物理口径，失败请求占墙钟见细则 3） |
+| tokens_per_sec（per 请求） | 流式 = completion/(E2E−TTFT)，含思考段、不含 prefill | 行业 per-user TPS = output_tokens/e2e_latency（含 prefill） | ✅ 口径已贴近；与行业差一段 prefill，横比时行业值 ≈ completion/e2e_ms×1000 |
+| 吞吐 ThroughputTPS | 全部请求 completion 之和 ÷ 墙钟（warmup 不计入） | vLLM/LLMPerf 同；GenAI-Perf 用首请求→末响应（略窄） | ✅ 一致（物理口径，失败请求占墙钟见细则 3） |
 | goodput | 达标请求数/墙钟 + 达标 token/墙钟 | vLLM：满足已配置 SLO 的成功请求/时长（req/s） | ✅ 对齐（子集语义见细则 11）；token 口径是本工具扩展 |
 | cached_tokens | usage.prompt_tokens_details.cached_tokens | OpenAI 口径，vLLM 同名透传 | ✅ 一致 |
 | 思考模型 TTFT | 首 reasoning chunk（= TTFTReasoning） | Neuron 的 llmperf_reasoning.patch 同口径 | ✅ 一致 |
 
 参考：NVIDIA NIM Metrics / GenAI-Perf docs、vLLM `bench serve` 文档（"Metric terminology is not standardized across benchmarking tools…use the measurement points and formulas rather than the metric names alone"）、ray-project/llmperf、awslabs Inference-Perf 关键指标页。
 
-## 报告侧聚合口径（gen_html_report.py）
-
-| 口径 | 规则 | 位置 |
-|---|---|---|
-| 并发表中位/min/max | mmm()，中位数；偶数个样本取两中值平均 | mmm() |
-| p95/p99 | 线性插值（numpy 默认口径）；**样本 <20（MIN_PCT_SAMPLE 常量）不输出分位**，退回中位 | pct9599() |
-| 前缀缓存判级 | 按 prompt_tokens 与 cached_tokens 关系分类 | classify_cache() |
-| 增量 prefill 斜率 | TTFT 对 new_tokens 的线性拟合，ms/千新 token | slope_ms_per_token() |
-| 混跑形状聚合 | 按 label×weight 分桶取中位；撞 key 合并 runs | shapes_table() |
-
-### 体验基线判级（第 8 节，SLO_TIERS 常量）
-
-- **3 档制归组**：输入 ≤4K 打档1/2；≥24K 打档3（agent 大上下文）；4–24K 不判级。
-- **判级方向**：TTFT/TPOT 是低优口径（`badge`：≤good ✅ / ≤pass ⚠️ / 超 ❌）；tok/s 是**高优口径（`badge_hi`）**——加新指标时先想清楚方向，别混用。
-- TTFT 优先取 p99（样本 <20 退中位）；**thinking=on 的 TTFT 是 TTFAT 口径（含思考时长），不套 TTFT 徽章**（TPOT/tok/s 仍判级）。
-- 阈值内置在 SLO_TIERS 常量：档1 优 0.45s/档2 及格 2s/档3 优 3s 及格 6s；TPOT 40/200ms；tok/s 25/10。未来由 `slo:` 配置段覆盖（ROADMAP 5.8 待做）。
-- 基线评估结果写进 perf-summary 的 `baseline` 数组（评估单元含场景/模型/档位/判级/证据），**不进退出码**——判级是参考结论不是门禁。
-
-## perf-summary.json 结构（summary_json 函数）
-
-```
-{ about, endpoint, tool, generated_at,
-  coverage,          # 请求数等覆盖度
-  baseline[],        # 5.8 基线评估单元
-  events{},          # 告警事件计数
-  per_model{},       # 按模型的聚合明细（浮点保留 3 位）
-  conclusions[], recommendations[{priority,text}], limitations[] }
-```
-
-HTML 里内嵌同内容 `<script type="application/json" id="perf-summary">` 块，AI/下游工具可直接从 HTML 提取，不必单独传文件。
-
 ## 演进规则（防漂移三条）
 
-1. **schema 不保向后兼容**（决策见 AGENTS.md）：改字段直接改类型，报告侧同步改；不写兼容双轨。
-2. **报告侧能算的不碰 Go**：聚合、分位、判级全部在 Python 侧；Go 只保证原始 per-request/per-turn 数据完整落盘。新增派生指标优先在报告侧做。
-3. **判级阈值单一来源**：所有阈值收敛在 SLO_TIERS；改基准值同步更新 latency-baselines.md 的依据引用。
+1. **schema 不保向后兼容**（决策见 AGENTS.md）：改字段直接改类型；大版本升级消费方按 `schema_version` 分流，不写兼容双轨。
+2. **分析侧能算的不碰 Go**：聚合、分位、判级、呈现全部在工具之外；Go 只保证原始 per-request/per-turn 数据完整落盘（含 raw_timings 原始序列）。新增派生指标优先在外部做。
+3. **契约文档单一来源**：字段/口径变更必须同步本文并递增 `SchemaVersionCurrent`——契约漂移比代码 bug 更伤（消费方不知道自己读错了什么）。

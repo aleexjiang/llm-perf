@@ -150,7 +150,7 @@ TTFT（`gen_ai.server.time_to_first_token`）与 TPOT（`gen_ai.server.time_per_
 
 ---
 
-## 7. 与 llm-perf 报告的映射（3 档制，报告侧已实现）
+## 7. 与 llm-perf 数据的映射（3 档制）
 
 **为什么 agent 场景重点看 30–40K 输入档**：现代 agent 产品基线上下文即 ~35K（系统提示 + 工具定义 + RAG 注入，用户发一句"你好"请求就已带 35K 上下文），短输入档的徽章代表不了 agent 体验。TTFT 判据必须显式覆盖 30–40K 输入段。
 
@@ -194,7 +194,7 @@ slo:                      # 体验基线评估（3 档制徽章 + 结论段）
   #   ttft_ms: {short_good: 450, short_pass: 2000, long_good: 3000, long_pass: 6000}
 ```
 
-落地形态：HTML 报告"体验基线评估"区（✅/⚠️/❌ 徽章 + 结论段，逐档位标注出处链接指向本文件）；基线不进退出码、不污染原始 JSON；thinking=on 单独分组不打短输入档徽章（共识 4）。
+落地形态（2026-09-17 报告层剥离后）：阈值随 JSON `slo_baseline` 透出、判级由分析侧实现（本文件是阈值的方法论依据，单一来源）；基线不进退出码、不污染原始 JSON；thinking=on 单独分组不打短输入档徽章（共识 4）。
 
 ---
 

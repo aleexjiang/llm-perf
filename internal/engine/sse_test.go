@@ -247,6 +247,32 @@ func TestFinalize_ITLPercentiles(t *testing.T) {
 	}
 }
 
+// 原始 chunk 序列（raw_timings）：开启时落盘 content_times_ms（相对 sent_at 的毫秒偏移，
+// feed 合成时钟 100ms 起、10ms/chunk）；关闭时缺键。ITL 分位数之外的抖动/峰值分析
+// 都依赖这份原始序列。
+func TestFinalize_ContentTimesMS(t *testing.T) {
+	raw := "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n" +
+		"data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n" +
+		"data: {\"choices\":[{\"delta\":{\"content\":\"c\"},\"finish_reason\":\"stop\"}]}\n" +
+		"data: [DONE]\n"
+	m := &TurnMetrics{Stream: true, rawTimings: true}
+	feed(t, m, raw, true)
+	want := []float64{100, 110, 120}
+	if len(m.ContentTimesMS) != len(want) {
+		t.Fatalf("ContentTimesMS 长度 = %d, want %d", len(m.ContentTimesMS), len(want))
+	}
+	for i, w := range want {
+		if m.ContentTimesMS[i] != w {
+			t.Errorf("ContentTimesMS[%d] = %v, want %v", i, m.ContentTimesMS[i], w)
+		}
+	}
+	m2 := &TurnMetrics{Stream: true} // 开关关闭：键不落盘
+	feed(t, m2, raw, true)
+	if m2.ContentTimesMS != nil {
+		t.Errorf("rawTimings 关闭时不应落盘原始序列: %v", m2.ContentTimesMS)
+	}
+}
+
 func BenchmarkParseSSEData(b *testing.B) {
 	line := []byte(`{"id":"chatcmpl-83baf14829319a30","object":"chat.completion.chunk","created":1788541311,"model":"qwen3.8-27b","choices":[{"index":0,"delta":{"reasoning":"User asks something"},"logprobs":null,"finish_reason":null,"token_ids":null}]}`)
 	b.ResetTimer()
