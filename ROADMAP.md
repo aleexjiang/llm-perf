@@ -110,7 +110,8 @@
   `full` 按原序注入全部 role；`multiturn.max_reply_chars` 可配（默认 2000）。
 - **注意**：`role: tool` 消息须带 `tool_call_id`，缺失跳过并计 warning，不静默丢弃；
   `reply[:2000]` 现在按字节切，一并改为按 rune 截（中文切半个字符）。
-- **验收**：真实 agent trace 上 full vs user_only 对比 context 深度与 TTFT——物料已就绪（第 4 节 trace-real-16）。
+- **验收**：真实 agent trace 上 full vs user_only 对比 context 深度与 TTFT——物料已就绪（第 4 节 trace-real-16，128 条）。
+  **注意样本场景不均衡**（非 coding 24 / coding 104，受数据源限制）：对比结论按"编码类 agent 会话"口径表述，勿外推为通用 agent 负载。
 
 ---
 
@@ -133,11 +134,26 @@
 
 ---
 
-## 4. 数据来源（支撑第 2 节验收）【已完成，2026-09-10】
+## 4. 数据来源（支撑第 2 节验收）【已完成，2026-09-10；扩样 + 二次脱敏 + 场景配平 2026-09-17】
 
-**物料已入库**：`configs/fixtures/trace-real-16.json.gz`（+ 同名 `.md` 清单）——16 条真实 agent 会话（脱敏），
-单会话峰值 prompt 20k–480k 四档，含 assistant/tool 消息与工具定义；`LoadTrace` 实跑
-`FullReplay=true`、缺 `tool_call_id`=0，`replay_mode: full` 真正生效不退化。逐条清单与脱敏规则见 `trace-real-16.md`。
+**物料已入库**：`configs/fixtures/trace-real-16.json.gz`（+ 同名 `.md` 清单）——**128 条**真实 agent 会话快照（脱敏），
+单次 prompt 20k–500k 六档（<40k / 40-80k / 80-150k / 150-250k / 250-500k / >500k），含 assistant/tool 消息与工具定义；
+只收 user 轮 ≥3 的会话（>32 轮的裁到 32 轮）。`LoadTrace` 实跑
+`FullReplay=true`、会话=128、缺 `tool_call_id`=0，user 轮 min/max=2/32，`replay_mode: full` 真正生效不退化。
+逐条清单与脱敏规则见 `trace-real-16.md`。
+
+**场景配平（2026-09-17，已尽力，结论留档）**：目标是压低 coding 占比，但撞上数据源硬约束——
+- 场景必须**按内容打标**（读会话首轮 prompt），不能按入口分：同一入口下既有编码也有办公，
+  WorkBuddy 里还跑了不少 llm-perf 工程会话。打标结果（≥3 轮会话 27 个）：**coding 15 个 / 非 coding 12 个**。
+- **非 coding 的硬天花板只有 24 条**：WorkBuddy craft 模式的 prompt 不携带历史（`system` + 1 条 `user` + 工具循环），
+  第 3 轮起的 span 有相当一部分 `user` 消息数仍为 1，被 `min_turns=2` 挡掉。
+- 根因是**用法形状**：154 个会话里 89 个只有 1 轮——工单/评估表/周报/文档处理/定时抓取天然一问一答，
+  长会话全是 llm-perf / GPU 容器这类工程任务。
+- 其它 18 个空间（`knot_platform` / `BoxAi` / `ima-copilot` 等）在本账号 `read_self` 权限下**全为空**，无法横向补样。
+- 落点：**非 coding 24 / coding 104**（19% : 81%）。要再压低 coding 占比，唯一路径是**下调总条目数**
+  （总 ~28 条才能到 coding 1/8），不是继续找样本。**此结论勿重复推导。**
+
+**体积提醒**：gzip 后约 12.6 MB / 解压约 46 MB，仓库内属大文件；按被测模型上下文上限用 `max_sessions` 裁剪。
 
 **导出协议备忘**（AgentLens OpenAPI，全 POST + JSON）：
 - 地址必须 **http://**（https 走内网代理会 502）；Header `X-Agentlens-Token: <明文>`，非 Bearer。
@@ -150,8 +166,13 @@
   取首调（起步基线）、末调（完整上下文）或相邻差分（每轮增量）。
 - 取样注意：session 内 seq 靠前的 trace 往往只有 1 个 user 轮（会被 `min_turns=2` 过滤），挑 seq≥3；
   候选池可能混入当前会话自身（含明文 token），必须排除。
+- **限额与吞吐（2026-09-17 实测）**：数据保留期约 **14 天**；traceList 单查询**有效上限 15 条**
+  （`page_size` 传 50 与翻页参数均无效）→ 只能**时间窗切片**（窗口可细到 ±1min）；
+  spanDetail 有独立限流（`code:50001`「调整至 1000 次/min」），实测**持续吞吐仅 ~0.3–0.5 次/秒**，
+  且**密集并发 + 短退避反而比低速顺序轮询快约 10 倍**（限流是桶式的：爆发后开桶可一次过一批）。
+- 快照取法：同 trace 内取 `inputTokens` **最大**的 span（即该次用户交互上下文最深处那次调用）。
 - 脱敏重点：**工具定义**（skill 清单带绝对路径与内网域名）是残留风险最高处，须与 messages 一并过脱敏；
-  原始未脱敏数据不入库，脱敏完成后即删。
+  `no_proxy=<内网域名白名单>` 一类环境 dump 也是成段漏点；原始未脱敏数据不入库，脱敏完成后即删。
 
 ---
 

@@ -46,8 +46,10 @@ dataset:
   # mode: "trace"
   # path: "ShareGPT_V3_unfiltered_cleaned_split.json"   # .json / .json.gz
   # path: "fixtures/trace-real-16.json.gz"   # 仓库内置真实 agent 会话样本（路径相对配置目录解析）：
-                                             # 16 条脱敏 trace，会话峰值 prompt 20k-480k 四档，
-                                             # 含 assistant/tool 消息，full 回放真正生效；逐条清单见 fixtures/trace-real-16.md
+                                             # 128 条脱敏 trace，单次 prompt 20k-500k 六档，
+                                             # 含 assistant/tool 消息，full 回放真正生效；
+                                             # 场景偏编码类（coding 104 / 非 coding 24，受数据源限制）；
+                                             # 逐条清单见 fixtures/trace-real-16.md
   # path: "/data/traces/customer-sessions.json.gz"   # 外部文件同样支持：绝对路径直通（客户环境导入的
                                              # trace 放哪都行）；相对路径以配置文件所在目录为基准，
                                              # 与启动时的工作目录解耦
