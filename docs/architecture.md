@@ -2,7 +2,7 @@
 
 > 面向维护者/二开者：模块边界、数据流、扩展点、已知坑位。使用方法见 [README](../README.md)；
 > 数据契约（JSON 输出与聚合口径）见 [data-contract.md](data-contract.md)；
-> 设计决策与测量哲学见 [AGENTS.md](../AGENTS.md)；评测体系（指标/分层/减法）见 [testing-architecture.md](testing-architecture.md)；能力规划见 [ROADMAP.md](../ROADMAP.md)。
+> 设计决策与测量哲学见 [AGENTS.md](../AGENTS.md)；评测体系（指标/分层/减法）见 [testing-architecture.md](testing-architecture.md)；运行方式见 [CODEBUDDY.md](../CODEBUDDY.md)。
 >
 > **本文不写行号**——行号随每次提交漂移（历史教训），定位一律用函数/类型名 grep。
 
@@ -15,7 +15,7 @@ YAML 配置 (configs/*.yaml)
 cmd/bench/main.go ── 组装 Client（auth/chat_path/retry/debug）、解析 --turns × --concurrency
   │                    probe 分支：engine.Probe → ProbeResult JSON（+ toolprobe 检查）
   ▼
-scenario 层（internal/scenario）── 按组合查表派发 Single / Multiturn / Concurrent
+scenario 层（internal/scenario）── 按组合派发 Multiturn / Concurrent（公共入口只运行多轮）
   │  每个场景：预热 → metrics 窗口(startWindow/finishWindow) → 请求循环 → 正确性金丝雀
   │  负载生成：filler（token 精确填充）或 trace（真实会话回放）
   ▼
@@ -39,13 +39,13 @@ report 层（internal/report）── Report 结构落盘 JSON（按模型分区
 | `internal/corpus` | corpus.go | 填充语料加载（en/zh/自定义路径），供 filler 构造 token 精确文本 | |
 | `internal/auth` | auth.go | 认证方案抽象：bearer / 裸 key / 自定义 header / none，chat 与 /metrics 共用 | 替代了早期 3 处硬编码 `Bearer ` |
 | `internal/engine` | client.go / sse.go / filler.go / trace.go / probe.go / toolprobe.go / corpus_filler.go | OpenAI 兼容客户端与逐 chunk 计时；SSE 解析；负载生成；兼容性探针 | 见下"engine 内部" |
-| `internal/scenario` | scenario.go、plan.go（测试画像） | 三场景编排：Single / Multiturn / Concurrent；闭环 runClosedRound / 开环 runOpenRound；混跑形状计划/聚合；正确性金丝雀；goodput；plan.go：PlanSummary 开跑前估算请求量（复用 ClampLadder/MaxTokensList/Variants，展示口径=执行口径） | 场景经 Register 注册表派发（main 不直接 import 各场景实现） |
+| `internal/scenario` | scenario.go、plan.go（测试画像） | 多轮编排：Multiturn / Concurrent；闭环 runClosedRound / 开环 runOpenRound；混跑形状计划/聚合；正确性金丝雀；goodput；warmup/失败/取消完整采集；plan.go：PlanSummary 开跑前估算请求量 | 场景经 Register 注册表派发（main 不直接 import 各场景实现） |
 | `internal/smetrics` | smetrics.go | 服务端 /metrics 采集（**可选的第二数据源**，客户端实测才是基线）：counter 差值 / gauge 轮询 / histogram 分位估计；指标名归一化（去 `_total`）。缺失或抓取失败一律不产生错误语义（`finishWindow` 返回 `Available=false`+`Note`，观测关闭返回 nil） | 引擎指标名表硬编码；指标名前缀自动识别引擎（vllm:/sglang:），**未识别显式告警、不静默回落 vLLM**（2026-09-08 修） |
-| `internal/report` | report.go | JSON 输出结构定义与落盘：Report / SingleRow / MultiturnRun / ConcurrentLevel / PartitionByModel | 只定义结构不做聚合 |
+| `internal/report` | report.go | JSON 输出结构定义与落盘：Report / SingleRow / MultiturnRun / ConcurrentLevel / AuxiliaryRequest / PartitionByModel | 主压测、warmup、correctness 原始数据分组落盘；只定义结构不做聚合 |
 
 ## engine 内部
 
-- **client.go**：`Client.Chat` = 重试循环（RetryPolicy 只重试连接层瞬时失败：传输错误/5xx/429/流中断；4xx 是确定性行为不重试）→ `attempt` 组请求体（ExtraBody 透传只挡 model/messages）→ 流式走 `readStream`，非流式走 `readWhole` → `Finalize` 由原始时间戳算派生指标（TTFT/思考拆分/ITL 分位/TPOT）。自定义 Transport：连接池 256/128 + DisableCompression（压缩攒批破坏 ITL 精度）。
+- **client.go**：`Client.Chat` = 重试循环（RetryPolicy 只重试连接层瞬时失败：传输错误/5xx/429/流中断；4xx 是确定性行为不重试）→ `attempt` 组请求体（ExtraBody 只允许供应商扩展字段，不能覆盖 stream/max_tokens/stream_options）→ 流式走 `readStream`，非流式走 `readWhole` → `Finalize` 由原始时间戳算派生指标（TTFT/思考拆分/ITL 分位/TPOT）。缺少 `[DONE]`、body 读取失败和主动取消均保留完整指标与状态。自定义 Transport：连接池 256/128 + DisableCompression（压缩攒批破坏 ITL 精度）。
 - **sse.go**：`ingestSSEBody` 是流解析唯一入口（时钟注入，生产 time.Now / 测试合成时钟）；`deltaPayload` 自定义 UnmarshalJSON 一次解析同时拿值和键名清单，`knownDeltaKeys` 白名单之外的键记 warnings（魔改引擎探测）；`tool_calls` 分片按 index 分桶聚合。
 - **filler.go**：token 精确的合成填充。注意 `SystemMsg` 把工具定义当纯文本塞 system 消息——只模拟体积，不发真实 `tools` 字段（定位见 AGENTS.md tool-call 一节）。
 - **trace.go**：`LoadTrace` 加载 ShareGPT / sessions 格式；`replay_mode` **默认 full**（按原序注入全部 role），`user_only` 只回放 user 轮（显式配置才生效）。
@@ -54,10 +54,10 @@ report 层（internal/report）── Report 结构落盘 JSON（按模型分区
 
 ## 关键数据结构
 
-- **`engine.TurnMetrics`**（client.go）：单请求全量计时+token 统计，是所有场景行的叶子单元。注意两类字段的区别：
+- **`engine.TurnMetrics`**（client.go）：单请求全量计时+token 统计，是所有场景行和 `auxiliary_requests` 的叶子单元。`phase` 标记 benchmark/warmup/correctness，主动取消用 `cancelled` 标记。注意两类字段的区别：
   - 带 `json:"-"` 的字段**不进压测数据**（`ToolCalls` 只被 probe 消费）——给 TurnMetrics 加字段时先想清楚是否污染压测 JSON；
   - `omitempty` 派生指标在非流式/无思考时缺省——报告侧必须容忍缺失。
-- **`report.Report`**（report.go）：单场景单文件。`Environment`（引擎识别存档）与 `ConfigRaw`（配置原文）随每份 JSON 落盘——回看数据时"当时什么引擎什么配置"有据可查。
+- **`report.Report`**（report.go）：单场景单文件。主压测请求位于场景数组，warmup/correctness 完整指标位于 `AuxiliaryRequests`；`Environment`（引擎识别存档）与 `ConfigRaw`（配置原文）随每份 JSON 落盘——回看数据时"当时什么引擎什么配置"有据可查。
 - **`smetrics.Sample`**：一次 /metrics 抓取快照；场景层 `startWindow/finishWindow` 取窗口差值挂到 Report.Server。
 
 ## 扩展点指引

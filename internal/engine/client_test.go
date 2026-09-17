@@ -210,6 +210,21 @@ func TestStreamBrokenSetsError(t *testing.T) {
 	}
 }
 
+func TestStreamEOFWithoutDoneIsFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\\\"choices\\\":[{\\\"delta\\\":{\\\"content\\\":\\\"ok\\\"}}]}\\n\\n")
+	}))
+	defer srv.Close()
+	m, err := NewClient(srv.URL, "", 5*time.Second, false).Chat(context.Background(), retryOpts(true))
+	if err != nil {
+		t.Fatalf("缺 [DONE] 的响应仍应返回指标对象供排障: %v", err)
+	}
+	if !m.StreamBroken || m.Error == "" {
+		t.Fatalf("缺 [DONE] 必须标记不完整失败: %+v", m)
+	}
+}
+
 // ── ThinkMS 负值钳 0：reasoning 块晚于 content 首包（魔改引擎时序异常）不污染中位数 ──
 
 func TestThinkMSNegativeClamped(t *testing.T) {

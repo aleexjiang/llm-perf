@@ -17,12 +17,6 @@ thinking:
     - {name: low,  enabled: true,  extra_body: {chat_template_kwargs: {enable_thinking: true}}}
     - {name: high, enabled: true,  extra_body: {chat_template_kwargs: {enable_thinking: true}}}
 
-single:
-  runs: 1
-  prompt_tokens: [500]
-  max_tokens: 64
-  fixed_seed: true
-
 multiturn:
   sessions: 1
   turns: 2
@@ -32,7 +26,7 @@ multiturn:
   max_tokens: 32
 
 concurrent:
-  multiturn: false
+  multiturn: true
   levels: [2]
   runs_per_worker: 1
   prompt_tokens: 300

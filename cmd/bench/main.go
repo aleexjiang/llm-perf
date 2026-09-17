@@ -2,13 +2,11 @@
 //
 // 契约：输入 YAML 配置，输出 JSON 原始数据；报告呈现由外部工具基于 JSON 二次加工。
 //
-// 用法（模式 = --turns × --concurrency 组合，无场景子命令）：
+// 用法：工具只保留 agent 多轮采集；--concurrency=1 表示单发多轮，>1 或 RPS 扫描表示多用户多轮。
 //
-//	bench -c configs/example.yaml                                  # 默认 turns=both concurrency=1（单发单轮+多轮，零并发压力）
-//	bench -c ... --turns single --concurrency 1                    # 单发单轮
-//	bench -c ... --turns multi  --concurrency 1                    # 单发多轮
-//	bench -c ... --turns single --concurrency 1,2,4                # 闭环并发爬坡（单轮）
-//	bench -c ... --turns multi  --concurrency 2,4                  # 闭环并发爬坡（每用户独立多轮会话）
+//	bench -c configs/example.yaml                                  # 默认多轮 + 配置中的并发/RPS 档位
+//	bench -c ... --concurrency 1                                   # 单发多轮（逐轮 history 滚动）
+//	bench -c ... --concurrency cfg                                 # 使用配置 concurrent.rate_sweep 或 levels
 //	bench probe -c configs/example.yaml [模型名]                    # 兼容性探针
 package main
 
@@ -40,35 +38,35 @@ func usage() {
 
 输入: YAML 配置    输出: JSON 原始数据（报告请用外部工具基于 JSON 生成）
 
-用法（模式 = --turns × --concurrency 组合，无场景子命令）:
+用法（只跑 agent 多轮采集，无单发单轮场景）:
   bench [-c 配置.yaml] [选项]
   bench probe [-c 配置.yaml] [模型名]
 
 核心选项:
-  --turns single|multi|both    单轮 / 多轮会话 / 两者都跑（默认 both）
-  --concurrency 1|1,2,4|cfg    并发=1 表示单发（串行）；逗号列表逐档爬坡；
-                               cfg 用配置里 concurrent.levels（默认 1）
+  --turns multi                 固定为多轮 agent 会话（默认 multi）
+  --concurrency 1|1,2,4|cfg    1=单发多轮；逗号列表=闭环多用户多轮；
+                               cfg=使用配置 concurrent.rate_sweep/request_rate/levels
   --thinking 变体名             只跑某个思考变体：on/off 或自定义档位名（如 low）；按变体名过滤，
                                 模型无该变体则整个模型跳过；both=全部（缺省不过滤）
-  --seed-salt N                测试隔离：重跑/换变体必须换盐，否则命中服务端前缀缓存
+  --seed-salt N                 测试隔离：重跑/换变体必须换盐，否则命中服务端前缀缓存
   -o 路径                       输出 .json 或目录（默认配置 output_dir）
   -m 模型子串                   只测包含该子串的模型
   --corpus en|zh|路径           填充语料；--max-ctx N 上下文截止
 
 probe 选项:
-  --no-toolcall                关闭 tool-call 健康检查（默认开启：检出引擎能否正常调工具，
-                               失败时给可行动结论；多 4 次请求、秒级、不进压测路径）
-  --probe-capture 目录          tool-call 检查的原始响应落盘（厂商排障证据/判据回归 fixture；
-                               含业务数据，外发前按需脱敏）
-  --cache                      开启前缀缓存定性检查（默认关：多 4 次长上下文请求，40k 档约多花 1-2 分钟）
-  --cache-size N               缓存检查的上下文大小（tokens，默认 40000，自动收到模型上限以内）
+  --no-toolcall                 关闭 tool-call 健康检查（默认开启）
+  --probe-capture 目录          tool-call 检查的原始响应落盘
+  --cache                       开启前缀缓存定性检查（默认关）
+  --cache-size N                缓存检查的上下文大小（tokens，默认 40000）
 
 组合语义:
-  --concurrency 1 --turns single            单发单轮档位矩阵（ladder × runs，缓存对照）
-  --concurrency 1 --turns multi             单发多轮会话（逐轮 history 滚动）
-  --concurrency 2,4 --turns single          闭环并发（固定 prompt，level 爬坡）
-  --concurrency 2,4 --turns multi           闭环并发（每虚拟用户独立多轮会话）
-  列表含 1 和更大值                          先跑单发场景再跑并发档位（仅 >1 的档位）
+  --concurrency 1               单发多轮：逐轮 history 滚动
+  --concurrency 2,4             闭环多用户多轮：每个虚拟用户独立会话
+  --concurrency cfg             优先使用 rate_sweep/request_rate，未配置时使用 levels
+
+排查模式:
+  warmup、benchmark、correctness、失败和主动取消请求都保留完整原始指标；
+  warmup/correctness 不进入 benchmark KPI，按 phase 分组落盘。
 
 排查模式:
   配置里 debug: true 时，原始响应留存到 <output_dir>/raw/、日志同步写 <output_dir>/run.log；
@@ -83,8 +81,8 @@ probe 选项:
 
 示例:
   bench probe -c configs/customer.yaml
-  bench -c configs/customer.yaml --turns single --concurrency 1 --thinking off -o out-single-off --seed-salt 1
-  bench -c configs/customer.yaml --turns both --concurrency 1,2,4 -o output/
+  bench -c configs/customer.yaml --concurrency 1 --thinking off -o out-multi-off --seed-salt 1
+  bench -c configs/customer.yaml --concurrency cfg -o output/
 `)
 	os.Exit(2)
 }
@@ -191,8 +189,8 @@ func main() {
 
 	fs := flag.NewFlagSet("bench", flag.ExitOnError)
 	cfgPath := fs.String("c", "configs/example.yaml", "YAML 配置文件路径")
-	turnsFlag := fs.String("turns", "both", "turns=single|multi|both：单轮 / 多轮会话 / 两者都跑")
-	concFlag := fs.String("concurrency", "1", "并发=1 表示单发（串行）；逗号列表如 1,2,4 逐档爬坡；cfg 用配置 concurrent.levels")
+	turnsFlag := fs.String("turns", "multi", "固定为 multi：多轮 agent 会话；单发多轮由 --concurrency 1 表示")
+	concFlag := fs.String("concurrency", "cfg", "并发/RPS 计划：1=单发多轮；逗号列表=闭环并发；cfg=使用配置的 rate_sweep/request_rate/levels")
 	modelFilter := fs.String("m", "", "只测包含该子串的模型")
 	outFlag := fs.String("o", "", "输出路径：.json 文件或目录（默认用配置 output_dir）")
 	corpusFlag := fs.String("corpus", "", "填充语料：en/zh（内置公版书）或自定义文件路径（.txt/.txt.gz）；覆盖配置 filler_corpus")
@@ -547,6 +545,10 @@ func main() {
 		}
 		concVals = append(concVals, n)
 	}
+	if len(concVals) == 0 && (cfg.Concurrent.RequestRate > 0 || len(cfg.Concurrent.RateSweep) > 0) {
+		// RPS-only 配置不需要再写无意义的 levels；补一个 1 仅用于生成单发多轮基线。
+		concVals = []int{1}
+	}
 	if len(concVals) == 0 {
 		fmt.Fprintln(os.Stderr, "--concurrency 解析结果为空")
 		os.Exit(1)
@@ -559,57 +561,45 @@ func main() {
 			vals = append(vals, n)
 		}
 	}
-	var turns []string
-	switch *turnsFlag {
-	case "single":
-		turns = []string{"single"}
-	case "multi":
-		turns = []string{"multi"}
-	case "both":
-		turns = []string{"single", "multi"}
-	default:
-		fmt.Fprintf(os.Stderr, "--turns %q 无效：用 single|multi|both\n", *turnsFlag)
+	if *turnsFlag != "multi" {
+		fmt.Fprintf(os.Stderr, "--turns %q 无效：当前工具只支持 multi（多轮 agent 会话）\n", *turnsFlag)
 		os.Exit(1)
 	}
 
 	type runItem struct {
 		name  string
 		sc    scenario.Scenario
-		highs []int // >1 的并发档位（交给 concurrent 场景）；空 = 纯单发场景
-		mt    bool  // concurrent 场景是否跑多轮会话
+		highs []int // >1 的闭环并发档位；空 = 单发多轮
+		mt    bool  // concurrent 场景恒为多轮会话
 	}
 	var items []runItem
-	for _, tm := range turns {
-		var ones, highs []int
-		for _, n := range vals {
-			if n == 1 {
-				ones = append(ones, n)
-			} else {
-				highs = append(highs, n)
-			}
+	var ones, highs []int
+	for _, n := range vals {
+		if n == 1 {
+			ones = append(ones, n)
+		} else {
+			highs = append(highs, n)
 		}
-		if len(ones) > 0 {
-			name := "single"
-			if tm == "multi" {
-				name = "multiturn"
-			}
-			sc, _ := scenario.Lookup(name)
-			items = append(items, runItem{name: name, sc: sc})
+	}
+	if len(ones) > 0 {
+		sc, _ := scenario.Lookup("multiturn")
+		items = append(items, runItem{name: "multiturn", sc: sc})
+	}
+	hasConfiguredRates := len(cfg.Concurrent.RateSweep) > 0 || cfg.Concurrent.RequestRate > 0
+	for _, ov := range cfg.ModelOverrides {
+		if ov != nil && ov.Concurrent != nil && (len(ov.Concurrent.RateSweep) > 0 || ov.Concurrent.RequestRate > 0) {
+			hasConfiguredRates = true
 		}
-		if len(highs) > 0 {
-			name := "concurrent"
-			if tm == "multi" {
-				name = "concurrent-multi"
-			}
-			sc, _ := scenario.Lookup("concurrent")
-			items = append(items, runItem{name: name, sc: sc, highs: highs, mt: tm == "multi"})
-		}
+	}
+	if len(highs) > 0 || hasConfiguredRates {
+		sc, _ := scenario.Lookup("concurrent")
+		items = append(items, runItem{name: "concurrent-multi", sc: sc, highs: highs, mt: true})
 	}
 	var names []string
 	for _, it := range items {
 		names = append(names, it.name)
 	}
-	log.Printf("执行计划: turns=%s concurrency=%v → %s（并发=1 即单发串行）", *turnsFlag, vals, strings.Join(names, " → "))
+	log.Printf("执行计划: turns=%s concurrency=%v → %s（并发=1 即单发多轮）", *turnsFlag, vals, strings.Join(names, " → "))
 
 	// 测试画像（5.10）：开跑前打印"这次要跑什么形状"总览；同一份数据随每份 JSON 落盘
 	planItems := make([]scenario.PlanItem, len(items))
@@ -679,7 +669,7 @@ func main() {
 		}
 		if ctx.Err() != nil {
 			fmt.Printf("[%s] ⚠️ 中断——已完成的 %d 组数据已保存: %s\n",
-				name, len(rep.Single)+len(rep.Multiturn)+len(rep.Concurrent), outPath)
+				name, len(rep.Multiturn)+len(rep.Concurrent), outPath)
 			return
 		}
 		if lastAbort != "" {
@@ -707,7 +697,9 @@ func main() {
 		cc := *cfg // 场景间互不影响：并发档位/多轮开关按本项覆盖
 		if len(it.highs) > 0 {
 			cc.Concurrent.Levels = it.highs
-			cc.Concurrent.Multiturn = it.mt
+		}
+		if it.name == "concurrent-multi" {
+			cc.Concurrent.Multiturn = true
 		}
 
 		// 每个场景各自派生 ctx + 熔断器：降速熔断只中止**本场景**（避免一个慢场景把整轮

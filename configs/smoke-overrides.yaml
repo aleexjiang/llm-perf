@@ -23,12 +23,6 @@ model_overrides:
     thinking:
       mode: "both"                # 踩坑形状：overrides 给 b 带来 on 变体
 
-single:
-  runs: 1
-  prompt_tokens: [500]
-  max_tokens: 64
-  fixed_seed: true
-
 multiturn:
   sessions: 1
   turns: 2

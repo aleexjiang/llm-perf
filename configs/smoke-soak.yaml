@@ -1,4 +1,4 @@
-# 10.5 时长制 soak 冒烟：duration_seconds + renew 会话续跑 + 报告侧稳定性区。
+# 时长制 soak 冒烟：duration_seconds + renew 会话续跑 + 原始稳定性数据采集。
 # 与其它冒烟配置独立的原因：时长制跑满墙钟（mock 上 ~12s），单独一份便于控制总时长。
 endpoint: "http://127.0.0.1:18099/router/v1"
 output_dir: "output-smoke-soak"
@@ -11,11 +11,6 @@ models: ["mock-model-a"]
 
 thinking:
   mode: "off"
-
-single:
-  runs: 1
-  prompt_tokens: [500]
-  max_tokens: [32]
 
 multiturn:
   sessions: 1

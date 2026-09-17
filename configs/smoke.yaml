@@ -12,6 +12,9 @@ output_dir: "output-smoke"
 timeout_seconds: 30
 filler_lang: "en"
 stream: true
+warmup_requests: 1
+correctness:
+  samples: 1
 
 models: ["mock-model-a", "mock-model-b"]
 
@@ -22,12 +25,6 @@ thinking:
   extra_body_off:
     chat_template_kwargs: {enable_thinking: false}
   max_tokens_floor: 2048
-
-single:
-  runs: 1
-  prompt_tokens: [500]
-  max_tokens: 64
-  fixed_seed: true
 
 multiturn:
   sessions: 1

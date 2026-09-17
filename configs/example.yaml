@@ -17,8 +17,8 @@ filler_lang: "en"                 # 填充文本语言：en / zh。长度按**�
                                   # 实际 token 数以服务端 usage 为准，bench probe 的 filler_fidelity 实测本部署保真度
 filler_corpus: "en"               # 真实文本语料填充："en"=战争与和平+白鲸记(内置,≈99万token) / "zh"=红楼梦(内置,≈62万token) /
                                   # 文件路径(.txt/.txt.gz)=自定义语料；留空=合成词表。语料比词表更贴近真实 tokenization
-max_prompt_tokens: 0              # 上下文截止（tokens）：>0 时所有请求 prompt 不超过该值——single 档位超限截到该值并去重，
-                                  # 多轮会话 ctx 到顶后停止加轮；0=不限制。CLI --max-ctx 可覆盖。上限参考 bench probe 的 context_limit
+max_prompt_tokens: 0              # 上下文截止（tokens）：>0 时多轮会话 ctx 到顶后停止加轮；0=不限制。
+                                  # CLI --max-ctx 可覆盖。上限参考 bench probe 的 context_limit
 stream: true                      # 流式开关。false 时只能测端到端延迟与 usage，TTFT/ITL/思考拆分 N/A
 debug: false                      # true: 原始响应留存 <output_dir>/raw/*.log + 日志写 run.log（排查魔改引擎用；
                                   # 请求失败时即使 false 也会自动转储）。新接引擎建议先跑 bench probe
@@ -62,8 +62,8 @@ dataset:
 
 # slo 段（SLO 口径统一入口，2026-09-12 由顶层 goodput 合流而来）：
 #   goodput（SLO 约束吞吐）：同时满足以下两条的请求才算有效（concurrent 结果里出 goodput 列）
-#   baseline（体验基线评估阈值，报告第 8 节的 ✅/⚠️/❌ 判据；未写的键用报告内置默认，
-#   判据与出处 docs/latency-baselines.md §7；enabled: false = 报告跳过该节）
+#   baseline（体验基线评估阈值；未写的键使用外部分析默认值，
+#   判据与出处 docs/latency-baselines.md §7；enabled: false = 外部分析跳过该节）
 # slo:
 #   goodput:
 #     ttft_ms: 2000
@@ -140,26 +140,17 @@ thinking:
   #   - {name: off,  enabled: false, extra_body: {reasoning_effort: "low"}}   # enabled:false = 思考关闭态
   #   - {name: low,  enabled: true,  extra_body: {reasoning_effort: "low"}}
   #   - {name: high, enabled: true,  extra_body: {reasoning_effort: "high"}}
-  # CLI 只跑单档：bench -c xxx.yaml --turns single --concurrency 1 --thinking low
+  # CLI 只跑单档：bench -c xxx.yaml --concurrency 1 --thinking low
 
 # 按模型覆盖思考配置：写到文件底部的 model_overrides.<模型>.thinking（字段级覆盖，
 # 只写要改的字段，其余继承全局 thinking）。不同模型/引擎的思考参数与档位词汇不同时用，
 # 先对各模型分别跑 probe（bench probe -c xxx.yaml <模型名>）确认可控参数再填。
 
-# 场景一：单发单轮（同 prompt 重复 runs 次，用于观察前缀缓存命中）
-single:
-  runs: 3
-  prompt_tokens: [4000, 10000, 20000, 40000]  # 默认到 40k；需更长上下文自行追加 100000, 200000（若超模型上限该档 400 报错自带上限数字，不影响其他档位）
-  # max_tokens 标量或列表（5.1 输出长度扫描）：列表时逐档扫描，报告按输出档分线。
-  # 注意 thinking=on 时各档会被 max_tokens_floor 抬高——要扫输出长度需档位 > floor（否则收敛为 floor 单档）
-  max_tokens: [256, 512, 1024]
-  fixed_seed: true                # true=各 run 用同一 prompt（测缓存）；false=每次换 prompt（测冷启动）
-
-# 场景二：单发多轮（模拟 agent：system + tool defs + 逐轮滚大的 history）
+# 主场景：单发多轮（模拟 agent：system + tool defs + 逐轮滚大的 history）
 # 形状对齐现代 agent 产品（5.9）：首调上下文 ~35k（system+tool defs 基座 21k × 1.07 模板开销 + 首轮 10k），
 # 8 轮滚到末轮 ~108k（128k 模型留 ~12k + 输出预算余量）。
 # 起步由 system_tokens + tool_defs_tokens 控制（AgentLens 首调实测中位 ~44k，n=4 偏高但样本不足，
-# 暂维持 35k，补样后再定，见 ROADMAP 5.9）；
+# 暂维持 35k，后续根据真实样本补充标定）；
 # probe 确认各模型上限后再微调 turn_tokens / turns。
 multiturn:
   sessions: 2                     # 跑几个独立会话
@@ -179,26 +170,18 @@ multiturn:
   #   - {weight: 3, name: real,  turn_tokens: 5000,  turns: 32}   # 对齐真实 agent 增量（AgentLens p50 +4k/轮）
   #   - {weight: 1, name: heavy, turn_tokens: 27500, turns: 8}    # 重度注入轮（S2 口径）
 
-# 场景三：并发（单轮或多轮由 multiturn 决定；闭环 levels 与开环到达率二选一）
+# 场景三：多用户多轮容量采集（RPS 主路径；request_rate/rate_sweep 与 levels 二选一）
 concurrent:
-  multiturn: false                # false=每用户独立单轮请求；true=每用户各自跑完整多轮会话（filler=模拟对话，trace=真实会话重放）
-  levels: [1, 2, 4, 8, 16]        # 闭环并发档位（request_rate/rate_sweep 未配置时生效）
-  runs_per_worker: 2              # 单轮模式下每个虚拟用户连续发几次
-  # duration_seconds: 30          # 10.5 时长制 soak：每档跑满墙钟秒数（runs_per_worker 忽略），到点停发新请求、在途跑完（drain）
-  # renew: true                   # 10.5 会话续跑：会话滚完 turns 轮换新种子重开（需 multiturn: true + duration_seconds），在途会话年龄铺满 0~turns 测稳态
-  prompt_tokens: 10000
-  max_tokens: 256                 # 标量或列表，同 single（列表会与 levels 相乘，注意总请求量）
-  # 5.7 闭环错峰发车（默认开）：首批发 1 路，等该批全部完成首轮后放下一批
-  # min(上批×ramp_factor, 剩余)，批次节奏自适应服务端首轮耗时；任一批次首轮失败即
-  # 终止测试（fail-fast），会话内连败 3 轮弃会话、全局连败 ≥2×level 终止（止损）。
-  # ramp: false                    # 显式 false 退回 barrier 齐射（所有 worker 同时发车）
-  # ramp_factor: 2                 # 批次放大系数，默认 2（可设 3；1 = 逐个串行发车）
-  # 开环到达率模式（对齐 vLLM bench serve / inference-perf）：请求按 Poisson 过程到达，
-  # 能测出排队-延迟曲线与饱和点；与 levels 互斥，两者都配时 rate_sweep 优先
-  # request_rate: 4                # 到达率 req/s
-  # rate_sweep: [1, 2, 4, 8, 16]  # 多档扫描（饱和点寻找）
-  # num_prompts: 64               # 总请求数（multiturn 时为总会话数），默认 32
-  # max_concurrency: 8            # 并发上限（0=不限），防到达率超容量时请求无限堆积
+  multiturn: true                 # 每个到达的新用户运行完整多轮会话
+  request_rate: 0.5               # 单档 RPS；需要扫描时改用 rate_sweep
+  # rate_sweep: [0.1, 0.25, 0.5, 1, 2]  # 多档 RPS 扫描
+  num_prompts: 32                 # 总会话数；multiturn 下 RPS 是会话到达率
+  max_concurrency: 0              # 客户端安全上限，0=不限
+  prompt_tokens: 10000             # 仅 mix/单轮兼容字段；多轮使用 multiturn 形状
+  max_tokens: 256                 # 每轮输出上限
+  burstiness: 1                   # 1=标准泊松；<1 更突发；>1 趋向均匀
+  # duration_seconds: 300          # soak：跑满墙钟，到点停发新会话、在途跑完
+  # renew: true                    # soak 多轮续跑：会话滚完后换新内容重开
   # 混合负载（5.6）：按权重确定性混跑长短请求（平滑加权轮转，小请求数下低权重形状不饿死）。
   # 线上流量从不均匀——均匀负载测出的吞吐/p99 系统性偏乐观，混跑才能测出容量折扣与真实尾延迟。
   # 与 multiturn: true 互斥；配置后本场景形状由 mix 各项决定，上方 prompt_tokens/max_tokens
@@ -222,13 +205,12 @@ concurrent:
 #     stream: true                  # 引擎能力差异：个别模型不支持流式时关掉
 #     thinking:
 #       max_tokens_floor: 16384     # 字段级覆盖，mode/extra_body 继承全局
-#     single:
-#       prompt_tokens: [4000, 10000, 20000]   # 只爬到该模型上下文内
-#       runs: 3
 #     multiturn:
 #       turns: 12
+#       turn_tokens: 8000
 #     concurrent:
-#       levels: [1, 4, 16]
+#       rate_sweep: [0.1, 0.25, 0.5, 1]
+#       num_prompts: 32
 #   "/models/DeepSeek-V4-Flash-0731":
 #     thinking:
 #       levels:

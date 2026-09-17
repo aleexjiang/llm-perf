@@ -66,15 +66,18 @@ func (r *MultiturnRun) FillLastPromptTokens() {
 // 完整多轮会话（filler=合成模拟对话，trace 数据源为真实会话重放），逐 turn 计量。
 // RequestRate>0 为开环到达率模式（Level=0，rate 为实际到达率）。
 type ConcurrentLevel struct {
-	Model         string                `json:"model"`
-	Thinking      string                `json:"thinking"`   // "on" / "off"
-	MaxTokens     int                   `json:"max_tokens"` // 输出长度（max_tokens 扫描维度；thinking=on 时已含 floor 抬高）
-	Level         int                   `json:"level"`
-	RequestRate   float64               `json:"request_rate,omitempty"` // 开环模式的到达率（req/s）
-	Requests      []*engine.TurnMetrics `json:"requests,omitempty"`
-	Sessions      []MultiturnRun        `json:"sessions,omitempty"`
-	WallSeconds   float64               `json:"wall_seconds"`
-	ThroughputTPS float64               `json:"throughput_tps"` // 整体 completion tokens/s
+	Model             string                `json:"model"`
+	Thinking          string                `json:"thinking"`   // "on" / "off"
+	MaxTokens         int                   `json:"max_tokens"` // 输出长度（max_tokens 扫描维度；thinking=on 时已含 floor 抬高）
+	Level             int                   `json:"level"`
+	RequestRate       float64               `json:"request_rate,omitempty"` // 开环模式的到达率（req/s）
+	Requests          []*engine.TurnMetrics `json:"requests,omitempty"`
+	Sessions          []MultiturnRun        `json:"sessions,omitempty"`
+	WallSeconds       float64               `json:"wall_seconds"`
+	ThroughputTPS     float64               `json:"throughput_tps"` // 完整成功请求的 completion tokens/s
+	CompletedRequests int                   `json:"completed_requests"`
+	FailedRequests    int                   `json:"failed_requests"`
+	CancelledRequests int                   `json:"cancelled_requests"`
 
 	// goodput（SLO 约束吞吐，配置了 goodput 时填充）：SLOMeet/SLOTotal 为达标/总请求数（多轮按 turn 计）。
 	// 刻意不带 omitempty（12.2）：0 是有意义的结果——slo_total>0 时 slo_meet=0 =「整档 0 达标」；
@@ -171,7 +174,7 @@ type PlanModel struct {
 // DurationS > 0 = 10.5 时长制档位（跑满墙钟）：请求数由吞吐决定、无法预先估算——
 // Requests 记 0 且渲染层以「—」呈现（不得当「0 个请求」读）。
 type PlanScenario struct {
-	Name      string `json:"name"` // single | multiturn | concurrent | concurrent-multi
+	Name      string `json:"name"` // multiturn | concurrent | concurrent-multi（公共入口）
 	Detail    string `json:"detail"`
 	Requests  int    `json:"requests"`
 	DurationS int    `json:"duration_s,omitempty"`
@@ -202,7 +205,7 @@ func (p *Plan) Render() []string {
 	return lines
 }
 
-// CorrectnessRow 一条正确性金丝雀请求的结果。
+// CorrectnessRow 一条正确性金丝雀请求的判定结果；完整计时在 Report.AuxiliaryRequests 中保留。
 type CorrectnessRow struct {
 	Model  string  `json:"model"`  // 该金丝雀请求发往的模型（按模型分区落盘时据此归属）
 	Number string  `json:"number"` // 要求转写的目标数字
@@ -210,6 +213,15 @@ type CorrectnessRow struct {
 	Match  bool    `json:"match"`
 	E2EMS  float64 `json:"e2e_ms"`
 	Error  string  `json:"error,omitempty"`
+}
+
+// AuxiliaryRequest 是不进入主 benchmark KPI、但必须完整留存的请求。
+// Phase 当前为 warmup/correctness；主压测请求继续保留在 single/multiturn/concurrent 中，
+// 避免重复复制大体量 TurnMetrics。
+type AuxiliaryRequest struct {
+	Phase   string              `json:"phase"`
+	Index   int                 `json:"index"`
+	Metrics *engine.TurnMetrics `json:"metrics"`
 }
 
 // GaugeSummary / HistSummary / ServerMetricsSummary：服务端 /metrics 观测汇总。
@@ -285,7 +297,7 @@ var Version = "llm-perf/dev"
 // SchemaVersionCurrent 数据契约版本：JSON 结构变更时递增，外部消费方据此做兼容判断。
 // 契约唯一权威文档 docs/data-contract.md，与本值同步维护（2026-09-17 报告层剥离后，
 // 这份 JSON 契约就是工具的对外接口）。
-const SchemaVersionCurrent = 2
+const SchemaVersionCurrent = 3
 
 // Report 是一次场景执行的完整数据，整体落盘为单个 JSON 文件。
 type Report struct {
@@ -296,17 +308,18 @@ type Report struct {
 	GeneratedAt   time.Time `json:"generated_at"`
 	// Test 测试类别（benchmark | performance | soak）：报告据其切换结论区口径。
 	// 恒有值且**不带 omitempty**——JSON 自描述，读者不必猜"缺键 = 默认还是旧产物"。
-	Test        string                `json:"test"`
-	Endpoint    string                `json:"endpoint"`
-	Note        string                `json:"note,omitempty"`
-	SLO         *SLO                  `json:"slo,omitempty"`
-	SLOBaseline *SLOBaseline          `json:"slo_baseline,omitempty"`
-	Plan        *Plan                 `json:"plan,omitempty"`
-	Single      []SingleRow           `json:"single,omitempty"`
-	Multiturn   []MultiturnRun        `json:"multiturn,omitempty"`
-	Concurrent  []ConcurrentLevel     `json:"concurrent,omitempty"`
-	Correctness []CorrectnessRow      `json:"correctness,omitempty"`
-	Server      *ServerMetricsSummary `json:"server_metrics,omitempty"`
+	Test              string                `json:"test"`
+	Endpoint          string                `json:"endpoint"`
+	Note              string                `json:"note,omitempty"`
+	SLO               *SLO                  `json:"slo,omitempty"`
+	SLOBaseline       *SLOBaseline          `json:"slo_baseline,omitempty"`
+	Plan              *Plan                 `json:"plan,omitempty"`
+	Single            []SingleRow           `json:"single,omitempty"`
+	Multiturn         []MultiturnRun        `json:"multiturn,omitempty"`
+	Concurrent        []ConcurrentLevel     `json:"concurrent,omitempty"`
+	Correctness       []CorrectnessRow      `json:"correctness,omitempty"`
+	AuxiliaryRequests []AuxiliaryRequest    `json:"auxiliary_requests,omitempty"`
+	Server            *ServerMetricsSummary `json:"server_metrics,omitempty"`
 	// KVCapacity 服务端 KV 容量画像（12.12，vllm:cache_config_info；场景开始时快照一次）。
 	// 用途单一：报告侧在容量/拐点结论里并列「实测拐点 vs KV 上界」，先回答「是不是
 	// KV 内存先满」。同为可选第二数据源——缺失（引擎未暴露/观测层关闭）不影响任何结论。
@@ -398,6 +411,13 @@ func (r *Report) PartitionByModel() []*Report {
 	}
 	for _, row := range r.Correctness {
 		get(row.Model).Correctness = append(buckets[row.Model].Correctness, row)
+	}
+	for _, row := range r.AuxiliaryRequests {
+		if row.Metrics == nil {
+			continue
+		}
+		model := row.Metrics.Model
+		get(model).AuxiliaryRequests = append(buckets[model].AuxiliaryRequests, row)
 	}
 	parts := make([]*Report, 0, len(order))
 	for _, m := range order {

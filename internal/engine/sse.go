@@ -320,6 +320,9 @@ func (m *TurnMetrics) closeOutWarnings(includeUsage bool) {
 	if includeUsage && !m.usageSeen {
 		m.warn("usage_missing") // 服务端未回 usage → token 数全 0，性能数据不可信
 	}
+	if m.usageSeen && m.PromptTokens == 0 && m.CompletionTokens == 0 && m.TotalTokens == 0 {
+		m.warn("usage_incomplete") // usage 对象存在但没有任何可用 token 数
+	}
 }
 
 // applyWholeBody 解析非流式 JSON 响应体并喂给 metrics。

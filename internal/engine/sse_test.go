@@ -247,6 +247,17 @@ func TestFinalize_ITLPercentiles(t *testing.T) {
 	}
 }
 
+func TestFinalize_NoTokenDeltaDoesNotProduceTTFT(t *testing.T) {
+	raw := "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n" +
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":0,\"total_tokens\":10}}\n" +
+		"data: [DONE]\n"
+	m := &TurnMetrics{Stream: true}
+	feed(t, m, raw, true)
+	if m.TTFT != 0 || m.DecodeMS != 0 || m.TPOTMS != 0 || m.TokensPerSec != 0 {
+		t.Fatalf("无 token 增量不应产生流式主指标: %+v", m)
+	}
+}
+
 // 原始 chunk 序列（raw_timings）：开启时落盘 content_times_ms（相对 sent_at 的毫秒偏移，
 // feed 合成时钟 100ms 起、10ms/chunk）；关闭时缺键。ITL 分位数之外的抖动/峰值分析
 // 都依赖这份原始序列。

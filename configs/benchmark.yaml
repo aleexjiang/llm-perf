@@ -6,11 +6,9 @@
 #
 # 跑法（两条命令，覆盖必测清单 1–3；off/on 由 thinking.mode: both 自动展开）：
 #   bench probe -c configs/benchmark.yaml          # ① 预检标定：min_tps、模型上限、引擎形态
-#   bench -c configs/benchmark.yaml --turns both --concurrency 1,2,4,8
-#     单发阶梯（1）+ 单发多轮（1，多轮语义下即会话数）+ 并发爬坡（2/4/8）
-#     注：`1` 归 single/multiturn，不构成并发档——level 1 的基线由单发场景代表
-#   # 条件格（业务形态是多用户 agent 时才跑，见 scenario-guide §1.5）：
-#   bench -c configs/benchmark.yaml --turns multi --concurrency 2,4
+#   bench -c configs/benchmark.yaml --concurrency cfg
+#     单发多轮（1）+ 多用户多轮 RPS/并发档位（配置中的 rate_sweep 或 levels）
+#   # 本工具不再运行单发单轮；单发多轮是 agent 基线，多用户多轮用于容量采集。
 #
 # 每轮必须换盐：--seed-salt <递增整数>（服务端 prefix cache 是内存态，不换盐冷路径测不干净）
 
@@ -50,14 +48,6 @@ thinking:
     chat_template_kwargs: {enable_thinking: false}
   max_tokens_floor: 8192          # 思考常 1500-2500+ token；cloud 实测 2048 会被吃光（finish=length 无正文）
 
-single:
-  runs: 3                         # 3 跑定冷/热：run1 冷、run2/3 热（fixed_seed 下同 prompt）
-  fixed_seed: true
-  prompt_tokens: [4000, 20000, 40000, 100000, 200000]
-                                  # 4000 = 短档判据；40000 对齐 agent 大上下文档（30–40K，现代 agent 基线形态）；
-                                  # 阶梯给 TTFT 衰减曲线与 TPOT 是否随深度漂移。超模型上限的档位会自动 400 跳过
-  max_tokens: [256]               # **固定**输出量：输出长度扫描是 performance 类别的探索，不进基准
-
 multiturn:
   sessions: 2
   turns: 8
@@ -69,12 +59,13 @@ multiturn:
   shared_base: true               # 基座跨会话共享（默认）＝「一套部署一套提示词」，测跨用户共享前缀值多少 TTFT
 
 concurrent:
-  multiturn: false                # 并发单轮（必测清单 §1.2）；并发多轮见文件头「条件格」
-  levels: [2, 4, 8]               # 基准只用 2/4/8；level 1 由单发场景代表（写 1 不构成并发档）
-  runs_per_worker: 2
-  prompt_tokens: 20000            # 并发档用中量输入：既有 prefill 压力又不至于让每档拖太久
-  max_tokens: 256                 # 与 single 同口径固定输出
-  # ramp / ramp_factor 用默认（错峰发车开、系数 2）——基准不追拐点，但错峰比齐射更贴真实到达
+  multiturn: true                 # 多用户 agent 会话；RPS 是新会话到达率
+  rate_sweep: [0.1, 0.25, 0.5, 1] # 基准容量采集档位
+  num_prompts: 32                 # 每档会话数
+  max_concurrency: 0              # 0=不限；仅作客户端安全上限
+  prompt_tokens: 20000            # 兼容字段；多轮实际形状由 multiturn 段决定
+  max_tokens: 256                 # 每轮固定输出
+  burstiness: 1                   # 标准泊松到达
 
 # 降速熔断：基准跑 5 档含 200k，服务端退化会白烧几小时窗口。
 # min_tps 必须按本部署稳态标定——用 bench probe 输出的建议值覆盖下面的 10（实测 16.6 tok/s

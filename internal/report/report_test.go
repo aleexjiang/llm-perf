@@ -103,6 +103,20 @@ func TestPartitionByModel(t *testing.T) {
 	}
 }
 
+func TestPartitionByModelAuxiliaryRequests(t *testing.T) {
+	r := &Report{AuxiliaryRequests: []AuxiliaryRequest{
+		{Phase: "warmup", Index: 0, Metrics: &engine.TurnMetrics{Model: "m1", Phase: "warmup"}},
+		{Phase: "correctness", Index: 0, Metrics: &engine.TurnMetrics{Model: "m2", Phase: "correctness"}},
+	}}
+	parts := r.PartitionByModel()
+	if len(parts) != 2 || len(parts[0].AuxiliaryRequests) != 1 || len(parts[1].AuxiliaryRequests) != 1 {
+		t.Fatalf("辅助请求应按模型分区: %+v", parts)
+	}
+	if parts[0].AuxiliaryRequests[0].Phase != "warmup" || parts[1].AuxiliaryRequests[0].Phase != "correctness" {
+		t.Fatalf("辅助请求 phase 丢失: %+v", parts)
+	}
+}
+
 // preemptions 的 JSON tag 刻意不带 omitempty：0 表示「窗口内没有发生抢占」这一
 // 有意义的结果（健康态），键一旦消失，读数据的人会把「实测 0」误读成「没采到这一项」。
 // 真机上 vllm:num_preemptions_total 存在且为 0，旧产物里却查无此键，正是这个坑。

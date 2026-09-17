@@ -3,7 +3,7 @@
 > 2026-09-12 架构讨论定稿。回答三个问题：工具往哪长（四层模型与三类测试）、什么不该再长（指标冻结与减法纪律）、
 > 多模型 / trace / filler 这些议题在体系里的位置。代码模块边界见 [architecture.md](architecture.md)；
 > 场景选型见 [scenario-guide.md](scenario-guide.md)；拍板摘要见 [AGENTS.md](../AGENTS.md)；
-> 能力 TODO 清单见 [ROADMAP.md](../ROADMAP.md) 第 10 节（清单只维护在 ROADMAP，本文不重复）。
+> 当前产品边界与运行方式见 [CODEBUDDY.md](../CODEBUDDY.md)；本文只记录指标和测试架构原则。
 >
 > 状态标记：【已拍板】= 讨论结论；【待拍板】= 有推荐方案等确认；【条件触发】= 明确不做，复活条件写明。
 
@@ -59,7 +59,7 @@ E2E = 排队等待 + prefill(全部输入) + N输出 × decode(逐token)
 | 输出 | SLO 徽章基线 | 容量曲线、饱和点、goodput@SLO、瓶颈归属 | 退化曲线、正确性时间线、事故留痕 |
 | 退出码 | 有 | 无（探索性） | 有（不达标即红） |
 
-现有能力归位：**基准** = probe 标定 + filler 阶梯 + fixed_seed + plan 画像 + SLO 三档（齐）；**性能** = 爬坡/开环/mix/goodput/速率容量曲线 + saturation_guard（齐，2026-09-12 GuideLLM 对照落地，见 ROADMAP 第 9 节）；**稳定性** = 守卫全在（stall_guard、saturation、canary、恢复探针），**缺负载原语（时长制+续跑）与报告面**。
+现有能力归位：**基准** = probe 标定 + 多轮 filler/trace + fixed_seed + plan 画像 + SLO 原始数据；**性能** = 闭环/开环 RPS/mix/goodput/速率容量原始数据 + saturation_guard；**稳定性** = stall_guard、saturation、canary、恢复探针与时长制续跑。报告聚合已移出本工具，统一由外部分析完成。
 
 【已拍板】suite 形态 = 配置顶层 `test: benchmark|performance|soak` + 单二进制不动（改动面小、smoke 兜得住）；子命令入口方案否决（CLI 改动面大）。suite 落地前以"预设配置 + 报告标注模式"过渡。
 
@@ -107,7 +107,7 @@ E2E = 排队等待 + prefill(全部输入) + N输出 × decode(逐token)
 
 多模型下必须的小修（与混合回放无关，现在逐模型跑同一份配置就已踩口径）：probe `decode_speed` 建议值按单模型实测，全局 `min_tps` 套用到更慢的模型会误杀 → per-model `stall_guard` 覆盖，或规则定为"按最慢被测模型标定"。
 
-trace 画像器（离线、不发包：per-model 流量画像 + 每轮调用链序列）是 ② 的数据源，但 **trace 线整体暂缓**（2026-09-12 拍板"后边再说"），见 ROADMAP 10.7。第一版范围限定：只做"每轮模型调用序列"，不做历史耗时参考线（历史值混着当时负载，容易从参考线被误读成判定线）。
+trace 画像器（离线、不发包：per-model 流量画像 + 每轮调用链序列）是外部数据分析的输入；当前压测只负责 full trace 多轮原始回放，不把线上历史耗时当判定线。
 
 ## 6. 客户端计时立场【已拍板】
 
@@ -127,14 +127,14 @@ trace 画像器（离线、不发包：per-model 流量画像 + 每轮调用链�
 2. **配置面不开新顶层旋钮**：新能力优先做成预设配置/文档指南（像 scenario-guide 给跑法、不给开关）；必须配置化的进 `model_overrides` 式差异段，不进全局面；
 3. **报告做减法**：一页纸重构——顶层 = 四个数 + 徽章 + 归因结论，现有各区降级附录。同时服务"非专业友好"（客户看第一页就够）与专业排障（附录全量保留）。
 
-**加法准入门槛**：新功能立项前回答两个问题——"你服务于四个数中的哪个？你属于控制层还是诊断层？"指认不出不做；条件触发项一律写明复活条件（清单见 ROADMAP 第 10.6 节）。
+**加法准入门槛**：新功能立项前回答两个问题——"你服务于四个数中的哪个？你属于控制层还是诊断层？"指认不出不做；新采集字段必须说明用途、阶段和外部消费口径。
 
 ## 8. 拍板记录（2026-09-12，按推荐方案定案）
 
 1. **suite 形态 = 配置顶层 `test:` 字段**；子命令方案否决（见 §3）；
 2. **`multiturn.shared_base` 默认 true**（基座跨会话共享为默认形态，见 §4）；
 3. **goodput@SLO 达标率默认 ≥95%**（与速率扫描"goodput 达标上限"口径一致，`slo:` 段可覆盖）；soak 漂移判定线默认 15%（末时段 goodput 比首时段掉 >15% 判退化 ❌）——两者真机标定后调；
-4. **trace-real-16 暂缓转正**：基准套件默认全 filler 格子，跨部署可比由 filler 标准格承担；随 trace 线（ROADMAP 10.7）重启再议；
+4. **trace-real-16 的使用边界**：基准横比优先使用固定 filler 格子；真实 trace 用于 agent 形状验证与外部画像，不把历史耗时直接当判定线；
 5. **token 口径 = probe 自举校准 + 报告 usage 实测分箱**（见 §4）。
 
-TODO 与落地顺序见 [ROADMAP](../ROADMAP.md) 第 10 节。
+运行方式与当前配置见 [CODEBUDDY.md](../CODEBUDDY.md) 和 [scenario-guide.md](scenario-guide.md)。

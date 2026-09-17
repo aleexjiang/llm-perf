@@ -228,6 +228,22 @@ func TestFinalizeLevelGoodput(t *testing.T) {
 	}
 }
 
+func TestFinalizeLevelSeparatesFailedAndCancelled(t *testing.T) {
+	e := &env{cfg: &config.Config{SLO: &config.SLOCfg{Goodput: &config.GoodputCfg{TTFTMS: 2000}}}}
+	lv := &report.ConcurrentLevel{Requests: []*engine.TurnMetrics{
+		{CompletionTokens: 100, TTFT: 1000},
+		{CompletionTokens: 80, Error: "HTTP 500"},
+		{CompletionTokens: 60, Error: "context canceled", Cancelled: true},
+	}}
+	finalizeLevel(e, lv, 10)
+	if lv.CompletedRequests != 1 || lv.FailedRequests != 1 || lv.CancelledRequests != 1 {
+		t.Fatalf("请求分类错误: %+v", lv)
+	}
+	if lv.ThroughputTPS != 10 || lv.SLOTotal != 2 {
+		t.Fatalf("失败/取消不应污染主吞吐或 SLO 分母: %+v", lv)
+	}
+}
+
 // ── httptest 集成：SSE 桩服务 ──
 
 type stubState struct {
@@ -473,7 +489,7 @@ func TestSingleCacheSemantics(t *testing.T) {
 // ── Scenario 注册表：新增场景实现接口 + Register 即可，main 零改动 ──
 
 func TestScenarioRegistry(t *testing.T) {
-	for _, name := range []string{"single", "multiturn", "concurrent"} {
+	for _, name := range []string{"multiturn", "concurrent"} {
 		if _, ok := Lookup(name); !ok {
 			t.Fatalf("场景 %s 应已注册", name)
 		}

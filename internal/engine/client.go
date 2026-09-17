@@ -114,6 +114,9 @@ type TurnMetrics struct {
 	Model    string `json:"model"`
 	Stream   bool   `json:"stream"`
 	Thinking bool   `json:"thinking"` // 本请求是否处于思考开启变体
+	// Phase 请求用途：benchmark（主压测）、warmup（预热）、correctness（正确性金丝雀）。
+	// 空值兼容直接由 engine.Client 调用的 probe/cache 诊断请求；场景层请求恒显式标记。
+	Phase string `json:"phase,omitempty"`
 
 	// 原始时间戳（仅流式填充）
 	SentAt           time.Time  `json:"sent_at"`
@@ -162,8 +165,8 @@ type TurnMetrics struct {
 	ITLMax        float64 `json:"itl_max_ms,omitempty"`
 
 	// ContentTimesMS 每个 content chunk 相对 sent_at 的毫秒偏移（原始序列，raw_timings
-	// 开启时落盘）：外部分析据此重建逐 token 时刻（峰值秒桶吞吐、抖动）。
-	// ITL 分位数之外的抖动信息只在这里有；非流式/关闭时缺键。
+	// 开启时落盘）：外部分析据此重建 chunk 到达时刻、间隔抖动和 chunk 级峰值。
+	// 一个 chunk 可能含多个 token，不能据此无损重建逐 token 时刻；非流式/关闭时缺键。
 	ContentTimesMS []float64 `json:"content_times_ms,omitempty"`
 	// TPOT 每 output token 时间（GenAI-Perf 口径：(E2E−TTFT)/(completion−1)，含思考 token），
 	// 横评常用；与 ITL（仅 content chunk 间隔）互补
@@ -181,6 +184,9 @@ type TurnMetrics struct {
 	// StreamBroken 流式读取中断（连接 reset/EOF 等）：响应不完整，TTFT/usage 可能部分可用
 	// 但整体不可信。重试策略（RetryPolicy）以此判定可重试。
 	StreamBroken bool `json:"stream_broken,omitempty"`
+	// Cancelled 客户端主动取消（SIGHUP/Ctrl+C/stall_guard）；原始请求仍保留，
+	// 但不进入已完成请求、SLO 分母或主吞吐统计。
+	Cancelled bool `json:"cancelled,omitempty"`
 
 	// RetryCount 经历过几次重试（RetryPolicy 开启时；计时只含最后一次成功尝试）
 	RetryCount int `json:"retry_count,omitempty"`
@@ -261,25 +267,17 @@ func (m *TurnMetrics) Finalize() {
 		}
 		return
 	}
-	if m.FirstChunkAt != nil {
-		// 先取 reasoning/content 两个含 token 首包中**较早者**——魔改引擎可能把
-		// content 排在 reasoning 之前（think_ms_negative 兜底同样预料到这种时序），
-		// 固定取 reasoning 会偏大并与 ttft_content_ms 矛盾。
-		// FirstChunkAt 是 role-only 空首 chunk（OpenAI 兼容服务标配，不算 token），
-		// 仅在全程无 token 时兜底；原始首 chunk 时刻保留在 first_chunk_at 供口径核查。
-		var first *time.Time
-		if m.FirstReasoningAt != nil {
-			first = m.FirstReasoningAt
-		}
-		if m.FirstContentAt != nil && (first == nil || m.FirstContentAt.Before(*first)) {
-			first = m.FirstContentAt
-		}
-		if first == nil {
-			first = m.FirstChunkAt
-		}
-		if first != nil {
-			m.TTFT = ms(m.SentAt, *first)
-		}
+	// TTFT 只锚定含 reasoning/content token 的首包；FirstChunkAt 仅保留协议首帧证据，
+	// role-only/usage/空 delta 流没有 token 增量时不得伪造 TTFT。
+	var first *time.Time
+	if m.FirstReasoningAt != nil {
+		first = m.FirstReasoningAt
+	}
+	if m.FirstContentAt != nil && (first == nil || m.FirstContentAt.Before(*first)) {
+		first = m.FirstContentAt
+	}
+	if first != nil {
+		m.TTFT = ms(m.SentAt, *first)
 	}
 	if m.FirstReasoningAt != nil {
 		m.TTFTReasoning = ms(m.SentAt, *m.FirstReasoningAt)
@@ -297,8 +295,6 @@ func (m *TurnMetrics) Finalize() {
 			}
 		}
 		m.DecodeMS = ms(*m.FirstContentAt, m.EndAt)
-	} else if m.FirstChunkAt != nil {
-		m.DecodeMS = ms(*m.FirstChunkAt, m.EndAt)
 	}
 	if m.Stream && m.Thinking && m.FirstContentAt == nil && m.FinishReason == "length" {
 		m.ThinkingNoContent = true
@@ -449,10 +445,12 @@ func (c *Client) attempt(ctx context.Context, o ChatOptions) (m *TurnMetrics, er
 		body["stream_options"] = map[string]any{"include_usage": true}
 	}
 	for k, v := range o.ExtraBody {
-		if k == "model" || k == "messages" {
-			continue // 核心字段不允许被透传覆盖
+		switch k {
+		case "model", "messages", "stream", "max_tokens", "stream_options":
+			continue // 测量核心字段不允许被供应商扩展静默覆盖
+		default:
+			body[k] = v
 		}
-		body[k] = v
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {
@@ -499,14 +497,19 @@ func (c *Client) attempt(ctx context.Context, o ChatOptions) (m *TurnMetrics, er
 		return m, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(buf), 500)), retryable
 	}
 
+	var bodyErr error
 	if o.Stream {
 		c.readStream(resp, m)
 	} else {
-		c.readWhole(resp, m)
+		bodyErr = c.readWhole(resp, m)
 	}
 	m.EndAt = time.Now()
 	m.Finalize()
 	c.dumpIfNeeded(m, payload, resp.StatusCode, resp.Header, o.Stream)
+	if bodyErr != nil {
+		retryable = !(errors.Is(ctx.Err(), context.Canceled) || errors.Is(ctx.Err(), context.DeadlineExceeded))
+		return m, fmt.Errorf("response body read failed: %w", bodyErr), retryable
+	}
 	return m, nil, m.StreamBroken
 }
 
@@ -520,6 +523,12 @@ func (c *Client) readStream(resp *http.Response, m *TurnMetrics) {
 		return
 	}
 	m.closeOutWarnings(c.IncludeUsage)
+	if !m.doneSeen {
+		m.StreamBroken = true
+		if m.Error == "" {
+			m.Error = "stream ended without [DONE]"
+		}
+	}
 }
 
 const maxRawKeep = 256 * 1024
@@ -595,14 +604,15 @@ func maskJSON(raw []byte) []byte {
 }
 
 // readWhole 读非流式响应体：解析逻辑在 sse.go（applyWholeBody）。
-func (c *Client) readWhole(resp *http.Response, m *TurnMetrics) {
+func (c *Client) readWhole(resp *http.Response, m *TurnMetrics) error {
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
 	if err != nil {
 		m.Error = err.Error()
-		return
+		return err
 	}
 	m.appendRaw(string(data))
 	m.applyWholeBody(data)
+	return nil
 }
 
 func truncate(s string, n int) string {

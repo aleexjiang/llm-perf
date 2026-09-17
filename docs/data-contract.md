@@ -9,7 +9,7 @@
 
 ## 版本
 
-每份场景 JSON 顶层带 `schema_version`（当前 **2**，常量 `report.SchemaVersionCurrent`）。
+每份场景 JSON 顶层带 `schema_version`（当前 **3**，常量 `report.SchemaVersionCurrent`）。
 结构变更时递增，消费方据此做兼容判断；schema 不保向后兼容（拍板见 AGENTS.md），大版本升级可能直接改字段类型。
 
 ## 数据流与落盘组织
@@ -36,17 +36,19 @@ Report
 ├── slo_baseline   # 体验基线三档阈值（配置了才填）：外部判级直接消费这份阈值，
 │                  #   不要内置自己的常量（阈值随部署走，单一来源在配置/JSON）
 ├── plan           # 测试画像：开跑前的场景×模型估算（展示口径=执行口径）
-├── single[]       # SingleRow: model, thinking, prompt_tokens, max_tokens, runs[]→TurnMetrics
 ├── multiturn[]    # MultiturnRun: model, thinking, session, max_tokens,
-│                  #   profile（5.11 混合档位名，仅 multiturn.profiles 生效时出现）,
+│                  #   profile（混合档位名，仅 multiturn.profiles 生效时出现）,
 │                  #   turns[]→TurnMetrics, batch/start_offset_s（5.7 爬坡发车）,
 │                  #   last_prompt_tokens/nominal_last_prompt（12.3 深度实测对照）
 ├── concurrent[]   # ConcurrentLevel: model, thinking, level, request_rate(开环>0),
-│                  #   requests[]→TurnMetrics（单轮）或 sessions[]→MultiturnRun（多轮会话，逐 turn 计量）,
-│                  #   wall_seconds, throughput_tps, slo_meet/slo_total/goodput_rps/goodput_tps,
+│                  #   sessions[]→MultiturnRun（多轮会话，逐 turn 计量）,
+│                  #   wall_seconds, throughput_tps（完整成功请求）, completed/failed/cancelled_requests,
+│                  #   slo_meet/slo_total/goodput_rps/goodput_tps,
 │                  #   waiting_max/running_max（观测峰值）, aborted（提前终止原因）,
 │                  #   shapes[]→ShapeStat（concurrent.mix 形状分解，中位数）
-├── correctness[]  # 金丝雀：{model, number, reply, match, e2e_ms, error}
+├── correctness[]  # 金丝雀判定：{model, number, reply, match, e2e_ms, error}
+├── auxiliary_requests[] # 不进入 benchmark KPI 但完整留存：phase=warmup/correctness，
+│                  #   metrics=完整 TurnMetrics（含失败、取消、warnings、usage、原始时序）
 ├── server_metrics # 可选第二数据源（客户端实测才是基线）。窗口差值/轮询聚合：
 │                  #   available（**仅指窗口差值 counter/hist 是否取到**）,
 │                  #   note（取不到时的原因；全仓只有"结束快照失败"会写它）,
@@ -57,8 +59,9 @@ Report
 │                  #   histograms{}, observation_degraded（观测失效须醒目标注）
 │                  #   缺失/取不到不得导致分析端少档位或改变判定
 ├── kv_capacity    # KV 静态容量画像（12.12，vllm:cache_config_info；缺失静默省略）
-├── source_check   # 两源一致性（10.1，仅并发场景）：client_tps/server_tps/deviation
-│                  #   （deviation 恒出现：0 = 两源完全一致，是最有意义的好结果）
+├── source_check   # 两源一致性（仅 benchmark 并发/RPS 窗口）：client_tps/server_tps/deviation
+│                  #   warmup/correctness 已排除；多模型时是端点级合计参考，不是单模型精确归因
+│                  #   deviation 恒出现：0 = 两源完全一致，是最有意义的好结果
 ├── environment    # 引擎识别存档（ProbeResult 轻量版）
 ├── config_raw     # 配置原文
 └── stall_trace    # .stall.csv 侧文件相对路径（--no-stall-trace 或未触发熔断时缺失）
@@ -74,11 +77,11 @@ Report
 
 | 类别 | 字段 | 消费规则 |
 |---|---|---|
-| 恒有 | model, stream, thinking, sent_at, end_at, e2e_ms, prompt_tokens, completion_tokens, total_tokens, tokens_per_sec | 直接用 |
+| 恒有 | model, stream, thinking, phase, sent_at, end_at, e2e_ms, prompt_tokens, completion_tokens, total_tokens, tokens_per_sec | `phase=benchmark` 为主压测；warmup/correctness 见 auxiliary_requests |
 | 流式才有（omitempty） | ttft_ms, ttft_reasoning_ms, ttft_content_ms, think_ms, decode_ms, itl_*(p50/p90/p95/p99/max), tpot_ms, reasoning_tokens, cached_tokens, finish_reason, reasoning_field, new_tokens(多轮) | 非流式缺失；判级前先判存在 |
-| 原始序列（raw_timings 开，默认开） | content_times_ms[]：每个 content chunk 相对 sent_at 的毫秒偏移 | **单调不减**；峰值秒桶吞吐、ITL 抖动、逐 token 时刻重建只靠这份原始序列（分位数之外的抖动信息不落盘就无法复原）。体积随输出 token 数线性增长，超长 soak 可 `raw_timings: false` 关闭 |
+| 原始序列（raw_timings 开，默认开） | content_times_ms[]：每个 content chunk 相对 sent_at 的毫秒偏移 | **单调不减**；这是 chunk 到达时刻序列，可做 chunk 间隔抖动分析，不能无损重建逐 token 时间。体积随输出 token 数线性增长，超长 soak 可 `raw_timings: false` 关闭 |
+| 质量标记 | thinking_no_content、stream_broken、cancelled、retry_count、warnings[] | 完整保留；分析主 KPI 前按 phase/error/cancelled 过滤 |
 | 不进 JSON（json:"-"） | ToolCalls（probe 专用） | 压测数据永远看不到 |
-| 质量标记 | thinking_no_content（思考吃光预算，剔除或调 max_tokens）、stream_broken（响应不完整）、retry_count、warnings[] | 分析前先过滤 |
 
 口径提醒：TPOT = (E2E−TTFT)/(completion−1) **含思考 token**（GenAI-Perf 横评口径）；ITL 只算 content chunk 间隔——**ITL 是 chunk 间隔、不是 token 间隔**：投机解码（MTP）会把多个 token 合进同一个 SSE chunk，此时 chunk 间隔 ≈ N × token 间隔（vLLM+MTP 实测约 2.66×），拿 ITL 分位当 TPOT 会把延迟判高约 2.6 倍。**判级一律用 `tpot_ms`，不用 ITL 分位**；`new_tokens` 是本轮相对上一轮新增 prompt tokens，配合 TTFT 得增量 prefill 速率。
 
@@ -88,8 +91,8 @@ Report
 
 1. **tokens_per_sec 是双口径字段**：流式 = completion/(E2E−TTFT)——首 token 后的全部生成时段，**含思考段**，与 TPOT 同窗互逆（≈1000/TPOT）；非流式 = completion/e2e_ms（含 prefill+排队，天然偏低）。**两者不可横向比较**；非流式行的 ttft/think/itl 缺失即提示口径。
 2. **失败判定唯一依据 `error` 字段**：断流（stream_broken）也写 error（"stream broken: …"）；`stream_broken` 只作补充标记。只看 stream_broken 会漏、只看 err 返回值会漏（attempt 返回 err=nil + 指标里的 Error）。
-3. **吞吐是物理口径**：ThroughputTPS = 全部请求（含失败）的 completion_tokens 之和 ÷ 墙钟。失败请求 0 产出但占墙钟——吞吐低可能是失败拖累而非 decode 慢，解读时先看失败数。Goodput ≤ Throughput 恒成立。
-4. **SLOTotal 含失败请求**：达标率分母 = 全部请求（失败=不达标）。非流式模式下 TPOT 不可测 → 配置 goodput 时非流式全不达标（设计如此，别用非流式测 goodput）。
+3. **吞吐是完整成功请求口径**：ThroughputTPS = `error==""` 且未主动取消请求的 completion_tokens 之和 ÷ 墙钟。失败/取消请求的完整原始指标仍落盘，但失败响应可能只有部分 usage，不能把不完整 token 混入主吞吐；档位同时落盘 completed/failed/cancelled 计数。
+4. **SLOTotal 含服务端失败、不含主动取消**：已发出但服务端/网络失败的请求计入 SLO 分母（失败=不达标）；工具主动取消属于控制行为，不计入完成数或 SLO 分母。非流式模式下 TPOT 不可测 → 配置 goodput 时非流式全不达标。
 5. **分位统一为线性插值**（2026-09-10 起）：ITL 分位（Go 侧 `percentile`）由最近秩 floor 取值改为线性插值，P50 偶数样本等于两中值平均——与分析侧 `median`、scenario 层 `aggregateShapes` 口径一致。此前同一报告内两者都叫 p99 但口径不同，现可比；与改动前的历史数据对比时 ITL 分位数会略升。
 6. **think_ms 保证 ≥ 0**：reasoning 首包晚于 content 首包（引擎时序异常）时钳 0 并记 `think_ms_negative` 告警，原始时序在 first_*_at 时间戳可核查。
 7. **usage 缺失的连锁**：服务端不回 usage 时 prompt/completion=0 + `usage_missing` 告警 → tokens_per_sec=0、TPOT 缺失、new_tokens 不更新（下轮会显示完整 prompt 而非增量）。有 usage_missing 告警的行，token 类指标全部不可信。
@@ -103,12 +106,24 @@ Report
 
 ## 开环到达（burstiness 与重整）
 
+## 请求阶段与完整采集
+
+所有场景请求都必须保留完整 `TurnMetrics`：主压测请求位于 `multiturn[]/concurrent[]`，预热与正确性金丝雀位于 `auxiliary_requests[]`。公共执行入口不再产生 `single[]`。
+`phase` 只决定请求用途，不决定是否落盘；失败、主动取消、usage 缺失和 stream broken 都是可分析的原始数据。
+
+- `warmup`：连接/首包预热，只不进入 benchmark KPI；
+- `benchmark`：主压测数据，按档位统计；
+- `correctness`：正确性判定请求，保留完整计时与 usage，但不进入性能 KPI；
+- `cancelled=true`：客户端主动取消，保留原始记录，不计入完成数、主吞吐和 SLO 分母。
+
+## 开环到达（burstiness 与重整）
+
 开环模式（`request_rate`/`rate_sweep`）的到达调度（scenario.go `poissonDelays`）：
 
 - 间隔 ~ Gamma(shape=`concurrent.burstiness`, scale=1/(rate·burstiness))：默认 1 = 标准泊松；<1 更突发；>1 趋向恒定间隔。
 - **延迟重整**：采样后按理论总量 (n−1)/rate 整体缩放——不同 seed 的到达总量严格一致，吞吐数据跨 run 可比的前提（对齐 vLLM bench serve 的 normalize_factor）。
 - 发射按**预生成的绝对时刻线**逐请求睡到点（补偿发射循环自身滞后），非"睡随机数再发"。
-- 消费 side：开环档位的负载口径 = 到达率 × 墙钟内的请求数；分析容量拐点时先核对完成数 ≈ 应到数（积压时完成率 < 到达率，此时吞吐数字不可直接当容量）。
+- 消费 side：开环档位的负载口径 = 到达率 × 墙钟内的请求数；分析容量拐点时先核对 `completed/failed/cancelled` 与应到请求数（积压时完成数可能在 drain 后才追平，不能只看最终完成率）。
 
 ## 主流口径对照（2026-09，对齐 GenAI-Perf/AIPerf、vLLM bench serve、LLMPerf、Inference-Perf）
 
@@ -119,7 +134,7 @@ Report
 | ITL | 相邻 content chunk 间隔，per-request 分位 | vLLM 池化所有请求 gap 后取分位；GenAI-Perf 为 per-response 值再聚合 | ⚠️ 有意差异：本工具是"单用户体验"视角（median-of-p99），与 vLLM 池化数值不可直接互比 |
 | E2E | 发出 → 流读完（含 [DONE]/usage 尾帧到达） | GenAI-Perf 剔除末尾 [DONE] | ⚠️ 偏差 ≤1 个尾帧（毫秒级），本工具略偏保守，不改 |
 | tokens_per_sec（per 请求） | 流式 = completion/(E2E−TTFT)，含思考段、不含 prefill | 行业 per-user TPS = output_tokens/e2e_latency（含 prefill） | ✅ 口径已贴近；与行业差一段 prefill，横比时行业值 ≈ completion/e2e_ms×1000 |
-| 吞吐 ThroughputTPS | 全部请求 completion 之和 ÷ 墙钟（warmup 不计入） | vLLM/LLMPerf 同；GenAI-Perf 用首请求→末响应（略窄） | ✅ 一致（物理口径，失败请求占墙钟见细则 3） |
+| 吞吐 ThroughputTPS | benchmark 档位内完整成功请求 completion 之和 ÷ 墙钟；warmup/correctness 不进入该档位 | vLLM/LLMPerf 同；GenAI-Perf 用首请求→末响应（略窄） | ✅ 客户端主口径；失败/取消计数另行落盘 |
 | goodput | 达标请求数/墙钟 + 达标 token/墙钟 | vLLM：满足已配置 SLO 的成功请求/时长（req/s） | ✅ 对齐（子集语义见细则 11）；token 口径是本工具扩展 |
 | cached_tokens | usage.prompt_tokens_details.cached_tokens | OpenAI 口径，vLLM 同名透传 | ✅ 一致 |
 | 思考模型 TTFT | 首 reasoning chunk（= TTFTReasoning） | Neuron 的 llmperf_reasoning.patch 同口径 | ✅ 一致 |

@@ -20,7 +20,8 @@ import (
 //     min_tps 即单流阈值（与 probe decode_speed 建议值、恢复探针同口径）。
 //   - 流需已出首 token（排除 TTFT/prefill 段）；刚出首 token 的流从**下一个采样窗**起
 //     参与判定（首个输出窗不满窗，避免半窗样本把速度算低）。
-//   - 计数器按流式 chunk 近似 token（主流引擎 1 chunk ≈ 1 token，与 ITL 口径一致）；
+//   - 计数器按流式 chunk 近似 token（不是 usage 精确 token 数；MTP/网关聚合时可能偏差）；
+//     因此该值只用于控制层提前止损，不能与 TurnMetrics.tokens_per_sec 当作同一指标。
 //     非流式请求没有实时信号，不参与判定。
 //   - 聚合速度保留为 stall.csv 观测面（agg_tps 列），不作为熔断依据。
 //

@@ -4,7 +4,7 @@
 # 见 mockserver.py 的 PROMPT_CHARS_THRESHOLD）的流式请求持续 6s+ 低于 min_tps=50 →
 # 每个场景都在窗口后熔断中止，用来验证「熔断 → 只中止当前场景 → 冷却 → 续跑下一场景」
 # 与 note / stall_trace 留痕。
-# 12d 段复用同一 mock 验证单流判据（12.10）：--turns single --concurrency 8 --stall-tps 20——
+# 12d 段复用同一 mock 验证单流判据（12.10）：--turns multi --concurrency 8 --stall-tps 20——
 # 8 路齐射各 5 tok/s，单流中位 ≈5 < 20（必须触发）、聚合 ≈40 ≥ 20（旧聚合口径不会触发）。
 # ⚠️ 档位与阈值耦合：改 filler 的长度口径（chars/token）时必须复核各档位生成的字符数
 # 仍 > 阈值——single.prompt_tokens=32 → ≈130 字符、multiturn turn1 ≈346 字符，目前都有裕量。
@@ -38,12 +38,6 @@ stall_guard:
   probe_factor: 0       # 8.2 探针关闭：本配置锁「纯计时冷却、两场景相继熔断续跑」的旧行为；
                         # 探针续跑/停整轮两条路径由 smoke.sh 第 12b/12c 节用 CLI 覆盖验证
 
-single:
-  runs: 1
-  prompt_tokens: [32]
-  max_tokens: 32
-  fixed_seed: true
-
 multiturn:
   sessions: 1
   turns: 2
@@ -53,7 +47,7 @@ multiturn:
   max_tokens: 32
 
 concurrent:
-  # 12d 单流判据用例（smoke.sh 以 --turns single --concurrency 8 --stall-tps 20 调用）：
+  # 单流判据用例（多轮 smoke 以 --turns multi --concurrency 8 --stall-tps 20 调用）：
   # 8 路齐射、每路 5 tok/s → 单流中位 ≈5 < 20 触发；聚合 ≈40 ≥ 20（旧聚合口径不会触发）。
   ramp: false           # 齐射：默认爬坡发车会让并发数上不去，测不出"多流同时劣化"
   runs_per_worker: 1

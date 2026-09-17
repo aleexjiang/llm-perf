@@ -17,12 +17,12 @@ import (
 
 // PlanItem 描述一个待执行场景（与 main 的执行计划项一一对应）。
 type PlanItem struct {
-	Name  string // single | multiturn | concurrent | concurrent-multi
-	Highs []int  // >1 的并发档位（concurrent 场景用）；空 = 纯单发场景
+	Name  string // multiturn | concurrent | concurrent-multi
+	Highs []int  // >1 的并发档位（concurrent 场景用）；空 = 单发多轮
 	MT    bool   // concurrent 场景是否跑多轮会话
 }
 
-// planTemplateOverhead chat template 开销估算系数（与 config 告警、ROADMAP 5.9 同一口径）。
+// planTemplateOverhead chat template 开销估算系数（与 config 告警、agent 多轮配置口径一致）。
 const planTemplateOverhead = 1.07
 
 // traceSingleSampleLimit 与场景层同名常量同口径：trace 单发档位最多取样会话数。

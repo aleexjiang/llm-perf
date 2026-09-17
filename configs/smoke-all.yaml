@@ -27,11 +27,6 @@ thinking:
     chat_template_kwargs: {enable_thinking: false}
   max_tokens_floor: 512
 
-single:
-  runs: 1
-  prompt_tokens: [500]
-  max_tokens: [32, 64]   # 列表写法冒烟（5.1 输出长度扫描）；thinking=on 时会被 floor(512) 收敛为单档，属预期
-
 multiturn:
   sessions: 1
   turns: 3

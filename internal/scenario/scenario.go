@@ -1,7 +1,7 @@
 // Package scenario 实现评测场景矩阵：
 //
-//	执行方式（单发/并发/开环到达率） × 轮次（单轮/多轮） × 思考模式（off/on，由 config.Thinking 展开），
-//	stream 为请求级开关（config.stream）。
+//	执行方式（单发多轮/多用户多轮/开环 RPS） × 思考模式（off/on，由 config.Thinking 展开），
+//	stream 为请求级开关（config.stream）；公共入口不再运行单发单轮。
 //
 // 横切能力（所有场景共用）：
 //   - warmup：场景开始前的预热请求（不计入统计，唯一内容避免污染被测前缀）
@@ -65,7 +65,7 @@ func Lookup(name string) (Scenario, bool) {
 }
 
 func init() {
-	Register(funcScenario{"single", Single})
+	// 公共 bench 只注册 agent 多轮路径；Single 保留为旧数据/内部回归辅助，不作为产品入口。
 	Register(funcScenario{"multiturn", Multiturn})
 	Register(funcScenario{"concurrent", Concurrent})
 }
@@ -109,18 +109,19 @@ func newEnv(ctx context.Context, cfg *config.Config, client *engine.Client) (*en
 			} else {
 				name := smetrics.DetectProviderName(sample)
 				if name == "" {
-					// 自研引擎指标名不带 vllm:/sglang: 前缀——不静默套错命名，显式告知
-					log.Printf("⚠️ 无法识别服务端指标命名（无 vllm:/sglang: 前缀，自研网关属预期）——按 vLLM 命名尝试，服务端指标大概率拿不到数")
-					name = "vllm"
-				}
-				e.srv = s
-				e.provider = smetrics.DetectProvider(sample)
-				e.kv = smetrics.ExtractKVCapacity(sample) // 12.12：KV 容量画像（未暴露则 nil）
-				n := len(sample.Counters) + len(sample.Gauges) + len(sample.Hists)
-				log.Printf("ℹ️ 服务端观测 %s 可用（%d 项指标，%s 命名）——额外采集一份作辅助，结论基线仍是客户端实测", cfg.MetricsPath, n, name)
-				if e.kv != nil {
-					// 容量归因的静态参照：报告会把「实测拐点 vs KV 上界」并列
-					log.Printf("ℹ️ %s", e.kv.Describe())
+					// 自研引擎指标名不带 vllm:/sglang: 前缀——未知命名只记录端点可达，
+					// 不静默套用 vLLM 语义，避免生成假 server_metrics 数据。
+					log.Printf("⚠️ 无法识别服务端指标命名（无 vllm:/sglang: 前缀）——跳过语义化 /metrics 采集，结论基线仍是客户端实测")
+				} else {
+					e.srv = s
+					e.provider = smetrics.DetectProvider(sample)
+					e.kv = smetrics.ExtractKVCapacity(sample) // 12.12：KV 容量画像（未暴露则 nil）
+					n := len(sample.Counters) + len(sample.Gauges) + len(sample.Hists)
+					log.Printf("ℹ️ 服务端观测 %s 可用（%d 项指标，%s 命名）——额外采集一份作辅助，结论基线仍是客户端实测", cfg.MetricsPath, n, name)
+					if e.kv != nil {
+						// 容量归因的静态参照：报告会把「实测拐点 vs KV 上界」并列
+						log.Printf("ℹ️ %s", e.kv.Describe())
+					}
 				}
 			}
 		}
@@ -188,6 +189,12 @@ func runOne(ctx context.Context, e *env, model string,
 		Thinking:  v.Enabled,
 		ExtraBody: v.ExtraBody,
 	})
+	if m != nil {
+		m.Phase = "benchmark"
+		if m.Error != "" && ctx.Err() != nil {
+			m.Cancelled = true
+		}
+	}
 	if err != nil {
 		log.Printf("    失败: %v", err)
 	} else {
@@ -253,21 +260,27 @@ const (
 // 单发矩阵的价值在"首轮长度分布"，取前 N 个即可代表分布，避免大数据集拖长单发矩阵。
 const traceSingleSampleLimit = 16
 
-func warmup(ctx context.Context, e *env, model string) {
+func warmup(ctx context.Context, e *env, model string) []*engine.TurnMetrics {
 	n := e.cfg.WarmupRequests
 	if n <= 0 {
-		return
+		return nil
 	}
 	vOff := config.ThinkingVariant{Name: "off", Enabled: false, ExtraBody: e.cfg.ThinkingFor(model).ExtraBodyOff}
 	now := time.Now().UnixNano()
+	out := make([]*engine.TurnMetrics, 0, n)
 	for i := 0; i < n; i++ {
 		msgs := []engine.Message{engine.UserMsg(warmupPromptTokens, now+int64(i), e.cfg.FillerLang)}
-		e.client.Chat(ctx, engine.ChatOptions{
+		m, _ := e.client.Chat(ctx, engine.ChatOptions{
 			Model: model, Messages: msgs, MaxTokens: warmupMaxTokens,
 			Stream: e.cfg.StreamEnabled(), ExtraBody: vOff.ExtraBody,
 		})
+		if m != nil {
+			m.Phase = "warmup"
+			out = append(out, m)
+		}
 	}
-	log.Printf("  预热 %d 条请求完成（不计入统计）", n)
+	log.Printf("  预热 %d 条请求完成（不计入主统计，完整数据已落盘）", len(out))
+	return out
 }
 
 // startWindow / finishWindow 场景窗口的服务端观测：开始快照+gauge 轮询 → 结束差值汇总。
@@ -448,17 +461,18 @@ func goodputOf(e *env, m *engine.TurnMetrics) bool {
 }
 
 // runCorrectness 数字转写金丝雀：验证服务返回的是真实生成内容（结构 200 但内容异常能被揪出）。
-func runCorrectness(ctx context.Context, e *env, model string) []report.CorrectnessRow {
+func runCorrectness(ctx context.Context, e *env, model string) ([]report.CorrectnessRow, []*engine.TurnMetrics) {
 	n := 0
 	if e.cfg.Correctness != nil {
 		n = e.cfg.Correctness.Samples
 	}
 	if n <= 0 {
-		return nil
+		return nil, nil
 	}
 	vOff := config.ThinkingVariant{Name: "off", Enabled: false, ExtraBody: e.cfg.ThinkingFor(model).ExtraBodyOff}
 	rng := rand.New(rand.NewSource(4242)) // 固定种子：金丝雀可复现
 	rows := []report.CorrectnessRow{}
+	metrics := make([]*engine.TurnMetrics, 0, n)
 	for i := 0; i < n; i++ {
 		num := 10000 + rng.Intn(89999)
 		var prompt string
@@ -468,6 +482,11 @@ func runCorrectness(ctx context.Context, e *env, model string) []report.Correctn
 			prompt = fmt.Sprintf("Reply with exactly this number and nothing else: %d", num)
 		}
 		m := runOne(ctx, e, model, []engine.Message{{Role: "user", Content: prompt}}, 16, vOff)
+		if m == nil {
+			continue
+		}
+		m.Phase = "correctness"
+		metrics = append(metrics, m)
 		reply := engine.TruncateRunes(m.ReplyText, 200)
 		rows = append(rows, report.CorrectnessRow{
 			Number: strconv.Itoa(num), Reply: reply,
@@ -481,17 +500,30 @@ func runCorrectness(ctx context.Context, e *env, model string) []report.Correctn
 			pass++
 		}
 	}
-	log.Printf("  正确性抽查: %d/%d 通过", pass, len(rows))
-	return rows
+	log.Printf("  正确性抽查: %d/%d 通过（完整指标已落盘）", pass, len(rows))
+	return rows, metrics
 }
 
 // runCorrectnessFor 金丝雀结果带上模型归属（数据按模型分区落盘时据此分桶）。
-func runCorrectnessFor(ctx context.Context, e *env, model string) []report.CorrectnessRow {
-	rows := runCorrectness(ctx, e, model)
+func runCorrectnessFor(ctx context.Context, e *env, model string) ([]report.CorrectnessRow, []*engine.TurnMetrics) {
+	rows, metrics := runCorrectness(ctx, e, model)
 	for i := range rows {
 		rows[i].Model = model
 	}
-	return rows
+	return rows, metrics
+}
+
+// appendAuxiliary 把不进入 benchmark KPI 的请求完整挂到报告；原始数据不丢，
+// 统计时由 phase 区分 warmup/correctness 与主压测。
+func appendAuxiliary(rep *report.Report, ms []*engine.TurnMetrics) {
+	for i, m := range ms {
+		if m == nil {
+			continue
+		}
+		rep.AuxiliaryRequests = append(rep.AuxiliaryRequests, report.AuxiliaryRequest{
+			Phase: m.Phase, Index: i, Metrics: m,
+		})
+	}
 }
 
 // forModel 切换到某模型生效的配置视图（model_overrides 差异覆盖）：
@@ -531,7 +563,7 @@ func Single(ctx context.Context, cfg *config.Config, client *engine.Client, mode
 			log.Printf("  %s: 无匹配的思考变体，跳过", model)
 			continue
 		}
-		warmup(ctx, e, model)
+		appendAuxiliary(rep, warmup(ctx, e, model))
 		for _, v := range th.Variants() {
 			maxToks := th.MaxTokensList(mc.Single.MaxTokens, v) // 输出长度扫描维度（列表多档 / 标量单档）
 			if e.trace != nil {
@@ -604,7 +636,9 @@ func Single(ctx context.Context, cfg *config.Config, client *engine.Client, mode
 				}
 			}
 		}
-		rep.Correctness = append(rep.Correctness, runCorrectnessFor(ctx, e, model)...)
+		rows, metrics := runCorrectnessFor(ctx, e, model)
+		rep.Correctness = append(rep.Correctness, rows...)
+		appendAuxiliary(rep, metrics)
 	}
 	return rep, nil
 }
@@ -728,10 +762,24 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 	}
 	applySLO(e, rep)
 	attachKVCapacity(e, rep)
+	models := filterModels(cfg.ActiveModels(), modelFilter)
+	for _, model := range models {
+		_, mc := forModel(e, cfg, model)
+		if len(mc.Thinking.Variants()) > 0 {
+			appendAuxiliary(rep, warmup(ctx, e, model))
+		}
+	}
 	before, poller, winStart := startWindow(ctx, e)
-	defer func() { rep.Server = finishWindow(e, before, poller, winStart) }()
+	serverDone := false
+	finishServer := func() {
+		if !serverDone {
+			rep.Server = finishWindow(e, before, poller, winStart)
+			serverDone = true
+		}
+	}
+	defer finishServer()
 
-	for _, model := range filterModels(cfg.ActiveModels(), modelFilter) {
+	for _, model := range models {
 		_, mc := forModel(e, cfg, model) // 该模型生效配置（model_overrides 差异覆盖）
 		mt := mc.Multiturn               // 遮蔽外层通用值（Note 仍描述通用基线；覆盖差异见 thinkingNoteSuffix）
 		if len(mt.Profiles) > 0 {
@@ -742,7 +790,6 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 			log.Printf("  %s: 无匹配的思考变体，跳过", model)
 			continue
 		}
-		warmup(ctx, e, model)
 		e.warnTraceWrap(mt.Sessions)
 		for _, v := range th.Variants() {
 			ctxAborted := false // 触发模型上下文上限：剩余会话必然同样超限，全部跳过
@@ -855,7 +902,17 @@ func Multiturn(ctx context.Context, cfg *config.Config, client *engine.Client, m
 				}
 			}
 		}
-		rep.Correctness = append(rep.Correctness, runCorrectnessFor(ctx, e, model)...)
+	}
+	// benchmark 服务端窗口在 correctness 之前结束；correctness 仍完整采集，但不混入 server 对账。
+	finishServer()
+	for _, model := range models {
+		_, mc := forModel(e, cfg, model)
+		if len(mc.Thinking.Variants()) == 0 {
+			continue
+		}
+		rows, metrics := runCorrectnessFor(ctx, e, model)
+		rep.Correctness = append(rep.Correctness, rows...)
+		appendAuxiliary(rep, metrics)
 	}
 	return rep, nil
 }
@@ -1069,30 +1126,45 @@ func Concurrent(ctx context.Context, cfg *config.Config, client *engine.Client, 
 	}
 	applySLO(e, rep)
 	attachKVCapacity(e, rep)
-	before, poller, winStart := startWindow(ctx, e)
-	defer func() { rep.Server = finishWindow(e, before, poller, winStart) }()
-	// 10.1 两源一致性：为交叉校验单开一对**更窄**的快照窗口——首个档位开始前 → 末个档位结束后。
-	// 刻意避开预热与金丝雀：场景窗口把它们算进服务端 token，而客户端侧的口径只含档位请求，
-	// 小数据集下这点偏差足以造出假告警（本轮观察窗口必须两侧同源）。
-	var chkBefore *smetrics.Sample
-	chkStarted := false
-	startSrcCheck := func() {
-		if chkStarted {
-			return
-		}
-		chkStarted = true
-		if e.srv != nil {
-			chkBefore, _ = e.srv.Scrape(ctx)
+	// 预热先对全部待测模型完成并落盘，随后才开启 benchmark 两源一致性窗口，
+	// 避免后续模型的 warmup 混入服务端 generation_tokens 差值。
+	models := filterModels(cfg.ActiveModels(), modelFilter)
+	for _, model := range models {
+		_, mc := forModel(e, cfg, model)
+		if len(mc.Thinking.Variants()) > 0 {
+			appendAuxiliary(rep, warmup(ctx, e, model))
 		}
 	}
-	defer func() { applySourceCheck(e, rep, chkBefore) }()
+	before, poller, winStart := startWindow(ctx, e)
+	serverDone := false
+	finishServer := func() {
+		if !serverDone {
+			rep.Server = finishWindow(e, before, poller, winStart)
+			serverDone = true
+		}
+	}
+	defer finishServer()
+
+	// 10.1 两源一致性窗口：只覆盖 benchmark 档位，不包含 warmup/correctness。
+	var chkBefore *smetrics.Sample
+	if e.srv != nil {
+		chkBefore, _ = e.srv.Scrape(ctx)
+	}
+	sourceCheckDone := false
+	finishSourceCheck := func() {
+		if sourceCheckDone {
+			return
+		}
+		sourceCheckDone = true
+		applySourceCheck(e, rep, chkBefore)
+	}
 	// 饱和止损判据一依赖 waiting 排队深度（场景级 GaugePoller）；观测层不可用时提前
 	// 说一声——waiting 判定不生效，墙钟上限（判据二）仍有效
 	if cfg.SaturationGuard.SatEnabled() && cfg.SaturationGuard.MaxWaiting > 0 && poller == nil {
 		log.Printf("⚠️ saturation_guard.max_waiting 需要 server_metrics 观测（waiting 排队深度不可得）——waiting 判定不生效，墙钟上限仍有效")
 	}
 
-	for _, model := range filterModels(cfg.ActiveModels(), modelFilter) {
+	for _, model := range models {
 		_, mc := forModel(e, cfg, model) // 该模型生效配置（model_overrides 差异覆盖）
 		cc := mc.Concurrent              // 遮蔽外层通用值：模型层可覆盖 levels/开环参数（Note 仍描述通用基线）
 		rates := openRates(cc)
@@ -1101,7 +1173,6 @@ func Concurrent(ctx context.Context, cfg *config.Config, client *engine.Client, 
 			log.Printf("  %s: 无匹配的思考变体，跳过", model)
 			continue
 		}
-		warmup(ctx, e, model)
 		for _, v := range th.Variants() {
 			tiers := th.MaxTokensList(cc.MaxTokens, v)
 			if len(cc.Mix) > 0 {
@@ -1110,40 +1181,53 @@ func Concurrent(ctx context.Context, cfg *config.Config, client *engine.Client, 
 			for _, maxTok := range tiers {
 				if rates != nil {
 					for _, rate := range rates {
-						startSrcCheck()
 						lv := runOpenRound(ctx, e, mc, model, v, rate, maxTok, poller)
 						logConcurrent(&lv)
 						rep.Concurrent = append(rep.Concurrent, lv)
 						if lv.Aborted != "" {
 							// 饱和止损：本到达率已饱和/超时，更高档只会更糟——停止后续档位
 							log.Printf("🛑 %s——停止后续到达率档位，已完成数据全部保留", lv.Aborted)
+							finishSourceCheck()
 							return rep, nil
 						}
 						if interrupted(ctx) {
 							log.Printf("🛑 已中止（中断或降速熔断）——停止新请求，已完成档位全部保留")
+							finishSourceCheck()
 							return rep, nil
 						}
 					}
 					continue
 				}
 				for _, level := range cc.Levels {
-					startSrcCheck()
 					lv := runClosedRound(ctx, e, mc, model, v, level, maxTok, poller)
 					logConcurrent(&lv)
 					rep.Concurrent = append(rep.Concurrent, lv)
 					if lv.Aborted != "" {
 						// 5.7 fail-fast / 止损：首轮挂大概率模型服务有问题，后续档位不必再跑
 						log.Printf("🛑 %s——停止后续档位与场景，已完成数据全部保留", lv.Aborted)
+						finishSourceCheck()
 						return rep, nil
 					}
 					if interrupted(ctx) {
 						log.Printf("🛑 已中止（中断或降速熔断）——停止新请求，已完成档位全部保留")
+						finishSourceCheck()
 						return rep, nil
 					}
 				}
 			}
 		}
-		rep.Correctness = append(rep.Correctness, runCorrectnessFor(ctx, e, model)...)
+	}
+	// benchmark 窗口在 correctness 之前结束，避免金丝雀 token 混入 server_metrics/source_check。
+	finishSourceCheck()
+	finishServer()
+	for _, model := range models {
+		_, mc := forModel(e, cfg, model)
+		if len(mc.Thinking.Variants()) == 0 {
+			continue
+		}
+		rows, metrics := runCorrectnessFor(ctx, e, model)
+		rep.Correctness = append(rep.Correctness, rows...)
+		appendAuxiliary(rep, metrics)
 	}
 	return rep, nil
 }
@@ -1672,13 +1756,24 @@ func finalizeLevel(e *env, lv *report.ConcurrentLevel, wall float64) {
 			if m == nil {
 				continue
 			}
-			throughput += float64(m.CompletionTokens)
+			if m.Cancelled {
+				lv.CancelledRequests++
+				continue
+			}
 			if e.cfg.EffGoodput() != nil {
+				// 服务端/网络失败是已发出的请求，仍进入 SLO 分母；主动取消是工具
+				// 控制行为，不是服务端结果，前面已单独排除。
 				lv.SLOTotal++
-				if goodputOf(e, m) {
-					meet++
-					meetTokens += float64(m.CompletionTokens)
-				}
+			}
+			if m.Error != "" {
+				lv.FailedRequests++
+				continue
+			}
+			lv.CompletedRequests++
+			throughput += float64(m.CompletionTokens)
+			if e.cfg.EffGoodput() != nil && goodputOf(e, m) {
+				meet++
+				meetTokens += float64(m.CompletionTokens)
 			}
 		}
 	}

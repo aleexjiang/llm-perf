@@ -12,26 +12,24 @@
 
 ## 场景矩阵
 
-模式 = `--turns` × `--concurrency` 两个参数的组合（**并发=1 即单发串行**）：
+模式 = 多轮会话 × 负载方式（公共入口不再支持单发单轮）：
 
 ```
-                --concurrency 1（单发）          --concurrency 2,4,...（并发）
---turns single  档位矩阵 ladder × runs          闭环并发（固定 prompt）
---turns multi   多轮会话逐轮滚动                 闭环并发（每用户独立会话）
+--concurrency 1       单发多轮：逐轮滚动 history
+--concurrency cfg     使用配置的 RPS/并发计划：多用户各自运行完整多轮会话
+--concurrency 2,4,8   闭环多用户多轮：固定会话数逐档采集
 ```
 
 ```bash
-./bench -c example.yaml --turns single --concurrency 1    # 单发单轮
-./bench -c example.yaml --turns multi  --concurrency 1    # 单发多轮
-./bench -c example.yaml --turns single --concurrency 1,2,4 # 并发爬坡（列表含 1 时先跑单发再跑 >1 档）
-./bench -c example.yaml                                    # 默认 turns=both concurrency=1
+./bench -c example.yaml --concurrency 1                 # 单发多轮
+./bench -c example.yaml --concurrency cfg               # 配置中的 RPS/并发主路径
+./bench probe -c example.yaml                            # 多模型兼容性探针
 ```
 
 | 场景 | 回答的问题 |
 |---|---|
-| `single`（conc=1, turns=single） | 单请求 TTFT / decode 速度随上下文长度如何增长？前缀缓存有没有命中？ |
-| `multiturn`（conc=1, turns=multi） | 多轮对话**滚**到 40k 时每轮 TTFT 如何？（模拟 agent：system + tool defs + 逐轮增长 history） |
-| `concurrent`（conc>1） | 并发 1→2→4→8→16 时 TTFT 衰减多少？整体吞吐峰值在哪？（turns=multi 时每个虚拟用户各自跑完整多轮会话；filler=模拟对话，trace 数据源=真实会话重放） |
+| `multiturn`（`--concurrency 1`） | 单用户多轮 history 滚动到深上下文时，每轮 TTFT、TPOT 与缓存行为如何？ |
+| `concurrent`（`--concurrency cfg`） | 多用户 agent 会话在不同 RPS/并发负载下的 TTFT、单流速度、失败与积压如何？（filler=模拟对话，trace=真实会话回放） |
 
 两个正交开关贯穿全部场景：
 
@@ -41,9 +39,11 @@
 - **流式**（`stream: true/false`，默认 `true`）：非流式只能测端到端延迟与 usage，
   TTFT/ITL/思考拆分不可测（JSON 中相应字段缺省）；用于 E2E 对照与网关缓冲问题排查
 
-并发场景支持两种负载模型（`concurrent` 段，互斥）：
+多用户多轮场景支持两种负载模型（`concurrent` 段，互斥）：
 
-- **闭环并发**（默认，`levels: [1,2,4,...]`）：N 个虚拟用户同时发车，测容量上限下的衰减；
+- **RPS 开环到达**（推荐主路径，`request_rate`/`rate_sweep`）：RPS 是新会话到达率；每个会话独立运行完整多轮，采集排队、TTFT、失败和 drain 数据；
+
+- **闭环并发**（辅助路径，`levels: [2,4,...]`）：N 个虚拟用户同时发车，测容量上限下的衰减；
   `duration_seconds` 改**时长制**（每档跑满墙钟秒数，`runs_per_worker` 忽略），配 `renew: true`
   （需先开 `multiturn: true`）时会话滚完 `turns` 轮换新种子重开——在途会话年龄铺满 0~turns 区间，
   测稳态吞吐与 KV 压力（soak 用，见[测试类别](#配置)）
@@ -70,7 +70,7 @@
 
 每个流式请求逐 chunk 记录时间戳，拆分为：
 
-- **TTFT**：首个任意 chunk（含排队 + prefill）
+- **TTFT**：首个含 reasoning/content token 的 chunk（含排队 + prefill；role-only/usage 空帧不计入）
 - **TTFT reasoning**：首个思考增量 chunk（`reasoning` / `reasoning_content` 双字段兼容）≈ prefill 完成时刻
 - **TTFT content**：首个可见内容 chunk = prefill + 思考
 - **思考时长**（`think_ms`）= TTFT content − TTFT reasoning；**每次对话（含多轮每一 turn）都有**
@@ -213,7 +213,8 @@ server_metrics: true   # 有 /metrics 就多采一份（vLLM 默认暴露）；�
 ```
 
 不可达或抓取失败时只打一行说明（`ℹ️ 未提供 /metrics …… 全部结论按客户端实测口径给出`），
-不中断、不降级措辞：报告里「数据来源」会如实写成「客户端实测（基线）；未启用或端点未提供 /metrics」。
+不中断、不降级措辞：外部分析应如实标注「客户端实测（基线）；未启用或端点未提供 /metrics」。
+未知指标命名不再静默套用 vLLM 语义，只记录端点可达并跳过语义化服务端数据。
 
 指标命名经 `MetricsProvider` 抽象，**按抓取样本的指标名前缀自动识别引擎**（`vllm:` → vLLM、
 `sglang:` → SGLang；无法识别时日志显式告警"按 vLLM 命名尝试，服务端指标大概率拿不到数"，
@@ -241,14 +242,14 @@ gauge 轮询自带健康度：从未成功或连续失败 ≥5 时 JSON 标记 `
 - **测试盐值**：`seed_salt: N`（CLI `--seed-salt`）给所有 prompt 种子叠加盐值——服务端 prefix cache
   是内存态且不会被挤出，同一配置重跑时"冷缓存"测量会被上次测试污染；**每次测试递增盐值**，
   或重启服务端清缓存（二选一）
-- **预热**：`warmup_requests: N` 每场景开始前发 N 条小请求暖连接（不计入统计，唯一内容不污染缓存对照）
-- **连接层重试**：`retry: {max_attempts: 2, backoff_ms: 300}` 对瞬时失败（reset/5xx/429）重试，默认关闭；重试留痕 warnings/retry_count
-- **降速熔断**：`stall_guard: {min_tps: 10, window_seconds: 600, cooldown_seconds: 300}` 按**单流 decode 速度中位**
+- **预热**：`warmup_requests: N` 每场景开始前发 N 条小请求暖连接；完整 `TurnMetrics` 落在 JSON 的 `auxiliary_requests[]`（phase=`warmup`），不进入 benchmark KPI
+- **连接层重试**：`retry: {max_attempts: 2, backoff_ms: 300}` 对瞬时失败（reset/5xx/429）重试，默认关闭；重试留痕 warnings/retry_count；失败/取消原始请求均保留
+- **降速熔断**：`stall_guard: {min_tps: 10, window_seconds: 600, cooldown_seconds: 300}` 按**单流流式增量速率近似值中位**；该值按 chunk 计数，是控制层止损信号，不等同于 usage 精确 token/s
   （各在飞流窗口内输出增量 / 时长，取中位——并发劣化时聚合值会掩盖单流卡顿）判定服务端退化，持续低于阈值
   即中止**当前场景**（不是整轮），冷却后继续下一个场景；已完成数据照常落盘，报告 note 标注熔断原因与现场速度。
   空闲与纯 prefill（未出首 token）不参与判定。CLI `--stall-tps/--stall-window/--stall-cooldown`、`--no-stall-guard`
 - **goodput**：`goodput: {ttft_ms: 2000, tpot_ms: 100}` 定义 SLO，concurrent 结果输出达标数与有效吞吐
-- **正确性抽查**：`correctness: {samples: 8}` 数字转写金丝雀，防"HTTP 200 但内容异常"的假成功
+- **正确性抽查**：`correctness: {samples: 8}` 数字转写金丝雀，防"HTTP 200 但内容异常"的假成功；判定结果在 `correctness[]`，完整请求指标在 `auxiliary_requests[]`（phase=`correctness`），不进入性能 KPI
 
 ## 快速开始
 
@@ -261,18 +262,17 @@ scp bin/bench-linux-amd64 configs/example.yaml 堡垒机:~/llm-perf/
 mv bench-linux-amd64 bench && chmod +x bench
 # 端点/key 直接写在配置文件里（endpoint + api_key 字面量；该配置勿入库）
 ./bench probe -c example.yaml       # ① 先探针：确认引擎兼容性与思考开关参数
-./bench -c example.yaml --turns single --concurrency 1   # ② 小档位验证解析正确性（改小 prompt_tokens/max_tokens）
-./bench -c example.yaml                                  # ③ 默认 turns=both concurrency=1（单发全矩阵）
+./bench -c example.yaml --concurrency 1                  # ② 单发多轮：先验证 history/usage/缓存采集
+./bench -c example.yaml --concurrency cfg                # ③ 多用户多轮：按配置的 RPS/并发计划采集
 ```
 
 ## 输出
 
-每个场景落一个 JSON 文件（含全部原始数据：逐 run 计时、逐 chunk 派生指标、usage token）：
+每个多轮场景落一个 JSON 文件（含全部原始数据：逐 turn 计时、逐 chunk 派生指标、usage token、辅助请求）：
 
 ```bash
-./bench -c example.yaml                                  # → output/single-<ts>.json multiturn-<ts>.json
-./bench -c example.yaml --turns single --concurrency 1 -o r1.json   # → 指定输出文件名
-./bench -c example.yaml --turns both --concurrency 1,2,4 -o results/  # → 指定输出目录
+./bench -c example.yaml --concurrency 1                 # → output/multiturn-<ts>.json
+./bench -c example.yaml --concurrency cfg -o results/   # → multiturn + concurrent-multi 数据目录
 ```
 
 **按模型分区**：配置了多个模型时，数据按模型分区落 `<output_dir>/<模型>/<场景>-<ts>.json`
@@ -283,19 +283,20 @@ mv bench-linux-amd64 bench && chmod +x bench
 output/
 ├── run.log
 ├── DeepSeek-V4-Flash-0731/
-│   ├── single-<ts>.json
-│   └── multiturn-<ts>.json
+│   ├── multiturn-<ts>.json
+│   └── concurrent-<ts>.json
 └── Qwen3.8-27B/
-    ├── single-<ts>.json
-    └── multiturn-<ts>.json
+    ├── multiturn-<ts>.json
+    └── concurrent-<ts>.json
 ```
 
 多模型 + `-o xxx.json` 会报错（一个文件装不下多个分区），请给目录。
 
 JSON 结构见 `internal/report/report.go` 与 [docs/data-contract.md](docs/data-contract.md)：
-`single` / `multiturn` / `concurrent` 三个数组，元素分别为档位 / 会话 / 并发档位，
-每条请求是 `engine.TurnMetrics`（流式含原始 chunk 序列 `content_times_ms`，供峰值秒桶吞吐、
-ITL 抖动等外部分析）；观测层开启时附 `server_metrics` 汇总（缓存命中率/排队/prefill-decode 分解）
+`multiturn` / `concurrent` 两个主场景数组，元素分别为会话 / 并发档位，
+每条主压测请求是 `engine.TurnMetrics`（含 `phase=benchmark`；流式含原始 chunk 序列 `content_times_ms`，
+供 chunk 间隔和抖动等外部分析）；warmup/correctness/失败/取消请求也完整保留，辅助请求位于
+`auxiliary_requests[]`。观测层开启时附 `server_metrics` 汇总（缓存命中率/排队/prefill-decode 分解）
 与逐请求 `server_counter_delta`。降速采样序列落旁文件 `*.stall.csv`。
 
 **分析在工具之外**：聚合、判级、画图由消费方完成。体验基线三档阈值（`slo_baseline`）随 JSON

@@ -1,4 +1,4 @@
-# 速率扫描冒烟（9.2 报告侧 + 10.1 两源一致性）：开环 rate_sweep 多档 + goodput + 观测层。
+# 速率扫描冒烟：开环 rate_sweep 多档 + goodput + 观测层原始数据。
 # 与 smoke-openloop.yaml 分开的原因：那份断言「request_rate == 4 且总请求 ≤ num_prompts」
 # 的固定档语义，这里要的是多档扫描（吞吐拐点/goodput 上限的交付物形态）。
 endpoint: "http://127.0.0.1:18099/router/v1"
@@ -23,12 +23,6 @@ thinking:
   extra_body_off:
     chat_template_kwargs: {enable_thinking: false}
 
-single:
-  runs: 1
-  prompt_tokens: [500]
-  max_tokens: 32
-  fixed_seed: true
-
 multiturn:
   sessions: 1
   turns: 2
@@ -38,8 +32,8 @@ multiturn:
   max_tokens: 32
 
 concurrent:
-  multiturn: false
-  rate_sweep: [2, 8]      # 两档到达率：报告侧出「速率扫描」表 + 拐点/goodput 上限结论
+  multiturn: true
+  rate_sweep: [2, 8]      # 两档到达率：外部分析据此计算容量曲线与 goodput 上限
   num_prompts: 4
   max_concurrency: 2
   prompt_tokens: 300

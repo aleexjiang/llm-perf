@@ -12,11 +12,6 @@ models: ["mock-model-a"]
 thinking:
   mode: "off"
 
-single:
-  runs: 1
-  prompt_tokens: [500]
-  max_tokens: [32]
-
 multiturn:
   turns: 4
   system_tokens: 100

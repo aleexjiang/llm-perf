@@ -6,6 +6,7 @@ package config
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -585,6 +586,9 @@ func (c *Config) ForModel(model string) *Config {
 		if s.MaxConcurrency > 0 {
 			m.MaxConcurrency = s.MaxConcurrency
 		}
+		if s.Burstiness > 0 {
+			m.Burstiness = s.Burstiness
+		}
 		v.Concurrent = m
 	}
 	if ov.MaxPromptTokens != nil {
@@ -693,12 +697,12 @@ type Config struct {
 	// Test 本轮测试类别（benchmark | performance | soak，留空 = performance）。
 	// 只切换报告的**结论区口径**，不改测量本身：三者共用同一套数据与判据
 	// （指标层已冻结为四个数，见 docs/testing-architecture.md）——类别是表达层的焦点声明，
-	// 不是第二套管线。soak 的时长制原语见 ROADMAP 10.5，落地前 soak 结论区只陈述
+	// 不是第二套管线。soak 的时长制原语见 docs/scenario-guide.md，采集层只保留原始证据，
 	// 现有可得证据（事故/提前终止/canary），缺证据处如实写 NA。
 	Test string `yaml:"test"`
 
-	// MaxPromptTokens 上下文截止（tokens）：>0 时所有请求的 prompt 规模都不超过该值。
-	// single 档位超限截到该值并去重；多轮会话 ctx 到顶后停止加轮。0 = 不限制。
+	// MaxPromptTokens 上下文截止（tokens）：>0 时所有多轮请求的 prompt 规模都不超过该值；
+	// 多轮会话 ctx 到顶后停止加轮。0 = 不限制。
 	// CLI --max-ctx 可覆盖。建议同时参考 bench probe 报告的模型 max_model_len。
 	MaxPromptTokens int `yaml:"max_prompt_tokens"`
 
@@ -1060,8 +1064,8 @@ func Load(path string) (*Config, error) {
 	if cfg.Concurrent.RequestRate < 0 {
 		return nil, fmt.Errorf("concurrent.request_rate 不能为负")
 	}
-	if cfg.Concurrent.Burstiness < 0 {
-		return nil, fmt.Errorf("concurrent.burstiness 不能为负（1=标准泊松；<1 更突发；>1 趋向均匀）")
+	if cfg.Concurrent.Burstiness < 0 || math.IsNaN(cfg.Concurrent.Burstiness) || math.IsInf(cfg.Concurrent.Burstiness, 0) {
+		return nil, fmt.Errorf("concurrent.burstiness 必须是有限非负数（1=标准泊松；<1 更突发；>1 趋向均匀）")
 	}
 	if cfg.Concurrent.RampFactor < 0 {
 		return nil, fmt.Errorf("concurrent.ramp_factor 不能为负（默认 2；1 = 逐个串行发车，无爬坡意义）")
@@ -1072,6 +1076,12 @@ func Load(path string) (*Config, error) {
 	}
 
 	// ── 输入合理性校验：错误在开跑前暴露，而不是跑完才发现 ──
+
+	// single 结构暂保留用于读取旧配置/旧内部测试，但公共 bench 入口不再执行；
+	// 显式配置时提醒用户迁移到 multiturn/concurrent，避免以为单发单轮仍会运行。
+	if len(cfg.Single.PromptTokens) > 0 || cfg.Single.Runs > 0 || len(cfg.Single.MaxTokens) > 0 {
+		cfg.Warnings = append(cfg.Warnings, "single 配置已废弃且不会由公共 bench 执行，请迁移到 multiturn 或 concurrent")
+	}
 
 	// 单发档位：拒绝非正值；排序去重（被修正时提示）；相邻增量 <10% 拒绝
 	if len(cfg.Single.PromptTokens) > 0 {
@@ -1347,7 +1357,7 @@ func Load(path string) (*Config, error) {
 		}
 		if cfg.Dataset.Mode == "trace" {
 			return nil, fmt.Errorf(
-				"duration_seconds 暂不支持 trace 回放（会话续跑 trace 侧暂缓，filler 先行——ROADMAP 10.5）；请改用 filler 数据源")
+				"duration_seconds 暂不支持 trace 回放（会话续跑需要 filler 形状）；请改用 filler 数据源")
 		}
 		if cfg.Concurrent.Multiturn && !cfg.Concurrent.Renew {
 			return nil, fmt.Errorf(
@@ -1673,14 +1683,9 @@ func (c *Config) MultiturnMaxDepth() int {
 	return 0
 }
 
-// LargestPromptTokens 返回配置中最大的单请求 prompt 规模（三场景取最大，用于超时提示与 probe 对比）。
+// LargestPromptTokens 返回多轮/并发配置中最大的 prompt 规模，用于超时提示与 probe 对比。
 func (c *Config) LargestPromptTokens() int {
 	mx := 0
-	for _, t := range c.Single.PromptTokens {
-		if t > mx {
-			mx = t
-		}
-	}
 	if est := c.MultiturnMaxDepth(); est > mx {
 		mx = est
 	}

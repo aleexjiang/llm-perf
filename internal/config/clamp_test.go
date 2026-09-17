@@ -42,16 +42,14 @@ func TestClampDisabled(t *testing.T) {
 func TestLargestPromptTokens(t *testing.T) {
 	cfg := &Config{
 		MaxPromptTokens: 262_144,
-		Single:          Single{PromptTokens: []int{4_000, 1_000_000}},
-		Multiturn:       Multiturn{SystemTokens: 800, ToolDefsTokens: 800, Turns: 4, TurnTokens: 500},
+		Multiturn:       Multiturn{SystemTokens: 800, ToolDefsTokens: 800, Turns: 4, TurnTokens: 100_000},
 		Concurrent:      Concurrent{PromptTokens: 10_240},
 	}
-	// single 最大 1M 被截到 262144；multiturn 估计 4800；concurrent 10240
+	// 多轮最大深度超过模型截止，被截到 262144；并发 prompt 为 10240。
 	if got := cfg.LargestPromptTokens(); got != 262_144 {
 		t.Fatalf("LargestPromptTokens=%d ≠ 262144", got)
 	}
 	cfg2 := &Config{
-		Single:     Single{PromptTokens: []int{4_000}},
 		Multiturn:  Multiturn{SystemTokens: 800, ToolDefsTokens: 800, Turns: 4, TurnTokens: 500},
 		Concurrent: Concurrent{PromptTokens: 10_240},
 	}
