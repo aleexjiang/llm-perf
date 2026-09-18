@@ -665,7 +665,14 @@ system + user + 当前模型 assistant
 - 报告标记 `synthetic_context=true` 和目标/实际 token 数；
 - 不把 synthetic context 宣称为真实工具调用性能。
 
-synthetic context 的消息 role、插入位置和是否需要工具协议仍需单独拍板。若坚持完全不出现 tool role，则应把它定义为显式 context payload，而不是伪装成真实 tool 结果。
+> 已拍板（2026-09-18）：方案 A，synthetic context 拼进当前 user 消息内部（`<context>` 块前缀 + 真实问题），不伪造 assistant/tool 链。
+
+**两条 cache 关键约束（方案 A 的修正，来自复盘发现）：**
+
+1. **synthetic context 只能尾部注入，严禁进 system 消息**。prefix cache 按 token 块前缀匹配，从第一个不同 token 起后续全部失效；system 位于序列最前端，每轮往 system 追加会使其后整段真实对话历史逐轮失效，等于没有会话内 cache。真实 trace 相邻快照 prefix 重合率 P50=1.0 正是因为真实会话是尾部 append-only。拼进 user 消息尾部后，turn N+1 序列 = turn N 完整序列 + 新增部分，前缀完全保留。
+2. **system 基座必须会话开始时一次定型，全程不变**。base context 用固定 seed 确定性生成，禁止包含时间戳、随机数、轮次计数等逐轮变化内容，否则同样从第 0 个 token 起失效。
+
+由方案 A 顺带保证的性质：不产生连续 user 消息（与异常形态清洗规则一致）；三种压测模式消息协议统一为纯 chat（concurrency 直接用 ShareGPT 也是纯 chat），不因消息构造差异引入额外变量。
 
 ### 13.5 prefix cache 测量口径
 
