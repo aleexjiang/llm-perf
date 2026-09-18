@@ -60,11 +60,12 @@ bench user -c customer.yaml --users 8
 
 语义：
 
-- `--users 1`：单用户顺序执行完整 trace 会话；
-- `--users N`：N 个独立用户并行执行各自 trace 会话；
-- 每个用户保留自己的 history；
-- `assistant`、`tool` 消息按 `replay_mode: full` 进入后续上下文；
-- 重点观察真实用户会话中的 TTFT、decode、失败、取消和上下文增长；
+- `--users 1`：单用户顺序执行生成式用户会话；
+- `--users N`：N 个独立用户并行执行各自生成式会话；
+- trace 只提供清洗后的用户输入和会话形状统计，不直接回放历史 `assistant`/`tool`；
+- 每个用户保留自己的 history；当前模型生成的 `assistant` 回复在下一轮原样进入 history；
+- `tool` 原始消息从运行时输入移除，重/中/轻会话需要的上下文形状由 profile 和确定性 synthetic context 构造；
+- 重点观察真实用户会话中的 TTFT、decode、失败、取消、prefix cache 和上下文增长；
 - 不以 RPS 或固定并发容量对齐为主要目标。
 
 数据结构以 `sessions[]` 为主。
@@ -127,16 +128,24 @@ bench concurrency -c customer.yaml \
 
 ### 4.1 正式压测数据
 
-正式压测统一使用脱敏 trace 或由 trace 提取的请求集：
+正式压测统一使用脱敏 trace 提取的用户输入与会话形状 profile，或由生成式会话导出的固定请求集：
 
 ```yaml
 trace:
   path: "/data/customer-sessions.jsonl.gz"
   format: "sharegpt"
-  replay_mode: "full"
+  replay_mode: "user_shape"
 ```
 
-用户会话模式使用完整 session；RPS 和 concurrency 模式使用独立 request sample。
+`user_shape` 不是把历史 `assistant`/`tool` 原样回放，而是：
+
+- 保留清洗后的 user 输入和 session 轮次统计；
+- 移除 trace 中的 `tool` 消息；
+- 运行时使用被测模型生成的 `assistant` 回复；
+- 按 profile 构造必要的 synthetic context；
+- 记录 profile、seed 和清洗统计，保证会话形状可追溯。
+
+用户会话模式使用生成式 session；RPS 需要明确采用 live session 到达还是固定 request snapshot；concurrency 与 vLLM 对比使用独立 request sample。
 
 ### 4.2 统一请求集
 
@@ -348,11 +357,11 @@ bench concurrency -c config.yaml --max-concurrency 1,2,4,8
 以下问题在实现前需要确定：
 
 1. `user` 多用户模式是固定用户数跑完指定 sessions，还是支持持续时长；
-2. RPS 模式是否使用独立 request sample，还是允许 trace session 的每个 turn 展开成请求；
+2. RPS 模式是 live session 到达，还是使用生成式 session 导出的固定 request snapshot；
 3. `concurrency` 是否只支持 `request_rate=inf`，还是同时保留有限 RPS + `max_concurrency`；
-4. vLLM 对比使用 customer trace request set，还是严格复刻 vLLM `random` 数据集参数；
-5. trace 中含多轮消息时，如何抽取 RPS/并发模式的独立请求；
-6. 输入长度、输出长度是否从 trace usage 读取，还是从配置指定目标范围；
+4. vLLM 对比使用 customer trace-derived request set，还是严格复刻 vLLM `random` 数据集参数；
+5. synthetic context 是否只模拟上下文体积，还是同时模拟明确的检索/工具结果语义；
+6. 输入长度、输出长度是否从 trace 统计读取，还是从 profile 指定目标范围；
 7. 多模型是否使用同一请求集，还是每个模型单独绑定 request set；
 8. 是否删除旧 `single`、`multiturn`、`concurrent` 场景名，还是保留一段时间的迁移别名；
 9. `request_rate=inf` 在配置和 JSON 中采用什么表示；
@@ -368,6 +377,8 @@ bench concurrency -c config.yaml --max-concurrency 1,2,4,8
 - 不在没有统一请求集的情况下宣称与 vLLM 数字严格可比。
 
 ## 12. `trace-real-128.json` 会话形状分析
+
+本节统计结果只用于提取用户输入和会话形状，不代表运行时应原样回放 trace 中的 `assistant`/`tool` 内容。历史 `assistant` 是旧模型输出，不能作为当前被测模型下一轮的真实回复。
 
 分析样本：
 
@@ -512,3 +523,97 @@ session_uniform：先等概率选 session，再选该 session 回合
 4. trace 中没有完整的服务端生成参数时，vLLM 对比需要另行指定输出预算或按历史输出长度分桶；
 5. llm-perf 与 vLLM 必须使用同一份 request set、同一输入消息、同一输出预算、同一请求数和同一调度参数，才能做严格数字比较；
 6. 仅一边使用 customer trace、另一边使用 vLLM random dataset 时，只能比较趋势，不能宣称数字等价。
+
+## 13. 生成式用户会话与动态 prefix cache
+
+### 13.1 trace 的新定位
+
+`trace-real-128.json` 不再作为完整消息回放输入，而作为**会话形状样本**：
+
+- 保留清洗后的 user 输入文本或其脱敏模板；
+- 提取轻/中/重会话的轮次、首轮上下文、总上下文和每轮增量分布；
+- 提取 assistant/tool 的长度统计，仅用于估计上下文形状；
+- 不把 trace 中旧模型生成的 assistant 回复放入当前被测模型的下一轮 history；
+- 不把 trace 中的 tool 消息原样放入运行时请求。
+
+### 13.2 初始 profile 划分
+
+第一版可以先用有效 user 轮次做粗分层，后续再用 prompt token 和上下文增量校准：
+
+| profile | 初始轮次 | 原始样本占比（清洗前参考） | 定位 |
+|---|---:|---:|---|
+| `light` | 2~4 轮 | 58/128，约 45.3% | 短用户会话 |
+| `medium` | 5~8 轮 | 37/128，约 28.9% | 典型用户会话 |
+| `heavy` | 9~32 轮 | 33/128，约 25.8% | 长会话/复杂任务 |
+
+这三个比例只是第一版先验。正式实现应在连续 user 异常清洗后重新计算，并检查各 profile 的 prompt token 分布，避免只按轮次数量而忽略上下文大小。
+
+### 13.3 运行时会话生成
+
+一次生成式会话按以下顺序执行：
+
+```text
+选择 profile 和 session seed
+→ 构造稳定的 system/base context
+→ 生成当前 user 输入
+→ 请求被测模型
+→ 取得被测模型真实 assistant 回复
+→ 将真实 assistant 回复追加到 history
+→ 进入下一轮
+```
+
+关键规则：
+
+1. 下一轮必须使用**当前被测模型真实生成的 assistant 回复**，不能使用 trace 中旧 assistant；
+2. 当前模型的响应差异会自然改变下一轮 prompt，也会自然改变后续 prefix cache 命中；
+3. 同一 session 内保持消息序列和序列化方式稳定，确保前一轮已经处理过的前缀可以被服务端复用；
+4. profile 只决定会话形状和输入分布，不直接伪造模型输出；
+5. `max_tokens`、停止条件和上下文上限必须记录到报告，不能从旧 assistant 文本反推。
+
+### 13.4 tool 的处理边界
+
+运行时移除 trace tool 不等于重度会话不需要上下文增长。需要区分两种方案：
+
+#### 方案 A：严格无 tool
+
+只保留：
+
+```text
+system + user + 当前模型 assistant
+```
+
+优点是协议简单、行为稳定；缺点是没有工具结果后，重度会话的上下文增长会明显小于原始 WorkBuddy 形状，无法复现 trace 中 tool 占据的大量上下文。
+
+#### 方案 B：合成 context，但不回放 trace tool
+
+根据 trace 的 tool 结果长度和每轮上下文增量统计，生成确定性的 synthetic context；它不是原始工具结果，也不要求真实工具执行，只用于复现重/中/轻会话的上下文体积。
+
+建议第一版采用：
+
+- `light`：不注入或只注入很小的 synthetic context；
+- `medium`：按 profile 注入中等 context；
+- `heavy`：按 trace 分布注入较大的 context；
+- synthetic context 使用固定 seed 生成，内容脱敏、不可携带业务秘密；
+- 报告标记 `synthetic_context=true` 和目标/实际 token 数；
+- 不把 synthetic context 宣称为真实工具调用性能。
+
+synthetic context 的消息 role、插入位置和是否需要工具协议仍需单独拍板。若坚持完全不出现 tool role，则应把它定义为显式 context payload，而不是伪装成真实 tool 结果。
+
+### 13.5 prefix cache 测量口径
+
+生成式用户模式测量的是：
+
+```text
+同一 session 内：前一轮 prompt 的稳定前缀
++ 当前模型真实 assistant 回复之后形成的新 history
++ 下一轮 user 输入
+```
+
+因此它是动态 cache：
+
+- prefix 命中受当前模型真实回复影响；
+- 不同模型会形成不同的后续 history；
+- 同一 trace profile 不能保证不同模型拥有完全相同的 token 前缀；
+- 结果重点是各模型在真实生成链下的 cache 行为，而不是冻结输入下的纯模型对比。
+
+如果需要与 vLLM `bench serve` 做严格数值对比，仍需另行导出冻结 request snapshot；不能把生成式 live user 结果和 frozen request benchmark 混成同一张结论表。
