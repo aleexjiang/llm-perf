@@ -650,8 +650,65 @@ type Config struct {
 	// 文本由经典书语料按 seed 生成，assistant 使用被测模型真实回复（动态 prefix cache）。
 	User User `yaml:"user"`
 
+	// RequestSet 冻结独立请求快照的数据源（rps/concurrency 模式共用）。
+	RequestSet RequestSet `yaml:"request_set"`
+	// RPS rps 模式配置（开环到达，冻结请求快照）。
+	RPS RPS `yaml:"rps"`
+	// Concurrency concurrency 模式配置（对齐 vLLM bench serve，固定在飞上限齐射）。
+	Concurrency ConcurrencyCfg `yaml:"concurrency"`
+
 	// 运行时解析
 	APIKey string `yaml:"-"`
+}
+
+// RequestSet 请求集数据源。
+type RequestSet struct {
+	// ShareGPTPath ShareGPT 数据集路径（.json/.json.gz）；rps/concurrency 的请求来源。
+	// 口径与 vLLM bench serve --dataset-name sharegpt 对齐：prompt=截至最后一条 user 的
+	// history，输出预算=其后 assistant 回复的估算 token，seed 抽样。
+	ShareGPTPath string `yaml:"sharegpt_path"`
+	// NumPrompts 总请求数（默认 100；样本不足时确定性回绕）。
+	NumPrompts int `yaml:"num_prompts"`
+	// Seed 抽样种子（与 vLLM --seed 对齐：同 seed 同样本序，跨工具可比的前提）。
+	Seed int64 `yaml:"seed"`
+	// MaxOutputTokens 单请求输出预算上限（0=不设上限；ShareGPT 存在超长回复）。
+	MaxOutputTokens int `yaml:"max_output_tokens"`
+}
+
+// RPS rps 模式参数。
+type RPS struct {
+	// Rates 到达率档位（req/s），多档 = 排队-延迟曲线扫描。
+	Rates []float64 `yaml:"rates"`
+	// MaxConcurrency 在飞请求上限（0=不限；防到达率超容量时无限堆积）。
+	MaxConcurrency int `yaml:"max_concurrency"`
+	// Burstiness 到达突发度（1=泊松；<1 更突发；>1 更均匀），默认 1。
+	Burstiness float64 `yaml:"burstiness"`
+}
+
+// GetBurstiness 突发度（未配置 = 1 标准泊松）。
+func (r RPS) GetBurstiness() float64 {
+	if r.Burstiness <= 0 {
+		return 1
+	}
+	return r.Burstiness
+}
+
+// ConcurrencyCfg concurrency 模式参数（对齐 vLLM bench serve）。
+type ConcurrencyCfg struct {
+	// Levels 在飞请求数档位（每档一轮：N 在飞齐射，跑完 num_prompts）。
+	Levels []int `yaml:"levels"`
+	// RequestRate 有限到达率 + 在飞上限的组合（0 = inf：尽快发起，仅 max_concurrency 控制）。
+	RequestRate float64 `yaml:"request_rate"`
+	// Burstiness 有限到达率下的到达分布（默认 1 泊松）。
+	Burstiness float64 `yaml:"burstiness"`
+}
+
+// GetBurstiness 突发度（未配置 = 1）。
+func (c ConcurrencyCfg) GetBurstiness() float64 {
+	if c.Burstiness <= 0 {
+		return 1
+	}
+	return c.Burstiness
 }
 
 // UserCfg user 模式配置。
@@ -766,6 +823,9 @@ func Load(path string) (*Config, error) {
 		}
 		if cfg.User.ProfilePath != "" && !filepath.IsAbs(cfg.User.ProfilePath) {
 			cfg.User.ProfilePath = filepath.Join(filepath.Dir(path), cfg.User.ProfilePath)
+		}
+		if cfg.RequestSet.ShareGPTPath != "" && !filepath.IsAbs(cfg.RequestSet.ShareGPTPath) {
+			cfg.RequestSet.ShareGPTPath = filepath.Join(filepath.Dir(path), cfg.RequestSet.ShareGPTPath)
 		}
 	}
 
@@ -956,6 +1016,10 @@ func Load(path string) (*Config, error) {
 	// user 模式默认输出长度（仅在启用 user 场景时填充，避免无关场景被误警告）
 	if cfg.User.ProfilePath != "" && len(cfg.User.MaxTokens) == 0 {
 		cfg.User.MaxTokens = IntList{256}
+	}
+	// 请求集默认值
+	if cfg.RequestSet.NumPrompts == 0 {
+		cfg.RequestSet.NumPrompts = 100
 	}
 	// 新增能力默认值与校验
 	if cfg.MetricsIntervalMS <= 0 {

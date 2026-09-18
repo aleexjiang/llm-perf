@@ -88,42 +88,8 @@ type env struct {
 
 func newEnv(ctx context.Context, cfg *config.Config, client *engine.Client) (*env, error) {
 	e := &env{cfg: cfg, client: client, perReqSrv: true}
-	if cfg.ServerMetrics {
-		s := smetrics.NewScraperAt(cfg.Endpoint, cfg.MetricsPath)
-		// /metrics 常与业务接口同一套认证保护——认证格式与 chat 请求保持一致
-		s.Auth = auth.Auth{Scheme: cfg.AuthScheme, Header: cfg.AuthHeader}
-		s.APIKey = cfg.APIKey
-		// 判定口径与 probe 一致：HTTP 200 但 0 项 vLLM 指标（网关占位响应）也算不可用，
-		// 否则观测层会带着空指标集白跑，报告里出现假"可用"
-		ok, detail := s.Available(ctx)
-		if !ok {
-			// /metrics 是引擎实现细节，不是标准端点（网关照不到、代理剥掉都属常见形态）。
-			// 客户端实测是本工具唯一的基线口径，服务端观测只是可选增强——
-			// 因此这里既不是错误，也不是"降级"：缺它不影响任何结论。
-			log.Printf("ℹ️ 未提供 %s（%v）——全部结论按客户端实测口径给出", cfg.MetricsPath, detail)
-		} else {
-			sample, err := s.Scrape(ctx)
-			if err != nil {
-				log.Printf("ℹ️ %s 抓取失败（%v）——本次按客户端实测口径给出结论", cfg.MetricsPath, err)
-			} else {
-				name := smetrics.DetectProviderName(sample)
-				if name == "" {
-					// 自研引擎指标名不带 vllm:/sglang: 前缀——未知命名只记录端点可达，
-					// 不静默套用 vLLM 语义，避免生成假 server_metrics 数据。
-					log.Printf("⚠️ 无法识别服务端指标命名（无 vllm:/sglang: 前缀）——跳过语义化 /metrics 采集，结论基线仍是客户端实测")
-				} else {
-					e.srv = s
-					e.provider = smetrics.DetectProvider(sample)
-					e.kv = smetrics.ExtractKVCapacity(sample) // 12.12：KV 容量画像（未暴露则 nil）
-					n := len(sample.Counters) + len(sample.Gauges) + len(sample.Hists)
-					log.Printf("ℹ️ 服务端观测 %s 可用（%d 项指标，%s 命名）——额外采集一份作辅助，结论基线仍是客户端实测", cfg.MetricsPath, n, name)
-					if e.kv != nil {
-						// 容量归因的静态参照：报告会把「实测拐点 vs KV 上界」并列
-						log.Printf("ℹ️ %s", e.kv.Describe())
-					}
-				}
-			}
-		}
+	if err := setupServerMetrics(ctx, e, cfg); err != nil {
+		return nil, err
 	}
 	if cfg.Dataset.Mode == "trace" {
 		ts, err := engine.LoadTrace(cfg.Dataset.Path, cfg.Dataset.Format, cfg.Dataset.ReplayMode, cfg.Dataset.MinTurns, cfg.Dataset.MaxSessions)
@@ -144,6 +110,50 @@ func newEnv(ctx context.Context, cfg *config.Config, client *engine.Client) (*en
 		}
 	}
 	return e, nil
+}
+
+// setupServerMetrics 装配服务端观测层（server_metrics: true 时）：probe 同口径判定
+// 可用性，DetectProvider 识别指标命名。所有场景共用（newEnv / rps / concurrency）。
+func setupServerMetrics(ctx context.Context, e *env, cfg *config.Config) error {
+	if !cfg.ServerMetrics {
+		return nil
+	}
+	s := smetrics.NewScraperAt(cfg.Endpoint, cfg.MetricsPath)
+	// /metrics 常与业务接口同一套认证保护——认证格式与 chat 请求保持一致
+	s.Auth = auth.Auth{Scheme: cfg.AuthScheme, Header: cfg.AuthHeader}
+	s.APIKey = cfg.APIKey
+	// 判定口径与 probe 一致：HTTP 200 但 0 项 vLLM 指标（网关占位响应）也算不可用，
+	// 否则观测层会带着空指标集白跑，报告里出现假"可用"
+	ok, detail := s.Available(ctx)
+	if !ok {
+		// /metrics 是引擎实现细节，不是标准端点（网关照不到、代理剥掉都属常见形态）。
+		// 客户端实测是本工具唯一的基线口径，服务端观测只是可选增强——
+		// 因此这里既不是错误，也不是"降级"：缺它不影响任何结论。
+		log.Printf("ℹ️ 未提供 %s（%v）——全部结论按客户端实测口径给出", cfg.MetricsPath, detail)
+		return nil
+	}
+	sample, err := s.Scrape(ctx)
+	if err != nil {
+		log.Printf("ℹ️ %s 抓取失败（%v）——本次按客户端实测口径给出结论", cfg.MetricsPath, err)
+		return nil
+	}
+	name := smetrics.DetectProviderName(sample)
+	if name == "" {
+		// 自研引擎指标名不带 vllm:/sglang: 前缀——未知命名只记录端点可达，
+		// 不静默套用 vLLM 语义，避免生成假 server_metrics 数据。
+		log.Printf("⚠️ 无法识别服务端指标命名（无 vllm:/sglang: 前缀）——跳过语义化 /metrics 采集，结论基线仍是客户端实测")
+		return nil
+	}
+	e.srv = s
+	e.provider = smetrics.DetectProvider(sample)
+	e.kv = smetrics.ExtractKVCapacity(sample) // 12.12：KV 容量画像（未暴露则 nil）
+	n := len(sample.Counters) + len(sample.Gauges) + len(sample.Hists)
+	log.Printf("ℹ️ 服务端观测 %s 可用（%d 项指标，%s 命名）——额外采集一份作辅助，结论基线仍是客户端实测", cfg.MetricsPath, n, name)
+	if e.kv != nil {
+		// 容量归因的静态参照：报告会把「实测拐点 vs KV 上界」并列
+		log.Printf("ℹ️ %s", e.kv.Describe())
+	}
+	return nil
 }
 
 // warnTraceTraceWrap trace 会话数不足所需时提示回绕复用（覆盖多样性受限）。

@@ -179,11 +179,11 @@ func main() {
 		case "probe":
 			mode = "probe"
 			args = args[1:]
-		case "user":
-			mode = "user"
+		case "user", "rps", "concurrency":
+			mode = args[0]
 			args = args[1:]
 		default:
-			fmt.Fprintf(os.Stderr, "未知参数 %q——压测子命令仅 probe/user；常规压测用 --concurrency 组合（见下）\n\n", args[0])
+			fmt.Fprintf(os.Stderr, "未知参数 %q——压测子命令：probe/user/rps/concurrency；常规压测用 --concurrency 组合（见下）\n\n", args[0])
 			usage()
 		}
 	}
@@ -220,6 +220,20 @@ func main() {
 		}
 		if cfg.User.ProfilePath == "" {
 			fmt.Fprintln(os.Stderr, "user 模式需要在配置里指定 user.profile_path（scripts/profile_build.py 产出）")
+			os.Exit(1)
+		}
+	}
+	if mode == "rps" || mode == "concurrency" {
+		if cfg.RequestSet.ShareGPTPath == "" {
+			fmt.Fprintln(os.Stderr, fmt.Sprintf("%s 模式需要在配置里指定 request_set.sharegpt_path（ShareGPT 数据集，与 vLLM bench serve 同源）", mode))
+			os.Exit(1)
+		}
+		if mode == "rps" && len(cfg.RPS.Rates) == 0 {
+			fmt.Fprintln(os.Stderr, "rps 模式需要在配置里指定 rps.rates（到达率档位 req/s）")
+			os.Exit(1)
+		}
+		if mode == "concurrency" && len(cfg.Concurrency.Levels) == 0 {
+			fmt.Fprintln(os.Stderr, "concurrency 模式需要在配置里指定 concurrency.levels（在飞请求数档位）")
 			os.Exit(1)
 		}
 	}
@@ -621,17 +635,18 @@ func main() {
 		}
 	}
 
-	// ── user 子命令：生成式多轮用户会话（profile 驱动，见 docs/workload-refactor-plan.md 13）──
-	// 走独立分支：不经 --turns × --concurrency 组合解析，形状全部来自 user.profile_path。
-	if mode == "user" {
-		sc, ok := scenario.Lookup("user")
+	// ── 独立子命令：user / rps / concurrency（新场景架构，见 docs/workload-refactor-plan.md）──
+	// 不经 --turns × --concurrency 组合解析；形状/请求集全部来自各自配置段。
+	switch mode {
+	case "user", "rps", "concurrency":
+		sc, ok := scenario.Lookup(mode)
 		if !ok {
-			fmt.Fprintln(os.Stderr, "user 场景未注册")
+			fmt.Fprintf(os.Stderr, "%s 场景未注册\n", mode)
 			os.Exit(1)
 		}
-		outPath := resolveOutPath(*outFlag, cfg.OutputDir, "user")
-		log.Printf("执行计划: user 模式 users=%d profile=%s", cfg.User.GetUsers(), cfg.User.ProfilePath)
-		run("user", outPath, func() (*report.Report, error) {
+		outPath := resolveOutPath(*outFlag, cfg.OutputDir, mode)
+		log.Printf("执行计划: %s 模式", mode)
+		run(mode, outPath, func() (*report.Report, error) {
 			return sc.Run(ctx, cfg, client, *modelFilter)
 		})
 		return
