@@ -105,6 +105,8 @@ trace assistant/tool 原样回放
 
 ### 3.4 `rps`：开环请求到达
 
+> 已拍板（2026-09-18）：输入形态选 B——冻结独立请求快照，rps 表示请求/秒的到达率；多轮会话行为由 `user` 模式覆盖。
+
 入口示例：
 
 ```bash
@@ -158,6 +160,8 @@ bench concurrency -c customer.yaml \
 ```
 
 目标：与 vLLM `bench serve` 的原生压测方式做尽量同口径对比。
+
+> 已拍板（2026-09-18）：数据源直接读取 ShareGPT 原始文件（`ShareGPT_V3_unfiltered_cleaned_split.json`），与 vLLM `--dataset-name sharegpt` 同源同格式，不做中间转换。对齐要求：`num_prompts`、随机抽样 seed、是否打乱、输出预算口径必须与 vLLM 侧命令参数一致；输出预算默认按 ShareGPT 历史 assistant 回复的 token 长度（vLLM 同口径），超模型上限的请求按统一截止策略处理并记录计数。
 
 语义：
 
