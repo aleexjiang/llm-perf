@@ -614,7 +614,13 @@ session_uniform：先等概率选 session，再选该 session 回合
 | `medium` | 5~8 轮 | 37/128，约 28.9% | 典型用户会话 |
 | `heavy` | 9~32 轮 | 33/128，约 25.8% | 长会话/复杂任务 |
 
-这三个比例只是第一版先验。正式实现应在连续 user 异常清洗后重新计算，并检查各 profile 的 prompt token 分布，避免只按轮次数量而忽略上下文大小。
+> 已拍板（2026-09-18）：**会话档位默认比例为 light:medium:heavy = 6:3:1，可通过配置调整**；不再沿用 trace 的 45/29/26 实测占比（trace 只做形状特征参考，不做权重来源）。
+
+**Agent 形状硬约束：首轮 prompt ≥ 35~40K token。**
+
+- 首轮 = system 基座 + 首轮 user 输入（含首轮 context），三个档位统一满足：现代 agent 产品基线上下文即 ~35K（system + 工具定义 + RAG 注入），短首轮代表不了 agent 体验（与 `docs/latency-baselines.md` 的 30–40K 判据对齐）；
+- 实现方式：system 基座按档位取 ~30~34K token 语料窗口，首轮 user+context 补足到 ≥35K；后续轮按 profile 的每轮增量分布增长；
+- `heavy` 档在此基础上保持更大的每轮增量（对齐 trace heavy 形状：每轮 5K~25K）。
 
 ### 13.3 运行时会话生成
 
