@@ -128,7 +128,7 @@ bench concurrency -c customer.yaml \
 
 ### 4.1 正式压测数据
 
-正式压测统一使用脱敏 trace 提取的用户输入与会话形状 profile，或由生成式会话导出的固定请求集：
+正式压测统一使用由 trace 特征生成的 session profile、synthetic request 或由生成式会话导出的固定请求集；不直接使用任何 trace 消息文本：
 
 ```yaml
 trace:
@@ -137,13 +137,14 @@ trace:
   replay_mode: "user_shape"
 ```
 
-`user_shape` 不是把历史 `assistant`/`tool` 原样回放，而是：
+`user_shape` 不是回放 trace 消息，而是：
 
-- 保留清洗后的 user 输入和 session 轮次统计；
-- 移除 trace 中的 `tool` 消息；
-- 运行时使用被测模型生成的 `assistant` 回复；
+- 只读取 trace 提取的 session profile 统计特征；
+- 不读取 trace 的 user/assistant/tool 文本作为运行时输入；
+- 运行时 user 输入全部由 profile、模板和 seed 生成；
+- 运行时 assistant 使用被测模型真实回复；
 - 按 profile 构造必要的 synthetic context；
-- 记录 profile、seed 和清洗统计，保证会话形状可追溯。
+- 记录 profile、seed 和特征版本，保证会话形状可追溯。
 
 用户会话模式使用生成式 session；RPS 需要明确采用 live session 到达还是固定 request snapshot；concurrency 与 vLLM 对比使用独立 request sample。
 
@@ -501,12 +502,12 @@ system(12,085)
 
 ### 12.5 对三种压测模式的落地结论
 
-- `user`：直接使用 128 个完整 trace session；每个 user 消息是一次请求点，前面的 system/assistant/tool 历史按 full replay 保留；
-- `rps`：从每个 user 位置提取完整历史前缀，形成 request snapshot，再按 `request_rate`、`num_prompts`、`max_concurrency` 调度；
-- `concurrency`：使用固定 request set，所有请求独立，作为与 vLLM `bench serve` 的对比输入；
+- `user`：使用由 trace 特征生成的轻/中/重 session profile，运行时 user 输入自己构造，assistant 使用被测模型真实回复；
+- `rps`：默认对生成式 session 做新会话到达调度；如果需要严格 vLLM 口径，则使用由 profile 生成的固定 request set；
+- `concurrency`：使用由 profile 生成的固定 request set，所有请求独立，作为与 vLLM `bench serve` 的对比输入；
 - filler：正式 benchmark 不再使用，仅保留给单元测试、mock、smoke 和 probe 最小连通性请求。
 
-RPS/concurrency 不能直接把整个 session 当成一个请求。应从 session 提取 user-turn snapshot；连续 user 消息属于异常段，正式请求集生成时跳过异常段，不合并、不单独建模，只记录清洗计数。正常 user-turn 再明确抽样策略：
+RPS/concurrency 不再从 session 提取原始 user-turn 文本。它们应消费由 session profile 生成的 synthetic request set；连续 user 消息的异常统计只影响 profile 特征清洗，不进入运行时数据。正常 profile 再明确抽样策略：
 
 ```text
 turn_uniform：所有 user 回合等概率
@@ -517,10 +518,10 @@ session_uniform：先等概率选 session，再选该 session 回合
 
 ### 12.6 数据清洗与对比约束
 
-1. 末尾 system 消息如果没有后续 user，不进入任何测量请求；
-2. 连续 user 消息视为异常数据：当前样本有 65 个异常段、涉及 65 个会话、额外 227 条 user 消息；正式分析和请求集生成时跳过，不合并、不单独建模，仅记录清洗计数；
-3. assistant 文本长度不能直接当作 `max_tokens`，因为其中可能只是工具调用或中间回复；
-4. trace 中没有完整的服务端生成参数时，vLLM 对比需要另行指定输出预算或按历史输出长度分桶；
+1. 末尾 system 消息如果没有后续 user，只影响特征统计，不进入运行时生成数据；
+2. 连续 user 消息视为异常特征：当前样本有 65 个异常段、涉及 65 个会话、额外 227 条 user 消息；只记录清洗计数，不进入 profile 参数估计；
+3. assistant/tool 文本不进入运行时数据，只用于估计交互步数、上下文增量和 profile 分布；
+4. trace 中没有完整的服务端生成参数时，profile 只记录目标输出预算区间，不能把历史 assistant 长度当成当前模型 `max_tokens`；
 5. llm-perf 与 vLLM 必须使用同一份 request set、同一输入消息、同一输出预算、同一请求数和同一调度参数，才能做严格数字比较；
 6. 仅一边使用 customer trace、另一边使用 vLLM random dataset 时，只能比较趋势，不能宣称数字等价。
 
@@ -530,11 +531,11 @@ session_uniform：先等概率选 session，再选该 session 回合
 
 `trace-real-128.json` 不再作为完整消息回放输入，而作为**会话形状样本**：
 
-- 保留清洗后的 user 输入文本或其脱敏模板；
-- 提取轻/中/重会话的轮次、首轮上下文、总上下文和每轮增量分布；
-- 提取 assistant/tool 的长度统计，仅用于估计上下文形状；
-- 不把 trace 中旧模型生成的 assistant 回复放入当前被测模型的下一轮 history；
-- 不把 trace 中的 tool 消息原样放入运行时请求。
+- 不提取、不复用 trace 中的 user 文本；
+- 只提取轻/中/重会话的轮次、首轮上下文、总上下文和每轮增量等统计特征；
+- 提取 assistant/tool 的长度和交互数量统计，仅用于估计上下文形状；
+- 不把 trace 中任何旧消息直接放入运行时请求；
+- 运行时 user、assistant 和 synthetic context 全部由当前测试配置、profile 和 seed 自己构造。
 
 ### 13.2 初始 profile 划分
 
@@ -617,3 +618,32 @@ synthetic context 的消息 role、插入位置和是否需要工具协议仍需
 - 结果重点是各模型在真实生成链下的 cache 行为，而不是冻结输入下的纯模型对比。
 
 如果需要与 vLLM `bench serve` 做严格数值对比，仍需另行导出冻结 request snapshot；不能把生成式 live user 结果和 frozen request benchmark 混成同一张结论表。
+
+## 14. 公开 ShareGPT 数据的使用边界
+
+可以下载公开 ShareGPT 数据集作为**形状参考集**，用于补充当前 128 个 WorkBuddy/Codex 会话的统计：
+
+- 用户消息字符/token 长度分布；
+- 有效 user 轮次分布；
+- 会话结束位置；
+- assistant 回复长度区间；
+- 普通对话与编码 Agent 会话的形状差异。
+
+但公开 ShareGPT 数据不进入正式运行时请求，也不与 WorkBuddy trace 的消息混合回放。它只参与 profile 参数估计，最终由 profile 生成 synthetic user/context 数据。
+
+参考数据使用规则：
+
+1. 记录数据集名称、版本、下载地址、采样日期和许可信息；
+2. 只保存聚合特征或生成所需的统计参数，不把第三方原始消息提交到仓库；
+3. ShareGPT 普通聊天分布与 WorkBuddy 编程 Agent 分布不同，不能直接合并权重；
+4. 默认以 WorkBuddy trace 作为 Agent 形状主参考，ShareGPT 只补充通用用户输入长度和轮次先验；
+5. 如果两者特征冲突，按场景分 profile，不做无依据的总体平均；
+6. synthetic 数据生成必须使用固定 seed，并把 `feature_source`、`feature_version`、`profile` 写入结果元数据。
+
+当前建议的特征来源分层：
+
+```text
+WorkBuddy trace：Agent 会话轮数、长上下文、工具链间接体积、重/中/轻比例
+ShareGPT：通用用户输入长度、普通多轮轮次和回复长度参考
+运行时生成器：根据 profile + seed 构造 user、context；assistant 使用被测模型真实输出
+```
