@@ -27,3 +27,6 @@ scripts/stall-e2e/reqs.log
 
 # Python 字节码缓存（mock/桩脚本运行产物）
 __pycache__/
+
+# 真机测试工作空间（含实测配置/二进制/产物，整目录不入库）
+/llm-perf-test/
