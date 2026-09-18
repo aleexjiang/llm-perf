@@ -693,15 +693,44 @@ system + user + 当前模型 assistant
 
 如果需要与 vLLM `bench serve` 做严格数值对比，仍需另行导出冻结 request snapshot；不能把生成式 live user 结果和 frozen request benchmark 混成同一张结论表。
 
-### 13.6 文本来源：经典书语料（已拍板 2026-09-18）
+### 13.6 文本来源：经典书语料库（已拍板 2026-09-18，一用户一书）
 
-user 模式重新设计后，运行时所有合成文本（system 基座、user 输入、synthetic context）统一取自**经典书语料**，不再使用随机词表或模板拼接：
+user 模式重新设计后，运行时所有合成文本（system 基座、user 输入、synthetic context）统一取自**经典书语料库**（≥10 本公版书），不再使用随机词表或模板拼接。
 
-- 复用 `internal/corpus`：内置 en（战争与和平+白鲸记，约 99 万 token）/ zh（红楼梦，约 62 万 token），支持自定义 `.txt/.txt.gz` 外置语料；`Window(targetChars, seed)` 确定性取窗、回绕、多字节安全；`CharsPerToken`（en 4.0 / zh 1.4）真机校准偏差 <2%；
-- 生成规则：窗口起点由 `(session_seed, turn)` 派生——会话间内容互不相同，会话内 append-only；长度由 profile 的 token 分布控制，字符数按 `CharsPerToken` 换算，实际以服务端 usage 为准；
-- probe 的 `filler_fidelity` 检查职责转给 user 模式：实测本部署真实换算比，偏离 >25% 告警；
-- `filler_lang: en/zh` 语义保留为语料语言选择；语料循环回绕足够覆盖 heavy 会话（单会话累计 ~100K token vs 语料 62 万+）；
-- 语料是公版书，无隐私问题，可随仓库分发；与 filler 的区别：filler 之前是**正式压测数据源**，语料现在只是 user 模式生成器的**文本原料**，负载形状由 profile 决定，不再有 `turn_tokens` 固定注入。
+**书单（12 本，全部公版，文体多样）：**
+
+| lang | 书名 | 选入理由 |
+|---|---|---|
+| en | War and Peace | 长叙事+法语混排，tokenization 复杂 |
+| en | Moby Dick | 长段落+航海术语 |
+| en | Pride and Prejudice | 对话密集、短句，与长叙事形成对比 |
+| en | Crime and Punishment | 俄译长句+心理描写 |
+| en | Les Misérables | 超长篇（heavy 会话基本不回绕） |
+| en | Don Quixote | 西译句式+古语 |
+| en | Adventures of Sherlock Holmes | 短篇集，推理对话+技术描述 |
+| zh | 红楼梦 | 对话+诗词混合 |
+| zh | 三国演义 | 半文言+战争叙事 |
+| zh | 水浒传 | 白话章回体，人名密集 |
+| zh | 西游记 | 韵文+叙事混合 |
+| zh | 儒林外史 | 讽刺白话，短句 |
+
+刻意排除：Ulysses（排版怪异污染 token 分布）、聊斋（文言占比过高）。
+
+**选书语义：**
+
+- `book_index = hash(session_seed) % len(books)`——确定性选书，重跑一致；
+- **一个用户（session）只读一本书**：该会话的 system 基座、每轮 user 输入、synthetic context 全部取自该书；
+- 用户之间书不同 → tokenization 多样性覆盖 12 种文体；同书用户窗口起点由 session_seed 错开，不共享前缀（除非 shared_base）；
+- 窗口起点由 `(session_seed, turn)` 派生，会话内 append-only；长度由 profile 的 token 分布控制，字符按 `CharsPerToken` 换算，实际以服务端 usage 为准；
+- heavy 会话（累计 ~100K token）在单本内循环回绕；Les Misérables（~70 万 token）基本不回绕。
+
+**落地影响：**
+
+- `internal/corpus` 按书拆分：`data/books/{lang}/{book-id}.txt.gz` + 注册表元数据（书名/lang/token 估算）；现有 `corpus-en.txt.gz`（W&P+Moby Dick 合并）拆开；
+- 12 本 gzip 后约 +10MB，二进制 ~13MB → ~23MB，单二进制部署仍成立；
+- `filler_lang` 改名 `corpus_lang`（en/zh），新增可选 `corpus_books` 过滤书单；
+- `CharsPerToken` 仍按 lang 全局值，各书偏差由 probe `filler_fidelity` 实测兜底（职责从 filler 转给 user 模式生成器）；
+- 语料是公版书，无隐私问题，可随仓库分发；与 filler 的区别：语料只是 user 模式生成器的**文本原料**，负载形状由 profile 决定，不再有 `turn_tokens` 固定注入。
 
 `shared_base` 语义在 user 模式延续，用于量化跨用户共享前缀的 cache 收益：
 
