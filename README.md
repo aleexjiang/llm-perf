@@ -10,63 +10,51 @@
 面向堡垒机/内网交付场景：本机交叉编译出 linux/amd64 二进制，连同配置文件
 （`bench` + `config.yaml`，端点与认证直接写进配置）拷贝到客户环境执行，跑完把 JSON 拉回来分析。
 
-## 场景矩阵
-
-模式 = 多轮会话 × 负载方式（公共入口不再支持单发单轮）：
-
-```
---concurrency 1       单发多轮：逐轮滚动 history
---concurrency cfg     使用配置的 RPS/并发计划：多用户各自运行完整多轮会话
---concurrency 2,4,8   闭环多用户多轮：固定会话数逐档采集
-```
+## 场景矩阵（显式子命令，2026-09-18 新架构）
 
 ```bash
-./bench -c example.yaml --concurrency 1                 # 单发多轮
-./bench -c example.yaml --concurrency cfg               # 配置中的 RPS/并发主路径
-./bench probe -c example.yaml                            # 多模型兼容性探针
+./bench probe        -c example.yaml    # ① 能力与健康探针（换引擎先跑）
+./bench user         -c example.yaml    # ② 生成式多轮用户会话（profile 驱动）
+./bench rps          -c example.yaml    # ③ 冻结请求快照的开环到达（体验拐点）
+./bench concurrency  -c example.yaml    # ④ 固定在飞齐射（总吞吐拐点，对齐 vLLM bench serve）
 ```
 
-| 场景 | 回答的问题 |
-|---|---|
-| `multiturn`（`--concurrency 1`） | 单用户多轮 history 滚动到深上下文时，每轮 TTFT、TPOT 与缓存行为如何？ |
-| `concurrent`（`--concurrency cfg`） | 多用户 agent 会话在不同 RPS/并发负载下的 TTFT、单流速度、失败与积压如何？（filler=模拟对话，trace=真实会话回放） |
+| 场景 | 输入 | 回答的问题 |
+|---|---|---|
+| `probe` | 无 trace | 引擎兼容性、usage/思考/tool-call 能力、/metrics、context limit |
+| `user` | profile + 经典书语料 | 真实形状多轮会话里 TTFT 逐轮斜率、动态 prefix cache、单流体验 |
+| `rps` | 冻结请求快照 | 到达率 X req/s 下的排队、TTFT P95、goodput——可对外承诺的到达率 |
+| `concurrency` | 冻结请求快照（ShareGPT） | 总吞吐拐点：系统最多能装多少；与 vLLM bench serve 横向对比 |
 
 两个正交开关贯穿全部场景：
 
 - **思考模式**（`thinking.mode: both/on/off`，默认 `both`）：off/on 两套 `extra_body` JSON
-  透传进请求体（对齐 vLLM `--extra-body`，适配任意网关的思考参数）。`both` 自动跑 A/B 对照；
+  透传进请求体（对齐 vLLM `--extra-body`）。`both` 自动跑 A/B 对照；
   思考开启时 `max_tokens` 自动抬到 `max_tokens_floor`（默认 2048），防止思考吃光输出预算
 - **流式**（`stream: true/false`，默认 `true`）：非流式只能测端到端延迟与 usage，
   TTFT/ITL/思考拆分不可测（JSON 中相应字段缺省）；用于 E2E 对照与网关缓冲问题排查
 
-多用户多轮场景支持两种负载模型（`concurrent` 段，互斥）：
+**rps vs concurrency 只差调度器**（请求源相同）：
 
-- **RPS 开环到达**（推荐主路径，`request_rate`/`rate_sweep`）：RPS 是新会话到达率；每个会话独立运行完整多轮，采集排队、TTFT、失败和 drain 数据；
+- **rps**（`rps.rates`）：请求按 Poisson 到达（`burstiness` 可调），`max_concurrency` 防无限堆积；
+  到达率超过服务能力时积压真实发生——测出过载下的排队曲线与体验拐点
+- **concurrency**（`concurrency.levels`）：N 个在飞打满后有空位就补（`request_rate: 0` = inf 齐射）；
+  服务端永远满负荷但不持续积压——测出总吞吐拐点与容量天花板
 
-- **闭环并发**（辅助路径，`levels: [2,4,...]`）：N 个虚拟用户同时发车，测容量上限下的衰减；
-  `duration_seconds` 改**时长制**（每档跑满墙钟秒数，`runs_per_worker` 忽略），配 `renew: true`
-  （需先开 `multiturn: true`）时会话滚完 `turns` 轮换新种子重开——在途会话年龄铺满 0~turns 区间，
-  测稳态吞吐与 KV 压力（soak 用，见[测试类别](#配置)）
-- **开环到达率**（`request_rate: 4` 或 `rate_sweep: [1,2,4,8]`）：请求按 Poisson 过程到达
-  （对齐 vLLM bench serve / inference-perf），测排队-延迟曲线；`rate_sweep` 多档扫描找饱和点，
-  `max_concurrency` 防止到达率超容量时无限堆积
+两个拐点配合读：**concurrency 告诉你系统有多能装，rps 告诉你敢承诺装多少**。
 
-## 数据源：filler vs trace
+## 数据源（全部外置，raw trace 不进仓库）
 
-- **filler**（默认）：token 精确的合成/语料填充（`filler_lang` + `filler_corpus`），
-  用于前缀缓存对照、上下文深度阶梯等**变量控制实验**
-- **trace**（`dataset.mode: trace`）：真实会话回放，多轮长度来自真实分布（贴近客户实际流量）。
-  支持 ShareGPT 格式与自定义 `sessions` 格式（`[{"turns": ["...", ...]}]`，`.json`/`.json.gz`），
-  token 以服务端 usage 为准；trace 模式下 system_tokens/turn_tokens 不生效（会话形状由回放决定）。
-  `dataset.replay_mode` 控制回放保真度：`full`（默认，按原序注入全部 role——assistant/tool 消息进上下文，
-  测真实 history 深度。真实 agent 会话里工具结果往往占上下文大头，user_only 的回放深度系统性偏小）；
-  `user_only`（只回放 user 轮，需对比历史口径时显式配置）；
-  full 模式下 `role: tool` 消息缺 `tool_call_id` 会被跳过并计数告警（不静默丢弃）
+- **user 模式**：profile.json（`scripts/profile_build.py` 从 raw trace 提取特征，不含消息文本）
+  + 内置 12 本公版书语料（一用户一书，seed 确定性选书）。运行时 user/context 由 profile+seed 生成，
+  **assistant 用被测模型真实回复**——prefix cache 反映真实生成链，不是冻结输入
+- **rps/concurrency 模式**：ShareGPT 数据集直接读取（`request_set.sharegpt_path`），
+  与 vLLM `bench serve --dataset-name sharegpt` 同口径：prompt = 截至最后一条 user 的 history，
+  输出预算 = 其后 assistant 回复估算 token，`seed` 蓄水池抽样。每条请求是**冻结独立快照**，
+  同 seed 同样本序，可复现、可与 vLLM 对比
 
 另有 `bench probe` 兼容性探针（换引擎先跑）、`debug` 原始流量留存与 `/metrics` 服务端观测层，
-见下文[兼容性](#兼容性多推理引擎支持)与[服务端观测层](#服务端观测层metrics)。
-
-## 指标口径
+见下文[兼容性](#兼容性多推理引擎支持)与[服务端观测层](#服务端观测层metrics)。## 指标口径
 
 每个流式请求逐 chunk 记录时间戳，拆分为：
 
@@ -84,30 +72,24 @@
 单发版关键对照：`fixed_seed: true` 时各 run 复用同一 prompt——Run2+ 的 TTFT 显著低于 Run1 即前缀缓存命中。
 多轮版关键判定：turn N 的 TTFT ≈ turn N−1 TTFT + 新增 token 的 prefill ⇒ 缓存命中；接近全量 prefill ⇒ 未命中。
 
-## 填充语料：真实文本，支持到 1M 上下文
+## 语料库：12 本公版书（user 模式文本原料）
 
-默认合成词表低信息量、可复现，但 tokenization 与语义分布和真实负载有差距。配置 `filler_corpus` 后
-改用**内置公版书语料**（go:embed 打进二进制，堡垒机无需额外文件）：
+user 模式的合成文本（system 基座 / user 输入 / context）全部取自内置语料库
+（go:embed 打进二进制，堡垒机无需额外文件）：一用户一本书，`hash(session_seed)` 确定性选书。
 
-| 配置值 | 语料 | 规模 |
-|---|---|---|
-| `filler_corpus: "en"` | 战争与和平 + 白鲸记（Gutenberg #2600/#2700） | ≈ 99 万 token |
-| `filler_corpus: "zh"` | 红楼梦（120 回全文） | ≈ 62 万 token（超出部分循环填充） |
-| `filler_corpus: "path/to/x.txt(.gz)"` | 自定义语料（UTF-8） | 不限 |
+| lang | 书目 |
+|---|---|
+| en | War and Peace / Moby Dick / Pride and Prejudice / Crime and Punishment / Les Misérables / Don Quixote / Sherlock Holmes |
+| zh | 红楼梦 / 三国演义 / 水浒传 / 西游记 / 儒林外史 |
 
-字符/token 换算比已在真实 Qwen 服务上校准（en 4.0 chars/token 实测偏差 <2%，zh 1.4 实测偏差 ≈3%），
-**合成词表与语料两条路径共用该系数**（否则同一档位切换语料会换一个负载量级）；
-`filler_lang` 决定填充语言与换算比；同 seed 仍产出相同文本（`fixed_seed` 缓存实验不受影响）。
-`bench probe` 的 `filler_fidelity` 检查会实测本部署的真实换算比，偏离构造系数 >25% 时告警。
+`corpus_lang: en|zh` 决定语料语言；字符/token 换算已在真实 Qwen 服务上校准
+（en 4.0、zh 1.4，偏差 <3%），`bench probe` 的 `filler_fidelity` 检查实测本部署真实换算比，
+偏离 >25% 告警。窗口起点由 (session_seed, turn) 派生：同配置重跑文本完全一致（可复现），
+会话间内容互不相同，会话内尾部 append-only（prefix cache 前缀逐字节保留）。
 
-**上下文截止**：`max_prompt_tokens`（或 CLI `--max-ctx`）设定压测的上下文上限——
-
-- single 档位超限自动截到该值并去重（如 `[50k, 300k, 1M] --max-ctx 262000` → `[50k, 262000]`）
-- 多轮会话逐轮逼近上限，最后不足一轮的空间压缩填充、到顶即停（日志注明提前结束）
-- `bench probe` 会读取服务端 `max_model_len` 并对比计划压测的最大档位，超限直接告警
-- 大上下文注意 `timeout_seconds`（1M 级 prefill 可能需要 5 分钟以上，工具在 ≥100k 档位时自动提示）
-
-## 兼容性：多推理引擎支持
+**上下文截止**：`max_prompt_tokens`（或 CLI `--max-ctx`）设定 user 多轮的上下文上限——
+会话逐轮逼近上限，到顶即停（日志注明提前结束）；`bench probe` 会读取服务端
+`max_model_len` 并对比计划压测的最大上下文（默认按 agent 基线 40K），超限直接告警。## 兼容性：多推理引擎支持
 
 核心协议是 OpenAI 兼容 `/v1/chat/completions`，vLLM / SGLang / TGI / MindIE（华为魔改 vLLM）/ llama.cpp 等均可用，
 但各引擎在**细节字段**上差异很大（`reasoning` vs `reasoning_content`、usage 是否回传、`stream_options` 支持、
@@ -242,14 +224,8 @@ gauge 轮询自带健康度：从未成功或连续失败 ≥5 时 JSON 标记 `
 - **测试盐值**：`seed_salt: N`（CLI `--seed-salt`）给所有 prompt 种子叠加盐值——服务端 prefix cache
   是内存态且不会被挤出，同一配置重跑时"冷缓存"测量会被上次测试污染；**每次测试递增盐值**，
   或重启服务端清缓存（二选一）
-- **预热**：`warmup_requests: N` 每场景开始前发 N 条小请求暖连接；完整 `TurnMetrics` 落在 JSON 的 `auxiliary_requests[]`（phase=`warmup`），不进入 benchmark KPI
 - **连接层重试**：`retry: {max_attempts: 2, backoff_ms: 300}` 对瞬时失败（reset/5xx/429）重试，默认关闭；重试留痕 warnings/retry_count；失败/取消原始请求均保留
-- **渐进加压**：RPS/并发档位按低到高执行；“慢”和排队增长都是需要保留的采集数据，外部分析根据 timeout、completed/failed/cancelled、waiting、TTFT 和 drain 时间判断容量
-  （各在飞流窗口内输出增量 / 时长，取中位——并发劣化时聚合值会掩盖单流卡顿）判定服务端退化，持续低于阈值
-  即中止**当前场景**（不是整轮），冷却后继续下一个场景；已完成数据照常落盘，报告 note 标注熔断原因与现场速度。
-  空闲与纯 prefill（未出首 token）不参与判定。CLI `--stall-tps/--stall-window/--stall-cooldown`、`--no-stall-guard`
-- **goodput**：`goodput: {ttft_ms: 2000, tpot_ms: 100}` 定义 SLO，concurrent 结果输出达标数与有效吞吐
-- **正确性抽查**：`correctness: {samples: 8}` 数字转写金丝雀，防"HTTP 200 但内容异常"的假成功；判定结果在 `correctness[]`，完整请求指标在 `auxiliary_requests[]`（phase=`correctness`），不进入性能 KPI
+- **goodput**：`slo: {goodput: {ttft_ms: 2000, tpot_ms: 100}}` 定义 SLO，rps/concurrency 结果输出达标数与有效吞吐
 
 ## 快速开始
 
@@ -262,17 +238,19 @@ scp bin/bench-linux-amd64 configs/example.yaml 堡垒机:~/llm-perf/
 mv bench-linux-amd64 bench && chmod +x bench
 # 端点/key 直接写在配置文件里（endpoint + api_key 字面量；该配置勿入库）
 ./bench probe -c example.yaml       # ① 先探针：确认引擎兼容性与思考开关参数
-./bench -c example.yaml --concurrency 1                  # ② 单发多轮：先验证 history/usage/缓存采集
-./bench -c example.yaml --concurrency cfg                # ③ 多用户多轮：按配置的 RPS/并发计划采集
+./bench user -c example.yaml        # ② 生成式多轮：真实形状 + 动态 prefix cache
+./bench rps -c example.yaml         # ③ 开环到达：排队-延迟曲线
+./bench concurrency -c example.yaml # ④ 固定在飞：总吞吐拐点（vLLM 对比）
 ```
 
 ## 输出
 
-每个多轮场景落一个 JSON 文件（含全部原始数据：逐 turn 计时、逐 chunk 派生指标、usage token、辅助请求）：
+每个子命令落一个 JSON 文件（含全部原始数据：逐 turn/请求计时、逐 chunk 派生指标、usage token）：
 
 ```bash
-./bench -c example.yaml --concurrency 1                 # → output/multiturn-<ts>.json
-./bench -c example.yaml --concurrency cfg -o results/   # → multiturn + concurrent-multi 数据目录
+./bench user         -c example.yaml   # → output/user-<ts>.json（sessions，含 profile 标签）
+./bench rps          -c example.yaml   # → output/rps-<ts>.json（requests，含 request_rate）
+./bench concurrency  -c example.yaml   # → output/concurrency-<ts>.json（requests，含 level）
 ```
 
 **按模型分区**：配置了多个模型时，数据按模型分区落 `<output_dir>/<模型>/<场景>-<ts>.json`
@@ -283,21 +261,20 @@ mv bench-linux-amd64 bench && chmod +x bench
 output/
 ├── run.log
 ├── DeepSeek-V4-Flash-0731/
-│   ├── multiturn-<ts>.json
-│   └── concurrent-<ts>.json
+│   ├── user-<ts>.json
+│   └── rps-<ts>.json
 └── Qwen3.8-27B/
-    ├── multiturn-<ts>.json
-    └── concurrent-<ts>.json
+    ├── user-<ts>.json
+    └── concurrency-<ts>.json
 ```
 
 多模型 + `-o xxx.json` 会报错（一个文件装不下多个分区），请给目录。
 
 JSON 结构见 `internal/report/report.go` 与 [docs/data-contract.md](docs/data-contract.md)：
-`multiturn` / `concurrent` 两个主场景数组，元素分别为会话 / 并发档位，
+`multiturn`（user 会话）/ `concurrent`（rps/concurrency 档位）两个主场景数组，
 每条主压测请求是 `engine.TurnMetrics`（含 `phase=benchmark`；流式含原始 chunk 序列 `content_times_ms`，
-供 chunk 间隔和抖动等外部分析）；warmup/correctness/失败/取消请求也完整保留，辅助请求位于
-`auxiliary_requests[]`。观测层开启时附 `server_metrics` 汇总（缓存命中率/排队/prefill-decode 分解）
-与逐请求 `server_counter_delta`。
+供 chunk 间隔和抖动等外部分析）；失败/取消请求也完整保留。观测层开启时附 `server_metrics` 汇总
+与两源一致性 `source_check`。
 
 **分析在工具之外**：聚合、判级、画图由消费方完成。体验基线三档阈值（`slo_baseline`）随 JSON
 透出，判级不要内置自己的常量；报告判据的方法论依据见 [docs/latency-baselines.md](docs/latency-baselines.md)。
@@ -311,7 +288,7 @@ JSON 结构见 `internal/report/report.go` 与 [docs/data-contract.md](docs/data
 容量边界多远；`benchmark` = 标准格上这台部署处于什么水平（跨部署可比，预设配置见
 `configs/benchmark.yaml`，格子即 [docs/scenario-guide.md](docs/scenario-guide.md) 的必测清单）；
 `soak` = 长时间跑会不会退化/出事故（结论区给稳定性三问：事故 / 正确性 / 漂移——漂移判据要求
-分时段长跑采样，用时长制 `concurrent.duration_seconds` + `renew`，见上文并发场景段）。
+分时段长跑采样，当前用 rps 模式长时运行采集，缺证据处如实写 NA）。
 三者共用同一套四个数与判据——换类别只换首屏口径，
 详细数据仍在折叠附录里一个不少。
 
