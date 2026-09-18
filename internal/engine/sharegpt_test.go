@@ -20,7 +20,32 @@ const sharegptFixture = `[
   ]},
   {"conversations":[
     {"from":"gpt","value":"没有 user 的会话应被跳过"}
+  ]},
+  {"conversations":[
+    {"from":"human","value":"c4"},
+    {"from":"gpt","value":"r4"}
+  ]},
+  {"conversations":[
+    {"from":"human","value":"c5"},
+    {"from":"gpt","value":"r5"}
+  ]},
+  {"conversations":[
+    {"from":"human","value":"c6"},
+    {"from":"gpt","value":"r6"}
+  ]},
+  {"conversations":[
+    {"from":"human","value":"c7"},
+    {"from":"gpt","value":"r7"}
   ]}
+]`
+
+const sharegptFixtureBig = `[
+  {"conversations":[{"from":"human","value":"a1"},{"from":"gpt","value":"b1"}]},
+  {"conversations":[{"from":"human","value":"a2"},{"from":"gpt","value":"b2"}]},
+  {"conversations":[{"from":"human","value":"a3"},{"from":"gpt","value":"b3"}]},
+  {"conversations":[{"from":"human","value":"a4"},{"from":"gpt","value":"b4"}]},
+  {"conversations":[{"from":"human","value":"a5"},{"from":"gpt","value":"b5"}]},
+  {"conversations":[{"from":"human","value":"a6"},{"from":"gpt","value":"b6"}]}
 ]`
 
 func writeShareGPT(t *testing.T, content string) string {
@@ -33,39 +58,34 @@ func writeShareGPT(t *testing.T, content string) string {
 }
 
 func TestLoadShareGPTRequests(t *testing.T) {
-	samples, err := LoadShareGPTRequests(writeShareGPT(t, sharegptFixture), 0, 42, 0)
+	samples, err := LoadShareGPTRequests(writeShareGPT(t, sharegptFixture), 2, 42, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 2 条有效快照（无 user 的会话被跳过）
 	if len(samples) != 2 {
 		t.Fatalf("快照数 = %d, want 2", len(samples))
 	}
-	// 按 ID 定位（seed 洗牌后顺序不确定）：快照 1 截至最后一条 user（q2），
-	// 不含其后的 assistant；输出预算 = a1 的估算
-	var s *RequestSample
-	for i := range samples {
-		if samples[i].ID == "sharegpt-0001" {
-			s = &samples[i]
+	for _, s := range samples {
+		// 无 user 的会话（原始 #3）不允许出现在任何 seed 的选样中
+		if s.ID == "sharegpt-0003" {
+			t.Fatalf("无 user 会话不应被选中: %s", s.ID)
 		}
-	}
-	if s == nil {
-		t.Fatal("缺少 sharegpt-0001")
-	}
-	if len(s.Messages) != 4 {
-		t.Fatalf("快照结构错误: %+v", s)
-	}
-	if last := s.Messages[len(s.Messages)-1]; last.Role != "user" || last.Content != "q2" {
-		t.Fatalf("最后一条应为 user q2: %+v", last)
-	}
-	if s.OutputTokens <= 0 {
-		t.Fatalf("输出预算应 >0: %d", s.OutputTokens)
+		if len(s.Messages) == 0 {
+			t.Fatalf("快照无消息: %+v", s)
+		}
+		// 截至最后一条 user：不含其后 assistant
+		if last := s.Messages[len(s.Messages)-1]; last.Role != "user" {
+			t.Fatalf("快照最后一条应为 user: %+v", last)
+		}
+		if s.OutputTokens <= 0 {
+			t.Fatalf("输出预算应 >0: %s %d", s.ID, s.OutputTokens)
+		}
 	}
 }
 
 func TestLoadShareGPTRequestsSampling(t *testing.T) {
 	p := writeShareGPT(t, sharegptFixture)
-	// 同 seed 同样本序（跨工具可比的前提）
+	// 同 seed 同样本序（跨 run 可复现的前提）
 	a, _ := LoadShareGPTRequests(p, 10, 42, 0)
 	b, _ := LoadShareGPTRequests(p, 10, 42, 0)
 	if len(a) != 10 { // 样本不足确定性回绕
@@ -76,12 +96,25 @@ func TestLoadShareGPTRequestsSampling(t *testing.T) {
 			t.Fatalf("同 seed 样本序不一致 at %d", i)
 		}
 	}
+	// 不同 seed：k=2 < pool=6，选样集合应不同
+	big := writeShareGPT(t, sharegptFixtureBig)
+	s1, _ := LoadShareGPTRequests(big, 2, 42, 0)
+	s2, _ := LoadShareGPTRequests(big, 2, 7, 0)
+	ids1 := s1[0].ID + s1[1].ID
+	ids2 := s2[0].ID + s2[1].ID
+	if ids1 == ids2 {
+		t.Fatalf("不同 seed 选样集合相同: %s", ids1)
+	}
 	// 输出预算上限
-	c, _ := LoadShareGPTRequests(p, 10, 42, 1)
-	for _, s := range c {
+	d, _ := LoadShareGPTRequests(p, 10, 42, 1)
+	for _, s := range d {
 		if s.OutputTokens != 1 {
 			t.Fatalf("max_output_tokens 裁剪失败: %d", s.OutputTokens)
 		}
+	}
+	// num_prompts <=0 拒绝
+	if _, err := LoadShareGPTRequests(p, 0, 42, 0); err == nil {
+		t.Fatal("num_prompts=0 应报错")
 	}
 }
 
