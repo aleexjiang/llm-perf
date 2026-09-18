@@ -128,14 +128,15 @@ bench concurrency -c customer.yaml \
 
 ### 4.1 正式压测数据
 
-正式压测统一使用由 trace 特征生成的 session profile、synthetic request 或由生成式会话导出的固定请求集；不直接使用任何 trace 消息文本：
+正式压测统一使用外置的 session profile、synthetic request 或由生成式会话导出的固定请求集；不直接使用任何 raw trace 消息文本，也不把 raw trace 随工具发布：
 
 ```yaml
-trace:
-  path: "/data/customer-sessions.jsonl.gz"
-  format: "sharegpt"
-  replay_mode: "user_shape"
+source:
+  profile_path: "/data/profiles/workbuddy-agent-v1.json"
+  request_set_path: "/data/request-sets/workbuddy-agent-v1.jsonl"
 ```
+
+raw trace（例如 `trace-real-128.json`）只在外部 profile 生成阶段读取；`llm-perf` 正式运行阶段只读取 profile/request set。
 
 `user_shape` 不是回放 trace 消息，而是：
 
@@ -150,7 +151,7 @@ trace:
 
 ### 4.2 统一请求集
 
-为了与 vLLM 原生压测做可复核对比，建议增加统一请求集格式：
+为了与 vLLM 原生压测做可复核对比，建议由外部 profile 生成器产出统一请求集格式：
 
 ```json
 {
@@ -646,4 +647,23 @@ synthetic context 的消息 role、插入位置和是否需要工具协议仍需
 WorkBuddy trace：Agent 会话轮数、长上下文、工具链间接体积、重/中/轻比例
 ShareGPT：通用用户输入长度、普通多轮轮次和回复长度参考
 运行时生成器：根据 profile + seed 构造 user、context；assistant 使用被测模型真实输出
+
+## 15. 外置数据边界
+
+这次改造后，原始数据不再属于 `llm-perf` 仓库或正式运行时：
+
+- `/Users/aleexjiang/Desktop/CodeBuddy/llm-perf/llm-perf-test/trace-real-128.json`：只作为外部 profile 提取阶段的原始输入，提取完成后不参与 benchmark；
+- 公开 ShareGPT：只作为外部特征分析参考，不随仓库发布，不进入运行时请求；
+- 客户 trace、profile、request set：全部通过外部路径注入，不提交仓库；
+- `llm-perf` 运行时只消费脱敏的 profile JSON 和 synthetic request set，不负责保存或分发原始会话。
+
+仓库内现有 `configs/fixtures/trace-real-16.json.gz` 和 `configs/fixtures/trace-sessions.json` 只用于当前旧 parser/smoke 回归。完成新场景迁移后应：
+
+1. 删除正式配置对这些 raw trace fixture 的引用；
+2. 将 smoke 改为使用仓库内极小、人工构造的 profile/request set，或测试代码内生成；
+3. `internal/engine/trace.go` 及 ShareGPT 解析逻辑移到外部 profile 生成器，或从正式运行二进制中移除；
+4. 清理 `README.md`、`CODEBUDDY.md`、`docs/architecture.md` 中“工具直接回放 trace”的旧描述；
+5. 在客户运行说明中只记录 profile/request set 的外置路径和 schema，不记录真实数据内容。
+
+因此，原始 `trace-real-128.json` 对正式 benchmark 没有运行时价值；它的唯一价值是一次性提取 profile 特征。若 profile 已固化且不再需要重新估计特征，该文件可以不再保留在当前开发环境中。
 ```
