@@ -435,7 +435,7 @@ system(12,085)
 它体现出三个重要特征：
 
 1. system 基座本身很大；
-2. 存在连续 user 消息；
+2. 原始数据中出现连续 user 消息，但这是异常数据，不作为目标 workload 形状；
 3. assistant/tool 交互远多于 user 轮次。
 
 `replay_mode: full` 应保留完整 role 顺序和 `tool_call_id`；当前样本的 7,681 条 tool 消息均带有工具调用标识，适合 full replay。
@@ -465,7 +465,7 @@ system(12,085)
 
 ### 12.4 实际请求 prompt 规模
 
-以每个 user 位置之前的完整消息前缀作为一次真实请求快照，共得到 1,021 个请求快照：
+以每个 user 位置之前的完整消息前缀作为一次原始请求快照，共得到 1,021 个快照；该数字包含连续 user 异常段，正式请求集需先按 12.6 清洗：
 
 | 指标 | 字符数 | 按 4 字符/token 粗估 |
 |---|---:|---:|
@@ -495,7 +495,7 @@ system(12,085)
 - `concurrency`：使用固定 request set，所有请求独立，作为与 vLLM `bench serve` 的对比输入；
 - filler：正式 benchmark 不再使用，仅保留给单元测试、mock、smoke 和 probe 最小连通性请求。
 
-RPS/concurrency 不能直接把整个 session 当成一个请求。应从 session 提取 user-turn snapshot，并明确抽样策略：
+RPS/concurrency 不能直接把整个 session 当成一个请求。应从 session 提取 user-turn snapshot；连续 user 消息属于异常段，正式请求集生成时跳过异常段，不合并、不单独建模，只记录清洗计数。正常 user-turn 再明确抽样策略：
 
 ```text
 turn_uniform：所有 user 回合等概率
@@ -507,7 +507,7 @@ session_uniform：先等概率选 session，再选该 session 回合
 ### 12.6 数据清洗与对比约束
 
 1. 末尾 system 消息如果没有后续 user，不进入任何测量请求；
-2. 连续 user 消息不应被静默合并，应保留为连续请求并记录 burst 关系；
+2. 连续 user 消息视为异常数据：当前样本有 65 个异常段、涉及 65 个会话、额外 227 条 user 消息；正式分析和请求集生成时跳过，不合并、不单独建模，仅记录清洗计数；
 3. assistant 文本长度不能直接当作 `max_tokens`，因为其中可能只是工具调用或中间回复；
 4. trace 中没有完整的服务端生成参数时，vLLM 对比需要另行指定输出预算或按历史输出长度分桶；
 5. llm-perf 与 vLLM 必须使用同一份 request set、同一输入消息、同一输出预算、同一请求数和同一调度参数，才能做严格数字比较；
