@@ -252,7 +252,7 @@ type sessionsFile struct {
 func parseSessions(data []byte) ([]TraceSession, error) {
 	// 唯一形态：[{"turns": [...]}, ...]（裸数组 [["u1","u2"]] 形态未文档化，已删除）
 	var objs []sessionsFile
-	if err := json.Unmarshal(data, &objs); err == nil && len(objs) > 0 && len(objs[0].Turns) > 0 {
+	if err := json.Unmarshal(data, &objs); err == nil && len(objs) > 0 {
 		out := make([]TraceSession, 0, len(objs))
 		for _, o := range objs {
 			if len(o.Turns) > 0 {

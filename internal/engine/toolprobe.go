@@ -23,6 +23,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+
+	"github.com/aleexjiang/llm-perf/internal/auth"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -211,7 +213,7 @@ func isJSONObjectString(s string) bool {
 // runToolCallCheck 执行 T2-T5 并把结果写进 res（check 与 verdicts）。
 // streamAnalyze 复用 probe 主流程的流式解析闭包（同一份解析代码 = 与计时同口径）。
 func runToolCallCheck(ctx context.Context, res *ProbeResult, check func(string, bool, string),
-	o ProbeOptions, base, chatPath string, timeout time.Duration, model string,
+	o ProbeOptions, effAuth auth.Auth, base, chatPath string, timeout time.Duration, model string,
 	streamAnalyze func([]byte) *TurnMetrics) {
 
 	wantName := builtinTools[0]["function"].(map[string]any)["name"].(string)
@@ -222,7 +224,7 @@ func runToolCallCheck(ctx context.Context, res *ProbeResult, check func(string, 
 		}
 		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, base+chatPath, bytes.NewReader(pj))
 		req.Header.Set("Content-Type", "application/json")
-		o.Auth.Apply(req, o.APIKey)
+		effAuth.Apply(req, o.APIKey)
 		resp, err := (&http.Client{Timeout: timeout}).Do(req)
 		if err != nil {
 			return 0, nil, err
@@ -243,7 +245,9 @@ func runToolCallCheck(ctx context.Context, res *ProbeResult, check func(string, 
 		fmt.Fprintf(&b, "endpoint=%s chat=%s model=%s status=%d captured_at=%s\n--- RAW ---\n",
 			o.Endpoint, chatPath, model, status, time.Now().Format(time.RFC3339))
 		b.Write(raw)
-		_ = os.WriteFile(filepath.Join(o.CaptureDir, name), b.Bytes(), 0o644)
+		path := filepath.Join(o.CaptureDir, name)
+		_ = os.WriteFile(path, b.Bytes(), 0o600)
+		_ = os.Chmod(path, 0o600)
 	}
 	apply := func(tag string, v toolCallVerdict, checkName string, detail string) {
 		switch v.Level {

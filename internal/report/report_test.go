@@ -43,6 +43,30 @@ func TestSaveJSONAnyRoundtrip(t *testing.T) {
 	if len(out.Single) != 1 || out.Single[0].Model != "m1" || out.Single[0].PromptTokens != 4096 {
 		t.Fatalf("嵌套字段保真失败: %+v", out.Single)
 	}
+	info, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("JSON 文件权限 = %o，want 600", got)
+	}
+}
+
+func TestSaveJSONAnyTightensExistingPermissions(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "out.json")
+	if err := os.WriteFile(p, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveJSONAny(map[string]string{"secret": "value"}, p); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("覆盖后的 JSON 文件权限 = %o，want 600", got)
+	}
 }
 
 // DefaultName：<场景>-<时间戳>.json。

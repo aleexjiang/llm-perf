@@ -63,12 +63,12 @@ probe 选项:
   --concurrency cfg             优先使用 rate_sweep/request_rate，未配置时使用 levels
 
 排查模式:
-  warmup、benchmark、correctness、失败和主动取消请求都保留完整原始指标；
-  warmup/correctness 不进入 benchmark KPI，按 phase 分组落盘。
+warmup、benchmark、correctness、失败和主动取消请求都保留完整原始指标；
+warmup/correctness 不进入 benchmark KPI，按 phase 分组落盘。
 
 排查模式:
-  配置里 debug: true 时，原始响应留存到 <output_dir>/raw/、日志同步写 <output_dir>/run.log；
-  任何请求失败时即使不开 debug 也会自动留存转储（写到系统临时目录）。
+配置里 debug: true 时，原始响应留存到 <output_dir>/raw/、日志同步写 <output_dir>/run.log；
+未显式开启 debug 时不会写入系统临时目录。
   Ctrl+C / kill / SSH 断开（SIGHUP）优雅中断：停止发新请求，已完成数据照常落盘；
   再按一次强制退出。长跑建议 nohup/tmux 挂后台，防连接抖动。
 
@@ -294,12 +294,15 @@ func main() {
 
 	// 排查基础能力：run.log 始终写（现场排查时日志永远拿得到）；raw 转储由 debug 控制
 	// run.log 追加而非覆盖：同目录多轮测试的日志都要留得住（两轮对照时踩过覆盖坑）
-	if err := os.MkdirAll(cfg.OutputDir, 0o755); err == nil {
-		if lf, err := os.OpenFile(filepath.Join(cfg.OutputDir, "run.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
-			fmt.Fprintf(lf, "\n===== test run %s（tool %s）=====\n", time.Now().Format(time.RFC3339), report.Version)
-			log.SetOutput(io.MultiWriter(os.Stderr, lf))
-			defer lf.Close()
-		}
+	if err := os.MkdirAll(cfg.OutputDir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "run.log 目录初始化失败: %v\n", err)
+	} else if lf, err := os.OpenFile(filepath.Join(cfg.OutputDir, "run.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600); err != nil {
+		fmt.Fprintf(os.Stderr, "run.log 打开失败: %v\n", err)
+	} else {
+		_ = lf.Chmod(0o600)
+		fmt.Fprintf(lf, "\n===== test run %s（tool %s）=====\n", time.Now().Format(time.RFC3339), report.Version)
+		log.SetOutput(io.MultiWriter(os.Stderr, lf))
+		defer lf.Close()
 	}
 
 	client := engine.NewClient(cfg.Endpoint, cfg.APIKey, cfg.Timeout(), *cfg.IncludeUsage)
@@ -366,7 +369,7 @@ func main() {
 			CaptureDir:      *captureFlag,
 			XVPromptTokens:  cfg.Concurrent.PromptTokens,
 			XVMaxTokens:     cfg.Concurrent.MaxTokens.Max(), // probe 上下文探测按最大输出预算（prompt+output 最坏组合）
-			ThinkingBudget:  th.MaxTokensFloor,
+			ThinkingBudget:  th.MaxTokensFloorValue(),
 			CacheCheck:      *cacheFlag,
 			CacheSizeTokens: *cacheSizeFlag,
 			FillerLang:      cfg.FillerLang,
@@ -477,6 +480,17 @@ func main() {
 	if len(concVals) == 0 {
 		fmt.Fprintln(os.Stderr, "--concurrency 解析结果为空")
 		os.Exit(1)
+	}
+	if strings.TrimSpace(*concFlag) != "cfg" {
+		// 显式数字列表表达闭环并发；不能被配置中的开环到达率静默覆盖。
+		cfg.Concurrent.RequestRate = 0
+		cfg.Concurrent.RateSweep = nil
+		for _, ov := range cfg.ModelOverrides {
+			if ov != nil && ov.Concurrent != nil {
+				ov.Concurrent.RequestRate = 0
+				ov.Concurrent.RateSweep = nil
+			}
+		}
 	}
 	seen := map[int]bool{}
 	var vals []int

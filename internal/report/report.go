@@ -337,7 +337,19 @@ func SaveJSONAny(v any, path string) error {
 			return err
 		}
 	}
-	return os.WriteFile(path, rj, 0o644)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if _, err := f.Write(rj); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // DefaultName 生成默认输出文件名：<scenario>-<timestamp>.json

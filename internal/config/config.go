@@ -251,7 +251,7 @@ type Thinking struct {
 	Mode           string         `yaml:"mode"`             // both（默认，A/B 对照）| on | off
 	ExtraBodyOn    map[string]any `yaml:"extra_body_on"`    // 思考开启时合并进请求体
 	ExtraBodyOff   map[string]any `yaml:"extra_body_off"`   // 思考关闭时合并进请求体
-	MaxTokensFloor int            `yaml:"max_tokens_floor"` // 思考开启时 max_tokens 下限保护（防思考吃光输出预算）
+	MaxTokensFloor *int           `yaml:"max_tokens_floor"` // nil=未配置（默认 2048），0=显式关闭下限保护
 
 	// Levels 自定义思考变体（低/中/高/极高等任意档位）：配置后取代 mode 展开。
 	// 不同推理框架参数名不同（OpenAI reasoning_effort / Qwen chat_template_kwargs.thinking_budget /
@@ -364,9 +364,17 @@ func (t Thinking) Variants() []ThinkingVariant {
 }
 
 // MaxTokens 对思考开启的变体应用 max_tokens 下限保护。
+func (t Thinking) MaxTokensFloorValue() int {
+	if t.MaxTokensFloor == nil {
+		return 0
+	}
+	return *t.MaxTokensFloor
+}
+
 func (t Thinking) MaxTokens(maxTokens int, v ThinkingVariant) int {
-	if v.Enabled && t.MaxTokensFloor > 0 && maxTokens < t.MaxTokensFloor {
-		return t.MaxTokensFloor
+	floor := t.MaxTokensFloorValue()
+	if v.Enabled && floor > 0 && maxTokens < floor {
+		return floor
 	}
 	return maxTokens
 }
@@ -400,7 +408,7 @@ func (c *Config) ThinkingFor(model string) *Thinking {
 		if ot.ExtraBodyOff != nil {
 			t.ExtraBodyOff = ot.ExtraBodyOff
 		}
-		if ot.MaxTokensFloor > 0 {
+		if ot.MaxTokensFloor != nil {
 			t.MaxTokensFloor = ot.MaxTokensFloor
 		}
 		if len(ot.Levels) > 0 {
@@ -668,6 +676,33 @@ func isBuiltinCorpus(spec string) bool {
 	return spec == "en" || spec == "zh"
 }
 
+// redactConfigSecrets 保留配置存档的结构和非敏感内容，但不保留认证字段值。
+// 只处理精确的顶层 YAML 键，避免误伤注释或相似字段名。
+func redactConfigSecrets(data []byte) string {
+	lines := strings.SplitAfter(string(data), "\n")
+	for i, line := range lines {
+		lineEnd := ""
+		content := line
+		if strings.HasSuffix(content, "\n") {
+			lineEnd = "\n"
+			content = strings.TrimSuffix(content, "\n")
+		}
+		content = strings.TrimSuffix(content, "\r")
+		trimmed := strings.TrimSpace(content)
+		colon := strings.IndexByte(trimmed, ':')
+		if colon < 0 {
+			continue
+		}
+		key := strings.TrimSpace(trimmed[:colon])
+		if key != "api_key" && key != "api_key_env" {
+			continue
+		}
+		prefix := content[:len(content)-len(trimmed)]
+		lines[i] = prefix + key + ": <redacted>" + lineEnd
+	}
+	return strings.Join(lines, "")
+}
+
 // Load 读取配置文件，应用默认值，再用环境变量覆盖。
 // 环境变量优先级最高：LLM_PERF_ENDPOINT、LLM_PERF_API_KEY。
 func Load(path string) (*Config, error) {
@@ -688,7 +723,7 @@ func Load(path string) (*Config, error) {
 		if err := dec.Decode(cfg); err != nil {
 			return nil, fmt.Errorf("parse config: %w", err)
 		}
-		cfg.Raw = string(data)
+		cfg.Raw = redactConfigSecrets(data)
 		// 相对路径以配置文件所在目录为基准（dataset.path / filler_corpus 等），
 		// 与启动时的工作目录解耦——从任何目录 `bench -f configs/xxx.yaml` 结果一致
 		if isRel := !filepath.IsAbs(cfg.Dataset.Path) && cfg.Dataset.Path != ""; isRel {
@@ -710,8 +745,13 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("endpoint 未配置（yaml endpoint 或 LLM_PERF_ENDPOINT）")
 	}
 	// 认证 key 解析优先级：环境变量 LLM_PERF_API_KEY > 配置字面量 api_key > api_key_env 指向的变量
+	apiKeyEnvValue := ""
 	if cfg.APIKeyEnv != "" {
-		cfg.APIKey = os.Getenv(cfg.APIKeyEnv)
+		apiKeyEnvValue = os.Getenv(cfg.APIKeyEnv)
+		if apiKeyEnvValue == "" && cfg.APIKeyLiteral == "" && os.Getenv("LLM_PERF_API_KEY") == "" {
+			return nil, fmt.Errorf("api_key_env 指向的环境变量 %q 未设置或为空", cfg.APIKeyEnv)
+		}
+		cfg.APIKey = apiKeyEnvValue
 	}
 	if cfg.APIKeyLiteral != "" {
 		cfg.APIKey = cfg.APIKeyLiteral
@@ -778,8 +818,9 @@ func Load(path string) (*Config, error) {
 	default:
 		return nil, fmt.Errorf("test 无效值 %q（可选 benchmark/performance/soak；留空 = performance）", rawTest)
 	}
-	if cfg.Thinking.MaxTokensFloor <= 0 {
-		cfg.Thinking.MaxTokensFloor = 2048
+	if cfg.Thinking.MaxTokensFloor == nil {
+		floor := 2048
+		cfg.Thinking.MaxTokensFloor = &floor
 	}
 	// model_overrides 覆盖校验：键必须在 models 列表内；thinking.mode 值合法
 	inModels := make(map[string]bool, len(cfg.Models))
@@ -957,7 +998,7 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Multiturn.TurnTokens > 0 && len(cfg.Multiturn.Profiles) == 0 {
 		base := cfg.Multiturn.SystemTokens + cfg.Multiturn.ToolDefsTokens
-		reach := base + cfg.Multiturn.Turns*cfg.Multiturn.TurnTokens
+		reach := safeMultiturnDepth(base, cfg.Multiturn.Turns, cfg.Multiturn.TurnTokens)
 		w := fmt.Sprintf("多轮可达深度：base %d + %d 轮 × %d ≈ 末轮 %d token",
 			base, cfg.Multiturn.Turns, cfg.Multiturn.TurnTokens, reach)
 		if cfg.MaxPromptTokens > 0 && reach > cfg.MaxPromptTokens {
@@ -996,7 +1037,7 @@ func Load(path string) (*Config, error) {
 			if effTurns <= 0 {
 				effTurns = cfg.Multiturn.Turns
 			}
-			reach := base + effTurns*p.TurnTokens
+			reach := safeMultiturnDepth(base, effTurns, p.TurnTokens)
 			w := fmt.Sprintf("混合档 %s（权重 %d）：base %d + %d 轮 × %d ≈ 末轮 %d token",
 				p.Name, p.Weight, base, effTurns, p.TurnTokens, reach)
 			if cfg.MaxPromptTokens > 0 && reach > cfg.MaxPromptTokens {
@@ -1133,19 +1174,20 @@ func Load(path string) (*Config, error) {
 	}
 
 	// 思考 floor 联动：on 时 max_tokens 会被抬高，off/on 的 E2E 口径不同
-	if thinkMayOn && cfg.Thinking.MaxTokensFloor > 0 {
+	floor := cfg.Thinking.MaxTokensFloorValue()
+	if thinkMayOn && floor > 0 {
 		for _, mt := range cfg.Single.MaxTokens {
-			if mt < cfg.Thinking.MaxTokensFloor {
+			if mt < floor {
 				cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
 					"single.max_tokens=%d < max_tokens_floor=%d：thinking=on 的请求会被抬高到 floor，off/on 的 E2E 不可直接横向比（off 受输出档钳制、on 受 floor 抬高）",
-					mt, cfg.Thinking.MaxTokensFloor))
+					mt, floor))
 			}
 		}
 		for _, mt := range cfg.Multiturn.MaxTokens {
-			if mt < cfg.Thinking.MaxTokensFloor {
+			if mt < floor {
 				cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
 					"multiturn.max_tokens=%d < max_tokens_floor=%d：thinking=on 的请求会被抬高到 floor",
-					mt, cfg.Thinking.MaxTokensFloor))
+					mt, floor))
 			}
 		}
 	}
@@ -1458,6 +1500,20 @@ func (c *Config) ClampOne(tokens int) int {
 	return tokens
 }
 
+func safeMultiturnDepth(base, turns, turnTokens int) int {
+	if base < 0 || turns < 0 || turnTokens < 0 {
+		return 0
+	}
+	maxInt := int(^uint(0) >> 1)
+	if turnTokens > 0 && turns > (maxInt-base)/turnTokens {
+		return maxInt
+	}
+	if base > maxInt-turns*turnTokens {
+		return maxInt
+	}
+	return base + turns*turnTokens
+}
+
 // MultiturnMaxDepth 多轮场景可达的最深上下文（混合档取最深档位；未配置返回 0）。
 // 口径与执行一致：档位 turns 覆盖时按该档位（base + turns×turn_tokens）计算。
 func (c *Config) MultiturnMaxDepth() int {
@@ -1470,14 +1526,14 @@ func (c *Config) MultiturnMaxDepth() int {
 			if effTurns <= 0 {
 				effTurns = mt.Turns
 			}
-			if r := base + effTurns*p.TurnTokens; r > mx {
+			if r := safeMultiturnDepth(base, effTurns, p.TurnTokens); r > mx {
 				mx = r
 			}
 		}
 		return mx
 	}
 	if mt.TurnTokens > 0 {
-		return base + mt.Turns*mt.TurnTokens
+		return safeMultiturnDepth(base, mt.Turns, mt.TurnTokens)
 	}
 	return 0
 }

@@ -19,6 +19,14 @@ func TestBuiltinLoad(t *testing.T) {
 	}
 }
 
+func TestWindowNegativeSeed(t *testing.T) {
+	c := &Corpus{text: []rune("abcdefghijklmnopqrstuvwxyz")}
+	got := c.Window(8, -7)
+	if len([]rune(got)) != 8 {
+		t.Fatalf("负 seed 应返回完整窗口，得到 %q", got)
+	}
+}
+
 func TestWindowDeterminism(t *testing.T) {
 	if err := Load("en", "en"); err != nil {
 		t.Fatal(err)

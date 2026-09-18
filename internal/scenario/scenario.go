@@ -23,6 +23,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aleexjiang/llm-perf/internal/auth"
 	"github.com/aleexjiang/llm-perf/internal/config"
@@ -187,7 +188,22 @@ func runOne(ctx context.Context, e *env, model string,
 		Thinking:  v.Enabled,
 		ExtraBody: v.ExtraBody,
 	})
-	if m != nil {
+	if m == nil {
+		// Client.Chat 在请求构造失败等边界路径可能只有 error；场景层仍必须保留一条
+		// 可序列化的失败指标，不能让主路径解引用 nil 丢掉整个场景。
+		m = &engine.TurnMetrics{
+			Model:    model,
+			Stream:   e.cfg.StreamEnabled(),
+			Thinking: v.Enabled,
+			Phase:    "benchmark",
+			Error:    "request returned no metrics",
+			EndAt:    time.Now(),
+		}
+		if err != nil {
+			m.Error = err.Error()
+		}
+		m.Finalize()
+	} else {
 		m.Phase = "benchmark"
 		if m.Error != "" && ctx.Err() != nil {
 			m.Cancelled = true
@@ -200,7 +216,7 @@ func runOne(ctx context.Context, e *env, model string,
 		if n := len(msgs); n > 0 {
 			last := msgs[n-1]
 			log.Printf("    输入[%d条消息,末条 %s %d字]: %s",
-				n, last.Role, len([]rune(last.Content)), engine.PreviewHeadTail(last.Content))
+				n, last.Role, utf8.RuneCountInString(last.Content), engine.PreviewHeadTail(last.Content))
 		}
 		if m.ReasoningChars > 0 {
 			log.Printf("    思考[%d字]: %s", m.ReasoningChars, engine.PreviewHeadTail(m.ReasoningText()))
@@ -547,7 +563,7 @@ func Single(ctx context.Context, cfg *config.Config, client *engine.Client, mode
 		Test:        cfg.TestKind(),
 		Endpoint:    cfg.Endpoint,
 		Note: fmt.Sprintf("单发单轮 runs=%d fixed_seed=%v stream=%v thinking=%s；思考开启时 max_tokens 下限 %d；数据源=%s%s",
-			cfg.Single.Runs, cfg.Single.FixedSeed, cfg.StreamEnabled(), cfg.Thinking.Mode, cfg.Thinking.MaxTokensFloor, cfg.Dataset.Mode, thinkingNoteSuffix(cfg)),
+			cfg.Single.Runs, cfg.Single.FixedSeed, cfg.StreamEnabled(), cfg.Thinking.Mode, cfg.Thinking.MaxTokensFloorValue(), cfg.Dataset.Mode, thinkingNoteSuffix(cfg)),
 	}
 	applySLO(e, rep)
 	attachKVCapacity(e, rep)

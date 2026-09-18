@@ -55,7 +55,7 @@ type Client struct {
 	ChatPath     string       // 接口路径，默认 /chat/completions（客户 router 路径不同时配置）
 	IncludeUsage bool         // 请求 stream_options.include_usage
 	HTTP         *http.Client //
-	DebugDir     string       // 非空时留存每个请求的原始响应到该目录（排查魔改引擎）；请求失败时即使为空也会留存
+	DebugDir     string       // 非空时留存每个请求的原始响应到该目录（排查魔改引擎）
 	Retry        *RetryPolicy // nil = 不重试（压测默认）
 
 	// RawTimings 原始 chunk 序列落盘：流式请求把每个含 token chunk 的时刻记进
@@ -81,9 +81,9 @@ func NewClient(baseURL, apiKey string, timeout time.Duration, includeUsage bool)
 	// 并发压测时会反复建连（TIME_WAIT 堆积 + 建连耗时混进 TTFT 污染数据）
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
-		MaxIdleConns:          256,
-		MaxIdleConnsPerHost:   0, // 不限：并发档超过上限时空闲连接被回收重建，握手耗时进 TTFT（P3-11）
-		MaxConnsPerHost:       0, // 不限：并发度由场景层控制
+		MaxIdleConns:          512,
+		MaxIdleConnsPerHost:   512, // 显式放宽：避免高并发流式请求因默认上限 2 反复建连
+		MaxConnsPerHost:       0,   // 不限：并发度由场景层控制
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
@@ -206,6 +206,7 @@ type TurnMetrics struct {
 	doneSeen       bool
 	reasoningField string
 	rawResp        []byte // 原始响应头部片段（用于失败/调试转储）
+	discardRaw     bool   // 未显式开启 DebugDir 时不在内存中保留原始请求/响应
 
 	reasoningBuf string // 思考增量累积（日志预览用；json:"-" 不入库，上限 64KB）
 
@@ -299,10 +300,10 @@ func (m *TurnMetrics) Finalize() {
 	if len(itl) > 0 {
 		sort.Float64s(itl) // 先排序，Max 取末位
 		m.ITLAvg = avg(itl)
-		m.ITLP50 = percentile(itl, 50)
-		m.ITLP90 = percentile(itl, 90)
-		m.ITLP95 = percentile(itl, 95)
-		m.ITLP99 = percentile(itl, 99)
+		m.ITLP50 = percentileSorted(itl, 50)
+		m.ITLP90 = percentileSorted(itl, 90)
+		m.ITLP95 = percentileSorted(itl, 95)
+		m.ITLP99 = percentileSorted(itl, 99)
 		m.ITLMax = itl[len(itl)-1]
 	}
 
@@ -345,6 +346,10 @@ func avg(xs []float64) float64 {
 func percentile(xs []float64, p float64) float64 {
 	s := append([]float64(nil), xs...)
 	sort.Float64s(s)
+	return percentileSorted(s, p)
+}
+
+func percentileSorted(s []float64, p float64) float64 {
 	n := len(s)
 	if n == 0 {
 		return 0
@@ -385,8 +390,9 @@ func (c *Client) Chat(ctx context.Context, o ChatOptions) (*TurnMetrics, error) 
 			if backoff <= 0 {
 				backoff = 300 * time.Millisecond
 			}
-			if d := backoff << (i - 1); d < 5*time.Second {
-				backoff = d // 指数退避，封顶 5s
+			shift := i - 1
+			if shift < 30 && backoff <= 5*time.Second/time.Duration(1<<shift) {
+				backoff <<= shift // 指数退避，封顶 5s
 			} else {
 				backoff = 5 * time.Second
 			}
@@ -443,7 +449,7 @@ func (c *Client) attempt(ctx context.Context, o ChatOptions) (m *TurnMetrics, er
 		return nil, err, false
 	}
 
-	m = &TurnMetrics{Model: o.Model, Stream: o.Stream, Thinking: o.Thinking, rawTimings: c.RawTimings}
+	m = &TurnMetrics{Model: o.Model, Stream: o.Stream, Thinking: o.Thinking, rawTimings: c.RawTimings, discardRaw: c.DebugDir == ""}
 	m.appendRaw(string(payload) + "\n--- RESPONSE ---\n")
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.ChatURL(), bytes.NewReader(payload))
 	if err != nil {
@@ -467,6 +473,8 @@ func (c *Client) attempt(ctx context.Context, o ChatOptions) (m *TurnMetrics, er
 
 	if resp.StatusCode != http.StatusOK {
 		buf, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		// 保留短错误摘要，同时有限 drain 剩余响应，尽可能让 HTTP/1.1 连接回到连接池。
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 		m.Error = fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(buf))
 		m.EndAt = time.Now()
 		m.Finalize()
@@ -514,23 +522,23 @@ const maxRawKeep = 256 * 1024
 
 // appendRaw 保留原始流片段（头尾各留一半），用于 debug 转储与失败排查。
 func (m *TurnMetrics) appendRaw(line string) {
-	if len(m.rawResp) >= maxRawKeep {
+	if m.discardRaw || len(m.rawResp) >= maxRawKeep {
 		return
+	}
+	remaining := maxRawKeep - len(m.rawResp)
+	if len(line) > remaining {
+		line = line[:remaining]
 	}
 	m.rawResp = append(m.rawResp, line...)
 }
 
-// dumpIfNeeded 把请求上下文 + 原始响应写进 DebugDir；请求失败时无条件留存。
+// dumpIfNeeded 把请求上下文 + 原始响应写进显式配置的 DebugDir。
 func (c *Client) dumpIfNeeded(m *TurnMetrics, reqBody []byte, status int, respHeader http.Header, stream bool) {
-	dumpOnError := m.Error != ""
-	if c.DebugDir == "" && !dumpOnError {
+	if c.DebugDir == "" {
 		return
 	}
 	dir := c.DebugDir
-	if dir == "" {
-		dir = os.TempDir()
-	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return
 	}
 	name := fmt.Sprintf("%s-%s-%d-%s.log", time.Now().Format("150405"), sanitize(m.Model), c.seq.Add(1), map[bool]string{true: "stream", false: "whole"}[stream])
@@ -541,7 +549,9 @@ func (c *Client) dumpIfNeeded(m *TurnMetrics, reqBody []byte, status int, respHe
 		fmt.Fprintf(&b, "response_headers: %s\n", truncate(respHeader.Get("Server")+" | "+respHeader.Get("Content-Type")+" | fingerprint header? "+respHeader.Get("X-Request-Id"), 300))
 	}
 	b.Write(m.rawResp)
-	_ = os.WriteFile(filepath.Join(dir, name), b.Bytes(), 0o644)
+	path := filepath.Join(dir, name)
+	_ = os.WriteFile(path, b.Bytes(), 0o600)
+	_ = os.Chmod(path, 0o600)
 }
 
 func sanitize(s string) string {
@@ -598,5 +608,5 @@ func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return s[:n] + "..."
+	return TruncateRunes(s, n) + "..."
 }

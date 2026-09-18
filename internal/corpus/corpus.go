@@ -73,8 +73,9 @@ func Load(spec, lang string) error {
 			return fmt.Errorf("corpus: gzip 解压失败: %w", zerr)
 		}
 		data, err = io.ReadAll(zr)
+		_ = zr.Close()
 		if err != nil {
-			return fmt.Errorf("corpus: gzip 读取失败: %w", zerr)
+			return fmt.Errorf("corpus: gzip 读取失败: %w", err)
 		}
 	}
 	if !utf8.Valid(data) {
@@ -109,7 +110,11 @@ func (c *Corpus) Window(targetChars int, seed int64) string {
 		return ""
 	}
 	// 起点：seed 决定，步长取素数避免与常见档位产生周期性对齐
-	start := int((seed % int64(n)) * 7919 % int64(n))
+	seedMod := seed % int64(n)
+	if seedMod < 0 {
+		seedMod += int64(n)
+	}
+	start := int((seedMod * 7919) % int64(n))
 	out := make([]rune, 0, targetChars)
 	if targetChars <= n-start {
 		out = append(out, c.text[start:start+targetChars]...)

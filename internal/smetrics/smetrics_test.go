@@ -30,6 +30,15 @@ vllm:request_queue_time_seconds_count 100
 vllm:some_other_metric 1.5
 `
 
+func TestParsePrometheusTimestamp(t *testing.T) {
+	s := Parse(`vllm:num_requests_running 7 1712000000000
+vllm:num_requests_waiting{engine="0"} 3 1712000000000
+`)
+	if s.Gauges["vllm:num_requests_running"] != 7 || s.Gauges["vllm:num_requests_waiting"] != 3 {
+		t.Fatalf("带 timestamp 的 gauge 解析错误: %+v", s.Gauges)
+	}
+}
+
 func TestParse(t *testing.T) {
 	s := Parse(sampleText)
 	if got := s.Counters["vllm:prefix_cache_hits"]; got != 11708800 {

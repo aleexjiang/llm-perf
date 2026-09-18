@@ -108,8 +108,20 @@ func (s *Scraper) Scrape(ctx context.Context) (*Sample, error) {
 			return sample, nil
 		}
 		lastErr = err
+		if code, ok := scrapeStatus(err); ok && code != http.StatusRequestTimeout && code != http.StatusTooManyRequests && code < 500 {
+			break
+		}
 	}
 	return nil, lastErr
+}
+
+type scrapeStatusError int
+
+func (e scrapeStatusError) Error() string { return fmt.Sprintf("HTTP %d", int(e)) }
+
+func scrapeStatus(err error) (int, bool) {
+	status, ok := err.(scrapeStatusError)
+	return int(status), ok
 }
 
 func (s *Scraper) scrapeOnce(ctx context.Context) (*Sample, error) {
@@ -124,7 +136,7 @@ func (s *Scraper) scrapeOnce(ctx context.Context) (*Sample, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+		return nil, scrapeStatusError(resp.StatusCode)
 	}
 	const maxBody = 16 << 20 // 16MB：超长响应截断会产生不完整半行，静默丢指标比失败更糟
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
@@ -151,7 +163,11 @@ func Parse(text string) *Sample {
 			continue
 		}
 		name, labels, rest := splitMetricLine(line)
-		val, err := strconv.ParseFloat(rest, 64)
+		fields := strings.Fields(rest)
+		if len(fields) == 0 {
+			continue
+		}
+		val, err := strconv.ParseFloat(fields[0], 64)
 		// NaN/±Inf（坏 exporter/采样窗口）会随 counter 差分扩散，最终让整份报告 JSON
 		// 序列化失败（Go json 拒绝 NaN）——解析层直接丢弃
 		if err != nil || name == "" || math.IsNaN(val) || math.IsInf(val, 0) {
@@ -165,7 +181,10 @@ func Parse(text string) *Sample {
 				h = &Hist{}
 				s.Hists[family] = h
 			}
-			le := parseLE(labels["le"])
+			le, ok := parseLE(labels["le"])
+			if !ok {
+				continue
+			}
 			// 带 label 的直方图（vLLM/SGLang：model_name、finished_reason 等）同一 le
 			// 会出现多条——必须按 (family, le) 累加，否则 histQuantile 的 map 覆盖
 			// 会让分位估算失真（与 _count/_sum 的跨系列求和口径一致）
@@ -211,7 +230,6 @@ func Parse(text string) *Sample {
 
 // splitMetricLine 拆出指标名、label 映射与值部分。
 func splitMetricLine(line string) (name string, labels map[string]string, value string) {
-	labels = map[string]string{}
 	sp := strings.IndexAny(line, " \t")
 	if sp < 0 {
 		return line, labels, ""
@@ -220,6 +238,7 @@ func splitMetricLine(line string) (name string, labels map[string]string, value 
 	head := line[:sp]
 	if i := strings.Index(head, "{"); i >= 0 && strings.HasSuffix(head, "}") {
 		name = head[:i]
+		labels = map[string]string{}
 		for _, kv := range splitLabels(head[i+1 : len(head)-1]) {
 			if eq := strings.Index(kv, "="); eq > 0 {
 				k := strings.TrimSpace(kv[:eq])
@@ -256,12 +275,12 @@ func splitLabels(s string) []string {
 	return out
 }
 
-func parseLE(s string) float64 {
+func parseLE(s string) (float64, bool) {
 	if s == "+Inf" {
-		return inf()
+		return inf(), true
 	}
-	v, _ := strconv.ParseFloat(s, 64)
-	return v
+	v, err := strconv.ParseFloat(s, 64)
+	return v, err == nil && !math.IsNaN(v)
 }
 
 // MetricsProvider 抽象不同推理引擎的 /metrics 指标命名。
@@ -537,6 +556,12 @@ type HistDelta struct {
 // 并发窗口内直方图混入其他流量的观测属已知近似（AIPerf 同口径）。
 // p 为 nil 时回落 vLLM 命名。
 func HistDeltas(before, after *Sample, p MetricsProvider) map[string]HistDelta {
+	if before == nil {
+		before = &Sample{Hists: map[string]*Hist{}}
+	}
+	if after == nil {
+		after = &Sample{Hists: map[string]*Hist{}}
+	}
 	if p == nil {
 		p = VLLM()
 	}
@@ -622,15 +647,16 @@ type GaugePoller struct {
 	ctx      context.Context
 	provider MetricsProvider
 
-	mu          sync.Mutex
-	samples     map[string][]float64
-	okSamples   int    // 成功抓取次数
-	totalFails  int    // 累计失败次数
-	consecFails int    // 连续失败次数
-	lastErr     string // 最后一次失败原因
-	stopOnce    sync.Once
-	done        chan struct{} // Stop 关闭：通知 loop 退出
-	stopped     chan struct{} // loop 退出时关闭：外部可等待
+	mu           sync.Mutex
+	samples      map[string][]float64
+	sampleTotals map[string]int
+	okSamples    int    // 成功抓取次数
+	totalFails   int    // 累计失败次数
+	consecFails  int    // 连续失败次数
+	lastErr      string // 最后一次失败原因
+	stopOnce     sync.Once
+	done         chan struct{} // Stop 关闭：通知 loop 退出
+	stopped      chan struct{} // loop 退出时关闭：外部可等待
 }
 
 // GaugeHealth 是轮询健康度汇总。
@@ -654,13 +680,14 @@ func StartGaugePoller(ctx context.Context, sc *Scraper, interval time.Duration, 
 	}
 	sc.MaxRetries = 0 // 轮询快速失败：失败计数即降级信号，下一 tick 天然是重试
 	g := &GaugePoller{
-		scraper:  sc,
-		interval: interval,
-		ctx:      ctx,
-		provider: p,
-		samples:  map[string][]float64{},
-		done:     make(chan struct{}),
-		stopped:  make(chan struct{}),
+		scraper:      sc,
+		interval:     interval,
+		ctx:          ctx,
+		provider:     p,
+		samples:      map[string][]float64{},
+		sampleTotals: map[string]int{},
+		done:         make(chan struct{}),
+		stopped:      make(chan struct{}),
 	}
 	go g.loop()
 	return g
@@ -699,12 +726,24 @@ func (g *GaugePoller) once() {
 	names := g.provider.GaugeNames()
 	for key, cands := range names {
 		for _, n := range cands {
-			if v, ok := sample.Counters[n]; ok {
-				g.samples[key] = append(g.samples[key], v)
+			if v, ok := sample.Gauges[n]; ok {
+				g.appendSample(key, v)
 				break
 			}
 		}
 	}
+}
+
+const maxGaugeSamples = 4096
+
+func (g *GaugePoller) appendSample(key string, value float64) {
+	g.sampleTotals[key]++
+	xs := g.samples[key]
+	if len(xs) >= maxGaugeSamples {
+		copy(xs, xs[1:])
+		xs = xs[:len(xs)-1]
+	}
+	g.samples[key] = append(xs, value)
 }
 
 // Health 返回轮询健康度（调用后轮询继续，可随时读取）。
@@ -759,7 +798,7 @@ func (g *GaugePoller) RunningSampleCount() int {
 func (g *GaugePoller) sampleCount(key string) int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return len(g.samples[key])
+	return g.sampleTotals[key]
 }
 
 // WaitingSamplesSince 返回下标 i 之后新采到的 waiting 样本（i 越界按 0 处理）。
@@ -777,11 +816,17 @@ func (g *GaugePoller) samplesSince(key string, i int) []float64 {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	xs := g.samples[key]
-	if i < 0 || i > len(xs) {
-		i = 0
+	total := g.sampleTotals[key]
+	oldest := total - len(xs)
+	if i < oldest {
+		i = oldest
 	}
-	out := make([]float64, len(xs)-i)
-	copy(out, xs[i:])
+	if i > total {
+		i = total
+	}
+	offset := i - oldest
+	out := make([]float64, len(xs)-offset)
+	copy(out, xs[offset:])
 	return out
 }
 

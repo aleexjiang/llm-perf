@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -148,6 +150,43 @@ func hasWarningPrefix(ws []string, prefix string) bool {
 		}
 	}
 	return false
+}
+
+func TestRawCaptureRequiresExplicitDebugDir(t *testing.T) {
+	srv, _ := flakyStub(t, []int{500})
+	c := NewClient(srv.URL, "", 5*time.Second, false)
+	m, err := c.Chat(context.Background(), retryOpts(false))
+	if err == nil || m == nil {
+		t.Fatalf("请求应失败且保留 metrics: m=%v err=%v", m, err)
+	}
+	if len(m.rawResp) != 0 {
+		t.Fatalf("未开启 DebugDir 时不应保留 raw，长度=%d", len(m.rawResp))
+	}
+}
+
+func TestRawCaptureUsesPrivateFile(t *testing.T) {
+	dir := t.TempDir()
+	srv, _ := flakyStub(t, []int{500})
+	c := NewClient(srv.URL, "", 5*time.Second, false)
+	c.DebugDir = filepath.Join(dir, "raw")
+	m, err := c.Chat(context.Background(), retryOpts(false))
+	if err == nil || m == nil {
+		t.Fatalf("请求应失败且保留 metrics: m=%v err=%v", m, err)
+	}
+	entries, err := os.ReadDir(c.DebugDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("显式 DebugDir 应生成一个 capture，得到 %d", len(entries))
+	}
+	info, err := entries[0].Info()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("raw 文件权限 = %o，want 600", got)
+	}
 }
 
 func TestPreviewHeadTail(t *testing.T) {

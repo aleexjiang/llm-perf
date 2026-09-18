@@ -99,7 +99,7 @@ def metrics(rep):
 multi = load_all("out-multi")
 check(len(multi) == 2, f"多模型单发多轮按模型落盘（{len(multi)} 份）")
 check(all(not rep.get("single") for rep in multi), "多轮产物不再包含 single 场景")
-check(all(rep.get("schema_version") == 3 for rep in multi), "数据契约版本为 3")
+check(all(rep.get("schema_version") == 4 for rep in multi), "数据契约版本为 4")
 check(all(rep.get("multiturn") for rep in multi), "单发多轮产物含 multiturn")
 aux = [a for rep in multi for a in (rep.get("auxiliary_requests") or [])]
 check(sum(a.get("phase") == "warmup" for a in aux) >= 2, "warmup 完整 TurnMetrics 落盘")

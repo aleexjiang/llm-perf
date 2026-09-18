@@ -258,20 +258,24 @@ func ingestSSEBody(m *TurnMetrics, body io.Reader, clock func() time.Time, inclu
 	scanner := bufio.NewScanner(body)
 	// 单行上限 8MB：1MB 曾把含超大 tool_calls arguments 的 SSE 行误判为
 	// stream_read_error（流断裂），整个请求被当失败
-	scanner.Buffer(make([]byte, 1024*1024), 8*1024*1024)
+	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 	badLines := 0
 	var lastBad string
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		m.appendRaw(line + "\n")
+		if m.doneSeen {
+			continue // [DONE] 后继续消费到 EOF，确保响应连接可复用
+		}
 		data, ok := splitSSEData(line)
 		if !ok {
 			continue // 非 SSE data 行（注释、BOM 等魔改迹象留存在 raw 转储里）
 		}
 		if data == "[DONE]" {
 			m.doneSeen = true
-			break
+			continue
 		}
+		chunkAt := clock()
 		ev, err := parseSSEData([]byte(data))
 		if err != nil {
 			// 聚合告警：魔改流可能几十行都解析失败，逐条记会刷屏
@@ -279,7 +283,7 @@ func ingestSSEBody(m *TurnMetrics, body io.Reader, clock func() time.Time, inclu
 			lastBad = data
 			continue
 		}
-		m.ingestEvent(ev, clock())
+		m.ingestEvent(ev, chunkAt)
 	}
 	if badLines > 0 {
 		m.warn("unparseable_stream_line ×%d, last=%.80s", badLines, lastBad)

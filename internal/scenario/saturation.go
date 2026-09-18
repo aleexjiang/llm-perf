@@ -159,7 +159,10 @@ func startSaturationWatch(ctx context.Context, sg *config.SaturationGuardCfg,
 		refreshPeak()
 		w, ok := pol.LatestWaiting()
 		if !ok {
-			return // 观测缺失：maxSeen 只记真实观测，判定侧由 dec 重置
+			if armed {
+				dec.observe(0, false, now) // 缺失采样必须打断连续超阈计时
+			}
+			return // maxSeen 只记真实观测
 		}
 		mu.Lock()
 		if w > maxSeen {

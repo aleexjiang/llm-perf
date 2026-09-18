@@ -352,6 +352,7 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 	}
 	chatSt, chatRaw := minChat()
 	if chatSt == http.StatusNotFound || chatSt == http.StatusMethodNotAllowed {
+		originalChatPath := chatPath
 		for _, p := range pathCandidates(chatPath, chatPathCandidates) {
 			chatPath = p
 			if st, raw, _, err := doChat(nil, 1, false); err == nil && st != http.StatusNotFound && st != http.StatusMethodNotAllowed {
@@ -359,6 +360,9 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 				res.Verdicts = append(res.Verdicts, "chat 实际挂在 "+p+"——把配置的 chat_path 改成该值")
 				break
 			}
+		}
+		if chatSt == http.StatusNotFound || chatSt == http.StatusMethodNotAllowed {
+			chatPath = originalChatPath
 		}
 	}
 	switch {
@@ -657,7 +661,7 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 	// 短请求串行测量流式输出速度，保留逐模型结果与最慢模型保守值；不参与压测判定，
 	// 也不自动生成任何阈值配置。
 	{
-		cli := NewClient(origin, o.APIKey, 120*time.Second, o.IncludeUsage)
+		cli := NewClient(origin, o.APIKey, timeout, o.IncludeUsage)
 		cli.Auth = effAuth
 		cli.ChatPath = chatPath
 		probeModels := o.Models
@@ -821,7 +825,7 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 
 	// ── 7. tool-call 健康检查（默认开；--no-toolcall 关闭）──
 	if o.ToolCall {
-		runToolCallCheck(ctx, res, check, o, origin, chatPath, timeout, model, streamAnalyze)
+		runToolCallCheck(ctx, res, check, o, effAuth, origin, chatPath, timeout, model, streamAnalyze)
 	}
 
 	// ── 7.5 前缀缓存定性探针（--cache 开启，默认关）──

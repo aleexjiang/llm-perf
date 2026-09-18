@@ -19,6 +19,8 @@ import (
 
 // ── 种子派生语义（表驱动锁定：测试盐值隔离、fixed_seed 档内复用/档间独立、worker 互异） ──
 
+func intPtr(v int) *int { return &v }
+
 func TestSingleSeed(t *testing.T) {
 	cases := []struct {
 		name              string
@@ -352,7 +354,7 @@ func testCfg(t *testing.T, endpoint string) *config.Config {
 		IncludeUsage:   &on,
 		Stream:         &on,
 		FillerLang:     "en",
-		Thinking:       config.Thinking{Mode: "off", MaxTokensFloor: 512},
+		Thinking:       config.Thinking{Mode: "off", MaxTokensFloor: intPtr(512)},
 		Models:         []string{"stub-model"},
 	}
 }

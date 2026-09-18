@@ -47,6 +47,24 @@ maxtokens: 999
 	}
 }
 
+func TestThinkingMaxTokensFloorZeroDisablesProtection(t *testing.T) {
+	cfg, err := Load(writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+thinking:
+  max_tokens_floor: 0
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Thinking.MaxTokensFloorValue(); got != 0 {
+		t.Fatalf("显式 floor=0 应保持关闭，得到 %d", got)
+	}
+	if got := cfg.Thinking.MaxTokens(16, ThinkingVariant{Enabled: true}); got != 16 {
+		t.Fatalf("显式 floor=0 不应抬高 max_tokens，得到 %d", got)
+	}
+}
+
 func TestLoad_InvalidThinkingMode(t *testing.T) {
 	p := writeTemp(t, `
 endpoint: "http://x:1/v1"
@@ -109,6 +127,40 @@ api_key_env: "SOME_MISSING_VAR"
 	}
 	if cfg2.APIKey != "env-key" {
 		t.Fatalf("LLM_PERF_API_KEY should have highest priority: %q", cfg2.APIKey)
+	}
+}
+
+func TestLoadRedactsConfigSecrets(t *testing.T) {
+	p := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+api_key: "literal-secret"
+api_key_env: "PRIVATE_KEY"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.APIKey != "literal-secret" {
+		t.Fatalf("运行时认证 key 不应被脱敏: %q", cfg.APIKey)
+	}
+	if strings.Contains(cfg.Raw, "literal-secret") || strings.Contains(cfg.Raw, "PRIVATE_KEY") {
+		t.Fatalf("配置存档仍包含敏感值: %q", cfg.Raw)
+	}
+	if strings.Count(cfg.Raw, "<redacted>") != 2 {
+		t.Fatalf("应脱敏两个认证字段: %q", cfg.Raw)
+	}
+}
+
+func TestLoadMissingAPIKeyEnvFails(t *testing.T) {
+	t.Setenv("LLM_PERF_API_KEY", "")
+	_, err := Load(writeTemp(t, `
+endpoint: http://x:1/v1
+models: [m1]
+api_key_env: MISSING_KEY_FOR_TEST
+`))
+	if err == nil || !strings.Contains(err.Error(), "api_key_env") {
+		t.Fatalf("缺失 api_key_env 应失败，得到: %v", err)
 	}
 }
 
@@ -215,26 +267,26 @@ func TestThinkingForModelOverride(t *testing.T) {
 	c := &Config{
 		Thinking: Thinking{
 			Mode:           "both",
-			MaxTokensFloor: 8192,
+			MaxTokensFloor: intPtr(8192),
 			ExtraBodyOn:    map[string]any{"chat_template_kwargs": map[string]any{"enable_thinking": true}},
 		},
 		ModelOverrides: map[string]*ModelOverride{
 			"/models/Qwen3.8-27B": {Thinking: &Thinking{
 				Levels: []LevelVariant{{Name: "low", Enabled: true, ExtraBody: map[string]any{"reasoning_effort": "low"}}},
 			}},
-			"/models/DeepSeek": {Thinking: &Thinking{MaxTokensFloor: 16384}},
+			"/models/DeepSeek": {Thinking: &Thinking{MaxTokensFloor: intPtr(16384)}},
 		},
 	}
 	q := c.ThinkingFor("/models/Qwen3.8-27B")
-	if len(q.Levels) != 1 || q.Mode != "both" || q.MaxTokensFloor != 8192 {
+	if len(q.Levels) != 1 || q.Mode != "both" || q.MaxTokensFloorValue() != 8192 {
 		t.Fatalf("Qwen: levels 覆盖，mode/floor 应继承全局: %+v", q)
 	}
 	d := c.ThinkingFor("/models/DeepSeek")
-	if d.MaxTokensFloor != 16384 || len(d.Levels) != 0 || d.Mode != "both" {
+	if d.MaxTokensFloorValue() != 16384 || len(d.Levels) != 0 || d.Mode != "both" {
 		t.Fatalf("DeepSeek: 只覆盖 floor，其余继承: %+v", d)
 	}
 	g := c.ThinkingFor("/models/未配置的模型")
-	if g.Mode != "both" || g.MaxTokensFloor != 8192 || len(g.Levels) != 0 {
+	if g.Mode != "both" || g.MaxTokensFloorValue() != 8192 || len(g.Levels) != 0 {
 		t.Fatalf("未覆盖模型应返回全局: %+v", g)
 	}
 	// CLI filter 继承到每个模型的生效配置
@@ -244,7 +296,7 @@ func TestThinkingForModelOverride(t *testing.T) {
 	}
 	// ForModel 视图的 thinking 与 ThinkingFor 一致（重复调用幂等）
 	fm := c.ForModel("/models/DeepSeek")
-	if fm.Thinking.MaxTokensFloor != 16384 || len(fm.Thinking.Levels) != 0 {
+	if fm.Thinking.MaxTokensFloorValue() != 16384 || len(fm.Thinking.Levels) != 0 {
 		t.Fatalf("ForModel thinking 覆盖错误: %+v", fm.Thinking)
 	}
 }
@@ -278,6 +330,7 @@ func TestEnabledForAndActiveModels(t *testing.T) {
 }
 
 func boolPtr(b bool) *bool { return &b }
+func intPtr(v int) *int    { return &v }
 
 // enabled 全部禁用 → Load 报错；部分禁用 → 提示跳过名单
 func TestLoadEnabledSwitch(t *testing.T) {
