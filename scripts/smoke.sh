@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# llm-perf 核心数据采集冒烟：只覆盖多轮 agent、RPS/并发、多模型、思考变体、probe 与完整辅助请求落盘。
-# 单发单轮已从公共执行入口移除；所有 benchmark 请求均为多轮会话。
+# llm-perf 冒烟：覆盖四个子命令（probe / user / rps / concurrency）与数据契约。
+# 2026-09-18 新架构：filler/旧 multiturn+concurrent 入口已下线，请求/会话形状
+# 来自 request_set.sharegpt_path（冻结快照）与 user.profile_path（profile 特征）。
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -13,9 +14,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for f in smoke smoke-all smoke-openloop; do
+# output_dir 重定向到临时目录；fixtures 相对路径重写到仓库绝对路径（冒烟从任意 cwd 运行）
+for f in smoke-probe smoke-user smoke-rps smoke-conc; do
   sed -e "s#^output_dir:.*#output_dir: $TMP/$f#" \
-      -e "s#\([[:space:]]*path:[[:space:]]*[\"']\{0,1\}\)fixtures/#\1$PWD/configs/fixtures/#" \
+      -e "s#\([[:space:]]*profile_path:[[:space:]]*\"\{0,1\}\)fixtures/#\1$PWD/configs/fixtures/#" \
+      -e "s#\([[:space:]]*sharegpt_path:[[:space:]]*\"\{0,1\}\)fixtures/#\1$PWD/configs/fixtures/#" \
       "configs/$f.yaml" >"$TMP/$f.yaml"
 done
 
@@ -37,30 +40,33 @@ done
 curl -sf "http://127.0.0.1:$PORT/metrics" >/dev/null
 
 run() {
-  local label="$1" out="$2"
-  shift 2
+  local label="$1" out="$2" cmd="$3"
+  shift 3
   echo "==> $label"
-  "$BENCH" -o "$TMP/$out" "$@" >"$TMP/$out.log" 2>&1 \
+  "$BENCH" "$cmd" -o "$TMP/$out" "$@" >"$TMP/$out.log" 2>&1 \
     || { echo "❌ $label 失败"; tail -40 "$TMP/$out.log"; exit 1; }
 }
 
-# 多模型单发多轮：验证模型独立分区、thinking 变体、warmup/correctness 完整采集。
-run "多模型单发多轮" out-multi -c "$TMP/smoke.yaml" --turns multi --concurrency 1
-# 多模型多用户多轮：验证闭环并发数据仍以 session/turn 为主。
-run "多模型闭环多轮" out-concurrent -c "$TMP/smoke.yaml" --turns multi --concurrency cfg --thinking off
-# 开环 RPS：request_rate/rate_sweep 是容量采集主路径。
-run "RPS 多轮" out-rps -c "$TMP/smoke-openloop.yaml" --turns multi --concurrency cfg --thinking off
-# 全能力：server_metrics、trace、多轮、goodput、correctness。
-run "全能力多轮" out-all -c "$TMP/smoke-all.yaml" --turns multi --concurrency 1 --thinking off
-
-# probe 必须独立落盘，支持配置中的多个模型；这里验证默认选择与模型列表采集。
+# probe：独立 JSON，采集多模型列表与能力检查项。
 echo "==> probe"
-"$BENCH" probe -c "$TMP/smoke.yaml" -o "$TMP/probe.json" >"$TMP/probe.log" 2>&1 \
+"$BENCH" probe -c "$TMP/smoke-probe.yaml" -o "$TMP/probe.json" >"$TMP/probe.log" 2>&1 \
   || { echo "❌ probe 失败"; tail -40 "$TMP/probe.log"; exit 1; }
 
-# 公共入口拒绝 single，防止产品范围回退。
-if "$BENCH" -c "$TMP/smoke.yaml" --turns single --concurrency 1 >"$TMP/single.log" 2>&1; then
-  echo "❌ --turns single 不应继续执行"; cat "$TMP/single.log"; exit 1
+# user：生成式多轮用户会话（profile 分派 + 语料生成 + 真实 assistant 进 history）。
+run "user 生成式多轮" out-user user -c "$TMP/smoke-user.yaml" --seed-salt 1
+
+# rps：冻结请求快照开环到达（高到达率近齐射，冒烟只验证调度与落盘形态）。
+run "rps 开环到达" out-rps rps -c "$TMP/smoke-rps.yaml" --seed-salt 2
+
+# concurrency：固定在飞齐射，多档位。
+run "concurrency 在飞齐射" out-conc concurrency -c "$TMP/smoke-conc.yaml" --seed-salt 3
+
+# 旧入口必须拒绝：子命令化后裸 bench / --turns / --concurrency 不再是合法入口。
+if "$BENCH" -c "$TMP/smoke-user.yaml" >"$TMP/legacy.log" 2>&1; then
+  echo "❌ 裸 bench（无子命令）不应继续执行"; cat "$TMP/legacy.log"; exit 1
+fi
+if "$BENCH" -c "$TMP/smoke-user.yaml" --concurrency 2,4 >/dev/null 2>&1; then
+  echo "❌ --concurrency 旧入口不应继续执行"; exit 1
 fi
 
 python3 - "$TMP" <<'PY'
@@ -86,41 +92,43 @@ def load_all(name):
                     out.append(json.load(f))
     return out
 
-def metrics(rep):
-    out = []
-    for row in rep.get("multiturn", []):
-        out.extend(row.get("turns") or [])
-    for level in rep.get("concurrent", []):
-        out.extend(level.get("requests") or [])
-        for session in level.get("sessions") or []:
-            out.extend(session.get("turns") or [])
-    return out
+# ── user：profile 分派、轮次、真实 assistant 进 history（prompt 逐轮增长）──
+user = load_all("out-user")
+check(len(user) == 1, f"user 产物按模型落盘（{len(user)} 份）")
+rep = user[0]
+check(rep.get("scenario") == "user", "报告 scenario=user")
+check(rep.get("schema_version") == 4, "数据契约版本为 4")
+sessions = rep.get("multiturn") or []
+check(len(sessions) == 2, f"users=2 应有 2 条会话（{len(sessions)}）")
+check(all(s.get("profile") in ("light", "medium", "heavy") for s in sessions), "会话带 profile 档位标签")
+check(all(len(s.get("turns") or []) >= 2 for s in sessions), "user 会话均为多轮（≥2 轮）")
+ok_growth = True
+for s in sessions:
+    ts = s.get("turns") or []
+    if len(ts) > 1 and ts[-1].get("prompt_tokens", 0) <= ts[0].get("prompt_tokens", 0):
+        ok_growth = False
+check(ok_growth, "assistant 回复进 history：prompt 逐轮增长（动态 prefix cache）")
+first_ok = all((s.get("turns") or [{}])[0].get("prompt_tokens", 0) >= 35000 for s in sessions)
+check(first_ok, "首轮 prompt ≥35K token（agent 形状硬约束）")
+metrics_user = [t for s in sessions for t in (s.get("turns") or [])]
+check(metrics_user and all(m.get("phase") == "benchmark" for m in metrics_user), "主压测 TurnMetrics 标记 phase=benchmark")
 
-multi = load_all("out-multi")
-check(len(multi) == 2, f"多模型单发多轮按模型落盘（{len(multi)} 份）")
-check(all(not rep.get("single") for rep in multi), "多轮产物不再包含 single 场景")
-check(all(rep.get("schema_version") == 4 for rep in multi), "数据契约版本为 4")
-check(all(rep.get("multiturn") for rep in multi), "单发多轮产物含 multiturn")
-aux = [a for rep in multi for a in (rep.get("auxiliary_requests") or [])]
-check(sum(a.get("phase") == "warmup" for a in aux) >= 2, "warmup 完整 TurnMetrics 落盘")
-check(sum(a.get("phase") == "correctness" for a in aux) >= 2, "correctness 完整 TurnMetrics 落盘")
-check(all((a.get("metrics") or {}).get("phase") == a.get("phase") for a in aux), "辅助请求 phase 与 metrics 一致")
-
-cm = load_all("out-concurrent")
-levels = [lv for rep in cm for lv in rep.get("concurrent", [])]
-check(levels and all(lv.get("sessions") for lv in levels), "闭环并发产物以多轮 sessions 落盘")
-check(levels and all(lv.get("completed_requests", 0) >= 0 and lv.get("failed_requests", 0) >= 0 for lv in levels), "并发档位落盘 completed/failed/cancelled 分类")
-
+# ── rps：开环到达 + 冻结快照 ──
 rps = load_all("out-rps")
-rps_levels = [lv for rep in rps for lv in rep.get("concurrent", [])]
+rps_levels = [lv for rep2 in rps for lv in rep2.get("concurrent", [])]
 check(rps_levels and all(lv.get("request_rate", 0) > 0 for lv in rps_levels), "RPS 档位 request_rate 落盘")
-check(rps_levels and all(lv.get("sessions") or lv.get("requests") for lv in rps_levels), "RPS 档位请求数据落盘")
+check(rps_levels and all(len(lv.get("requests") or []) == 6 for lv in rps_levels), "RPS 档位 6 条冻结请求全部落盘")
+check(rps_levels and all(lv.get("completed_requests") == 6 for lv in rps_levels), "RPS 档位 completed 计数正确")
 
-all_reps = load_all("out-all")
-all_metrics = [m for rep in all_reps for m in metrics(rep)]
-check(all_metrics and all(m.get("phase") == "benchmark" for m in all_metrics), "主压测 TurnMetrics 标记 phase=benchmark")
+# ── concurrency：固定在飞齐射，多档位 ──
+conc = load_all("out-conc")
+conc_levels = [lv for rep2 in conc for lv in rep2.get("concurrent", [])]
+check([lv.get("level") for lv in conc_levels] == [1, 2], "concurrency 两档位按序落盘（level 1,2）")
+check(all(len(lv.get("requests") or []) == 6 for lv in conc_levels), "每档位 6 条请求全部落盘")
+check(all(lv.get("completed_requests") == 6 and lv.get("failed_requests") == 0 for lv in conc_levels), "concurrency completed/failed 计数正确")
+
+# ── probe ──
 probe = json.load(open(os.path.join(root, "probe.json"), encoding="utf-8"))
-check(set(probe.get("models") or []) >= {"mock-model-a", "mock-model-b"}, "probe 采集多模型列表")
 check(bool(probe.get("checks")), "probe checks 落盘")
 
 if failures:

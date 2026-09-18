@@ -1,76 +1,52 @@
-# 基准套件预设配置（test: benchmark）
+# ── llm-perf 基准预设（benchmark 类别）──
+# 必测清单：单流体验 + 容量上限 + 排队-延迟。跑法（两条命令，off/on 由 thinking 自动展开）：
+#   bench probe -c configs/benchmark.yaml            # ① 预检标定：min_tps、模型上限、引擎形态
+#   bench user -c configs/benchmark.yaml             # ② 真实形状多轮：TTFT 逐轮斜率 + 动态 prefix cache
+#   bench concurrency -c configs/benchmark.yaml      # ③ 固定在飞齐射：总吞吐拐点（对齐 vLLM bench serve）
+#   bench rps -c configs/benchmark.yaml              # ④ 开环到达：排队-延迟曲线、体验拐点
 #
-# 用途：跨部署/跨版本横比。把 docs/scenario-guide.md §1 的必测清单编成固定格子，
-# 使「同一组格 + 同一 filler 口径 + 同一判据」在每台部署上都成立——三者缺一则数不可比。
-# 探索性内容（容量拐点、饱和点、输出长度扫描、混合负载）不在此列，属 performance 类别。
-#
-# 跑法（两条命令，覆盖必测清单 1–3；off/on 由 thinking.mode: both 自动展开）：
-#   bench probe -c configs/benchmark.yaml          # ① 预检标定：min_tps、模型上限、引擎形态
-#   bench -c configs/benchmark.yaml --concurrency cfg
-#     单发多轮（1）+ 多用户多轮 RPS/并发档位（配置中的 rate_sweep 或 levels）
-#   # 本工具不再运行单发单轮；单发多轮是 agent 基线，多用户多轮用于容量采集。
-#
-# 每轮必须换盐：--seed-salt <递增整数>（服务端 prefix cache 是内存态，不换盐冷路径测不干净）
-
-test: "benchmark"
+# 基准刻意不写 slo.baseline（各部署各写一把尺子 = 横比失效）；判级阈值见 docs/latency-baselines.md。
+# 探索性内容（饱和点细扫、输出长度扫描、混合负载）不在此列，属 performance 类别。
 
 endpoint: "http://<实例IP>:<端口>/router/v1"
-api_key: ""                       # 或 api_key_env: "LLM_PERF_API_KEY"
-auth_scheme: "bearer"             # bearer | raw（裸 key）| none；配合 auth_header 可用自定义 header
+api_key: ""                        # 或 api_key_env: "LLM_PERF_API_KEY"
+auth_scheme: "bearer"              # bearer | raw（裸 key）| none；配合 auth_header 可用自定义 header
 output_dir: "output"
-timeout_seconds: 900              # 基准含 200k 档位，prefill 可能很久；客户环境实测后调整
+timeout_seconds: 600
+corpus_lang: "en"                  # 语料语言：user 模式文本生成用（zh 场景改 zh）
+seed_salt: 0                       # 每次战役递增；服务端 prefix cache 未清时重测必须换盐
+server_metrics: true
+include_usage: true
+stream: true
+test: "benchmark"                  # 报告结论区切"标准水平"口径；不改测量本身
 
 models:
-  - "/models/<模型名>"            # 必须与 /v1/models 返回的 id 完全一致
-
-# ── 口径：基准可比性的三条前提，改任何一条都会让「跨部署比」失效 ──
-filler_lang: "en"
-filler_corpus: "en"               # 真实语料填充（≈99 万 token）。留空=合成词表——同 seed 也产出不同文本，
-                                  # 与语料路径的长度口径虽已统一（corpus.CharsPerToken），但 tokenization 分布不同
-stream: true                      # TTFT/ITL 判据依赖流式；false 时这两项 N/A（基准不完整）
-include_usage: true               # 实测 token 数：报告横轴按服务端 usage 分箱，是可比性的锚
-server_metrics: true              # 服务端观测只做交叉验证/辅助归因；不可达时自动降级，不影响结论
-warmup_requests: 2                # 预热不污染缓存对照（内容唯一）
-
-# 判据**刻意留空**：走 slo.baseline 内置默认（docs/latency-baselines.md §7）。
-# 每台部署各自写一份阈值 = 每台部署各用一把尺子，横比立即失效。
-# 确需覆盖时在报告里同时标注判据来源。goodput@SLO 的阈值则按客户 SLO 显式配：
-# slo:
-#   goodput:
-#     ttft_ms: 2000
-#     tpot_ms: 100
+  - "/models/Qwen3.8-27B"
 
 thinking:
-  mode: "both"                    # off 与 on 各跑一遍（基准必测：思考开销是容量规划系数）
+  mode: "both"                     # off 与 on 各跑一遍（思考开销是容量规划系数）
   extra_body_on:
     chat_template_kwargs: {enable_thinking: true}
   extra_body_off:
     chat_template_kwargs: {enable_thinking: false}
-  max_tokens_floor: 8192          # 思考常 1500-2500+ token；cloud 实测 2048 会被吃光（finish=length 无正文）
 
-multiturn:
-  sessions: 2
-  turns: 8
-  system_tokens: 18000            # 基座形状对齐现代 agent：首调 ~35k，8 轮滚到 ~108k（128k 模型留余量）
-  tool_defs_tokens: 3000
-  turn_tokens: 10000
+# ② user：agent 形状多轮（首轮 ≥35K；6:3:1 轻/中/重默认比例，可调）
+user:
+  profile_path: "profiles/agent-v1.json"   # 由 scripts/profile_build.py 从 raw trace 提取
+  users: 10                        # 6 轻 + 3 中 + 1 重（权重分派，确定性）
   max_tokens: 256
-  keep_assistant: true
-  shared_base: true               # 基座跨会话共享（默认）＝「一套部署一套提示词」，测跨用户共享前缀值多少 TTFT
 
-concurrent:
-  multiturn: true                 # 多用户 agent 会话；RPS 是新会话到达率
-  rate_sweep: [0.1, 0.25, 0.5, 1] # 基准容量采集档位
-  num_prompts: 32                 # 每档会话数
-  max_concurrency: 0              # 0=不限；仅作客户端安全上限
-  prompt_tokens: 20000            # 兼容字段；多轮实际形状由 multiturn 段决定
-  max_tokens: 256                 # 每轮固定输出
-  burstiness: 1                   # 标准泊松到达
+# ③④ 请求集：冻结快照（与 vLLM bench serve 同源同参才可数字对比）
+request_set:
+  sharegpt_path: "ShareGPT_V3_unfiltered_cleaned_split.json"
+  num_prompts: 1000
+  seed: 42
+  max_output_tokens: 0             # 0 = 按 ShareGPT assistant 回复长度（vLLM 同口径）
 
-correctness:
-  samples: 8                      # 四个数之一：防"HTTP 200 但内容异常"的假成功
+concurrency:
+  levels: [1, 2, 4, 8, 16, 32]     # 总吞吐拐点扫描
+  request_rate: 0                  # 0 = inf 齐射
 
-# ── 基准不测（改这些等于换了一套基准，横比失效）──
-# saturation_guard     饱和止损属容量探索 → performance 类别
-# rate_sweep           开环到达率扫描＝找饱和点 → performance 类别
-# single.max_tokens    输出长度扫描 → performance 类别
+rps:
+  rates: [1, 2, 4]                 # 体验拐点扫描（围绕 concurrency 拐点吞吐换算的到达率）
+  max_concurrency: 64

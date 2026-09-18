@@ -16,26 +16,7 @@ func writeTemp(t *testing.T, content string) string {
 	return p
 }
 
-func TestLoad_Defaults(t *testing.T) {
-	p := writeTemp(t, `
-endpoint: "http://x:1/v1"
-models: ["m1"]
-`)
-	cfg, err := Load(p)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Thinking.Mode != "both" {
-		t.Errorf("mode default = %q", cfg.Thinking.Mode)
-	}
-	if cfg.Single.Runs != 3 || len(cfg.Concurrent.MaxTokens) != 1 || cfg.Concurrent.MaxTokens[0] != 256 {
-		t.Error("scenario defaults missing")
-	}
-	if !cfg.StreamEnabled() || !*cfg.IncludeUsage {
-		t.Error("stream/include_usage should default true")
-	}
-}
-
+// UnknownFields(true)：配置项拼错（如 maxtokens）会被静默忽略，现场跑完才发现没生效
 func TestLoad_UnknownFieldRejected(t *testing.T) {
 	p := writeTemp(t, `
 endpoint: "http://x:1/v1"
@@ -77,8 +58,6 @@ thinking: {mode: "maybe"}
 }
 
 // test 类别：留空 = performance（默认不改行为）；大小写不敏感；非法值报错。
-// 断言同时查 cfg.Test 与 cfg.TestKind()——报告侧读的是落盘的 Test 键，
-// 归一化必须在 Load 里完成，不能只靠读侧的 TestKind() 兜。
 func TestLoad_TestKind(t *testing.T) {
 	base := "endpoint: \"http://x:1/v1\"\nmodels: [\"m1\"]\n"
 	cases := []struct {
@@ -166,7 +145,7 @@ api_key_env: MISSING_KEY_FOR_TEST
 
 // 随仓库的每份配置都必须能通过严格解析（防止加字段后忘了同步模板）
 func TestShippedConfigsParse(t *testing.T) {
-	for _, name := range []string{"example.yaml", "smoke.yaml", "smoke-all.yaml"} {
+	for _, name := range []string{"example.yaml", "smoke-probe.yaml", "smoke-user.yaml", "smoke-rps.yaml", "smoke-conc.yaml"} {
 		p := filepath.Join("..", "..", "configs", name)
 		if _, err := Load(p); err != nil {
 			t.Errorf("%s: %v", name, err)
@@ -174,36 +153,55 @@ func TestShippedConfigsParse(t *testing.T) {
 	}
 }
 
-// filler_corpus 的「按配置目录解析相对路径」只对文件路径生效；
-// en/zh 是内置语料哨兵，必须原样透传给 corpus.Load。
-// 回归：曾无条件 join，把 en 变成 configs/en，语料加载直接失败。
-func TestFillerCorpusBuiltinNotJoined(t *testing.T) {
-	p := filepath.Join("..", "..", "configs", "example.yaml")
+// corpus_path 的「按配置目录解析相对路径」只对文件路径生效；
+// en/zh 是内置语料哨兵，必须原样透传。
+func TestCorpusPathBuiltinNotJoined(t *testing.T) {
+	p := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+corpus_path: "my.txt.gz"
+`)
 	cfg, err := Load(p)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.FillerCorpus != "en" {
-		t.Errorf("内置语料哨兵被当成路径拼接了: %q", cfg.FillerCorpus)
+	if want := filepath.Join(filepath.Dir(p), "my.txt.gz"); cfg.CorpusPath != want {
+		t.Errorf("文件路径应按配置目录解析: got %q want %q", cfg.CorpusPath, want)
 	}
-
-	// 文件路径仍以配置文件所在目录为基准
-	p2 := writeTemp(t, `
-endpoint: "http://x:1/v1"
-models: ["m1"]
-filler_corpus: "my.txt.gz"
-`)
-	cfg2, err := Load(p2)
+	// 内置哨兵不拼接
+	cfg2, err := Load(writeTemp(t, "endpoint: \"http://x:1/v1\"\nmodels: [\"m1\"]\ncorpus_path: \"en\"\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := filepath.Join(filepath.Dir(p2), "my.txt.gz"); cfg2.FillerCorpus != want {
-		t.Errorf("文件路径应按配置目录解析: got %q want %q", cfg2.FillerCorpus, want)
+	if cfg2.CorpusPath != "en" {
+		t.Errorf("内置语料哨兵被当成路径拼接了: %q", cfg2.CorpusPath)
+	}
+}
+
+// user/request_set 的相对路径以配置目录为基准（profile/sharegpt 都可能放配置旁）
+func TestUserAndRequestSetPathJoin(t *testing.T) {
+	p := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+user:
+  profile_path: "profiles/agent-v1.json"
+request_set:
+  sharegpt_path: "data/sharegpt.json"
+`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Dir(p)
+	if want := filepath.Join(dir, "profiles/agent-v1.json"); cfg.User.ProfilePath != want {
+		t.Errorf("profile_path 应按配置目录解析: got %q want %q", cfg.User.ProfilePath, want)
+	}
+	if want := filepath.Join(dir, "data/sharegpt.json"); cfg.RequestSet.ShareGPTPath != want {
+		t.Errorf("sharegpt_path 应按配置目录解析: got %q want %q", cfg.RequestSet.ShareGPTPath, want)
 	}
 }
 
 // levels 模式下 extra_body_on/off 为空；probe 靠 ProbeExtraBodies 从 levels 兜底取开关两态。
-// 不兜底会让整块思考探测被静默跳过——部署侧关思考这类问题就查不出来。
 func TestProbeExtraBodiesFromLevels(t *testing.T) {
 	th := Thinking{
 		Levels: []LevelVariant{
@@ -332,7 +330,6 @@ func TestEnabledForAndActiveModels(t *testing.T) {
 func boolPtr(b bool) *bool { return &b }
 func intPtr(v int) *int    { return &v }
 
-// enabled 全部禁用 → Load 报错；部分禁用 → 提示跳过名单
 func TestLoadEnabledSwitch(t *testing.T) {
 	all := writeTemp(t, `
 endpoint: "http://x:1/v1"
@@ -363,130 +360,91 @@ model_overrides:
 	}
 }
 
-// normalizeLadder：排序去重 + 增量 <10% 拒绝 + 非正值报错（模型覆盖段复用同一校验）
-func TestNormalizeLadder(t *testing.T) {
-	got, changed, err := normalizeLadder([]int{10000, 4000, 10000}, "x")
+// normalizeMaxTokens：排序去重 + 非正值报错
+func TestNormalizeMaxTokens(t *testing.T) {
+	got, changed, err := normalizeMaxTokens(IntList{512, 128, 512}, "x")
 	if err != nil || !changed {
 		t.Fatalf("排序去重: %v %v", got, err)
 	}
-	if len(got) != 2 || got[0] != 4000 || got[1] != 10000 {
-		t.Fatalf("应排序去重为 [4000 10000]: %v", got)
+	if len(got) != 2 || got[0] != 128 || got[1] != 512 {
+		t.Fatalf("应排序去重为 [128 512]: %v", got)
 	}
-	if _, _, err := normalizeLadder([]int{0}, "x"); err == nil {
+	if _, _, err := normalizeMaxTokens(IntList{0}, "x"); err == nil {
 		t.Fatal("非正值应报错")
 	}
-	if _, _, err := normalizeLadder([]int{40000, 41000}, "x"); err == nil {
-		t.Fatal("增量 <10% 应报错")
+	if _, changed, _ := normalizeMaxTokens(IntList{256}, "x"); changed {
+		t.Fatal("单值不应有修正")
 	}
 }
 
-// 测量守卫：短输出档的方向性偏悲观提示 + 输入/输出只扫一维的归因提示
-func TestLoad_MeasurementGuards(t *testing.T) {
+// user 模式启用时 max_tokens 默认 256 + 归一化生效
+func TestLoad_UserDefaults(t *testing.T) {
 	p := writeTemp(t, `
 endpoint: "http://x:1/v1"
 models: ["m1"]
-single:
-  runs: 1
-  prompt_tokens: [500, 1000, 2000]
-  max_tokens: 64
+user:
+  profile_path: "profile.json"
+  max_tokens: [512, 256, 512]
 `)
 	cfg, err := Load(p)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(cfg.User.MaxTokens) != 2 || cfg.User.MaxTokens[0] != 256 || cfg.User.MaxTokens[1] != 512 {
+		t.Fatalf("user.max_tokens 应排序去重: %v", cfg.User.MaxTokens)
+	}
 	joined := strings.Join(cfg.Warnings, "\n")
-	if !strings.Contains(joined, "single.max_tokens=64 偏小") {
-		t.Errorf("短输出档应有守卫告警，got: %v", cfg.Warnings)
+	if !strings.Contains(joined, "user.max_tokens") {
+		t.Fatalf("应有排序去重提示: %v", cfg.Warnings)
 	}
-	if !strings.Contains(joined, "输出长度也做多档对照") {
-		t.Errorf("输入多档/输出单档应有归因提示，got: %v", cfg.Warnings)
-	}
-
-	// 正常工作点不应误报
-	p2 := writeTemp(t, `
-endpoint: "http://x:1/v1"
-models: ["m1"]
-single:
-  runs: 3
-  prompt_tokens: [500]
-  max_tokens: 512
-`)
-	cfg2, err := Load(p2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, w := range cfg2.Warnings {
-		if strings.Contains(w, "系统性偏悲观") || strings.Contains(w, "只扫了一个") {
-			t.Errorf("正常配置不应有测量守卫告警: %q", w)
-		}
+	// users 缺省 = 1；shared_base 缺省 = true
+	if cfg.User.GetUsers() != 1 || !cfg.User.GetSharedBase() {
+		t.Fatalf("user 默认值错误: users=%d shared=%v", cfg.User.GetUsers(), cfg.User.GetSharedBase())
 	}
 }
 
-// 5.1 输出长度扫描：max_tokens 接受标量或列表；列表排序去重、非正值报错；守卫逐档生效。
-func TestLoad_MaxTokensList(t *testing.T) {
-	p := writeTemp(t, `
-endpoint: "http://x:1/v1"
-models: ["m1"]
-single:
-  prompt_tokens: [500]
-  max_tokens: [512, 128, 512]
-`)
-	cfg, err := Load(p)
+// request_set 默认值与校验
+func TestLoad_RequestSetDefaults(t *testing.T) {
+	cfg, err := Load(writeTemp(t, "endpoint: \"http://x:1/v1\"\nmodels: [\"m1\"]\nrequest_set:\n  sharegpt_path: \"x.json\"\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cfg.Single.MaxTokens) != 2 || cfg.Single.MaxTokens[0] != 128 || cfg.Single.MaxTokens[1] != 512 {
-		t.Errorf("max_tokens 列表应排序去重为 [128 512]，got %v", cfg.Single.MaxTokens)
+	if cfg.RequestSet.NumPrompts != 100 {
+		t.Fatalf("num_prompts 默认应 100: %d", cfg.RequestSet.NumPrompts)
 	}
-	joined := strings.Join(cfg.Warnings, "\n")
-	if !strings.Contains(joined, "single.max_tokens 已排序去重") {
-		t.Errorf("应提示排序去重，got: %v", cfg.Warnings)
+	if cfg.RequestSet.Seed != 0 {
+		t.Fatalf("seed 默认应 0: %d", cfg.RequestSet.Seed)
 	}
-
-	p2 := writeTemp(t, `
-endpoint: "http://x:1/v1"
-models: ["m1"]
-single:
-  max_tokens: [128, 0]
-`)
-	if _, err := Load(p2); err == nil {
-		t.Error("max_tokens 列表含非正值应报错")
-	}
-
-	// 标量非正值与列表口径一致：显式写 0 应报错而非静默走默认
-	p2b := writeTemp(t, `
-endpoint: "http://x:1/v1"
-models: ["m1"]
-single:
-  max_tokens: 0
-`)
-	if _, err := Load(p2b); err == nil {
-		t.Error("max_tokens 标量非正值应报错（与列表口径一致）")
-	}
-
-	// 标量写法不变；thinking floor 告警逐档判断（列表中只有 <floor 的档位才提示）
-	p3 := writeTemp(t, `
-endpoint: "http://x:1/v1"
-models: ["m1"]
-single:
-  max_tokens: [64, 4096]
-`)
-	cfg3, err := Load(p3)
-	if err != nil {
-		t.Fatal(err)
-	}
-	found := false
-	for _, w := range cfg3.Warnings {
-		if strings.Contains(w, "single.max_tokens=64 < max_tokens_floor") {
-			found = true
-		}
-	}
-	if !found {
-		t.Errorf("列表中 <floor 的档位应触发 floor 告警，got: %v", cfg3.Warnings)
+	// 负值拒绝
+	if _, err := Load(writeTemp(t, "endpoint: \"http://x:1/v1\"\nmodels: [\"m1\"]\nrequest_set:\n  num_prompts: -1\n")); err == nil {
+		t.Fatal("num_prompts 负值应报错")
 	}
 }
 
-// ── slo 段（goodput 合流 + 基线阈值透出，2026-09-12）──
+// rps.rates / concurrency.levels 值域校验
+func TestLoad_RPSAndConcurrencyValidation(t *testing.T) {
+	if _, err := Load(writeTemp(t, "endpoint: \"http://x:1/v1\"\nmodels: [\"m1\"]\nrps:\n  rates: [2, 0]\n")); err == nil {
+		t.Fatal("rps.rates 含 0 应报错")
+	}
+	if _, err := Load(writeTemp(t, "endpoint: \"http://x:1/v1\"\nmodels: [\"m1\"]\nconcurrency:\n  levels: [1, -2]\n")); err == nil {
+		t.Fatal("concurrency.levels 含负值应报错")
+	}
+	cfg, err := Load(writeTemp(t, "endpoint: \"http://x:1/v1\"\nmodels: [\"m1\"]\nconcurrency:\n  levels: [2, 2, 4]\nrps:\n  rates: [1]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Concurrency.Levels) != 2 || cfg.Concurrency.Levels[0] != 2 || cfg.Concurrency.Levels[1] != 4 {
+		t.Fatalf("levels 应去重保序: %v", cfg.Concurrency.Levels)
+	}
+	joined := strings.Join(cfg.Warnings, "\n")
+	if !strings.Contains(joined, "重复档位") {
+		t.Fatalf("重复档位应有提示: %v", cfg.Warnings)
+	}
+	// burstiness 缺省 = 1（泊松）
+	if got := cfg.RPS.GetBurstiness(); got != 1 {
+		t.Fatalf("rps.burstiness 缺省应 1: %v", got)
+	}
+}
 
 func TestLoad_SLOGoodput(t *testing.T) {
 	p := writeTemp(t, `
@@ -506,7 +464,7 @@ slo:
 		t.Fatalf("slo.goodput 解析不符：%+v", g)
 	}
 
-	// 旧顶层 goodput 已合流：KnownFields(true) 应直接拒绝（schema 不保兼容，2026-09-08 拍板）
+	// 旧顶层 goodput 已合流：KnownFields(true) 应直接拒绝（schema 不保兼容）
 	p2 := writeTemp(t, `
 endpoint: "http://x:1/v1"
 models: ["m1"]
@@ -532,7 +490,6 @@ slo:
 }
 
 func TestLoad_SLOBaseline(t *testing.T) {
-	off := false
 	p := writeTemp(t, `
 endpoint: "http://x:1/v1"
 models: ["m1"]
@@ -577,7 +534,6 @@ slo:
 	if cfg2.EffBaseline().BaselineEnabled() {
 		t.Error("enabled:false 应不渲染基线评估")
 	}
-	_ = off
 
 	// long_min_tokens ≤ short_max_tokens 报错
 	p3 := writeTemp(t, `
@@ -605,97 +561,7 @@ slo:
 	}
 }
 
-// ── saturation_guard（饱和止损，2026-09-12）──
-
-func TestLoad_SaturationGuard(t *testing.T) {
-	p := writeTemp(t, `
-endpoint: "http://x:1/v1"
-models: ["m1"]
-server_metrics: true
-saturation_guard:
-  max_waiting: 32
-`)
-	cfg, err := Load(p)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sg := cfg.SaturationGuard
-	if sg == nil || !sg.SatEnabled() {
-		t.Fatal("配置了 saturation_guard 段应默认启用")
-	}
-	if sg.MaxWaiting != 32 || sg.WindowSeconds != 120 || sg.SampleSeconds != 5 {
-		t.Errorf("默认值填充不符：%+v", sg)
-	}
-	if !strings.Contains(strings.Join(cfg.Warnings, "\n"), "饱和止损已启用") {
-		t.Errorf("应打印启用提示: %v", cfg.Warnings)
-	}
-
-	// 未配 server_metrics：waiting 判定不生效的提示
-	p2 := writeTemp(t, `
-endpoint: "http://x:1/v1"
-models: ["m1"]
-saturation_guard:
-  max_waiting: 32
-`)
-	cfg2, err := Load(p2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(strings.Join(cfg2.Warnings, "\n"), "server_metrics") {
-		t.Errorf("未开 server_metrics 应有提示: %v", cfg2.Warnings)
-	}
-
-	// 段写了但两个阈值都为 0：不生效提示
-	p3 := writeTemp(t, `
-endpoint: "http://x:1/v1"
-models: ["m1"]
-saturation_guard:
-  window_seconds: 60
-`)
-	cfg3, err := Load(p3)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(strings.Join(cfg3.Warnings, "\n"), "没有判定阈值") {
-		t.Errorf("无阈值应有提示: %v", cfg3.Warnings)
-	}
-
-	// enabled: false = 保留配置但不启用
-	p4 := writeTemp(t, `
-endpoint: "http://x:1/v1"
-models: ["m1"]
-saturation_guard:
-  enabled: false
-  max_waiting: 32
-`)
-	cfg4, err := Load(p4)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg4.SaturationGuard.SatEnabled() {
-		t.Error("enabled:false 应不启用")
-	}
-
-	// 负值 / 采样长于窗口报错
-	p5 := writeTemp(t, "endpoint: \"http://x:1/v1\"\nmodels: [\"m1\"]\nsaturation_guard:\n  max_waiting: -1\n")
-	if _, err := Load(p5); err == nil {
-		t.Error("max_waiting 为负应报错")
-	}
-	p6 := writeTemp(t, `
-endpoint: "http://x:1/v1"
-models: ["m1"]
-saturation_guard:
-  max_waiting: 32
-  window_seconds: 5
-  sample_seconds: 30
-`)
-	if _, err := Load(p6); err == nil {
-		t.Error("sample_seconds 大于 window_seconds 应报错")
-	}
-}
-
-// 12.7：levels 档位名不得使用保留字（on/off/both，大小写不敏感）——CLI --thinking
-// 按变体名过滤，档位恰好叫保留字时永远无法通过 CLI 选中。fail-fast 在加载时报错。
+// thinking.levels 保留字（on/off/both）fail-fast：CLI 按变体名过滤时永远无法选中
 func TestThinkingLevelsReservedNames(t *testing.T) {
 	base := "endpoint: \"http://x:1/v1\"\nmodels: [\"m1\"]\n"
 	for _, name := range []string{"off", "ON", "Both", "oFf"} {
@@ -718,9 +584,7 @@ func TestThinkingLevelsReservedNames(t *testing.T) {
 	}
 }
 
-// 12.8：levels 模式下 ExtraBodyOn/Off 废弃不回填 → 金丝雀/预热裸发 → 思考吃光
-// max_tokens → match=false（r4 实测）。ThinkingFor 从 levels 第一个 enabled=false
-// 的变体兜底 ExtraBodyOff；显式 extra_body_off 优先；无关闭档时保持 nil。
+// 12.8：levels 模式下 ExtraBodyOff 从 enabled=false 档兜底；显式 extra_body_off 优先
 func TestThinkingForBackfillsExtraBodyOff(t *testing.T) {
 	c := &Config{
 		Models: []string{"m1"},
@@ -749,205 +613,5 @@ func TestThinkingForBackfillsExtraBodyOff(t *testing.T) {
 	}}
 	if got := c3.ThinkingFor("m1").ExtraBodyOff; got != nil {
 		t.Fatalf("无关闭档时 ExtraBodyOff 应保持 nil，got %v", got)
-	}
-}
-
-// ── 10.5 时长制 soak：duration_seconds + renew 校验（fail-fast 五态）──
-
-func TestLoad_SoakDurationEnablesAndWarns(t *testing.T) {
-	p := writeTemp(t, `
-endpoint: "http://x:1/v1"
-models: ["m1"]
-concurrent:
-  levels: [2]
-  duration_seconds: 30
-`)
-	cfg, err := Load(p)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Concurrent.DurationSeconds != 30 || cfg.Concurrent.Renew {
-		t.Fatalf("duration_seconds=%d renew=%v, want 30/false",
-			cfg.Concurrent.DurationSeconds, cfg.Concurrent.Renew)
-	}
-	if !strings.Contains(strings.Join(cfg.Warnings, ";"), "时长制") {
-		t.Errorf("duration 生效应有 Warnings: %v", cfg.Warnings)
-	}
-}
-
-func TestLoad_SoakDurationOpenLoopRejected(t *testing.T) {
-	p := writeTemp(t, `
-endpoint: "http://x:1/v1"
-models: ["m1"]
-concurrent:
-  request_rate: 4
-  duration_seconds: 30
-`)
-	if _, err := Load(p); err == nil || !strings.Contains(err.Error(), "闭环") {
-		t.Fatalf("开环 + duration_seconds 应报闭环专属错误, got %v", err)
-	}
-}
-
-func TestLoad_SoakDurationTraceRejected(t *testing.T) {
-	dir := t.TempDir()
-	tracePath := filepath.Join(dir, "trace.json")
-	if err := os.WriteFile(tracePath, []byte("[]"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	p := writeTemp(t, `
-endpoint: "http://x:1/v1"
-models: ["m1"]
-dataset:
-  mode: trace
-  path: `+tracePath+`
-concurrent:
-  levels: [2]
-  duration_seconds: 30
-`)
-	if _, err := Load(p); err == nil || !strings.Contains(err.Error(), "trace") {
-		t.Fatalf("trace + duration_seconds 应报错（filler 先行）, got %v", err)
-	}
-}
-
-func TestLoad_SoakMultiturnDurationNeedsRenew(t *testing.T) {
-	p := writeTemp(t, `
-endpoint: "http://x:1/v1"
-models: ["m1"]
-concurrent:
-  multiturn: true
-  levels: [2]
-  duration_seconds: 30
-`)
-	if _, err := Load(p); err == nil || !strings.Contains(err.Error(), "renew") {
-		t.Fatalf("多轮 + duration_seconds 未开 renew 应报错, got %v", err)
-	}
-}
-
-func TestLoad_SoakRenewNeedsDuration(t *testing.T) {
-	p := writeTemp(t, `
-endpoint: "http://x:1/v1"
-models: ["m1"]
-concurrent:
-  multiturn: true
-  levels: [2]
-  renew: true
-`)
-	if _, err := Load(p); err == nil || !strings.Contains(err.Error(), "duration_seconds") {
-		t.Fatalf("renew 无 duration_seconds 应报错, got %v", err)
-	}
-}
-
-func TestLoad_SoakRenewNeedsMultiturn(t *testing.T) {
-	p := writeTemp(t, `
-endpoint: "http://x:1/v1"
-models: ["m1"]
-concurrent:
-  levels: [2]
-  duration_seconds: 30
-  renew: true
-`)
-	if _, err := Load(p); err == nil || !strings.Contains(err.Error(), "多轮") {
-		t.Fatalf("renew 非多轮应报错, got %v", err)
-	}
-}
-
-// ── 5.11 混合档（multiturn.profiles）：校验 + 告警 + 可达深度 ──
-
-func TestLoad_MultiturnProfiles(t *testing.T) {
-	// 合法：name 留空补 profileN；逐档位可达深度告警；标量 turn_tokens 并存 → 让位告警
-	p := writeTemp(t, `
-endpoint: "http://x:1/v1"
-models: ["m1"]
-multiturn:
-  turns: 32
-  system_tokens: 26000
-  tool_defs_tokens: 8000
-  turn_tokens: 5000
-  profiles:
-    - {weight: 3, turn_tokens: 5000, turns: 32}
-    - {weight: 1, name: heavy, turn_tokens: 27500, turns: 8}
-`)
-	cfg, err := Load(p)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ps := cfg.Multiturn.Profiles
-	if len(ps) != 2 {
-		t.Fatalf("profiles 应解析 2 档，got %d", len(ps))
-	}
-	if ps[0].Name != "profile1" || ps[1].Name != "heavy" {
-		t.Errorf("name 留空应补 profileN：%q / %q", ps[0].Name, ps[1].Name)
-	}
-	joined := strings.Join(cfg.Warnings, "\n")
-	// profile1：base 34000 + 32 轮 × 5000 = 194000；heavy：34000 + 8 × 27500 = 254000
-	if !strings.Contains(joined, "混合档 profile1（权重 3）") || !strings.Contains(joined, "194000") {
-		t.Errorf("应逐档位打印可达深度，got: %v", cfg.Warnings)
-	}
-	if !strings.Contains(joined, "标量 turn_tokens 不再参与") {
-		t.Errorf("profiles 与标量并存应告警让位，got: %v", cfg.Warnings)
-	}
-	// MultiturnMaxDepth 取最深档位（heavy 254000 深于 profile1 194000）
-	if got := cfg.MultiturnMaxDepth(); got != 254000 {
-		t.Errorf("MultiturnMaxDepth 应取最深档位 254000，got %d", got)
-	}
-}
-
-func TestLoad_MultiturnProfilesRejected(t *testing.T) {
-	base := "endpoint: \"http://x:1/v1\"\nmodels: [\"m1\"]\nmultiturn:\n  profiles:\n"
-	cases := []struct {
-		name  string
-		block string
-		want  string
-	}{
-		{"weight=0", "    - {weight: 0, turn_tokens: 5000}\n", "必须为正整数"},
-		{"turn_tokens 缺失", "    - {weight: 1}\n", "turn_tokens"},
-		{"turn_tokens 过大", "    - {weight: 1, turn_tokens: 300000}\n", "过大"},
-		{"turns 为负", "    - {weight: 1, turn_tokens: 5000, turns: -1}\n", "不能为负"},
-		{"name 重复", "    - {weight: 1, name: x, turn_tokens: 5000}\n    - {weight: 1, name: x, turn_tokens: 5000}\n", "重复"},
-	}
-	for _, c := range cases {
-		if _, err := Load(writeTemp(t, base+c.block)); err == nil || !strings.Contains(err.Error(), c.want) {
-			t.Errorf("%s: 应报含 %q 的错误, got %v", c.name, c.want, err)
-		}
-	}
-
-	// trace 互斥（filler 先行）：重放的会话形状来自数据，无法按权重分档
-	dir := t.TempDir()
-	tracePath := filepath.Join(dir, "trace.json")
-	if err := os.WriteFile(tracePath, []byte("[]"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	p := writeTemp(t, `
-endpoint: "http://x:1/v1"
-models: ["m1"]
-dataset:
-  mode: trace
-  path: `+tracePath+`
-multiturn:
-  profiles:
-    - {weight: 1, turn_tokens: 5000}
-`)
-	if _, err := Load(p); err == nil || !strings.Contains(err.Error(), "trace") {
-		t.Fatalf("profiles + trace 应互斥报错, got %v", err)
-	}
-}
-
-// MultiturnMaxDepth：均匀档 = base + turns×turn_tokens；混合档取最深；无增量 = 0。
-func TestMultiturnMaxDepth(t *testing.T) {
-	cfg := &Config{Multiturn: Multiturn{SystemTokens: 1000, ToolDefsTokens: 500, Turns: 8, TurnTokens: 4000}}
-	if got := cfg.MultiturnMaxDepth(); got != 33500 {
-		t.Errorf("均匀档 = %d, want 33500", got)
-	}
-	cfg.Multiturn.TurnTokens = 0
-	if got := cfg.MultiturnMaxDepth(); got != 0 {
-		t.Errorf("无增量 = %d, want 0", got)
-	}
-	cfg.Multiturn = Multiturn{SystemTokens: 100, Turns: 4, TurnTokens: 100,
-		Profiles: []MixProfile{
-			{Weight: 1, TurnTokens: 100, Turns: 4},
-			{Weight: 2, TurnTokens: 100, Turns: 8},
-		}}
-	if got := cfg.MultiturnMaxDepth(); got != 900 {
-		t.Errorf("混合档应取最深 = %d, want 900", got)
 	}
 }

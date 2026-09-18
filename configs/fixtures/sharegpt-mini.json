@@ -1,0 +1,20 @@
+[
+  {"conversations":[
+    {"from":"system","value":"You are a helpful assistant."},
+    {"from":"human","value":"What is the capital of France?"},
+    {"from":"gpt","value":"The capital of France is Paris."},
+    {"from":"human","value":"What is it famous for?"}
+  ]},
+  {"conversations":[
+    {"from":"human","value":"Hello"},
+    {"from":"gpt","value":"Hi there! How can I help you today?"}
+  ]},
+  {"conversations":[
+    {"from":"human","value":"Write a haiku about rain."},
+    {"from":"gpt","value":"Soft rain on rooftops\nwhispers of a grey morning\npuddles hold the sky."}
+  ]},
+  {"conversations":[
+    {"from":"human","value":"Name three primary colors."},
+    {"from":"gpt","value":"Red, blue, and yellow are the three primary colors."}
+  ]}
+]

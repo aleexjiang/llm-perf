@@ -1,182 +1,79 @@
-# llm-perf 配置示例
-# 端点与认证直接写在本文件（endpoint + api_key）；环境变量 LLM_PERF_ENDPOINT、LLM_PERF_API_KEY 优先级更高（应急用；工具不读 .env 文件）
+# llm-perf 配置参考（2026-09-18 新架构）
+#
+# 场景 = 显式子命令，各取所需配置段：
+#   bench probe        # 能力与健康探针（引擎/usage/thinking/tool-call/metrics）
+#   bench user         # 生成式多轮用户会话（user: 段 + 语料库）
+#   bench rps          # 冻结请求快照的开环到达（request_set: + rps: 段）
+#   bench concurrency  # 固定在飞齐射（request_set: + concurrency: 段）
+#
+# filler / 旧 multiturn/concurrent/single 配置已下线（见 docs/workload-refactor-plan.md）。
 
 endpoint: "http://<客户路由IP>:30082/router/v1"
-api_key: ""                      # 字面量 key，直接写这里（仅用于不入库的本地配置）；也可改用 api_key_env 从环境变量读
-auth_scheme: "bearer"            # 认证格式：bearer（默认，Authorization: Bearer <key>）/ raw（裸 key 无 Bearer 前缀，
-                                 # 部分网关如此）/ none（免认证端点）；配合 auth_header 可用自定义 header 名
-# auth_header: "X-API-Key"       # 自定义认证 header 名（默认 Authorization）；AgentLens 等网关用自定义 header 时配
-output_dir: "output"              # 输出 JSON 的默认目录（-o 可覆盖）
-timeout_seconds: 600              # 客户环境慢 + 并发高档位排队，放宽（300s 可能不够）；对 bench probe 同样生效
-chat_path: "/chat/completions"    # 接口路径（默认 /chat/completions）；客户 router 路径不同时改
-metrics_path: "/metrics"          # 服务端指标路径（默认 /metrics）；如挂在 /actuator/prometheus 时改
-# models_path: "/models"          # 模型列表路径（默认 /models）；个别网关列表接口路径不同时改（probe 用）
-include_usage: true               # 请求 stream_options.include_usage，从 usage 字段取精确 token 数
-filler_lang: "en"                 # 填充文本语言：en / zh。长度按**字符/token**换算（en≈4 字符/token、zh≈1.4 字/token，
-                                  # 见 corpus.CharsPerToken，Qwen 实测偏差<2%）；合成词表与语料两条路径共用该系数，
-                                  # 实际 token 数以服务端 usage 为准，bench probe 的 filler_fidelity 实测本部署保真度
-filler_corpus: "en"               # 真实文本语料填充："en"=战争与和平+白鲸记(内置,≈99万token) / "zh"=红楼梦(内置,≈62万token) /
-                                  # 文件路径(.txt/.txt.gz)=自定义语料；留空=合成词表。语料比词表更贴近真实 tokenization
-max_prompt_tokens: 0              # 上下文截止（tokens）：>0 时多轮会话 ctx 到顶后停止加轮；0=不限制。
-                                  # CLI --max-ctx 可覆盖。上限参考 bench probe 的 context_limit
-stream: true                      # 流式开关。false 时只能测端到端延迟与 usage，TTFT/ITL/思考拆分 N/A
-debug: false                      # true: 原始响应留存 <output_dir>/raw/*.log + 日志写 run.log（排查魔改引擎用；
-                                  # 请求失败时即使 false 也会自动转储）。新接引擎建议先跑 bench probe
-server_metrics: true              # 服务端观测层：抓推理服务原生 /metrics（vLLM 默认暴露）——前缀缓存命中率、
-                                  # 排队深度、prefill/decode 分解、MTP 接受率；不可达时自动降级纯客户端计时
-warmup_requests: 0                # 每场景开始前的预热请求数（不计入统计，唯一内容不污染缓存对照）
-
-# 数据源：filler（默认）= token 精确填充，用于缓存对照/上下文深度等变量控制实验；
-#         trace = 真实会话回放（ShareGPT/自定义），贴近实际流量分布，token 以服务端 usage 为准
-dataset:
-  mode: "filler"
-  # mode: "trace"
-  # path: "ShareGPT_V3_unfiltered_cleaned_split.json"   # .json / .json.gz
-  # path: "fixtures/trace-real-16.json.gz"   # 仓库内置真实 agent 会话样本（路径相对配置目录解析）：
-                                             # 128 条脱敏 trace，单次 prompt 20k-500k 六档，
-                                             # 含 assistant/tool 消息，full 回放真正生效；
-                                             # 场景偏编码类（coding 104 / 非 coding 24，受数据源限制）；
-                                             # 逐条清单见 fixtures/trace-real-16.md
-  # path: "/data/traces/customer-sessions.json.gz"   # 外部文件同样支持：绝对路径直通（客户环境导入的
-                                             # trace 放哪都行）；相对路径以配置文件所在目录为基准，
-                                             # 与启动时的工作目录解耦
-  # format: "sharegpt"       # sharegpt | sessions（自定义 [{"turns":[...]}]；留空自动识别）
-  # min_turns: 2             # 会话最少 user 轮数
-  # max_sessions: 64         # 最多加载多少会话（0=不限）
-  # replay_mode: "full"      # 回放保真度：full（默认，按原序注入全部 role——assistant/tool 消息进上下文，
-                             # 测真实 history 深度）| user_only（只回放 user 轮——上下文系统性偏小，
-                             # 仅问答类数据集或快速对比用）
-
-# slo 段（SLO 口径统一入口，2026-09-12 由顶层 goodput 合流而来）：
-#   goodput（SLO 约束吞吐）：同时满足以下两条的请求才算有效（concurrent 结果里出 goodput 列）
-#   baseline（体验基线评估阈值；未写的键使用外部分析默认值，
-#   判据与出处 docs/latency-baselines.md §7；enabled: false = 外部分析跳过该节）
-# slo:
-#   goodput:
-#     ttft_ms: 2000
-#     tpot_ms: 100
-#   baseline:
-#     short_max_tokens: 4000    # 短输入档上界
-#     long_min_tokens: 24000    # agent 大上下文档下界
-#     short_good_ttft: 0.45     # s（MLPerf Interactive p99）
-#     short_pass_ttft: 2.0      # s（MLPerf Server p99）
-#     long_good_ttft: 3.0       # s（agent 大上下文，推导值）
-#     long_pass_ttft: 6.0
-#     good_tpot: 40             # ms
-#     pass_tpot: 200            # ms
-
-# 饱和止损（默认关闭）：负载饱和时停止继续发压；任一判据触发即**停止向当前档位发新请求**
-# （drain：在飞跑完，已发出的请求全部保留完整数据）并停止后续档位，aborted 留痕。
-# max_waiting 标定：各档 waiting 峰值会落盘（waiting_max）；外部分析据此标定阈值，
-# 阈值低于正常水位会把正常排队当饱和误切。
-# CLI 覆盖：--sat-waiting / --sat-window / --sat-max-wall；--no-sat-guard 关闭。
-# saturation_guard:
-#   max_waiting: 32           # waiting 排队深度阈值（需 server_metrics: true；0=不启用）
-#   window_seconds: 120       # 持续超阈多久触发（任何一次回落即重置计时）
-#   sample_seconds: 5         # 探测周期
-#   max_wall_seconds: 3600    # 单档发射窗口上限（0=不启用；到点只停发新请求，在飞跑完）
-
-# 正确性抽查（防"HTTP 200 但内容异常"的假成功）：数字转写金丝雀，结果进 JSON 与报告数据质量节
-# correctness:
-#   samples: 8
-
-# 战役盐值：服务端 prefix cache 是内存态且不会被挤出——同一配置重跑时"冷缓存"测量会被
-# 上次战役污染。每次测试战役递增盐值（或重启服务端清缓存）。CLI --seed-salt 可覆盖。
-# seed_salt: 1
-
-# 连接层重试（默认关闭——压测语义下重试会掩盖服务端不稳定）：只重试瞬时失败
-# （TCP/流被 reset、HTTP 5xx/429），4xx 不重试。重试会计入 warnings/retry_count 留痕
-# retry:
-#   max_attempts: 2     # 总尝试次数
-#   backoff_ms: 300     # 退避基数（指数退避，封顶 5s）
-
+api_key: ""                      # 字面量 key（仅用于不入库的本地配置）；也可改用 api_key_env
+auth_scheme: "bearer"            # bearer（默认）| raw（裸 key）| none；auth_header 自定义 header 名
+output_dir: "output"
+timeout_seconds: 600             # 客户环境慢 + 并发高档位排队，放宽；对 probe 同样生效
+chat_path: "/chat/completions"   # 接口路径（默认）
+metrics_path: "/metrics"         # 服务端指标路径（默认）
+# models_path: "/models"        # probe 用；网关路径不同时改
+include_usage: true              # 从 usage 字段取精确 token 数
+stream: true                     # 流式开关。false 时 TTFT/ITL/思考拆分 N/A
+corpus_lang: "en"                # 语料语言 en/zh：user 模式文本生成 + probe 语料校准共用
+seed_salt: 0                     # 测试隔离：重跑/换变体递增，避免命中服务端 prefix cache
+server_metrics: true             # 服务端观测层（缓存命中率/排队/prefill-decode 分解）
+metrics_interval_ms: 500         # gauge 轮询间隔
+debug: false                     # true: 原始响应 → <output_dir>/raw/，日志 → run.log
+raw_timings: true                # 原始 chunk 序列落盘（raw_timings）；超长测试可关
+max_prompt_tokens: 0             # 上下文截止：user 多轮到顶后停止加轮；0=不限制；--max-ctx 可覆盖
 models:
-  - "/models/DeepSeek-V4-Flash-0731"
-  - "/models/Qwen3.8-Flash-Next"
-  - "/models/Qwen3.8-27B"
+  - "/models/Qwen3.8-27B"        # served name（/models 列表里的 ID）
 
-# 思考模式：both=每个场景自动跑 off/on 各一遍（A/B 对照）；on / off=只跑其一。
-# extra_body 通用透传（对齐 vLLM --extra-body），按实际网关写参数，不同服务示例：
-#   vLLM/Qwen:  {chat_template_kwargs: {enable_thinking: true}}
-#   其他网关:   {thinking: {type: enabled}} / {enable_thinking: true} 等
+# ── 思考模式（probe 会自动探测哪个参数可控）──
 thinking:
-  mode: "both"
+  mode: "both"                   # off/on 各跑一遍（A/B 对照）；levels 配置后取代 mode
   extra_body_on:
     chat_template_kwargs: {enable_thinking: true}
   extra_body_off:
     chat_template_kwargs: {enable_thinking: false}
-  max_tokens_floor: 8192          # 思考普遍 1500-2500+ token，云上实测 2048 会被吃光（finish=length 无内容）
-  # 思考等级（可选）：probe 探测到可控参数后启用；配置 levels 后上面的 mode/extra_body_on/off 失效。
-  # 报告与日志按 name 分组，参数名随框架不同（OpenAI reasoning_effort / Qwen thinking_budget / GLM thinking.type）：
-  # levels:
-  #   - {name: off,  enabled: false, extra_body: {reasoning_effort: "low"}}   # enabled:false = 思考关闭态
-  #   - {name: low,  enabled: true,  extra_body: {reasoning_effort: "low"}}
-  #   - {name: high, enabled: true,  extra_body: {reasoning_effort: "high"}}
-  # CLI 只跑单档：bench -c xxx.yaml --concurrency 1 --thinking low
+  # max_tokens_floor: 2048       # 思考开启时 max_tokens 下限保护；显式 0 = 关闭
+  # levels:                      # 自定义思考档位（配后 mode/extra_body 不参与展开）
+  #   - {name: low, enabled: true, extra_body: {reasoning_effort: low}}
 
-# 按模型覆盖思考配置：写到文件底部的 model_overrides.<模型>.thinking（字段级覆盖，
-# 只写要改的字段，其余继承全局 thinking）。不同模型/引擎的思考参数与档位词汇不同时用，
-# 先对各模型分别跑 probe（bench probe -c xxx.yaml <模型名>）确认可控参数再填。
+# ── user 模式：生成式多轮用户会话（bench user）──
+# 形状来自 profile.json（scripts/profile_build.py 从 raw trace 提取特征，不含消息文本）；
+# 文本由内置 12 本公版书语料按 seed 生成（一用户一书）；assistant 用被测模型真实回复。
+user:
+  profile_path: "profiles/agent-v1.json"  # 相对配置目录解析
+  users: 8                       # 并行用户数（每用户一条完整多轮会话）
+  max_tokens: 256                # 输出预算（标量或列表）
+  shared_base: true              # 全部用户同一 system 基座（测跨用户共享前缀 cache 收益）
 
-# 主场景：单发多轮（模拟 agent：system + tool defs + 逐轮滚大的 history）
-# 形状对齐现代 agent 产品（5.9）：首调上下文 ~35k（system+tool defs 基座 21k × 1.07 模板开销 + 首轮 10k），
-# 8 轮滚到末轮 ~108k（128k 模型留 ~12k + 输出预算余量）。
-# 起步由 system_tokens + tool_defs_tokens 控制（AgentLens 首调实测中位 ~44k，n=4 偏高但样本不足，
-# 暂维持 35k，后续根据真实样本补充标定）；
-# probe 确认各模型上限后再微调 turn_tokens / turns。
-multiturn:
-  sessions: 2                     # 跑几个独立会话
-  turns: 8                        # 每个会话几轮
-  system_tokens: 18000            # 模拟 agent 的 system 基座（角色指令 + 记忆 + 工作规范）
-  tool_defs_tokens: 3000          # 模拟 agent 的 tool definitions 持续开销
-  turn_tokens: 10000              # 每轮新增 user 消息：8 轮滚到 ~108k（base 21k + 8×10k）
-                                  # 每轮 10k 量级模拟"每轮新增工具结果 + 追问"；多轮滚到 108k ≠ 单条塞 108k，两者推理行为不同
-  max_tokens: 256                 # 标量或列表，同 single（多轮列表会与 sessions 相乘，注意总时长）
-  keep_assistant: true            # assistant 回复保留进 history（真实 agent 行为）
-  max_reply_chars: 2000           # assistant 回复进 history 的截断长度（按字符计，中文安全；默认 2000）
-  # 混合档（5.11，跨会话混合）：并发多轮时（--turns multi --concurrency 2,4,…）按权重把会话
-  # 分属不同增量档——测"重度会话与轻量会话同场竞技"的容量与相互干扰（重度抢 KV 对轻量体验的
-  # 影响）。SWRR 确定性分配；标量 turn_tokens 在并发多轮下让位于档位（并存
-  # 告警）；仅并发多轮生效，filler 专属（dataset.mode=trace 互斥）。示例：真实增量档 3 份 + 重度档 1 份：
-  # profiles:
-  #   - {weight: 3, name: real,  turn_tokens: 5000,  turns: 32}   # 对齐真实 agent 增量（AgentLens p50 +4k/轮）
-  #   - {weight: 1, name: heavy, turn_tokens: 27500, turns: 8}    # 重度注入轮（S2 口径）
+# ── rps / concurrency：冻结请求快照（与 vLLM bench serve 同口径）──
+# 请求 = ShareGPT 会话截至最后一条 user 的完整 history；输出预算 = 其后 assistant 估算 token。
+# 严格数字对比要求：两边同 sharegpt_path、同 num_prompts、同 seed、同输出预算、同调度参数。
+request_set:
+  sharegpt_path: "ShareGPT_V3_unfiltered_cleaned_split.json"   # .json / .json.gz
+  num_prompts: 1000
+  seed: 42
+  max_output_tokens: 0           # 单请求输出预算上限（0=不设上限）
 
-# 场景三：多用户多轮容量采集（RPS 主路径；request_rate/rate_sweep 与 levels 二选一）
-concurrent:
-  multiturn: true                 # 每个到达的新用户运行完整多轮会话
-  request_rate: 0.5               # 单档 RPS；需要扫描时改用 rate_sweep
-  # rate_sweep: [0.1, 0.25, 0.5, 1, 2]  # 多档 RPS 扫描
-  num_prompts: 32                 # 总会话数；multiturn 下 RPS 是会话到达率
-  max_concurrency: 0              # 客户端安全上限，0=不限
-  prompt_tokens: 10000             # 闭环单轮兼容字段；多轮使用 multiturn 形状
-  max_tokens: 256                 # 每轮输出上限
-  burstiness: 1                   # 1=标准泊松；<1 更突发；>1 趋向均匀
-  # duration_seconds: 300          # soak：跑满墙钟，到点停发新会话、在途跑完
-  # renew: true                    # soak 多轮续跑：会话滚完后换新内容重开
+rps:
+  rates: [1, 2, 4, 8]            # 到达率档位（req/s），多档=排队-延迟曲线扫描
+  max_concurrency: 64            # 在飞上限（0=不限；防到达率超容量时无限堆积）
+  burstiness: 1                  # 1=泊松；<1 更突发；>1 更均匀
 
-# ─────────────────────────────────────────────────────────────
-# 按模型覆盖（可选，配置组织的推荐方式）：顶部通用 + 底部差异
-# 键=模型名（必须在 models 列表内，否则配置报错）；只写与通用配置不同的项，
-# 未写的键继承顶层（思考覆盖支持字段级：thinking 内只写要改的字段）。
-# 多模型战役的数据按模型分区落 <output_dir>/<模型>/<场景>-<ts>.json，重测/作废
-# 单模型不纠缠；单模型配置仍直接落 output_dir。
-#
+concurrency:
+  levels: [1, 2, 4, 8, 16]       # 在飞请求数档位（每档跑满 num_prompts）
+  request_rate: 0                # 0=inf 齐射；>0 = 有限到达率 + 在飞上限组合
+  burstiness: 1
+
+# ── SLO（可选）：goodput 判定 + 体验基线评估阈值 ──
+# slo:
+#   goodput: {ttft_ms: 2000, tpot_ms: 100}
+#   baseline: {short_max_tokens: 4000, long_min_tokens: 24000}
+
+# ── 按模型差异覆盖（未写的键继承顶层）──
 # model_overrides:
-#   "/models/Qwen3.8-27B":
-#     enabled: false                # 本次不测该模型（分批重测时临时关掉；全禁用会报错）
-#     max_prompt_tokens: 131072     # 该模型上下文较小：档位提前截止、多轮提前停轮
-#     stream: true                  # 引擎能力差异：个别模型不支持流式时关掉
-#     thinking:
-#       max_tokens_floor: 16384     # 字段级覆盖，mode/extra_body 继承全局
-#     multiturn:
-#       turns: 12
-#       turn_tokens: 8000
-#     concurrent:
-#       rate_sweep: [0.1, 0.25, 0.5, 1]
-#       num_prompts: 32
-#   "/models/DeepSeek-V4-Flash-0731":
-#     thinking:
-#       levels:
-#         - {name: low,  enabled: true,  extra_body: {chat_template_kwargs: {thinking_budget: 1024}}}
-#         - {name: high, enabled: true,  extra_body: {chat_template_kwargs: {thinking_budget: 16384}}}
+#   "/models/DeepSeek":
+#     thinking: {max_tokens_floor: 4096}
+#     enabled: false              # 本次跳过

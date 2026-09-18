@@ -1,0 +1,10 @@
+# ── llm-perf smoke：probe 冒烟（mock server 127.0.0.1:18099）──
+endpoint: "http://127.0.0.1:18099/router/v1"
+api_key_env: ""
+output_dir: "output-smoke-probe"
+models: ["mock-model-a", "mock-model-b"]
+corpus_lang: "en"
+thinking:
+  mode: "off"
+  extra_body_off:
+    chat_template_kwargs: {enable_thinking: false}

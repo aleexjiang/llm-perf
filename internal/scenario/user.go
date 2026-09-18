@@ -54,7 +54,7 @@ func UserScenario(ctx context.Context, cfg *config.Config, client *engine.Client
 	if err != nil {
 		return nil, err
 	}
-	lang := cfg.FillerLang
+	lang := cfg.CorpusLang
 	if lang == "" {
 		lang = "en"
 	}

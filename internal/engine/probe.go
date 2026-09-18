@@ -182,7 +182,7 @@ type ProbeOptions struct {
 	// CacheSizeTokens 缓存探针的上下文大小（tokens），默认 40000（agent 真实档位）
 	CacheSizeTokens int
 
-	// FillerLang 缓存探针的填充语料语言（继承配置 filler_lang）
+	// FillerLang 缓存探针的填充语料语言（继承配置 corpus_lang）
 	FillerLang string
 }
 

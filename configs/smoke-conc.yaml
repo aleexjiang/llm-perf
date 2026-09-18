@@ -1,0 +1,14 @@
+# ── llm-perf smoke：concurrency 模式（mock server 127.0.0.1:18099）──
+endpoint: "http://127.0.0.1:18099/router/v1"
+api_key_env: ""
+output_dir: "output-smoke-conc"
+models: ["mock-model-a"]
+thinking:
+  mode: "off"
+request_set:
+  sharegpt_path: "fixtures/sharegpt-mini.json"
+  num_prompts: 6
+  seed: 42
+  max_output_tokens: 64
+concurrency:
+  levels: [1, 2]       # 两档在飞，找总吞吐拐点的最小形态

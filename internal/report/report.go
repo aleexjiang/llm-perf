@@ -13,23 +13,15 @@ import (
 	"github.com/aleexjiang/llm-perf/internal/smetrics"
 )
 
-// SingleRow：一个模型在一个 token 档位 × 思考模式 × 输出长度下的多次 run。
-type SingleRow struct {
-	Model        string                `json:"model"`
-	Thinking     string                `json:"thinking"` // "on" / "off"
-	PromptTokens int                   `json:"prompt_tokens"`
-	MaxTokens    int                   `json:"max_tokens"` // 输出长度（max_tokens 扫描维度；thinking=on 时已含 floor 抬高）
-	Runs         []*engine.TurnMetrics `json:"runs"`
-}
-
 // MultiturnRun：一个模型的一次多轮会话（每 turn 均含思考时长）。
+// user 模式复用本结构：Session = 用户序号；Profile = 会话档位（light/medium/heavy）。
 type MultiturnRun struct {
 	Model     string `json:"model"`
 	Thinking  string `json:"thinking"` // "on" / "off"
 	Session   int    `json:"session"`
 	MaxTokens int    `json:"max_tokens"` // 输出长度（max_tokens 扫描维度；thinking=on 时已含 floor 抬高）
 
-	// 5.11 混合档：本会话所属档位名（multiturn.profiles.name）；空 = 未启用混合档。
+	// 会话档位标签：user 模式来自 profile 的 light/medium/heavy；空 = 未分档。
 	// 报告/分析按此分组切各档位体验（TTFT、单流速度等）。
 	Profile string `json:"profile,omitempty"`
 
@@ -297,7 +289,6 @@ type Report struct {
 	SLO               *SLO                  `json:"slo,omitempty"`
 	SLOBaseline       *SLOBaseline          `json:"slo_baseline,omitempty"`
 	Plan              *Plan                 `json:"plan,omitempty"`
-	Single            []SingleRow           `json:"single,omitempty"`
 	Multiturn         []MultiturnRun        `json:"multiturn,omitempty"`
 	Concurrent        []ConcurrentLevel     `json:"concurrent,omitempty"`
 	Correctness       []CorrectnessRow      `json:"correctness,omitempty"`
@@ -387,10 +378,6 @@ func (r *Report) PartitionByModel() []*Report {
 		buckets[model] = p
 		order = append(order, model)
 		return p
-	}
-	for i := range r.Single {
-		p := get(r.Single[i].Model)
-		p.Single = append(p.Single, r.Single[i])
 	}
 	for i := range r.Multiturn {
 		p := get(r.Multiturn[i].Model)

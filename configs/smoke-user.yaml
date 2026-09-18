@@ -1,0 +1,12 @@
+# ── llm-perf smoke：user 模式（mock server 127.0.0.1:18099）──
+endpoint: "http://127.0.0.1:18099/router/v1"
+api_key_env: ""
+output_dir: "output-smoke-user"
+models: ["mock-model-a"]
+corpus_lang: "en"
+thinking:
+  mode: "off"
+user:
+  profile_path: "fixtures/profile-mini.json"   # 相对配置目录解析
+  users: 2
+  max_tokens: 32

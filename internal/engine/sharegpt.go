@@ -59,6 +59,36 @@ func LoadShareGPTRequests(path string, numPrompts int, seed int64, maxOutputToke
 	return loadShareGPTTwoPass(path, numPrompts, rand.New(rand.NewSource(seed)), maxOutputTokens)
 }
 
+// sharegptTurn ShareGPT 词表的一条消息（兼容 role/content 与 from/value 两种键名变体）。
+type sharegptTurn struct {
+	From    string `json:"from"`
+	Role    string `json:"role"`
+	Value   string `json:"value"`
+	Content string `json:"content"`
+}
+
+func (t sharegptTurn) role() string {
+	r := strings.ToLower(t.From)
+	if r == "" {
+		r = strings.ToLower(t.Role)
+	}
+	return r
+}
+
+func (t sharegptTurn) isUser() bool { return t.role() == "human" || t.role() == "user" }
+
+func (t sharegptTurn) text() string {
+	if t.Value != "" {
+		return t.Value
+	}
+	return t.Content
+}
+
+type sharegptConv struct {
+	Conversations []sharegptTurn `json:"conversations"`
+	Messages      []sharegptTurn `json:"messages"` // 兼容变体
+}
+
 // sharegptStreamFn 返回 false 表示提前终止流。
 type sharegptStreamFn func(ordinal int, conv *sharegptConv) bool
 

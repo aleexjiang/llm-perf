@@ -18,11 +18,12 @@ func TestSaveJSONAnyRoundtrip(t *testing.T) {
 
 	in := Report{
 		Tool:        "llm-perf/test",
-		Scenario:    "single",
+		Scenario:    "user",
 		GeneratedAt: time.Now(),
 		Endpoint:    "http://stub/v1",
-		Single: []SingleRow{{
-			Model: "m1", Thinking: "off", PromptTokens: 4096,
+		Multiturn: []MultiturnRun{{
+			Model: "m1", Thinking: "off", Session: 1,
+			Turns: []*engine.TurnMetrics{{Model: "m1", PromptTokens: 4096}},
 		}},
 	}
 
@@ -37,11 +38,11 @@ func TestSaveJSONAnyRoundtrip(t *testing.T) {
 	if err := json.Unmarshal(raw, &out); err != nil {
 		t.Fatalf("JSON 解析: %v", err)
 	}
-	if out.Tool != "llm-perf/test" || out.Scenario != "single" || out.Endpoint != "http://stub/v1" {
+	if out.Tool != "llm-perf/test" || out.Scenario != "user" || out.Endpoint != "http://stub/v1" {
 		t.Fatalf("字段保真失败: %+v", out)
 	}
-	if len(out.Single) != 1 || out.Single[0].Model != "m1" || out.Single[0].PromptTokens != 4096 {
-		t.Fatalf("嵌套字段保真失败: %+v", out.Single)
+	if len(out.Multiturn) != 1 || out.Multiturn[0].Model != "m1" || len(out.Multiturn[0].Turns) != 1 || out.Multiturn[0].Turns[0].PromptTokens != 4096 {
+		t.Fatalf("嵌套字段保真失败: %+v", out.Multiturn)
 	}
 	info, err := os.Stat(p)
 	if err != nil {
@@ -91,13 +92,12 @@ func TestVersionNonEmpty(t *testing.T) {
 // PartitionByModel：按行 Model 分桶、保序、缺 model 的 correctness 行复制进每个分区、归属字段回填
 func TestPartitionByModel(t *testing.T) {
 	r := &Report{
-		Tool: "t", Scenario: "single", Endpoint: "http://stub/v1",
-		Single: []SingleRow{
-			{Model: "m1", Thinking: "off", PromptTokens: 100},
-			{Model: "m2", Thinking: "off", PromptTokens: 200},
-			{Model: "m1", Thinking: "on", PromptTokens: 300},
+		Tool: "t", Scenario: "user", Endpoint: "http://stub/v1",
+		Multiturn: []MultiturnRun{
+			{Model: "m1", Session: 1},
+			{Model: "m2", Session: 1},
+			{Model: "m1", Session: 2},
 		},
-		Multiturn: []MultiturnRun{{Model: "m2", Session: 1}},
 		Correctness: []CorrectnessRow{
 			{Model: "m2", Number: "12345", Match: true},
 			{Model: "m1", Number: "67890", Match: false},
@@ -110,10 +110,10 @@ func TestPartitionByModel(t *testing.T) {
 	if parts[0].PartitionModel != "m1" || parts[1].PartitionModel != "m2" {
 		t.Fatalf("分区应按首次出现顺序: %s, %s", parts[0].PartitionModel, parts[1].PartitionModel)
 	}
-	if len(parts[0].Single) != 2 || len(parts[0].Multiturn) != 0 {
+	if len(parts[0].Multiturn) != 2 {
 		t.Fatalf("m1 分区数据错误: %+v", parts[0])
 	}
-	if len(parts[1].Single) != 1 || len(parts[1].Multiturn) != 1 {
+	if len(parts[1].Multiturn) != 1 {
 		t.Fatalf("m2 分区数据错误: %+v", parts[1])
 	}
 	if len(parts[0].Correctness) != 1 || len(parts[1].Correctness) != 1 {
@@ -121,7 +121,7 @@ func TestPartitionByModel(t *testing.T) {
 	}
 	// Endpoint 级字段原样带入
 	for _, p := range parts {
-		if p.Tool != "t" || p.Scenario != "single" || p.Endpoint != "http://stub/v1" {
+		if p.Tool != "t" || p.Scenario != "user" || p.Endpoint != "http://stub/v1" {
 			t.Fatalf("分区头字段丢失: %+v", p)
 		}
 	}

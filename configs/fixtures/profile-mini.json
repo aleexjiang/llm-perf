@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "generated_at": "2026-09-18T00:00:00Z",
+  "source": "smoke-fixture",
+  "first_turn_tokens": [35000, 40000],
+  "profiles": {
+    "light":  {"weight": 0.6, "turns_range": [2, 3], "user_input_tokens": [80, 300], "context_tokens": [500, 1500]},
+    "medium": {"weight": 0.3, "turns_range": [4, 5], "user_input_tokens": [80, 300], "context_tokens": [500, 1500]},
+    "heavy":  {"weight": 0.1, "turns_range": [6, 6], "user_input_tokens": [80, 300], "context_tokens": [500, 1500]}
+  },
+  "cleaning": {}
+}
