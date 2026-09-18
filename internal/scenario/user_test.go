@@ -84,8 +84,8 @@ func TestUserScenario(t *testing.T) {
 			t.Fatalf("会话缺 profile 标签: %+v", run)
 		}
 		dist[run.Profile]++
-		// 轮次必须在档位范围内（heavy 单元素 = 恰好 9 轮）
-		want := map[string][2]int{"light": {2, 4}, "medium": {5, 8}, "heavy": {9, 9}}[run.Profile]
+		// 轮次必须在档位范围内（heavy 单元素 = 下限 9，运行时上限 defaultTurnsUpper=32）
+		want := map[string][2]int{"light": {2, 4}, "medium": {5, 8}, "heavy": {9, 32}}[run.Profile]
 		if len(run.Turns) < want[0] || len(run.Turns) > want[1] {
 			t.Fatalf("profile=%s 轮次 %d 超出 [%d,%d]", run.Profile, len(run.Turns), want[0], want[1])
 		}

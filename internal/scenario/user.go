@@ -159,16 +159,32 @@ func runOneUserSession(ctx context.Context, e *env, prof *Profile, lang, model s
 	}
 	cpr := corpus.CharsPerToken(lang)
 
-	// 档位轮次：[lo,hi] 均匀采样；单元素 = 固定下限（运行时以 ctx 截止保护）
-	turnLo, turnHi := spec.turnBounds(e.cfg.MaxPromptTokens)
+	// 档位轮次：[lo,hi] 均匀采样；单元素 = 下限 + 运行时上限 32（review R1-H2 修正）。
+	// 不把 MaxPromptTokens（token 数）当轮次上限——上下文到顶由 ctxLimitHit 运行时止损。
+	turnLo, turnHi := spec.turnBounds(0)
 	turns := turnLo
 	if turnHi > turnLo {
 		turns = turnLo + rng.Intn(turnHi-turnLo+1)
 	}
 
-	// system 基座：一次定型，全程冻结（cache 约束 2）
+	// system 基座：一次定型，全程冻结（cache 约束 2）。
+	// shared_base=true（默认）：全部用户同一基座内容——基座种子/取窗 seed 与 userIdx 解耦
+	// （review R1-H1 修正：会话 rng 是 per-session 的，直接用它取窗会让每个用户基座互异，
+	// "跨用户共享前缀 cache 收益"恒为 0，与配置注释矛盾）。基座书也固定（与用户自选书解耦，
+	// 避免不同书文长度不一致导致基座差异）；用户的 user/context 仍取自各自的书。
+	// shared_base=false：每用户独立基座（per-session seed 与书）。
+	baseSeed := seed
+	baseBook := book
+	baseWindowSeed := rng.Int63()
+	if e.cfg.User.GetSharedBase() {
+		baseSeed = sharedBaseSeed(e.cfg.SeedSalt)
+		if sb := corpus.SelectBook(lang, baseSeed); sb != nil {
+			baseBook = sb
+		}
+		baseWindowSeed = baseSeed
+	}
 	baseMsg := engine.Message{Role: "system",
-		Content: book.Window(int(firstTurnBaseTokens*cpr), rng.Int63())}
+		Content: baseBook.Window(int(firstTurnBaseTokens*cpr), baseWindowSeed)}
 
 	sample := func(r []int) int {
 		if len(r) != 2 || r[1] <= r[0] {
@@ -210,6 +226,12 @@ func runOneUserSession(ctx context.Context, e *env, prof *Profile, lang, model s
 
 		m := runOne(ctx, e, model, msgs, maxTok, v)
 		run.Turns = append(run.Turns, m)
+		// 首轮实测深度校验（review R1-L1）：估算保证的 35K 依赖 CharsPerToken 系数，
+		// 真实 tokenizer 偏差在此暴露（session 内只告警一次）
+		if turn == 0 && m.PromptTokens > 0 && m.PromptTokens < prof.FirstTurnTokens[0] {
+			log.Printf("    ⚠️ 首轮实测 prompt %dtk < 约束 %dtk——语料换算比偏差，建议跑 bench probe 看 filler_fidelity",
+				m.PromptTokens, prof.FirstTurnTokens[0])
+		}
 		// 真实 assistant 回复进 history：动态 prefix cache 的核心（不能用 trace 旧回复）
 		if m.ReplyText != "" {
 			msgs = append(msgs, engine.Message{Role: "assistant",
@@ -219,12 +241,27 @@ func runOneUserSession(ctx context.Context, e *env, prof *Profile, lang, model s
 			log.Printf("    🛑 触发模型上下文上限（limit=%stk）——提前结束会话", limit)
 			break
 		}
+		// 失败轮终止会话（review R1-M1）：失败轮无 assistant 回复，若继续下一轮会产生
+		// 连续 user 消息（违反方案 A 不变量，部分端点直接 400 使失败扩散到后续所有轮）。
+		// 失败轮的完整指标已保留在 Turns 里（含 Error），已完成轮不受影响。
+		if m.Error != "" {
+			log.Printf("    🛑 轮次失败（%s）——终止该会话，避免连续 user 消息", previewErr(m.Error))
+			break
+		}
 		if interrupted(ctx) {
 			break
 		}
 	}
 	run.FillLastPromptTokens()
 	return run
+}
+
+// previewErr 错误摘要（日志用）。
+func previewErr(s string) string {
+	if len(s) > 120 {
+		return s[:120] + "..."
+	}
+	return s
 }
 
 // swrr 平滑加权轮转（nginx 语义）：档位分派在用户序上交错展开，
@@ -284,4 +321,10 @@ func weightsDesc(prof *Profile) string {
 // userSeed 会话种子：盐 + 用户序号派生（确定性；同配置重跑同内容）。
 func userSeed(salt, userIdx int) int64 {
 	return int64(salt)*1000003 + int64(userIdx+1)*7919 + 42
+}
+
+// sharedBaseSeed 共享基座种子（shared_base=true）：与 userIdx 解耦，
+// 全部用户得到同一基座内容；盐值仍参与（换盐隔离冷缓存）。
+func sharedBaseSeed(salt int) int64 {
+	return int64(salt)*1000003 + 977
 }

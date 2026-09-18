@@ -72,12 +72,23 @@ func LoadProfile(path string) (*Profile, error) {
 	return &p, nil
 }
 
-// turnBounds 档位轮次上下界（单元素 range = [lo, lo]，由运行时上限另行保护）。
+// defaultTurnsUpper 轮次上限缺省值：单元素 turns_range（如 heavy 的 [9]）表示"至少 lo 轮、
+// 无 profile 级上限"，运行时用该值封顶（review R1-H2 修正：此前单元素被当成固定值，
+// heavy 会话全部恰好 9 轮，违背 plan 12.1"保留完整轮次分布"）。与 plan 13.2 的 heavy
+// 9~32 轮口径一致。
+const defaultTurnsUpper = 32
+
+// turnBounds 档位轮次上下界。
+// 双元素 [lo,hi]：均匀采样区间；单元素 [lo]：下限采样，上限取 defaultTurnsUpper
+// 再被 maxTurns（max_prompt_tokens 截止派生）进一步收窄。
 func (s *ProfileSpec) turnBounds(maxTurns int) (int, int) {
 	lo := s.TurnsRange[0]
-	hi := lo
+	hi := defaultTurnsUpper
 	if len(s.TurnsRange) > 1 {
 		hi = s.TurnsRange[1]
+		if hi < lo {
+			hi = lo
+		}
 	}
 	if maxTurns > 0 && hi > maxTurns {
 		hi = maxTurns
