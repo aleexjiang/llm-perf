@@ -1,0 +1,86 @@
+[
+  {
+    "id": "crime-and-punishment",
+    "title": "Crime and Punishment",
+    "lang": "en",
+    "file": "en/crime-and-punishment.txt.gz",
+    "chars": 1134997
+  },
+  {
+    "id": "don-quixote",
+    "title": "Don Quixote",
+    "lang": "en",
+    "file": "en/don-quixote.txt.gz",
+    "chars": 2297414
+  },
+  {
+    "id": "les-miserables",
+    "title": "Les Miserables",
+    "lang": "en",
+    "file": "en/les-miserables.txt.gz",
+    "chars": 3225521
+  },
+  {
+    "id": "moby-dick",
+    "title": "Moby Dick",
+    "lang": "en",
+    "file": "en/moby-dick.txt.gz",
+    "chars": 1218727
+  },
+  {
+    "id": "pride-and-prejudice",
+    "title": "Pride and Prejudice",
+    "lang": "en",
+    "file": "en/pride-and-prejudice.txt.gz",
+    "chars": 728264
+  },
+  {
+    "id": "sherlock-holmes",
+    "title": "Adventures of Sherlock Holmes",
+    "lang": "en",
+    "file": "en/sherlock-holmes.txt.gz",
+    "chars": 562137
+  },
+  {
+    "id": "war-and-peace",
+    "title": "War and Peace",
+    "lang": "en",
+    "file": "en/war-and-peace.txt.gz",
+    "chars": 3206589
+  },
+  {
+    "id": "hongloumeng",
+    "title": "红楼梦",
+    "lang": "zh",
+    "file": "zh/hongloumeng.txt.gz",
+    "chars": 863983
+  },
+  {
+    "id": "rulin-waishi",
+    "title": "儒林外史",
+    "lang": "zh",
+    "file": "zh/rulin-waishi.txt.gz",
+    "chars": 278676
+  },
+  {
+    "id": "sanguo-yanyi",
+    "title": "三国演义",
+    "lang": "zh",
+    "file": "zh/sanguo-yanyi.txt.gz",
+    "chars": 622096
+  },
+  {
+    "id": "shuihu-zhuan",
+    "title": "水浒传",
+    "lang": "zh",
+    "file": "zh/shuihu-zhuan.txt.gz",
+    "chars": 544453
+  },
+  {
+    "id": "xiyouji",
+    "title": "西游记",
+    "lang": "zh",
+    "file": "zh/xiyouji.txt.gz",
+    "chars": 757516
+  }
+]
