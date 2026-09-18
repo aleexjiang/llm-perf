@@ -49,7 +49,29 @@ bench probe -c customer.yaml
 
 tool-call 只属于 `probe`，不进入用户、RPS、并发压测路径。
 
-### 3.2 `user`：真实用户会话
+### 3.2 `profile-build`：外部会话形状建模（不属于 benchmark）
+
+`profile-build` 不是 `llm-perf` 正式压测子命令，而是外部数据处理阶段：
+
+```bash
+profile-build \
+  --trace /data/raw/workbuddy-trace.jsonl \
+  --reference /data/reference/sharegpt \
+  --output /data/profiles/workbuddy-agent-v1.json
+```
+
+语义：
+
+- 读取外部 raw trace 和可选的 ShareGPT 参考数据；
+- 只提取轻/中/重会话的统计特征；
+- 不把 raw trace 的 user、assistant、tool 文本带入运行时；
+- 产出 profile 和 synthetic request set；
+- 不访问被测模型，不生成实时 assistant 回复；
+- profile 版本、数据集版本、采样规则和 seed 写入元数据。
+
+`profile-build` 只负责把外部数据提炼成可复用的会话形状，不负责执行压测。
+
+### 3.3 `user`：生成式用户会话
 
 入口示例：
 
@@ -58,19 +80,30 @@ bench user -c customer.yaml --users 1
 bench user -c customer.yaml --users 8
 ```
 
-语义：
+`user` 模式仍然有意义，但不是 trace 原样回放：
 
-- `--users 1`：单用户顺序执行生成式用户会话；
-- `--users N`：N 个独立用户并行执行各自生成式会话；
-- trace 只提供清洗后的用户输入和会话形状统计，不直接回放历史 `assistant`/`tool`；
-- 每个用户保留自己的 history；当前模型生成的 `assistant` 回复在下一轮原样进入 history；
-- `tool` 原始消息从运行时输入移除，重/中/轻会话需要的上下文形状由 profile 和确定性 synthetic context 构造；
-- 重点观察真实用户会话中的 TTFT、decode、失败、取消、prefix cache 和上下文增长；
-- 不以 RPS 或固定并发容量对齐为主要目标。
+- trace 只提供轻/中/重 profile、轮次、上下文规模和增量分布；
+- 运行时 user/context 由 profile、模板和 seed 构造；
+- trace 中的旧 `assistant`、`tool` 不进入运行时 history；
+- 每一轮请求完成后，把**当前被测模型真实生成的 assistant 回复**追加到下一轮 history；
+- prefix cache 按当前被测模型实际形成的动态前缀运行，反映真实生成链对 cache 的影响；
+- 不把 `user` 结果作为不同模型之间的严格冻结输入对比，跨模型对比使用 `rps`/`concurrency` 的固定 request set。
+
+因此，`user` 测的是：
+
+```text
+profile 约束下的动态用户会话 + 当前模型真实回复 + 动态 prefix cache
+```
+
+而不是：
+
+```text
+trace assistant/tool 原样回放
+```
 
 数据结构以 `sessions[]` 为主。
 
-### 3.3 `rps`：开环请求到达
+### 3.4 `rps`：开环请求到达
 
 入口示例：
 
@@ -91,9 +124,9 @@ bench rps -c customer.yaml \
 - `burstiness > 1`：更均匀；
 - 到达率由调度器控制，服务端排队和执行速度可能使实际完成速率低于目标到达率。
 
-RPS 模式默认以**独立请求**为单位，输出数据以 `requests[]` 为主。它不自动把每个请求串成多轮用户会话；需要真实多轮会话时使用 `user` 模式。
+RPS 模式默认以**冻结的独立请求快照**为单位，输出数据以 `requests[]` 为主。它不运行 live 多轮会话；多轮形状已在外部 profile-build 阶段转换为固定 request set。
 
-### 3.4 `concurrency`：原生压测对比
+### 3.5 `concurrency`：原生压测对比
 
 入口示例：
 
