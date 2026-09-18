@@ -179,8 +179,11 @@ func main() {
 		case "probe":
 			mode = "probe"
 			args = args[1:]
+		case "user":
+			mode = "user"
+			args = args[1:]
 		default:
-			fmt.Fprintf(os.Stderr, "未知参数 %q——压测模式没有场景子命令，用 --turns × --concurrency 组合（见下）\n\n", args[0])
+			fmt.Fprintf(os.Stderr, "未知参数 %q——压测子命令仅 probe/user；常规压测用 --concurrency 组合（见下）\n\n", args[0])
 			usage()
 		}
 	}
@@ -203,12 +206,22 @@ func main() {
 	captureFlag := fs.String("probe-capture", "", "probe: tool-call 检查原始响应落盘目录（排障证据/判据 fixture；含业务数据外发前脱敏）")
 	cacheFlag := fs.Bool("cache", false, "probe: 开启前缀缓存定性检查（默认关；同 prompt 连发 3 次 + 乱序冷基线各 1 次，长上下文请求）")
 	cacheSizeFlag := fs.Int("cache-size", 40000, "probe --cache 的上下文大小（tokens，默认 40000；自动收到模型上限以内）")
+	usersFlag := fs.Int("users", 0, "user: 并行用户数（每用户一条生成式多轮会话）；>0 覆盖配置 user.users")
 	fs.Parse(args)
 
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "配置错误:", err)
 		os.Exit(1)
+	}
+	if mode == "user" {
+		if *usersFlag > 0 {
+			cfg.User.Users = *usersFlag
+		}
+		if cfg.User.ProfilePath == "" {
+			fmt.Fprintln(os.Stderr, "user 模式需要在配置里指定 user.profile_path（scripts/profile_build.py 产出）")
+			os.Exit(1)
+		}
 	}
 	for _, w := range cfg.Warnings {
 		log.Printf("配置提示: %s", w)
@@ -606,6 +619,22 @@ func main() {
 		} else {
 			fmt.Printf("[%s] 完成，用时 %s，输出: %s\n", name, time.Since(start).Round(time.Second), outPath)
 		}
+	}
+
+	// ── user 子命令：生成式多轮用户会话（profile 驱动，见 docs/workload-refactor-plan.md 13）──
+	// 走独立分支：不经 --turns × --concurrency 组合解析，形状全部来自 user.profile_path。
+	if mode == "user" {
+		sc, ok := scenario.Lookup("user")
+		if !ok {
+			fmt.Fprintln(os.Stderr, "user 场景未注册")
+			os.Exit(1)
+		}
+		outPath := resolveOutPath(*outFlag, cfg.OutputDir, "user")
+		log.Printf("执行计划: user 模式 users=%d profile=%s", cfg.User.GetUsers(), cfg.User.ProfilePath)
+		run("user", outPath, func() (*report.Report, error) {
+			return sc.Run(ctx, cfg, client, *modelFilter)
+		})
+		return
 	}
 
 	for _, it := range items {

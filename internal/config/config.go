@@ -645,9 +645,38 @@ type Config struct {
 	Multiturn  Multiturn  `yaml:"multiturn"`
 	Concurrent Concurrent `yaml:"concurrent"`
 
+	// User user 模式（生成式多轮会话，profile 驱动）——见 docs/workload-refactor-plan.md 13。
+	// 与旧 multiturn/concurrent 的区别：形状来自外置 profile.json（trace 特征提炼），
+	// 文本由经典书语料按 seed 生成，assistant 使用被测模型真实回复（动态 prefix cache）。
+	User User `yaml:"user"`
+
 	// 运行时解析
 	APIKey string `yaml:"-"`
 }
+
+// UserCfg user 模式配置。
+type User struct {
+	// ProfilePath profile.json 路径（scripts/profile_build.py 产出；相对路径以配置目录为基准）。
+	ProfilePath string `yaml:"profile_path"`
+	// Users 并行用户数（每个用户独立一条生成式多轮会话），0 = 1。
+	Users int `yaml:"users"`
+	// MaxTokens 输出长度（标量或列表；列表 = 输出长度扫描维度）。
+	MaxTokens IntList `yaml:"max_tokens"`
+	// SharedBase 基座是否跨用户共享（默认 true）：true = 全部用户同一 system 基座（同一
+	// seed 取窗），测跨用户共享前缀的 cache 收益；false = 每用户独立基座。
+	SharedBase *bool `yaml:"shared_base"`
+}
+
+// GetUsers 用户数（0/未配置 = 1）。
+func (u User) GetUsers() int {
+	if u.Users <= 0 {
+		return 1
+	}
+	return u.Users
+}
+
+// GetSharedBase 基座是否跨用户共享（未配置默认 true）。
+func (u User) GetSharedBase() bool { return u.SharedBase == nil || *u.SharedBase }
 
 // 测试类别取值（Config.Test）。三者是同一个测量管线的三种**表达焦点**，
 // 不改变探针/场景/指标——报告按类别切换结论区首屏，回答不同的问题：
@@ -734,6 +763,9 @@ func Load(path string) (*Config, error) {
 		// 例外：en/zh 是内置语料哨兵（见 isBuiltinCorpus），不是路径
 		if cfg.FillerCorpus != "" && !isBuiltinCorpus(cfg.FillerCorpus) && !filepath.IsAbs(cfg.FillerCorpus) {
 			cfg.FillerCorpus = filepath.Join(filepath.Dir(path), cfg.FillerCorpus)
+		}
+		if cfg.User.ProfilePath != "" && !filepath.IsAbs(cfg.User.ProfilePath) {
+			cfg.User.ProfilePath = filepath.Join(filepath.Dir(path), cfg.User.ProfilePath)
 		}
 	}
 
@@ -920,6 +952,10 @@ func Load(path string) (*Config, error) {
 	}
 	if len(cfg.Concurrent.MaxTokens) == 0 {
 		cfg.Concurrent.MaxTokens = IntList{256}
+	}
+	// user 模式默认输出长度（仅在启用 user 场景时填充，避免无关场景被误警告）
+	if cfg.User.ProfilePath != "" && len(cfg.User.MaxTokens) == 0 {
+		cfg.User.MaxTokens = IntList{256}
 	}
 	// 新增能力默认值与校验
 	if cfg.MetricsIntervalMS <= 0 {
