@@ -1,6 +1,10 @@
 # 压测场景与负载模型改造计划
 
-> 状态：讨论稿，尚未实施
+> 状态：**第一阶段已落地**（2026-09-18）：`corpus` 12 本公版书语料库（一用户一书）、
+> `scripts/profile_build.py`、`bench user`（生成式多轮会话）、`bench rps` / `bench concurrency`
+> （冻结请求快照，ShareGPT 直接读取）、CLI 三个子命令均已实现并通过单测/竞态/mock e2e 验证；
+> 运行方式见 CODEBUDDY.md。**尚未完成**：正式路径 filler 下线与旧入口（--turns ×
+> --concurrency）迁移、smoke 对新子命令的覆盖、ShareGPT 抽样与 vLLM 的实测对齐验证。
 >
 > 日期：2026-09-18
 >
