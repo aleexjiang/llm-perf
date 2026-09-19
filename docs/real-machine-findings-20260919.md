@@ -193,3 +193,16 @@
 
 2.4（max_tokens 过小）属配置建议，已由矩阵测试文档记录；rps/concurrency 真实 ShareGPT
 大样本复测仍为后续事项。
+
+## 五、rps/concurrency 真实样本复测中断（环境事件）
+
+- 时间：2026-09-19 17:00 起，`<real-endpoint>` 全端点（含 /models、/metrics）返回 502
+  腾讯 OA 拦截页（`<!DOCTYPE html>...<title>提示</title>`）——网络入口层故障
+  （VPN/代理/网关），非服务自身、非工具问题。手动 curl 复现 5/5 全部 502。
+- 中断前的部分数据（level=1 期间）：ShareGPT 200 条抽样已出现 143 个唯一请求 502 失败
+  （id 分布随机，非特定会话）——即故障在 level=1 时已发生，只是当时未识别为环境问题。
+- 观测到的工具问题已修复：`/metrics` 抓取超时 5s 在高负载下不够
+  （`context deadline exceeded` → 观测层误判不可用），已放宽到 15s（fc38e42）。
+- 待环境恢复后重跑：concurrency levels [1,8,32] × 200 prompts、rps rates [1,4] × 100
+  prompts（配置：`/tmp/cfg-conc-real.yaml`、`/tmp/cfg-rps-real.yaml`，临时目录需重建）。
+  部分日志存于 `llm-perf-test/real-matrix/real-conc-real.log`。
