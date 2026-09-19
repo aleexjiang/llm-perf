@@ -285,12 +285,14 @@ func runOneUserSession(ctx context.Context, e *env, prof *Profile, lang, model s
 			log.Printf("    🛑 轮次失败（%s）——终止该会话，避免连续 user 消息", previewErr(m.Error))
 			break
 		}
-		// 空回复轮终止会话（真机发现 1.2）：finish=stop 且 completion<8 且无错误——
-		// 模型偶发直接吐 stop（真机实测 ~7%，长上下文轮更频）。该轮 assistant 为空，
-		// 与失败轮同语义终止，避免连续 user 消息；异常留痕在 warnings 里可分析。
-		if !m.Cancelled && m.FinishReason == "stop" && m.CompletionTokens > 0 && m.CompletionTokens < 8 {
-			m.Warnings = append(m.Warnings, fmt.Sprintf("empty_reply: finish=stop completion=%d——终止会话，避免空 assistant 连续 user", m.CompletionTokens))
-			log.Printf("    🛑 空回复轮（completion=%d，finish=stop）——终止该会话", m.CompletionTokens)
+		// 空回复轮终止会话（真机发现 1.2）：finish=stop 但**无任何可见输出**
+		//（content 与 reasoning 全空）——模型偶发直接吐 stop（真机实测 ~7%，
+		// 长上下文轮更频）。以可见输出为准而非 completion 位数：极短但正常的回复
+		//（如 "OK"）不该终止会话。该轮 assistant 为空，与失败轮同语义终止，
+		// 避免连续 user 消息；异常留痕在 warnings 里可分析。
+		if !m.Cancelled && m.FinishReason == "stop" && m.ReplyText == "" && m.ReasoningChars == 0 {
+			m.Warnings = append(m.Warnings, fmt.Sprintf("empty_reply: finish=stop completion=%d content=0 reasoning=0——终止会话，避免空 assistant 连续 user", m.CompletionTokens))
+			log.Printf("    🛑 空回复轮（completion=%d，finish=stop，无可见输出）——终止该会话", m.CompletionTokens)
 			break
 		}
 		if interrupted(ctx) {
