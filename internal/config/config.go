@@ -222,6 +222,18 @@ func (t Thinking) Variants() []ThinkingVariant {
 		}
 		vs = out
 	}
+	// 关闭态兜底：变体未带任何 extra_body 时，注入 enable_thinking=false。
+	// 真机实测（2026-09-19，Qwen3.8 chat template）坐实：不传思考参数时部署默认
+	// thinking=auto，长上下文输入下 128 token 全耗在思考链、content 为空，
+	// user 多轮的 assistant 进不了 history（连续 user + 动态 cache 失效）。
+	// 显式写了 extra_body/extra_body_off 的变体尊重显式值，不覆盖。
+	for i, v := range vs {
+		if !v.Enabled && v.ExtraBody == nil {
+			vs[i].ExtraBody = map[string]any{
+				"chat_template_kwargs": map[string]any{"enable_thinking": false},
+			}
+		}
+	}
 	return vs
 }
 

@@ -32,7 +32,7 @@ import (
 
 // firstTurnBaseTokens 首轮基座（system）目标 token：落在 [35K,40K] 首轮约束内，
 // 余量留给首轮 user 输入与合成 context。基座一经生成本会话内冻结。
-const firstTurnBaseTokens = 33000
+const firstTurnBaseTokens = 27000
 
 // assistantReplyCap 真实 assistant 回复进 history 的截断上限（字符，rune 安全）。
 // 输出长度受 max_tokens 请求约束，此上限只是防御性护栏（如服务端不尊重 max_tokens）。

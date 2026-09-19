@@ -15,7 +15,7 @@ type Profile struct {
 	Version         int                     `json:"version"`
 	GeneratedAt     string                  `json:"generated_at"`
 	Source          string                  `json:"source"`
-	FirstTurnTokens []int                   `json:"first_turn_tokens"` // [min,max]：首轮 prompt 总量硬约束（agent 形状 35-40K）
+	FirstTurnTokens []int                   `json:"first_turn_tokens"` // [min,max]：首轮 prompt 总量硬约束（agent 形状 ~30K）
 	Profiles        map[string]*ProfileSpec `json:"profiles"`
 	Cleaning        map[string]int          `json:"cleaning"`
 	Notes           []string                `json:"notes"`
@@ -65,9 +65,9 @@ func LoadProfile(path string) (*Profile, error) {
 	if total <= 0 {
 		return nil, fmt.Errorf("user profile 权重总和为 0")
 	}
-	if len(p.FirstTurnTokens) != 2 || p.FirstTurnTokens[0] < 35000 {
-		// agent 形状硬约束（plan 13.2）：首轮 prompt ≥ 35K token
-		return nil, fmt.Errorf("user profile first_turn_tokens 非法：首轮 prompt 必须 ≥35000 token（agent 形状约束），得到 %v", p.FirstTurnTokens)
+	if len(p.FirstTurnTokens) != 2 || p.FirstTurnTokens[0] < 28000 {
+		// agent 形状硬约束（plan 13.2，2026-09-19 真机校准）：首轮 prompt ≈ 30K（下限 28K）
+		return nil, fmt.Errorf("user profile first_turn_tokens 非法：首轮 prompt 必须 ≥28000 token（agent 形状约束），得到 %v", p.FirstTurnTokens)
 	}
 	return &p, nil
 }
