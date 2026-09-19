@@ -3,7 +3,7 @@
 > 状态：已全部修复（2026-09-19 第二批）。各项修复对应关系见第四节；真机回归验证：
 > server_metrics 落盘（available=true）、new_tokens 非零、思考默认关闭、空回复轮终止。
 >
-> 环境：vLLM 直连 `http://<real-endpoint>/v1`，模型 `qwen3.8-27b`（Qwen3.8-27B-FP8），
+> 环境：vLLM 直连 `<real-endpoint>/v1`，模型 `qwen3.8-27b`（Qwen3.8-27B-FP8），
 > `max_model_len=262144`，/metrics 可达（567 项 vLLM 指标）。
 > 工具版本：commit 34a58d0 + user 场景修复（shared_base seed / heavy turn bounds / 失败终止）。
 >
