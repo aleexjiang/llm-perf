@@ -31,7 +31,7 @@
 | 暖（真实 agent 典型体验） | 错峰开环 multiturn，逐轮共享前缀 | 已有能力 |
 | 冷（最坏角落） | single 大 prompt + 换 seed 击败缓存 | 已有能力 |
 | 缓存收益量化 | `fixed_seed` true/false 对照 + server_metrics 命中率 | 已有能力 |
-| 稳态 soak | 会话续跑（`duration_seconds` + `renew`，见 `docs/scenario-guide.md`） | 已有能力 |
+| 稳态 soak | 会话续跑（`duration_seconds` + `renew`） | 已有能力 |
 
 ## 工作纪律
 

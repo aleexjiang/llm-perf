@@ -2,7 +2,7 @@
 
 > 2026-09-12 架构讨论定稿。回答三个问题：工具往哪长（四层模型与三类测试）、什么不该再长（指标冻结与减法纪律）、
 > 多模型 / trace / filler 这些议题在体系里的位置。代码模块边界见 [architecture.md](architecture.md)；
-> 场景选型见 [scenario-guide.md](scenario-guide.md)；拍板摘要见 [AGENTS.md](../AGENTS.md)；
+> 拍板摘要见 [AGENTS.md](../AGENTS.md)；
 > 当前产品边界与运行方式见 [CODEBUDDY.md](../CODEBUDDY.md)；本文只记录指标和测试架构原则。
 >
 > 状态标记：【已拍板】= 讨论结论；【待拍板】= 有推荐方案等确认；【条件触发】= 明确不做，复活条件写明。

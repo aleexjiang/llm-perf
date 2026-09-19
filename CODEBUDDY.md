@@ -53,7 +53,7 @@ scripts/smoke.sh
 - `run.log`：测试级日志；
 - `raw/`：开启 `debug` 或请求失败时的原始响应证据。
 
-字段和统计口径见 `docs/data-contract.md`，场景选择见 `docs/scenario-guide.md`。`/metrics` 只作为参考、诊断和控制层数据，客户端计时是评测基线。
+字段和统计口径见 `docs/data-contract.md`，场景选择见 `README.md`。`/metrics` 只作为参考、诊断和控制层数据，客户端计时是评测基线。
 
 ## 配置与敏感信息
 
