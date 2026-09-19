@@ -2,6 +2,9 @@ package scenario
 
 import (
 	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -93,5 +96,43 @@ func TestConcurrencyScenario(t *testing.T) {
 		if lv.Level == 0 || len(lv.Requests) != 6 {
 			t.Fatalf("档位 %d 数据错误: level=%d requests=%d", i, lv.Level, len(lv.Requests))
 		}
+	}
+}
+
+// TestBarrierOpenLoopRateIndependentOfLatency 开环到达率与处理耗时解耦（review H3 回归）：
+// 旧实现 worker 处理完上一请求才按间隔 sleep——处理慢于到达间隔时实际发射率被拉长，
+// 变成"带节奏的闭环"，测不到过载排队。新实现由独立发射时钟按泊松过程注入。
+// 构造：4 请求、rate=100/s（间隔 10ms）、每请求处理 300ms——
+// 解耦后 wall ≈ 首请求处理 300ms + 少量发射窗口；耦合实现 wall ≈ 4×300ms = 1.2s。
+func TestBarrierOpenLoopRateIndependentOfLatency(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n"+
+			"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n"+
+			"data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}}\n\n")
+	}))
+	defer srv.Close()
+
+	cfg := testCfg(t, srv.URL)
+	cfg.RequestSet = config.RequestSet{NumPrompts: 4, Seed: 42}
+	cfg.Thinking = config.Thinking{Mode: "off"}
+	e := &env{cfg: cfg, client: engine.NewClient(srv.URL, "", 10*time.Second, true), perReqSrv: false}
+	em, _ := forModel(e, cfg, "stub-model")
+
+	samples := make([]engine.RequestSample, 4)
+	for i := range samples {
+		samples[i] = engine.RequestSample{OutputTokens: 8}
+	}
+	start := time.Now()
+	lv := runRequestBarrier(context.Background(), em, "stub-model",
+		config.ThinkingVariant{Name: "off"}, samples, 4, 100, 1)
+	wall := time.Since(start)
+
+	if len(lv.Requests) != 4 {
+		t.Fatalf("应完成 4 个请求，实际 %d", len(lv.Requests))
+	}
+	if wall > 800*time.Millisecond {
+		t.Fatalf("开环 wall=%v > 800ms——发射时钟仍与处理耗时耦合（旧实现 ≈1.2s）", wall)
 	}
 }

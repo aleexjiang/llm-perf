@@ -1,6 +1,7 @@
 # 真机测试发现记录（2026-09-19）
 
-> 状态：测试与记录，**未修复**。按用户要求：找出问题、记录，不修。
+> 状态：已全部修复（2026-09-19 第二批）。各项修复对应关系见第四节；真机回归验证：
+> server_metrics 落盘（available=true）、new_tokens 非零、思考默认关闭、空回复轮终止。
 >
 > 环境：vLLM 直连 `http://<real-endpoint>/v1`，模型 `qwen3.8-27b`（Qwen3.8-27B-FP8），
 > `max_model_len=262144`，/metrics 可达（567 项 vLLM 指标）。
@@ -176,15 +177,19 @@
 
 ---
 
-## 四、建议修复优先级（待拍板，未动手）
+## 四、修复状态（2026-09-19 全部完成）
 
-| # | 问题 | 级别 | 工作量 |
-|---|---|---|---|
-| 1 | user 场景装配 server_metrics（1.3） | HIGH | 1 行 |
-| 2 | new_tokens 基准推进（1.4） | HIGH | ~10 行 |
-| 3 | 空回复轮识别 + 终止会话（1.2） | HIGH | ~20 行 |
-| 4 | thinking 参数显式化兜底/告警（1.1） | HIGH | ~30 行 |
-| 5 | 首轮超限告警（2.3）+ 组合上限预警（2.5） | MEDIUM | ~30 行 |
-| 6 | user 会话错峰选项（2.2） | MEDIUM | ~20 行 |
-| 7 | H3 barrier 限速（review 遗留）+ rps/concurrency 真样本复测 | MEDIUM | ~40 行 |
-| 8 | filler_fidelity 支持语料路径（3.1） | LOW | ~40 行 |
+| # | 问题（对应发现） | 修复方式 |
+|---|---|---|
+| 1 | user 装配 server_metrics（1.3） | UserScenario env 构造后调用 setupServerMetrics；真机回归 available=true |
+| 2 | new_tokens 基准推进（1.4） | 会话循环维护 prevPrompt 基准（仅成功轮推进）；真机回归逐轮 new 非零 |
+| 3 | 空回复轮识别 + 终止（1.2） | finish=stop 且 completion<8 视为空回复轮：warnings 留痕 + 终止会话 |
+| 4 | thinking 显式化兜底（1.1） | Variants() 对无 extra_body 的关闭态变体注入 enable_thinking=false（真机验证） |
+| 5 | 首轮超上限告警（2.3）+ 组合上限预警（2.6） | 首轮 >FirstTurnTokens[1] 告警；启动时 estMaxContext vs max_prompt_tokens 预警 |
+| 6 | 极短输出 decode 指标置空（2.5） | Finalize 中 completion<8 时 ITL/TPOT/tok/s 置空并 warnings 留痕 |
+| 7 | user 会话错峰（2.2） | user.stagger_ms 配置（默认 0）：第 N 个用户延迟 N×stagger 启动 |
+| 8 | H3 barrier 限速（rps request_rate 失真） | 独立发射时钟按泊松注入 + 容量=level 队列背压（vLLM 语义），含回归测试 |
+| 9 | filler_fidelity 语料路径（3.1） | probe 校准前自动加载内置语料，与 user 模式同口径 |
+
+2.4（max_tokens 过小）属配置建议，已由矩阵测试文档记录；rps/concurrency 真实 ShareGPT
+大样本复测仍为后续事项。

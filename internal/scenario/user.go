@@ -6,7 +6,7 @@
 //     窗口起点由 (session_seed, turn) 派生，内容确定可复现；
 //   - 每轮把**被测模型真实生成的 assistant 回复**追加进下一轮 history——
 //     prefix cache 反映当前模型真实回复形成的动态前缀（与冻结快照的本质差异）；
-//   - agent 形状硬约束：首轮 prompt ≥ 35K token（基座 + 首轮 user/context）。
+//   - agent 形状硬约束：首轮 prompt ≈ 30K token（基座 + 首轮 user/context）。
 //
 // cache 安全双约束（13.4 复盘修正）：
 //  1. 合成 context 只能尾部注入（拼进当前 user 消息内），严禁进 system——
@@ -61,8 +61,21 @@ func UserScenario(ctx context.Context, cfg *config.Config, client *engine.Client
 	if corpus.Library(lang) == nil {
 		return nil, fmt.Errorf("user 模式语料库为空（lang=%s）——检查 corpus_lang/filler_lang 配置", lang)
 	}
+	// 组合上限预警（真机发现 2.6）：首轮上限 + 各档位最大轮数 × 最大增量会逼近
+	// max_prompt_tokens 时启动告警——运行时 ctxLimitHit 止损只是兜底，形状本身该可控。
+	if cfg.MaxPromptTokens > 0 {
+		if est := estMaxContext(prof); est > cfg.MaxPromptTokens {
+			log.Printf("⚠️ profile 形状预计最大上下文 ≈%dtk > max_prompt_tokens=%d——长会话会被 ctxLimit 提前止损；建议下调轮次/增量或调高 max_prompt_tokens",
+				est, cfg.MaxPromptTokens)
+		}
+	}
 
 	e := &env{cfg: cfg, client: client, perReqSrv: false}
+	// 服务端观测层：之前漏装配导致 user 场景 JSON 恒无 server_metrics（真机发现 1.3），
+	// cache hit/preemption 等归因数据全部缺失——与 rps/concurrency 同口径装配。
+	if err := setupServerMetrics(ctx, e, cfg); err != nil {
+		return nil, err
+	}
 	rep := &report.Report{
 		Tool:        report.Version,
 		Scenario:    "user",
@@ -110,6 +123,7 @@ func runUserSessions(ctx context.Context, e *env, prof *Profile, lang, model str
 	v config.ThinkingVariant, maxTok int) []report.MultiturnRun {
 
 	users := e.cfg.User.GetUsers()
+	stagger := time.Duration(e.cfg.User.GetStaggerMS()) * time.Millisecond
 	selector := newSWRR(prof)
 	labels := make([]string, users)
 	for u := 0; u < users; u++ {
@@ -121,6 +135,16 @@ func runUserSessions(ctx context.Context, e *env, prof *Profile, lang, model str
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
+			// 会话启动错峰（stagger_ms，默认 0）：users>1 时全部会话同时发首轮，
+			// 并发 prefill 互抢使首轮 TTFT 差异达 1.7 倍且逐轮曲线双峰（真机发现 2.2）。
+			// 错峰后逐轮 TTFT 斜率更干净；分派（swrr labels）不受启动顺序影响。
+			if stagger > 0 && idx > 0 {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(stagger):
+				}
+			}
 			if interrupted(ctx) {
 				return
 			}
@@ -195,6 +219,7 @@ func runOneUserSession(ctx context.Context, e *env, prof *Profile, lang, model s
 
 	firstTotal := sample(prof.FirstTurnTokens)
 	msgs := []engine.Message{baseMsg}
+	prevPrompt := 0 // new_tokens 基准：上一成功轮的实测 prompt（发现 1.4：旧实现恒 0）
 	for turn := 0; turn < turns; turn++ {
 		if interrupted(ctx) {
 			break
@@ -225,12 +250,24 @@ func runOneUserSession(ctx context.Context, e *env, prof *Profile, lang, model s
 		msgs = append(msgs, engine.Message{Role: "user", Content: content.String()})
 
 		m := runOne(ctx, e, model, msgs, maxTok, v)
+		// new_tokens：本轮相对上一成功轮新增的 prompt tokens（增量 prefill 速率的分母，
+		// "越聊越贵"曲线的一级变量）。失败/异常轮 usage 缺失，跳过推进、下轮与上成功轮比。
+		if m.PromptTokens > 0 {
+			m.NewTokens = m.PromptTokens - prevPrompt
+			prevPrompt = m.PromptTokens
+		}
 		run.Turns = append(run.Turns, m)
-		// 首轮实测深度校验（review R1-L1）：估算保证的 35K 依赖 CharsPerToken 系数，
+		// 首轮实测深度校验（review R1-L1）：估算保证依赖 CharsPerToken 系数，
 		// 真实 tokenizer 偏差在此暴露（session 内只告警一次）
-		if turn == 0 && m.PromptTokens > 0 && m.PromptTokens < prof.FirstTurnTokens[0] {
-			log.Printf("    ⚠️ 首轮实测 prompt %dtk < 约束 %dtk——语料换算比偏差，建议跑 bench probe 看 filler_fidelity",
-				m.PromptTokens, prof.FirstTurnTokens[0])
+		if turn == 0 && m.PromptTokens > 0 {
+			if m.PromptTokens < prof.FirstTurnTokens[0] {
+				log.Printf("    ⚠️ 首轮实测 prompt %dtk < 约束 %dtk——语料换算比偏差，建议跑 bench probe 看 filler_fidelity",
+					m.PromptTokens, prof.FirstTurnTokens[0])
+			} else if m.PromptTokens > prof.FirstTurnTokens[1] {
+				// 真机发现 2.3：档位增量下限与首轮上限冲突时静默超限——至少让超限可见
+				log.Printf("    ⚠️ 首轮实测 prompt %dtk > 约束上限 %dtk——档位 context_tokens 下限优先，宁可超首轮也不产生空转轮",
+					m.PromptTokens, prof.FirstTurnTokens[1])
+			}
 		}
 		// 真实 assistant 回复进 history：动态 prefix cache 的核心（不能用 trace 旧回复）
 		if m.ReplyText != "" {
@@ -248,12 +285,40 @@ func runOneUserSession(ctx context.Context, e *env, prof *Profile, lang, model s
 			log.Printf("    🛑 轮次失败（%s）——终止该会话，避免连续 user 消息", previewErr(m.Error))
 			break
 		}
+		// 空回复轮终止会话（真机发现 1.2）：finish=stop 且 completion<8 且无错误——
+		// 模型偶发直接吐 stop（真机实测 ~7%，长上下文轮更频）。该轮 assistant 为空，
+		// 与失败轮同语义终止，避免连续 user 消息；异常留痕在 warnings 里可分析。
+		if !m.Cancelled && m.FinishReason == "stop" && m.CompletionTokens > 0 && m.CompletionTokens < 8 {
+			m.Warnings = append(m.Warnings, fmt.Sprintf("empty_reply: finish=stop completion=%d——终止会话，避免空 assistant 连续 user", m.CompletionTokens))
+			log.Printf("    🛑 空回复轮（completion=%d，finish=stop）——终止该会话", m.CompletionTokens)
+			break
+		}
 		if interrupted(ctx) {
 			break
 		}
 	}
 	run.FillLastPromptTokens()
 	return run
+}
+
+// estMaxContext 按 profile 形状估算单个会话可滚到的最大 prompt token（保守上界：
+// 首轮上限 + 档位最大轮数 × (最大 user 输入 + 最大增量)）。用于启动时的组合上限预警。
+func estMaxContext(prof *Profile) int {
+	mx := prof.FirstTurnTokens[1]
+	for _, spec := range prof.Profiles {
+		_, turnHi := spec.turnBounds(0)
+		ctxHi, userHi := 0, 0
+		if len(spec.ContextTokens) == 2 {
+			ctxHi = spec.ContextTokens[1]
+		}
+		if len(spec.UserInputTokens) == 2 {
+			userHi = spec.UserInputTokens[1]
+		}
+		if v := prof.FirstTurnTokens[1] + turnHi*(ctxHi+userHi); v > mx {
+			mx = v
+		}
+	}
+	return mx
 }
 
 // previewErr 错误摘要（日志用）。

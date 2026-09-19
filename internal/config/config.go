@@ -501,7 +501,13 @@ type User struct {
 	// SharedBase 基座是否跨用户共享（默认 true）：true = 全部用户同一 system 基座（同一
 	// seed 取窗），测跨用户共享前缀的 cache 收益；false = 每用户独立基座。
 	SharedBase *bool `yaml:"shared_base"`
+	// StaggerMS 会话启动错峰（毫秒，默认 0）：users>1 时第 N 个用户延迟 N×stagger_ms
+	// 启动，避免全部首轮同时 prefill 互抢（真机实测首轮 TTFT 差异达 1.7 倍、逐轮曲线双峰）。
+	StaggerMS int `yaml:"stagger_ms"`
 }
+
+// GetStaggerMS 会话启动错峰毫秒数（0 = 同时启动）。
+func (u User) GetStaggerMS() int { return u.StaggerMS }
 
 // GetUsers 用户数（0/未配置 = 1）。
 func (u User) GetUsers() int {

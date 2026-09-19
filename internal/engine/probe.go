@@ -736,11 +736,17 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 		if lang == "" {
 			lang = "en"
 		}
+		// 校准样本与正式压测同口径（真机发现 3.1）：语料未注册时先加载内置书语料，
+		// 实测 chars/token 就是 user 模式生成器真实使用的换算路径；此前只测合成词表
+		//（真机 6.6 chars/token、偏差 -39%），对自然文本语料的适用性无法回答。
+		if CorpusInfo(lang) == "" {
+			_ = LoadCorpus(lang, lang) // 失败时回退合成词表路径，检查照常可测
+		}
 		const calibTokens = 2000 // 足够长：chat template 开销 <1%；prefill 快，探针时长可控
 		sample := Filler(calibTokens, 90001, lang)
 		src := "合成词表"
 		if CorpusInfo(lang) != "" {
-			src = "内置语料"
+			src = "内置语料（与 user 模式同口径）"
 		}
 		switch {
 		case sample == "":

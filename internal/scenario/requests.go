@@ -284,7 +284,9 @@ func ConcurrencyScenario(ctx context.Context, cfg *config.Config, client *engine
 }
 
 // runRequestBarrier 固定在飞一轮：level 个 worker 从共享游标拉请求；
-// request_rate>0 时 worker 发射前按泊松间隔等待（有限到达率 + 在飞上限组合）。
+// request_rate>0 时由独立发射时钟按泊松过程注入请求（到达率与处理耗时的耦合被切断，
+// review H3 / vLLM 语义）：旧实现 worker 处理完上一请求才 sleep 下一间隔，处理变慢时
+// 实际到达率被拉长（变成带节奏的闭环），测不到过载下的真实排队。
 func runRequestBarrier(ctx context.Context, e *env, model string, v config.ThinkingVariant,
 	samples []engine.RequestSample, level int, requestRate, burstiness float64) report.ConcurrentLevel {
 
@@ -293,14 +295,53 @@ func runRequestBarrier(ctx context.Context, e *env, model string, v config.Think
 		lv.RequestRate = requestRate
 	}
 	start := time.Now()
-	var idx atomic.Int64
 	var mu sync.Mutex
+	var idx atomic.Int64 // 闭环共享游标
 	var wg sync.WaitGroup
-	wg.Add(level)
+
+	// 请求来源：开环（request_rate>0）= 独立发射协程按泊松过程把请求注入容量 = level
+	// 的缓冲队列——队列满即背压（max_concurrency 闸门），到达率与处理耗时解耦；
+	// 闭环（request_rate=0，即 inf）= 共享游标，worker 有空位立刻拉下一个。
+	reqCh := make(chan int, level)
+	if requestRate > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer close(reqCh)
+			rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+			for i := range samples {
+				d := gammaSample(rng, burstiness) / (requestRate * burstiness) // 到达间隔均值 1/rate
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(time.Duration(d * float64(time.Second))):
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case reqCh <- i:
+				}
+			}
+		}()
+	}
+
+	runReq := func(sample engine.RequestSample) {
+		m := requestRunner(ctx, e, model, v, sample.OutputTokens, sample)
+		mu.Lock()
+		lv.Requests = append(lv.Requests, m)
+		mu.Unlock()
+	}
+
 	for w := 0; w < level; w++ {
+		wg.Add(1)
 		go func(worker int) {
 			defer wg.Done()
-			rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(worker)))
+			if requestRate > 0 {
+				for i := range reqCh {
+					runReq(samples[i])
+				}
+				return
+			}
 			for {
 				if interrupted(ctx) {
 					return
@@ -309,20 +350,7 @@ func runRequestBarrier(ctx context.Context, e *env, model string, v config.Think
 				if i >= len(samples) {
 					return
 				}
-				if requestRate > 0 {
-					// 有限到达率：worker 内按泊松节奏发射（共享总速率 / worker 数）
-					d := gammaSample(rng, burstiness) / (requestRate / float64(level) * burstiness)
-					select {
-					case <-ctx.Done():
-						return
-					case <-time.After(time.Duration(d * float64(time.Second))):
-					}
-				}
-				sample := samples[i]
-				m := requestRunner(ctx, e, model, v, sample.OutputTokens, sample)
-				mu.Lock()
-				lv.Requests = append(lv.Requests, m)
-				mu.Unlock()
+				runReq(samples[i])
 			}
 		}(w)
 	}

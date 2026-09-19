@@ -316,6 +316,16 @@ func (m *TurnMetrics) Finalize() {
 		}
 	}
 
+	// 极短输出轮（真机发现 2.5）：completion < 8 时只有 1~2 个 decode chunk，
+	// ITL 分位/TPOT/tok/s 全部退化为噪声（真机实测近空轮 tok/s=1704、itl_p50=0）。
+	// 置空让「测不出」与「真的是这个数」可区分，并留痕供会话聚合侧排除。
+	if m.CompletionTokens > 0 && m.CompletionTokens < 8 && m.FinishReason == "stop" && !m.Cancelled {
+		m.warn("short_output: completion=%d<8——decode 指标（ITL/TPOT/tok/s）不可测，已置空", m.CompletionTokens)
+		m.ITLAvg, m.ITLP50, m.ITLP90, m.ITLP95, m.ITLP99, m.ITLMax = 0, 0, 0, 0, 0, 0
+		m.TPOTMS, m.TokensPerSec = 0, 0
+		return
+	}
+
 	// TPOT（GenAI-Perf 口径）：含思考 token 在内的每个 output token 平均耗时
 	if m.CompletionTokens > 1 && m.TTFT > 0 {
 		m.TPOTMS = (m.E2EMS - m.TTFT) / float64(m.CompletionTokens-1)
