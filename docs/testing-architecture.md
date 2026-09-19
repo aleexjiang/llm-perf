@@ -137,4 +137,4 @@ trace 画像器（离线、不发包：per-model 流量画像 + 每轮调用链�
 4. **trace-real-16 的使用边界**：基准横比优先使用固定 filler 格子；真实 trace 用于 agent 形状验证与外部画像，不把历史耗时直接当判定线；
 5. **token 口径 = probe 自举校准 + 报告 usage 实测分箱**（见 §4）。
 
-运行方式与当前配置见 [CODEBUDDY.md](../CODEBUDDY.md) 和 [scenario-guide.md](scenario-guide.md)。
+运行方式与当前配置见 [CODEBUDDY.md](../CODEBUDDY.md)。
