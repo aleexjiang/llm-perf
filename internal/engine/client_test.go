@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -310,5 +311,41 @@ func TestPercentileMedianParity(t *testing.T) {
 	}
 	if got := percentile([]float64{1, 2, 3, 4}, 100); got != 4 {
 		t.Fatalf("P100 应取最大=4，实际 %v", got)
+	}
+}
+
+// TestSamplingParamsInBody 请求级采样参数（真机发现：user 模式轨迹对齐需要 temperature=0）：
+// 显式字段进请求体；nil 不传（服务端默认）；ExtraBody 不得静默覆盖显式采样参数。
+func TestSamplingParamsInBody(t *testing.T) {
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &got)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\ndata: [DONE]\n\n")
+	}))
+	t.Cleanup(srv.Close)
+
+	c := NewClient(srv.URL, "", 5*time.Second, true)
+	temp, topP := 0.0, 0.9
+	_, err := c.Chat(context.Background(), ChatOptions{
+		Model: "m", Stream: true, MaxTokens: 8,
+		Messages:    []Message{{Role: "user", Content: "hi"}},
+		Temperature: &temp, TopP: &topP,
+		ExtraBody: map[string]any{"temperature": 1.5}, // 应被显式字段保护
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["temperature"] != 0.0 || got["top_p"] != 0.9 {
+		t.Fatalf("采样参数注入错误: temperature=%v top_p=%v", got["temperature"], got["top_p"])
+	}
+
+	got = nil
+	if _, err := c.Chat(context.Background(), retryOpts(true)); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got["temperature"]; ok {
+		t.Fatalf("nil 采样参数不应进请求体: %v", got)
 	}
 }
