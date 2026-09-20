@@ -680,6 +680,9 @@ func StartGaugePoller(ctx context.Context, sc *Scraper, interval time.Duration, 
 	if p == nil {
 		p = VLLM()
 	}
+	if interval <= 0 {
+		interval = 500 * time.Millisecond
+	}
 	sc.MaxRetries = 0 // 轮询快速失败：失败计数即降级信号，下一 tick 天然是重试
 	g := &GaugePoller{
 		scraper:      sc,

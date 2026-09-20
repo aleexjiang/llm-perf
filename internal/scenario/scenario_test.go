@@ -19,6 +19,7 @@ import (
 type stubState struct {
 	mu       sync.Mutex
 	count    int
+	gen      int          // /metrics 桩：generation counter，每次抓取递增
 	failReq  map[int]bool // 第 N 个请求（1-based）强制断连
 	promptOv map[int]int  // 第 N 个请求（1-based）强制返回指定 prompt_tokens（模拟 tokenizer 重切分回退）
 	bodies   []int        // 每个请求的 messages 数量
@@ -30,6 +31,17 @@ type stubState struct {
 func sseStub(t *testing.T, state *stubState) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/metrics" {
+			state.mu.Lock()
+			state.gen += 100
+			gen := state.gen
+			state.mu.Unlock()
+			w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+			fmt.Fprintf(w, "# HELP vllm:generation_tokens_total Number of generation tokens.\n"+
+				"# TYPE vllm:generation_tokens_total counter\n"+
+				"vllm:generation_tokens_total{model_name=\"stub-model\"} %d\n", gen)
+			return
+		}
 		var body struct {
 			Messages []struct {
 				Role    string `json:"role"`
@@ -117,6 +129,7 @@ func testCfg(t *testing.T, endpoint string) *config.Config {
 	on := true
 	return &config.Config{
 		Endpoint:       endpoint,
+		MetricsPath:    "/metrics",
 		OutputDir:      t.TempDir(),
 		TimeoutSeconds: 10,
 		IncludeUsage:   &on,

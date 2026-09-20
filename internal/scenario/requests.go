@@ -140,6 +140,7 @@ func RPSScenario(ctx context.Context, cfg *config.Config, client *engine.Client,
 	attachKVCapacity(e, rep)
 	before, poller, winStart := startWindow(ctx, e)
 	defer func() { rep.Server = finishWindow(e, before, poller, winStart) }()
+	defer applySourceCheck(e, rep, before)
 
 	for _, model := range cfg.ActiveModels() {
 		if modelFilter != "" && !strings.Contains(model, modelFilter) {
@@ -253,6 +254,7 @@ func ConcurrencyScenario(ctx context.Context, cfg *config.Config, client *engine
 	attachKVCapacity(e, rep)
 	before, poller, winStart := startWindow(ctx, e)
 	defer func() { rep.Server = finishWindow(e, before, poller, winStart) }()
+	defer applySourceCheck(e, rep, before)
 
 	for _, model := range cfg.ActiveModels() {
 		if modelFilter != "" && !strings.Contains(model, modelFilter) {

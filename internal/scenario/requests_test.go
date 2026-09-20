@@ -12,6 +12,7 @@ import (
 
 	"github.com/aleexjiang/llm-perf/internal/config"
 	"github.com/aleexjiang/llm-perf/internal/engine"
+	"github.com/aleexjiang/llm-perf/internal/report"
 )
 
 const requestSetFixture = `[
@@ -96,6 +97,37 @@ func TestConcurrencyScenario(t *testing.T) {
 		if lv.Level == 0 || len(lv.Requests) != 6 {
 			t.Fatalf("档位 %d 数据错误: level=%d requests=%d", i, lv.Level, len(lv.Requests))
 		}
+	}
+}
+
+// TestRequestScenariosSourceCheck 回归：数据契约承诺 rps/concurrency 输出 source_check
+// （真机发现：applySourceCheck 已实现但场景未接线，字段在真实 vLLM JSON 中恒缺失）。
+func TestRequestScenariosSourceCheck(t *testing.T) {
+	for name, run := range map[string]func(*config.Config, *engine.Client) (*report.Report, error){
+		"rps": func(cfg *config.Config, c *engine.Client) (*report.Report, error) {
+			cfg.RPS = config.RPS{Rates: []float64{60}, MaxConcurrency: 0}
+			return RPSScenario(context.Background(), cfg, c, "")
+		},
+		"concurrency": func(cfg *config.Config, c *engine.Client) (*report.Report, error) {
+			cfg.Concurrency = config.ConcurrencyCfg{Levels: []int{1}}
+			return ConcurrencyScenario(context.Background(), cfg, c, "")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := sseStub(t, &stubState{})
+			cfg := rpsTestCfg(t, srv.URL)
+			cfg.ServerMetrics = true
+			rep, err := run(cfg, engine.NewClient(srv.URL, "", 10*time.Second, true))
+			if err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			if rep.SourceCheck == nil {
+				t.Fatalf("%s 应输出 source_check", name)
+			}
+			if rep.SourceCheck.ClientTokens <= 0 || rep.SourceCheck.ServerTokens <= 0 {
+				t.Fatalf("%s source_check 数据不完整: %+v", name, rep.SourceCheck)
+			}
+		})
 	}
 }
 

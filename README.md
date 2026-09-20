@@ -320,3 +320,4 @@ deploy/             # 推理服务 compose 存档：vLLM 基线 + SGLang / Tenso
 - [docs/latency-baselines.md](docs/latency-baselines.md) — 体验基线 3 档制的依据与原文链接
 - [docs/testing-architecture.md](docs/testing-architecture.md) — 评测体系架构：指标第一性原理与冻结、四层模型、三类测试、trace/filler 分工、客户端计时立场、减法纪律（2026-09-12 定稿）
 - [AGENTS.md](AGENTS.md) — 统一项目指南：项目边界、运行方式、设计拍板、验证纪律与工程陷阱
+- [docs/real-machine-28.39.118.57-20260921.md](docs/real-machine-28.39.118.57-20260921.md) — 最新真机全量测试记录
