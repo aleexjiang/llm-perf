@@ -6,12 +6,12 @@
 #   bench rps          # 冻结请求快照的开环到达（request_set: + rps: 段）
 #   bench concurrency  # 固定在飞齐射（request_set: + concurrency: 段）
 #
-# filler / 旧 multiturn/concurrent/single 配置已下线（见 docs/workload-refactor-plan.md）。
+# filler / 旧 multiturn/concurrent/single 配置已下线。
 
 endpoint: "http://<客户路由IP>:30082/router/v1"
 api_key: ""                      # 字面量 key（仅用于不入库的本地配置）；也可改用 api_key_env
 auth_scheme: "bearer"            # bearer（默认）| raw（裸 key）| none；auth_header 自定义 header 名
-output_dir: "output"
+output_dir: "llm-perf-test/output"
 timeout_seconds: 600             # 客户环境慢 + 并发高档位排队，放宽；对 probe 同样生效
 chat_path: "/chat/completions"   # 接口路径（默认）
 metrics_path: "/metrics"         # 服务端指标路径（默认）

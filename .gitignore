@@ -3,15 +3,12 @@
 bin/bench
 bin/bench-*
 
-output/
-output-*/
 # WorkBuddy 项目数据（记忆/日志/技能），不入库
 .workbuddy/
 .env
 *.test
 .DS_Store
 configs/customer.yaml
-CODEBUDDY.local.md
 # 客户环境实测配置（含真实端点/密钥），只留本机
 configs/customer-*.yaml
 configs/customer-*.md

@@ -10,7 +10,7 @@
 ## 版本
 
 每份场景 JSON 顶层带 `schema_version`（当前 **4**，常量 `report.SchemaVersionCurrent`）。
-结构变更时递增，消费方据此做兼容判断；schema 不保向后兼容（拍板见 AGENTS.md），大版本升级可能直接改字段类型。
+结构变更时递增，消费方据此做兼容判断；schema 不保向后兼容（拍板见 [AGENTS.md](../AGENTS.md)），大版本升级可能直接改字段类型。
 
 ## 数据流与落盘组织
 
@@ -138,6 +138,6 @@ Report
 
 ## 演进规则（防漂移三条）
 
-1. **schema 不保向后兼容**（决策见 AGENTS.md）：改字段直接改类型；大版本升级消费方按 `schema_version` 分流，不写兼容双轨。
+1. **schema 不保向后兼容**（决策见 [AGENTS.md](../AGENTS.md)）：改字段直接改类型；大版本升级消费方按 `schema_version` 分流，不写兼容双轨。
 2. **分析侧能算的不碰 Go**：聚合、分位、判级、呈现全部在工具之外；Go 只保证原始 per-request/per-turn 数据完整落盘（含 raw_timings 原始序列）。新增派生指标优先在外部做。
 3. **契约文档单一来源**：字段/口径变更必须同步本文并递增 `SchemaVersionCurrent`——契约漂移比代码 bug 更伤（消费方不知道自己读错了什么）。

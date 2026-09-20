@@ -1,7 +1,7 @@
 # 内部架构设计
 > 面向维护者/二开者：模块边界、数据流、扩展点、已知坑位。使用方法见 [README](../README.md)；
 > 数据契约（JSON 输出与聚合口径）见 [data-contract.md](data-contract.md)；
-> 设计决策与测量哲学见 [AGENTS.md](../AGENTS.md)；评测体系（指标/分层/减法）见 [testing-architecture.md](testing-architecture.md)；运行方式见 [CODEBUDDY.md](../CODEBUDDY.md)；会话形状与场景拆分的决策记录见 [archive/workload-refactor-plan.md](archive/workload-refactor-plan.md)。
+> 设计决策、测量哲学与运行方式见 [AGENTS.md](../AGENTS.md)；评测体系（指标/分层/减法）见 [testing-architecture.md](testing-architecture.md)。
 >
 > **本文不写行号**——行号随每次提交漂移（历史教训），定位一律用函数/类型名 grep。
 
@@ -36,7 +36,7 @@ report 层（internal/report）── Report 结构落盘 JSON（按模型分区
 | 包 | 关键文件 | 职责 | 备注 |
 |---|---|---|---|
 | `cmd/bench` | main.go | CLI 入口：子命令派发（probe/user/rps/concurrency）、flag 解析、Ctrl+C/SIGHUP 优雅中断、输出路径/模型分区 | 场景语义不进 main——main 只按注册表派发 |
-| `internal/config` | config.go | YAML 加载 + env 覆盖 + `model_overrides` 合并（ForModel）；`IntList` 支持标量/列表（输出长度扫描）；thinking 变体派生（Variants，含关闭态 enable_thinking 兜底注入） | schema 不保向后兼容（决策见 AGENTS.md） |
+| `internal/config` | config.go | YAML 加载 + env 覆盖 + `model_overrides` 合并（ForModel）；`IntList` 支持标量/列表（输出长度扫描）；thinking 变体派生（Variants，含关闭态 enable_thinking 兜底注入） | schema 不保向后兼容（决策见 [AGENTS.md](../AGENTS.md)） |
 | `internal/corpus` | corpus.go + data/books/ | 公版书语料库（12 本 en/zh）：按书加载、确定性取窗（Window）、CharsPerToken 校准系数 | 语料是 user 模式生成器的文本原料，不是压测数据源 |
 | `internal/auth` | auth.go | 认证方案抽象：bearer / 裸 key / 自定义 header / none，chat 与 /metrics 共用 | 替代了早期 3 处硬编码 `Bearer ` |
 | `internal/engine` | client.go / sse.go / sharegpt.go / filler.go / corpus_filler.go / probe.go / toolprobe.go / cacheprobe.go | OpenAI 兼容客户端与逐 chunk 计时；SSE 解析；ShareGPT request set 加载；语料窗口；兼容性探针 | 见下"engine 内部" |
@@ -80,7 +80,7 @@ report 层（internal/report）── Report 结构落盘 JSON（按模型分区
 
 ## 已知坑位（改代码前先看）
 
-1. **prefix cache 的两条硬约束**（user 场景，详见 archive/workload-refactor-plan.md 13.4）：synthetic context 只能尾部注入、严禁进 system；system 基座会话开始一次定型，禁止时间戳/随机数。违反任何一条，会话内 cache 全部失效。
+1. **prefix cache 的两条硬约束**（user 场景）：synthetic context 只能尾部注入、严禁进 system；system 基座会话开始一次定型，禁止时间戳/随机数。违反任何一条，会话内 cache 全部失效。
 2. **thinking 关闭必须显式**：`Variants()` 对无 extra_body 的关闭态变体注入 `enable_thinking=false`——部署默认 thinking=auto 时长上下文会把输出预算全吃进思考链（真机坐实）。改这里时保留显式值优先。
 3. **seed 规则**：`fixed_seed` / 会话 / worker 三套确定性 seed 公式 + `--seed-salt` 测试隔离——重跑对照必须换盐，否则命中服务端前缀缓存。
 4. **截断必须按 rune**：`TruncateRunes`（client.go）是唯一正确姿势，按字节切中文出半个 UTF-8 字符（历史 bug）。

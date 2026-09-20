@@ -248,9 +248,9 @@ mv bench-linux-amd64 bench && chmod +x bench
 每个子命令落一个 JSON 文件（含全部原始数据：逐 turn/请求计时、逐 chunk 派生指标、usage token）：
 
 ```bash
-./bench user         -c example.yaml   # → output/user-<ts>.json（sessions，含 profile 标签）
-./bench rps          -c example.yaml   # → output/rps-<ts>.json（requests，含 request_rate）
-./bench concurrency  -c example.yaml   # → output/concurrency-<ts>.json（requests，含 level）
+./bench user         -c example.yaml   # → llm-perf-test/output/user-<ts>.json（sessions，含 profile 标签）
+./bench rps          -c example.yaml   # → llm-perf-test/output/rps-<ts>.json（requests，含 request_rate）
+./bench concurrency  -c example.yaml   # → llm-perf-test/output/concurrency-<ts>.json（requests，含 level）
 ```
 
 **按模型分区**：配置了多个模型时，数据按模型分区落 `<output_dir>/<模型>/<场景>-<ts>.json`
@@ -258,7 +258,7 @@ mv bench-linux-amd64 bench && chmod +x bench
 顶层（测试级共享）。单模型配置（或 `-m` 过滤后只剩一个）保持原布局直接落 output_dir：
 
 ```bash
-output/
+llm-perf-test/output/
 ├── run.log
 ├── DeepSeek-V4-Flash-0731/
 │   ├── user-<ts>.json
@@ -319,3 +319,4 @@ deploy/             # 推理服务 compose 存档：vLLM 基线 + SGLang / Tenso
 - [docs/data-contract.md](docs/data-contract.md) — 数据契约：JSON 输出结构、聚合口径、报告侧对齐规则
 - [docs/latency-baselines.md](docs/latency-baselines.md) — 体验基线 3 档制的依据与原文链接
 - [docs/testing-architecture.md](docs/testing-architecture.md) — 评测体系架构：指标第一性原理与冻结、四层模型、三类测试、trace/filler 分工、客户端计时立场、减法纪律（2026-09-12 定稿）
+- [AGENTS.md](AGENTS.md) — 统一项目指南：项目边界、运行方式、设计拍板、验证纪律与工程陷阱

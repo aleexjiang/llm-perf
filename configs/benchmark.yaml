@@ -11,7 +11,7 @@
 endpoint: "http://<实例IP>:<端口>/router/v1"
 api_key: ""                        # 或 api_key_env: "LLM_PERF_API_KEY"
 auth_scheme: "bearer"              # bearer | raw（裸 key）| none；配合 auth_header 可用自定义 header
-output_dir: "output"
+output_dir: "llm-perf-test/output"
 timeout_seconds: 600
 corpus_lang: "en"                  # 语料语言：user 模式文本生成用（zh 场景改 zh）
 seed_salt: 0                       # 每次战役递增；服务端 prefix cache 未清时重测必须换盐
