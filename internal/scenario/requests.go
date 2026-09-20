@@ -46,12 +46,14 @@ func requestRunner(ctx context.Context, e *env, model string, v config.ThinkingV
 	maxTok int, sample engine.RequestSample) *engine.TurnMetrics {
 
 	m, err := e.client.Chat(ctx, engine.ChatOptions{
-		Model:     model,
-		Messages:  sample.Messages,
-		MaxTokens: maxTok,
-		Stream:    e.cfg.StreamEnabled(),
-		Thinking:  v.Enabled,
-		ExtraBody: v.ExtraBody,
+		Model:       model,
+		Messages:    sample.Messages,
+		MaxTokens:   maxTok,
+		Stream:      e.cfg.StreamEnabled(),
+		Thinking:    v.Enabled,
+		ExtraBody:   v.ExtraBody,
+		Temperature: e.cfg.Sampling.Temperature,
+		TopP:        e.cfg.Sampling.TopP,
 	})
 	if m == nil {
 		m = &engine.TurnMetrics{

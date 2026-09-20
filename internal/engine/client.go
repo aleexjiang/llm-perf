@@ -381,6 +381,11 @@ type ChatOptions struct {
 	Stream    bool
 	Thinking  bool           // 仅记录进指标，标记本请求是否思考开启
 	ExtraBody map[string]any // 合并进请求体（思考开关等透传；不可覆盖 model/messages）
+	// Temperature/TopP 请求级采样参数（nil = 不传，服务端默认）。user 模式重跑对照
+	// 需要轨迹对齐时显式传 temperature=0（真机发现：默认采样下 assistant 长度随机，
+	// 会话第 3 轮起自然分叉——设计使然，但对照实验需要可控）。
+	Temperature *float64
+	TopP        *float64
 }
 
 // Chat 发起一次 chat completion（流式或非流式），返回计时指标。
@@ -443,13 +448,19 @@ func (c *Client) attempt(ctx context.Context, o ChatOptions) (m *TurnMetrics, er
 		"stream":     o.Stream,
 		"max_tokens": o.MaxTokens,
 	}
+	if o.Temperature != nil {
+		body["temperature"] = *o.Temperature
+	}
+	if o.TopP != nil {
+		body["top_p"] = *o.TopP
+	}
 	if o.Stream && c.IncludeUsage {
 		body["stream_options"] = map[string]any{"include_usage": true}
 	}
 	for k, v := range o.ExtraBody {
 		switch k {
-		case "model", "messages", "stream", "max_tokens", "stream_options":
-			continue // 测量核心字段不允许被供应商扩展静默覆盖
+		case "model", "messages", "stream", "max_tokens", "stream_options", "temperature", "top_p":
+			continue // 测量核心字段与显式采样参数不允许被供应商扩展静默覆盖
 		default:
 			body[k] = v
 		}

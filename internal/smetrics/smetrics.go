@@ -72,7 +72,7 @@ func NewScraperAt(endpoint, metricsPath string) *Scraper {
 	base := strings.TrimRight(endpoint, "/")
 	base = strings.TrimSuffix(base, "/v1")
 	return &Scraper{
-		URL:        base + metricsPath,
+		URL: base + metricsPath,
 		// 真机实测（真实端点高负载档位）：vLLM /metrics 采集会阻塞 >5s，
 		// 5s 超时把整个观测层判成不可用——放宽到 15s，重试逻辑保持不变。
 		Client:     &http.Client{Timeout: 15 * time.Second},

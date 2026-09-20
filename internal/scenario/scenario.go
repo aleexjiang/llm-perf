@@ -150,12 +150,14 @@ func runOne(ctx context.Context, e *env, model string,
 		before, _ = e.srv.Scrape(ctx)
 	}
 	m, err := e.client.Chat(ctx, engine.ChatOptions{
-		Model:     model,
-		Messages:  msgs,
-		MaxTokens: maxTokens,
-		Stream:    e.cfg.StreamEnabled(),
-		Thinking:  v.Enabled,
-		ExtraBody: v.ExtraBody,
+		Model:       model,
+		Messages:    msgs,
+		MaxTokens:   maxTokens,
+		Stream:      e.cfg.StreamEnabled(),
+		Thinking:    v.Enabled,
+		ExtraBody:   v.ExtraBody,
+		Temperature: e.cfg.Sampling.Temperature,
+		TopP:        e.cfg.Sampling.TopP,
 	})
 	if m == nil {
 		// Client.Chat 在请求构造失败等边界路径可能只有 error；场景层仍必须保留一条

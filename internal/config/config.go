@@ -68,6 +68,13 @@ type GoodputCfg struct {
 	TPOTMS float64 `yaml:"tpot_ms"` // 如 100
 }
 
+// Sampling 请求级采样参数（2026-09-20）：所有压测请求统一携带。
+// nil 字段 = 不传该参数（服务端默认）；user 模式轨迹对齐对照传 temperature: 0。
+type Sampling struct {
+	Temperature *float64 `yaml:"temperature"` // 0 = 贪心（重跑轨迹可对齐）；nil = 服务端默认
+	TopP        *float64 `yaml:"top_p"`
+}
+
 // SLOCfg SLO 口径段（5.8 合流）：goodput 判定阈值 + 报告"体验基线评估"阈值。
 // 之前 goodput 阈值在 Go 侧、基线三档判据是报告脚本内置常量——同一份 SLO 拆在两处，
 // 阈值改不动、口径对不齐；现在都从配置进、随 JSON 透出，报告侧消费同一份。
@@ -137,6 +144,9 @@ func (t *Thinking) SetFilter(name string) { t.filter = name }
 // levels 模式下 extra_body_on/off 通常为空（参数写在 levels 里），若直接读取会让 probe
 // 整块思考探测被跳过——部署侧关思考这类问题就查不出来。这里从 levels 兜底：
 // 取第一个 enabled=true 的变体当开启态、第一个 enabled=false 的当关闭态。
+// 关闭态仍为空时注入 enable_thinking=false——与压测路径 Variants() 兜底同语义，
+// 保证 probe 探测口径与压测一致（真机发现：部署默认 thinking=auto 时，
+// max_tokens=1 的非流式探测全部进思考链 → chat_nonstream 持续误报）。
 func (t Thinking) ProbeExtraBodies() (on, off map[string]any) {
 	on, off = t.ExtraBodyOn, t.ExtraBodyOff
 	for _, v := range t.Levels {
@@ -145,6 +155,11 @@ func (t Thinking) ProbeExtraBodies() (on, off map[string]any) {
 		}
 		if !v.Enabled && off == nil {
 			off = v.ExtraBody
+		}
+	}
+	if off == nil {
+		off = map[string]any{
+			"chat_template_kwargs": map[string]any{"enable_thinking": false},
 		}
 	}
 	return on, off
@@ -408,6 +423,12 @@ type Config struct {
 	// 跨请求存活——同一配置重跑时 prompt 与上次完全相同，"冷缓存"测量会被上次测试污染。
 	// 每次测试（改代码/改配置后的重测）递增盐值即可隔离；不改服务端也能拿到干净的冷缓存。
 	SeedSalt int `yaml:"seed_salt"`
+
+	// Sampling 请求级采样参数（nil 字段 = 不传，走服务端默认）。
+	// user 模式的 assistant 回复由被测模型采样生成——默认采样下同配置重跑的会话轨迹
+	// 会自然分叉（真机实测：同 salt 前 2 轮 prompt 一致、第 3 轮起分叉）。需要轨迹对齐
+	// 的对照实验显式传 temperature: 0（贪心）。
+	Sampling Sampling `yaml:"sampling"`
 
 	// Warnings 配置诊断提示（Load 时生成，非序列化字段）：不阻止运行，
 	// 但启动时打印——数量级不合理、轮次不足、覆盖关系等"合法但值得知道"的事
