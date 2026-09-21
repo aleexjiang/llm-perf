@@ -63,6 +63,32 @@ probe JSON 是独立结构。warmup、correctness、失败和主动取消都保�
 - 自有环境测试配置和测试产物放在 `llm-perf-test/`，整目录不入库。
 - 仓库只保留 `configs/example.yaml`、`configs/benchmark.yaml`、smoke 配置和测试 fixture。
 
+## 真机报告要求（2026-09-21 拍板）
+
+除 `probe` 外，`user`、`rps`、`concurrency` 每个真机场景都必须产出 HTML 报告。
+报告以原始 JSON 为唯一输入；Go 采集器仍只负责采集 JSON，HTML 渲染放在外部分析流程。
+
+每个场景报告必须覆盖以下内容，不得只给汇总数字：
+
+1. **吞吐**：总吞吐 tok/s；有多个档位/速率时给出完整曲线或对照表。
+2. **单流速度**：tokens per second 分布，至少给 P50/P95/P99；说明口径是否含思考 token。
+3. **TTFT**：P50/P95/P99（必要时 max），按档位/档次/请求构成分列，避免长短上下文混报。
+4. **TPOT**：P50/P95/P99；只使用 `tpot_ms`，不用 ITL 分位替代。
+5. **Goodput@SLO**：满足配置 SLO 的请求比例、goodput req/s 和 goodput tok/s；
+   未配置 SLO 时在报告中显式标 NA，不得用普通吞吐替代。
+6. **E2E 延迟**：P50/P95/P99；结合 TTFT、TPOT 和输出长度解释长尾来源。
+7. **TTFT 分解 + 服务端排队/KV 画像**：结合 `/metrics` 报告 queue、prefill、decode 的窗口分解，
+   以及 running/waiting 峰值均值、KV usage 和 preemptions；区分排队、prefill 竞争和 KV 压力。
+8. **请求构成**：场景、thinking、stream、采样参数、模型/档位、prompt token 分布、
+   输出预算、成功/失败/取消数量，以及 user 的会话/轮次与 rps/concurrency 的请求源和样本构成。
+9. **数据解读**：解释拐点、排队、缓存、失败和告警对结论的影响；两源一致性、`/metrics`
+   观测与客户端口径不一致时必须显式说明。
+10. **可承诺用户数估算**：按目标 SLO 折算支持的用户/并发数；给出一到多档用户规模假设
+    （在线用户、并发会话、请求到达率或平均输出形状），区分“可承诺容量”“尽力而为容量”
+    和“饱和探索容量”。估算必须注明换算假设，不得把饱和峰值直接当成可承诺容量。
+
+报告文件放在本轮测试输出目录，与原始 JSON 同批保存；外发前检查是否包含敏感配置或业务数据。
+
 ## 设计拍板
 
 - **采集器边界（2026-09-17）**：报告层已整体剥离。Go 只保证原始数据可信、完整、自描述；
