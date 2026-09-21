@@ -38,6 +38,11 @@ type MultiturnRun struct {
 	//   0 = trace 模式（轮次来自回放会话，名义值无意义，实测深度即原会话深度）。
 	LastPromptTokens  int `json:"last_prompt_tokens,omitempty"`
 	NominalLastPrompt int `json:"nominal_last_prompt,omitempty"`
+
+	// TokenBudget user 场景的单请求总上下文预算（prompt + output）：
+	// `max_prompt_tokens` 语义修正后即该预算，剩余空间不足以容纳下一轮 prompt + max_tokens
+	// 时提前止损，不再发出必然 400 的请求。0 = 未启用预算控制。
+	TokenBudget int `json:"token_budget,omitempty"`
 }
 
 // FillLastPromptTokens 12.3：从轮次数据回填末轮实测 prompt_tokens（倒序找第一个 >0 的成功轮，
@@ -272,7 +277,7 @@ var Version = "llm-perf/dev"
 // SchemaVersionCurrent 数据契约版本：JSON 结构变更时递增，外部消费方据此做兼容判断。
 // 契约唯一权威文档 docs/data-contract.md，与本值同步维护（2026-09-17 报告层剥离后，
 // 这份 JSON 契约就是工具的对外接口）。
-const SchemaVersionCurrent = 4
+const SchemaVersionCurrent = 5
 
 // Report 是一次场景执行的完整数据，整体落盘为单个 JSON 文件。
 type Report struct {

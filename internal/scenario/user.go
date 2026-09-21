@@ -61,12 +61,24 @@ func UserScenario(ctx context.Context, cfg *config.Config, client *engine.Client
 	if corpus.Library(lang) == nil {
 		return nil, fmt.Errorf("user 模式语料库为空（lang=%s）——检查 corpus_lang/filler_lang 配置", lang)
 	}
-	// 组合上限预警（真机发现 2.6）：首轮上限 + 各档位最大轮数 × 最大增量会逼近
-	// max_prompt_tokens 时启动告警——运行时 ctxLimitHit 止损只是兜底，形状本身该可控。
+	// TokenBudget 是 max_prompt_tokens 的准确语义：单请求 prompt + output 总预算。
+	// 上一轮真机只按 prompt 截止，最后在 max_model_len 处撞上 256 输出预算（r1-r3 heavy）。
+	// 这里用最大 max_tokens 计算会话窗口，避免输出扫描中只有小档位受控、大档位仍然 400。
+	var tokenBudget int
+	maxOutput := 0
+	for _, mt := range cfg.User.MaxTokens {
+		if mt > maxOutput {
+			maxOutput = mt
+		}
+	}
+	if maxOutput <= 0 {
+		maxOutput = 256
+	}
 	if cfg.MaxPromptTokens > 0 {
-		if est := estMaxContext(prof); est > cfg.MaxPromptTokens {
-			log.Printf("⚠️ profile 形状预计最大上下文 ≈%dtk > max_prompt_tokens=%d——长会话会被 ctxLimit 提前止损；建议下调轮次/增量或调高 max_prompt_tokens",
-				est, cfg.MaxPromptTokens)
+		tokenBudget = cfg.MaxPromptTokens
+		if est := estMaxContext(prof); est > tokenBudget {
+			log.Printf("⚠️ profile 形状预计最大上下文 ≈%dtk > token_budget=%d——长会话会在预算内提前止损；建议下调轮次/增量或调高 max_prompt_tokens",
+				est, tokenBudget)
 		}
 	}
 
@@ -110,7 +122,7 @@ func UserScenario(ctx context.Context, cfg *config.Config, client *engine.Client
 				if interrupted(ctx) {
 					break
 				}
-				runs := runUserSessions(ctx, em, prof, lang, model, v, maxTok)
+				runs := runUserSessions(ctx, em, prof, lang, model, v, maxTok, tokenBudget)
 				rep.Multiturn = append(rep.Multiturn, runs...)
 			}
 		}
@@ -120,7 +132,7 @@ func UserScenario(ctx context.Context, cfg *config.Config, client *engine.Client
 
 // runUserSessions 并行执行 users 条生成式会话（每用户一条，模型串行保证 e.cfg 不被并发改写）。
 func runUserSessions(ctx context.Context, e *env, prof *Profile, lang, model string,
-	v config.ThinkingVariant, maxTok int) []report.MultiturnRun {
+	v config.ThinkingVariant, maxTok, tokenBudget int) []report.MultiturnRun {
 
 	users := e.cfg.User.GetUsers()
 	stagger := time.Duration(e.cfg.User.GetStaggerMS()) * time.Millisecond
@@ -148,7 +160,7 @@ func runUserSessions(ctx context.Context, e *env, prof *Profile, lang, model str
 			if interrupted(ctx) {
 				return
 			}
-			runs[idx] = runOneUserSession(ctx, e, prof, lang, model, v, maxTok, idx, labels[idx])
+			runs[idx] = runOneUserSession(ctx, e, prof, lang, model, v, maxTok, tokenBudget, idx, labels[idx])
 		}(u)
 	}
 	wg.Wait()
@@ -163,13 +175,14 @@ func runUserSessions(ctx context.Context, e *env, prof *Profile, lang, model str
 
 // runOneUserSession 单个用户的完整多轮会话：profile 定形状，语料定内容，模型定回复。
 func runOneUserSession(ctx context.Context, e *env, prof *Profile, lang, model string,
-	v config.ThinkingVariant, maxTok int, userIdx int, profileLabel string) report.MultiturnRun {
+	v config.ThinkingVariant, maxTok, tokenBudget int, userIdx int, profileLabel string) report.MultiturnRun {
 
 	run := report.MultiturnRun{
-		Model:     model,
-		Thinking:  v.Name,
-		Session:   userIdx + 1,
-		MaxTokens: maxTok,
+		Model:       model,
+		Thinking:    v.Name,
+		Session:     userIdx + 1,
+		MaxTokens:   maxTok,
+		TokenBudget: tokenBudget,
 	}
 	spec := prof.Profiles[profileLabel]
 	run.Profile = profileLabel
@@ -220,6 +233,9 @@ func runOneUserSession(ctx context.Context, e *env, prof *Profile, lang, model s
 	firstTotal := sample(prof.FirstTurnTokens)
 	msgs := []engine.Message{baseMsg}
 	prevPrompt := 0 // new_tokens 基准：上一成功轮的实测 prompt（发现 1.4：旧实现恒 0）
+	// lastBaseline 是下一轮 prompt 的下限估计：上一轮实测 prompt + assistant 回复 token。
+	// usage 缺失时置 0，只保留原有的运行时兜底，不做错误截断。
+	lastBaseline := 0
 	for turn := 0; turn < turns; turn++ {
 		if interrupted(ctx) {
 			break
@@ -247,6 +263,31 @@ func runOneUserSession(ctx context.Context, e *env, prof *Profile, lang, model s
 				book.Window(int(float64(ctxTk)*cpr), rng.Int63()), contextTag)
 		}
 		content.WriteString(question)
+
+		// 输出预算预留：把本轮计划 user/context 增量、上一轮实测历史和 assistant 回复
+		// 一并计入下一轮估算。只在 estimate > 0 且确定性超过预算时止损；
+		// usage 缺失或估算不足时继续执行，让原有 ctxLimitHit 兜底。
+		planIncrement := int(float64(userTk+ctxTk) / cpr)
+		nextPrompt := lastBaseline
+		if nextPrompt == 0 {
+			nextPrompt = firstTurnBaseTokens
+		}
+		estimate := nextPrompt + planIncrement
+		if tokenBudget > 0 && estimate > 0 && estimate+maxTok > tokenBudget {
+			m := &engine.TurnMetrics{
+				Model: model, Stream: e.cfg.StreamEnabled(), Thinking: v.Enabled, Phase: "benchmark",
+				Warnings: []string{fmt.Sprintf(
+					"token_budget_exhausted: estimated_prompt=%d + max_tokens=%d > %d——停止本轮，避免 context 400",
+					estimate, maxTok, tokenBudget)},
+				EndAt: time.Now(),
+			}
+			m.Finalize()
+			run.Turns = append(run.Turns, m)
+			log.Printf("    🛑 上下文预算不足（estimated_prompt=%d + max_tokens=%d > %d）——提前结束会话",
+				estimate, maxTok, tokenBudget)
+			break
+		}
+
 		msgs = append(msgs, engine.Message{Role: "user", Content: content.String()})
 
 		m := runOne(ctx, e, model, msgs, maxTok, v)
@@ -255,6 +296,17 @@ func runOneUserSession(ctx context.Context, e *env, prof *Profile, lang, model s
 		if m.PromptTokens > 0 {
 			m.NewTokens = m.PromptTokens - prevPrompt
 			prevPrompt = m.PromptTokens
+		}
+		if tokenBudget > 0 && m.PromptTokens > 0 && m.Error == "" && !m.Cancelled {
+			nextPromptBase := m.PromptTokens + m.CompletionTokens
+			if m.ReplyText == "" {
+				// finish=length 时 completion 也可能进思考/输出预算；没有可见回复则下轮
+				// assistant 消息为空，但服务端模型上限仍按完整 usage 评估，保守不减。
+				nextPromptBase = m.PromptTokens + maxTok
+			}
+			if nextPromptBase > lastBaseline {
+				lastBaseline = nextPromptBase
+			}
 		}
 		run.Turns = append(run.Turns, m)
 		// 首轮实测深度校验（review R1-L1）：估算保证依赖 CharsPerToken 系数，

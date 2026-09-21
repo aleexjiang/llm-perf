@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -112,6 +113,46 @@ func TestUserScenarioRequiresProfile(t *testing.T) {
 	cfg := testCfg(t, srv.URL)
 	if _, err := UserScenario(context.Background(), cfg, engine.NewClient(srv.URL, "", 5*time.Second, true), ""); err == nil {
 		t.Fatal("缺 profile_path 应报错")
+	}
+}
+
+// TestUserScenarioStopsWithinTokenBudget 回归：max_prompt_tokens 是 prompt+output 总预算。
+// 上一轮实测历史 + 本轮计划增量 + max_tokens 超过预算时，必须在发出请求前止损，
+// 不能像真机 r1-r3 那样用 400 消耗最后一轮。
+func TestUserScenarioStopsWithinTokenBudget(t *testing.T) {
+	srv := sseStub(t, &stubState{})
+	cfg := testCfg(t, srv.URL)
+	cfg.User = config.User{
+		ProfilePath: writeProfile(t, testProfileJSON),
+		Users:       1,
+		MaxTokens:   config.IntList{256},
+	}
+	cfg.MaxPromptTokens = 35000 // 首轮实测可达 35-40K，因此至少第二轮会在请求前止损
+
+	rep, err := UserScenario(context.Background(), cfg, engine.NewClient(srv.URL, "", 30*time.Second, true), "")
+	if err != nil {
+		t.Fatalf("UserScenario: %v", err)
+	}
+	if len(rep.Multiturn) != 1 {
+		t.Fatalf("应有 1 个会话，实际 %d", len(rep.Multiturn))
+	}
+	run := rep.Multiturn[0]
+	if run.TokenBudget != cfg.MaxPromptTokens {
+		t.Fatalf("token_budget=%d，want %d", run.TokenBudget, cfg.MaxPromptTokens)
+	}
+	stopped := false
+	for _, m := range run.Turns {
+		if m.Error != "" {
+			t.Fatalf("预算止损后不应发出失败请求: %+v", m)
+		}
+		for _, w := range m.Warnings {
+			if strings.Contains(w, "token_budget_exhausted") {
+				stopped = true
+			}
+		}
+	}
+	if !stopped {
+		t.Fatalf("应触发 token_budget_exhausted；turns=%d", len(run.Turns))
 	}
 }
 

@@ -9,7 +9,7 @@
 
 ## 版本
 
-每份场景 JSON 顶层带 `schema_version`（当前 **4**，常量 `report.SchemaVersionCurrent`）。
+每份场景 JSON 顶层带 `schema_version`（当前 **5**，常量 `report.SchemaVersionCurrent`）。
 结构变更时递增，消费方据此做兼容判断；schema 不保向后兼容（拍板见 [AGENTS.md](../AGENTS.md)），大版本升级可能直接改字段类型。
 
 ## 数据流与落盘组织
@@ -38,7 +38,8 @@ Report
 ├── multiturn[]    # MultiturnRun: model, thinking, session, max_tokens,
 │                  #   profile（混合档位名，仅 multiturn.profiles 生效时出现）,
 │                  #   turns[]→TurnMetrics, start_offset_s（soak 时段分析）,
-│                  #   last_prompt_tokens/nominal_last_prompt（12.3 深度实测对照）
+│                  #   last_prompt_tokens/nominal_last_prompt（12.3 深度实测对照）,
+│                  #   token_budget（user 单请求 prompt+output 总预算；0=未启用）
 ├── concurrent[]   # ConcurrentLevel: model, thinking, level, request_rate(开环>0),
 │                  #   sessions[]→MultiturnRun（多轮会话，逐 turn 计量）,
 │                  #   wall_seconds, throughput_tps（完整成功请求）, completed/failed/cancelled_requests,

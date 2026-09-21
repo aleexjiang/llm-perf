@@ -95,15 +95,18 @@ r1/rps `rate=6` 有一请求返回 HTML 502，body 为代理页面而非 vLLM �
 该请求计入 `failed_requests=1`，其余 99 条正常；r2/r3 同档位 0 失败。
 判断为网关/代理瞬时故障。JSON 中已保留完整错误与计数，后续分析应按 `error` 过滤。
 
-### 4. user 长会话上下文边界未预留输出预算（工具设计问题，待修）
+### 4. user 长会话上下文边界未预留输出预算（工具设计问题，已修复）
 
 三轮 heavy 会话最后都在同一位置失败：服务端返回
 `prompt contains at least 261889 input tokens`，请求还要求 256 个输出 token，
 总数超过 `max_model_len=262144`。工具能识别“模型上下文上限”并安全终止会话，但
 构造下一轮 prompt 时只对齐了 prompt 上限，没有为 `max_tokens` 预留空间。
 
-建议：user 构造轮次前用 `max_model_len - max_tokens` 作为 prompt 预算；probe 已能拿到
-`max_model_len` 时可直接下发该约束。这属于测量工具的边界误差，不影响已完成轮数据。
+处理：`max_prompt_tokens` 现在按“单请求 prompt + output 总预算”执行。user 在构造每轮
+请求前用上一轮实测历史加 assistant 回复、再叠加本轮计划 user/context 增量估算 prompt，
+并预留本变体的 `max_tokens`；估算超过预算时直接记 `token_budget_exhausted` 并提前止损，
+不再发出确定性 400。`token_budget` 随 `MultiturnRun` 落盘，数据契约版本升到 5。
+该修复通过 `TestUserScenarioStopsWithinTokenBudget` 回归测试。
 
 ### 5. 配置路径相对语义需注意（使用问题，已修正本次配置）
 

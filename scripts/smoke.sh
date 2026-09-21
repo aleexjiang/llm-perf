@@ -97,7 +97,7 @@ user = load_all("out-user")
 check(len(user) == 1, f"user 产物按模型落盘（{len(user)} 份）")
 rep = user[0]
 check(rep.get("scenario") == "user", "报告 scenario=user")
-check(rep.get("schema_version") == 4, "数据契约版本为 4")
+check(rep.get("schema_version") == 5, "数据契约版本为 5")
 sessions = rep.get("multiturn") or []
 check(len(sessions) == 2, f"users=2 应有 2 条会话（{len(sessions)}）")
 check(all(s.get("profile") in ("light", "medium", "heavy") for s in sessions), "会话带 profile 档位标签")
