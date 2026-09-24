@@ -336,24 +336,41 @@ func (vllmProvider) HistNames() []string {
 
 func VLLM() MetricsProvider { return vllmProvider{} }
 
-// ── SGLang 命名（草案：排队 gauge 已按公开文档实现；缓存 counter 暂缺——
-// 接真机时按其 /metrics 校准补充，缺失键即不出数不影响其余指标） ──
+// ── SGLang 命名（v0.5.x 官方 /metrics） ──
+// 官方参考：production_metrics 页面与 v0.5.x collector。SGLang 需要显式
+// --enable-metrics；没有 vLLM 的 hit/query counter 与 preemption counter。
+// cache_hit_rate 是当前统计窗口的 gauge，不能伪装成 counter 做前后差分，
+// 因此作为 gauge 收集，避免把服务端历史命中率误报为本次请求窗口命中率。
 
 type sglangProvider struct{}
 
 func (sglangProvider) Name() string { return "sglang" }
 
-func (sglangProvider) CounterNames() map[string][]string { return map[string][]string{} }
-
-func (sglangProvider) GaugeNames() map[string][]string {
+func (sglangProvider) CounterNames() map[string][]string {
 	return map[string][]string{
-		"running":  {"sglang:num_running_reqs"},
-		"waiting":  {"sglang:num_queue_reqs"},
-		"kv_usage": {"sglang:token_usage"},
+		// prompt_tokens 用于观测层原始事实；generation_tokens 还用于两源一致性校验。
+		"prompt_tokens":     {"sglang:prompt_tokens"},
+		"generation_tokens": {"sglang:generation_tokens"},
 	}
 }
 
-func (sglangProvider) HistNames() []string { return nil }
+func (sglangProvider) GaugeNames() map[string][]string {
+	return map[string][]string{
+		"running":        {"sglang:num_running_reqs"},
+		"waiting":        {"sglang:num_queue_reqs"},
+		"kv_usage":       {"sglang:token_usage"},
+		"kv_used_tokens": {"sglang:num_used_tokens"},
+		"cache_hit_rate": {"sglang:cache_hit_rate"},
+	}
+}
+
+func (sglangProvider) HistNames() []string {
+	return []string{
+		"sglang:time_to_first_token_seconds",
+		"sglang:e2e_request_latency_seconds",
+		"sglang:time_per_output_token_seconds",
+	}
+}
 
 func SGLang() MetricsProvider { return sglangProvider{} }
 
@@ -494,7 +511,10 @@ type CounterDelta struct {
 	Preemptions            float64 `json:"preemptions,omitempty"`
 	SpecDrafts             float64 `json:"spec_drafts,omitempty"`
 	SpecAcceptedTokens     float64 `json:"spec_accepted_tokens,omitempty"`
-	// GenerationTokens 服务端自报的生成 token 数（vLLM: generation_tokens_total；SGLang 暂缺）。
+	// PromptTokens 是服务端自报的 prefill token 总数（SGLang prompt_tokens_total）。
+	// 它是观测层原始事实，不参与评测指标；缺失时为 0（omitempty）。
+	PromptTokens float64 `json:"prompt_tokens,omitempty"`
+	// GenerationTokens 服务端自报的生成 token 数（vLLM / SGLang generation_tokens counter 差值）。
 	// 用途单一：与客户端实测的 completion tokens 做**两源一致性**交叉校验（10.1）——
 	// 数百并发流下客户端可能自己成瓶颈，客户端读数会系统性偏低。0 = 引擎未暴露该 counter。
 	GenerationTokens float64 `json:"generation_tokens,omitempty"`
@@ -532,6 +552,7 @@ func DiffCounters(before, after *Sample, p MetricsProvider) *CounterDelta {
 		"preemptions":          &d.Preemptions,
 		"spec_drafts":          &d.SpecDrafts,
 		"spec_accepted":        &d.SpecAcceptedTokens,
+		"prompt_tokens":        &d.PromptTokens,
 		"generation_tokens":    &d.GenerationTokens,
 	} {
 		delta := get(after, key) - get(before, key)
@@ -649,16 +670,16 @@ type GaugePoller struct {
 	ctx      context.Context
 	provider MetricsProvider
 
-	mu           sync.Mutex
-	samples      map[string][]float64
-	sampleTotals map[string]int
-	okSamples    int    // 成功抓取次数
-	totalFails   int    // 累计失败次数
-	consecFails  int    // 连续失败次数
-	lastErr      string // 最后一次失败原因
-	stopOnce     sync.Once
-	done         chan struct{} // Stop 关闭：通知 loop 退出
-	stopped      chan struct{} // loop 退出时关闭：外部可等待
+	mu          sync.Mutex
+	samples     map[string][]float64
+	sampleTotal map[string]int
+	okSamples   int    // 成功抓取次数
+	totalFails  int    // 累计失败次数
+	consecFails int    // 连续失败次数
+	lastErr     string // 最后一次失败原因
+	stopOnce    sync.Once
+	done        chan struct{} // Stop 关闭：通知 loop 退出
+	stopped     chan struct{} // loop 退出时关闭：外部可等待
 }
 
 // GaugeHealth 是轮询健康度汇总。
@@ -685,14 +706,14 @@ func StartGaugePoller(ctx context.Context, sc *Scraper, interval time.Duration, 
 	}
 	sc.MaxRetries = 0 // 轮询快速失败：失败计数即降级信号，下一 tick 天然是重试
 	g := &GaugePoller{
-		scraper:      sc,
-		interval:     interval,
-		ctx:          ctx,
-		provider:     p,
-		samples:      map[string][]float64{},
-		sampleTotals: map[string]int{},
-		done:         make(chan struct{}),
-		stopped:      make(chan struct{}),
+		scraper:     sc,
+		interval:    interval,
+		ctx:         ctx,
+		provider:    p,
+		samples:     map[string][]float64{},
+		sampleTotal: map[string]int{},
+		done:        make(chan struct{}),
+		stopped:     make(chan struct{}),
 	}
 	go g.loop()
 	return g
@@ -742,7 +763,7 @@ func (g *GaugePoller) once() {
 const maxGaugeSamples = 4096
 
 func (g *GaugePoller) appendSample(key string, value float64) {
-	g.sampleTotals[key]++
+	g.sampleTotal[key]++
 	xs := g.samples[key]
 	if len(xs) >= maxGaugeSamples {
 		copy(xs, xs[1:])
@@ -766,75 +787,6 @@ func (g *GaugePoller) Health() GaugeHealth {
 // Stop 停止轮询（幂等；不等待 loop 退出，Summary 会先 Stop 再读数据）。
 func (g *GaugePoller) Stop() { g.stopOnce.Do(func() { close(g.done) }) }
 
-// LatestWaiting 返回最近一次成功采样到的排队深度（waiting，语义键）。
-// ok=false = 从未采到（观测层不可用 / 引擎无该指标）。
-// 饱和止损的 waiting 判据用它取实时值——Summary 的峰值/均值是事后聚合，档位中途不可读。
-func (g *GaugePoller) LatestWaiting() (float64, bool) {
-	return g.latest("waiting")
-}
-
-// LatestRunning 返回最近一次成功采样到的执行数（running，语义键）。12.5 观测对偶。
-func (g *GaugePoller) LatestRunning() (float64, bool) {
-	return g.latest("running")
-}
-
-func (g *GaugePoller) latest(key string) (float64, bool) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	xs := g.samples[key]
-	if len(xs) == 0 {
-		return 0, false
-	}
-	return xs[len(xs)-1], true
-}
-
-// WaitingSampleCount 返回 waiting 的累计成功采样条数。
-// 与 WaitingSamplesSince 配对，用于"只统计某段时间窗内新采到的样本"——
-// 档位级 waiting 峰值不能用 LatestWaiting（它读的是全局最后一帧，会串档位）。
-func (g *GaugePoller) WaitingSampleCount() int {
-	return g.sampleCount("waiting")
-}
-
-// RunningSampleCount 返回 running 的累计成功采样条数（12.5 观测对偶，与 RunningSamplesSince 配对）。
-func (g *GaugePoller) RunningSampleCount() int {
-	return g.sampleCount("running")
-}
-
-func (g *GaugePoller) sampleCount(key string) int {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.sampleTotals[key]
-}
-
-// WaitingSamplesSince 返回下标 i 之后新采到的 waiting 样本（i 越界按 0 处理）。
-// 返回副本，调用方可安全读取。
-func (g *GaugePoller) WaitingSamplesSince(i int) []float64 {
-	return g.samplesSince("waiting", i)
-}
-
-// RunningSamplesSince 返回下标 i 之后新采到的 running 样本（12.5 观测对偶）。
-func (g *GaugePoller) RunningSamplesSince(i int) []float64 {
-	return g.samplesSince("running", i)
-}
-
-func (g *GaugePoller) samplesSince(key string, i int) []float64 {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	xs := g.samples[key]
-	total := g.sampleTotals[key]
-	oldest := total - len(xs)
-	if i < oldest {
-		i = oldest
-	}
-	if i > total {
-		i = total
-	}
-	offset := i - oldest
-	out := make([]float64, len(xs)-offset)
-	copy(out, xs[offset:])
-	return out
-}
-
 // Summary 返回各 gauge 的峰值/均值。
 func (g *GaugePoller) Summary() map[string]GaugeSummary {
 	g.Stop()
@@ -855,4 +807,39 @@ func (g *GaugePoller) Summary() map[string]GaugeSummary {
 		out[k] = GaugeSummary{Max: max, Avg: sum / float64(len(xs)), Samples: len(xs)}
 	}
 	return out
+}
+
+// MaxSince 返回指定语义 gauge 从累计样本下标 start 之后新采样本的峰值。
+// start 由档位开始时 SampleTotal 获取，避免相邻档位的峰值串档。
+// ok=false = 该区间没有采到该指标。
+func (g *GaugePoller) MaxSince(key string, start int) (float64, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	xs := g.samples[key]
+	total := g.sampleTotal[key]
+	oldest := total - len(xs)
+	if start < oldest {
+		start = oldest
+	}
+	if start > total {
+		start = total
+	}
+	offset := start - oldest
+	if offset >= len(xs) {
+		return 0, false
+	}
+	mx := xs[offset]
+	for _, v := range xs[offset+1:] {
+		if v > mx {
+			mx = v
+		}
+	}
+	return mx, true
+}
+
+// SampleTotal 返回指定语义 gauge 自 poller 创建以来的采样条数。
+func (g *GaugePoller) SampleTotal(key string) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.sampleTotal[key]
 }

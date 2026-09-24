@@ -100,6 +100,7 @@ func UserScenario(ctx context.Context, cfg *config.Config, client *engine.Client
 	}
 	applySLO(e, rep)
 
+	scenarioStart := time.Now()
 	before, poller, winStart := startWindow(ctx, e)
 	defer func() { rep.Server = finishWindow(e, before, poller, winStart) }()
 
@@ -127,6 +128,11 @@ func UserScenario(ctx context.Context, cfg *config.Config, client *engine.Client
 			}
 		}
 	}
+	var allTurns []*engine.TurnMetrics
+	for _, run := range rep.Multiturn {
+		allTurns = append(allTurns, run.Turns...)
+	}
+	rep.Throughput = report.BuildThroughputSummary(allTurns, time.Since(scenarioStart).Seconds())
 	return rep, nil
 }
 

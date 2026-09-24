@@ -75,6 +75,9 @@ func TestRPSScenario(t *testing.T) {
 	if lv.CompletedRequests != 6 || lv.ThroughputTPS <= 0 {
 		t.Fatalf("汇总错误: completed=%d tps=%.1f", lv.CompletedRequests, lv.ThroughputTPS)
 	}
+	if lv.SLOTotal != 0 || lv.SLOMeet != 0 || lv.GoodputRPS != 0 || lv.GoodputTPS != 0 {
+		t.Fatalf("未配置 SLO 时 goodput 应保持零值: %+v", lv)
+	}
 }
 
 // TestConcurrencyScenario 集成：固定在飞齐射（request_rate=inf）+ 多档位。
@@ -128,6 +131,56 @@ func TestRequestScenariosSourceCheck(t *testing.T) {
 				t.Fatalf("%s source_check 数据不完整: %+v", name, rep.SourceCheck)
 			}
 		})
+	}
+}
+
+// TestFinishLevelGoodput 回归：数据契约承诺的档位级 goodput 字段必须接线。
+// 已配置 SLO 时失败请求计入分母且不达标，主动取消不计入分母；
+// goodput_rps 是达标请求数/墙钟，goodput_tps 只累计达标请求的 completion tokens。
+func TestFinishLevelGoodput(t *testing.T) {
+	e := &env{cfg: &config.Config{
+		SLO: &config.SLOCfg{Goodput: &config.GoodputCfg{TTFTMS: 100, TPOTMS: 50}},
+	}}
+	lv := report.ConcurrentLevel{
+		WallSeconds: 2,
+		Requests: []*engine.TurnMetrics{
+			{TTFT: 80, TPOTMS: 40, CompletionTokens: 100},
+			{TTFT: 120, TPOTMS: 40, CompletionTokens: 200},
+			{Error: "HTTP 500", CompletionTokens: 300},
+			{Cancelled: true, CompletionTokens: 400},
+		},
+	}
+	finishLevel(e, &lv)
+	if lv.SLOMeet != 1 || lv.SLOTotal != 3 {
+		t.Fatalf("SLO 计数错误: meet=%d total=%d", lv.SLOMeet, lv.SLOTotal)
+	}
+	if lv.GoodputRPS != 0.5 || lv.GoodputTPS != 50 {
+		t.Fatalf("goodput 汇总错误: rps=%v tps=%v", lv.GoodputRPS, lv.GoodputTPS)
+	}
+	if lv.CompletedRequests != 2 || lv.FailedRequests != 1 || lv.CancelledRequests != 1 {
+		t.Fatalf("成败计数错误: completed=%d failed=%d cancelled=%d",
+			lv.CompletedRequests, lv.FailedRequests, lv.CancelledRequests)
+	}
+}
+
+// rps/concurrency 的档位级活跃 decode 聚合必须由场景层落盘，
+// 不能只在报告脚本里临时重算。
+func TestFinishLevelActiveDecodeTPS(t *testing.T) {
+	e := &env{cfg: &config.Config{}}
+	base := time.Now()
+	lv := report.ConcurrentLevel{
+		WallSeconds: 3,
+		Requests: []*engine.TurnMetrics{
+			{Stream: true, SentAt: base, TTFT: 100, E2EMS: 2100, EndAt: base.Add(2100 * time.Millisecond), CompletionTokens: 100},
+			{Stream: true, SentAt: base.Add(500 * time.Millisecond), TTFT: 100, E2EMS: 1600, EndAt: base.Add(2100 * time.Millisecond), CompletionTokens: 100},
+		},
+	}
+	finishLevel(e, &lv)
+	if lv.ActiveDecodeTPS <= 0 {
+		t.Fatalf("active_decode_tps 未写入: %+v", lv)
+	}
+	if lv.ActiveDecodeTPS <= lv.ThroughputTPS {
+		t.Fatalf("重叠 decode 的活跃聚合应高于 batch 平均: active=%.1f batch=%.1f", lv.ActiveDecodeTPS, lv.ThroughputTPS)
 	}
 }
 

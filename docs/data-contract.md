@@ -9,7 +9,7 @@
 
 ## 版本
 
-每份场景 JSON 顶层带 `schema_version`（当前 **5**，常量 `report.SchemaVersionCurrent`）。
+每份场景 JSON 顶层带 `schema_version`（当前 **7**，常量 `report.SchemaVersionCurrent`）。
 结构变更时递增，消费方据此做兼容判断；schema 不保向后兼容（拍板见 [AGENTS.md](../AGENTS.md)），大版本升级可能直接改字段类型。
 
 ## 数据流与落盘组织
@@ -51,7 +51,9 @@ Report
 ├── server_metrics # 可选第二数据源（客户端实测才是基线）。窗口差值/轮询聚合：
 │                  #   available（**仅指窗口差值 counter/hist 是否取到**）,
 │                  #   note（取不到时的原因；全仓只有"结束快照失败"会写它）,
-│                  #   cache_hit/query, spec_drafts/accepted,
+│                  #   cache_hit/query（vLLM counter；SGLang 的 cache_hit_rate 在 gauges）,
+│                  #   prompt_tokens/generation_tokens（服务端 counter 差值；SGLang 提供）,
+│                  #   spec_drafts/accepted,
 │                  #   preemptions（**恒出现，刻意不带 omitempty**：0 = 窗口内没有发生抢占,
 │                  #     这本身是有意义的好结果；键一消失就会被读成"这项没采到"）,
 │                  #   gauges{}（轮询独立于结束快照，available=false 时仍可能有效）,
@@ -61,6 +63,16 @@ Report
 ├── source_check   # 两源一致性（仅 benchmark 并发/RPS 窗口）：client_tps/server_tps/deviation
 │                  #   warmup/correctness 已排除；多模型时是端点级合计参考，不是单模型精确归因
 │                  #   deviation 恒出现：0 = 两源完全一致，是最有意义的好结果
+├── throughput     # 场景级总吞吐与分层单流速度（user 也有）：
+│                  #   wall_seconds / completion_tokens / throughput_tps（端到端：token/墙钟）,
+│                  #   active_decode_tokens / active_decode_seconds / active_decode_tps
+│                  #     （时间对齐活跃 decode 聚合：重叠 [TTFT,E2E] 区间内各流相加）,
+│                  #   streaming.all|stop|length.{
+│                  #     count, completion_tokens, decode_seconds, weighted_tps,
+│                  #     active_decode_tokens/seconds/tps,
+│                  #     p50/p95/p99_tps, p50/p95_ttft_ms, p50/p95_tpot_ms}
+│                  #   总吞吐只算完整成功请求；单流主结论用 weighted_tps，
+│                  #   stop/length 分层避免把自然结束与输出预算截断混成一个中位数
 ├── environment    # 可选环境存档；普通 bench 不自动 probe，显式 probe 结果独立落盘
 └── config_raw     # 配置原文
 ```

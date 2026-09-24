@@ -71,6 +71,8 @@ type env struct {
 	// kv 是场景开始快照提取的 KV 容量画像（12.12）：nil = 观测层不可用或引擎未暴露
 	// vllm:cache_config_info。仅作容量归因的并列参照，不影响任何结论口径。
 	kv *smetrics.KVCapacity
+	// gauge 是场景窗口的后台 gauge 轮询器；档位级 running/waiting 峰值从它读取。
+	gauge *smetrics.GaugePoller
 	// perReqSrv 逐请求 /metrics 前后抓取（SrvDelta）开关：仅串行路径启用。
 	// 并发/开环下每请求抓取落在计时窗口内（压低 wall_seconds 口径的吞吐）、
 	// 各请求差值窗口互相重叠无归因意义，且给服务端叠加可观测负载——
@@ -247,7 +249,30 @@ func startWindow(ctx context.Context, e *env) (*smetrics.Sample, *smetrics.Gauge
 		return nil, nil, time.Time{}
 	}
 	poller := smetrics.StartGaugePoller(ctx, e.srv, time.Duration(e.cfg.MetricsIntervalMS)*time.Millisecond, e.provider)
+	e.gauge = poller
 	return before, poller, start
+}
+
+// gaugeSampleStarts 记录当前轮询样本累计值，供档位结束后做区间峰值。
+// 观测层未启用/未采到对应指标时返回 0，applyGaugePeaks 会自然跳过。
+func (e *env) gaugeSampleStarts() (waiting, running int) {
+	if e.gauge == nil {
+		return 0, 0
+	}
+	return e.gauge.SampleTotal("waiting"), e.gauge.SampleTotal("running")
+}
+
+// applyGaugePeaks 将本档位区间内的 running/waiting 峰值写回档位结果。
+func (e *env) applyGaugePeaks(lv *report.ConcurrentLevel, waitingStart, runningStart int) {
+	if e.gauge == nil || lv == nil {
+		return
+	}
+	if v, ok := e.gauge.MaxSince("waiting", waitingStart); ok {
+		lv.WaitingMax = v
+	}
+	if v, ok := e.gauge.MaxSince("running", runningStart); ok {
+		lv.RunningMax = v
+	}
 }
 
 // finalScrapeCtx 结束快照的独立 ctx（12.11）：场景 ctx 此时可能已被取消——运行中断
@@ -296,6 +321,7 @@ func finishWindow(e *env, before *smetrics.Sample,
 	summary.Preemptions = d.Preemptions
 	summary.SpecDrafts = d.SpecDrafts
 	summary.SpecAcceptedTokens = d.SpecAcceptedTokens
+	summary.PromptTokens = d.PromptTokens
 	summary.GenerationTokens = d.GenerationTokens
 	summary.Hists = smetrics.HistDeltas(before, after, e.provider)
 	return summary

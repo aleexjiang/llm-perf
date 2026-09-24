@@ -154,6 +154,65 @@ func TestServerMetricsPreemptionsZeroKept(t *testing.T) {
 	}
 }
 
+// SGLang 的 prompt/generation counter 必须随 ServerMetricsSummary 落盘；
+// 缺字段时 omitempty 会隐藏，消费方无法区分“引擎没暴露”和“工具没接线”。
+func TestServerMetricsTokenCountersKept(t *testing.T) {
+	b, err := json.Marshal(ServerMetricsSummary{Available: true, PromptTokens: 1000, GenerationTokens: 800})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	s := string(b)
+	if !strings.Contains(s, `"prompt_tokens":1000`) ||
+		!strings.Contains(s, `"generation_tokens":800`) {
+		t.Fatalf("服务端 token counter 未落盘: %s", s)
+	}
+}
+
+// user/rps/concurrency 共用总吞吐入口：吞吐只看完整成功请求；
+// stop/length 分层的加权单流速度不能混成一个中位数。
+func TestBuildThroughputSummary(t *testing.T) {
+	base := time.Unix(100, 0)
+	summary := BuildThroughputSummary([]*engine.TurnMetrics{
+		{Stream: true, SentAt: base, EndAt: base.Add(1100 * time.Millisecond), TTFT: 100, E2EMS: 1100, CompletionTokens: 100, TPOTMS: 10, FinishReason: "stop"},
+		{Stream: true, SentAt: base, EndAt: base.Add(2200 * time.Millisecond), TTFT: 200, E2EMS: 2200, CompletionTokens: 100, TPOTMS: 20, FinishReason: "length"},
+		{Stream: true, Error: "HTTP 500", CompletionTokens: 50, FinishReason: "stop"},
+		{Stream: true, Cancelled: true, CompletionTokens: 50},
+	}, 2)
+	if summary.CompletedRequests != 2 || summary.FailedRequests != 1 || summary.CancelledRequests != 1 {
+		t.Fatalf("完成/失败/取消计数错误: %+v", summary)
+	}
+	if summary.CompletionTokens != 200 || summary.ThroughputTPS != 100 {
+		t.Fatalf("总吞吐错误: tokens=%d tps=%v", summary.CompletionTokens, summary.ThroughputTPS)
+	}
+	if summary.Streaming.All.Count != 2 || summary.Streaming.All.WeightedTPS != 200.0/3.0 {
+		t.Fatalf("全成功分层错误: %+v", summary.Streaming.All)
+	}
+	if summary.ActiveDecodeTokens != 200 || summary.ActiveDecodeTPS <= 0 {
+		t.Fatalf("活跃 decode 聚合错误: %+v", summary)
+	}
+	if summary.Streaming.Stop.Count != 1 || summary.Streaming.Stop.WeightedTPS != 100 {
+		t.Fatalf("stop 分层错误: %+v", summary.Streaming.Stop)
+	}
+	if summary.Streaming.Length.Count != 1 || summary.Streaming.Length.WeightedTPS != 50 {
+		t.Fatalf("length 分层错误: %+v", summary.Streaming.Length)
+	}
+}
+
+func TestBuildThroughputSummaryActiveDecodeUnion(t *testing.T) {
+	base := time.Unix(100, 0)
+	summary := BuildThroughputSummary([]*engine.TurnMetrics{
+		{Stream: true, SentAt: base, TTFT: 100, E2EMS: 1000, EndAt: base.Add(time.Second), CompletionTokens: 10, FinishReason: "stop"},
+		{Stream: true, SentAt: base.Add(200 * time.Millisecond), TTFT: 100, E2EMS: 1000, EndAt: base.Add(1200 * time.Millisecond), CompletionTokens: 10, FinishReason: "stop"},
+	}, 2)
+	// 两条 decode 区间并集 = [100ms,1200ms] = 1.1s；重叠区应相加，而不是把两条单流速率平均。
+	if summary.ActiveDecodeSeconds < 1.09 || summary.ActiveDecodeSeconds > 1.11 {
+		t.Fatalf("活跃 decode 并集时间错误: %v", summary.ActiveDecodeSeconds)
+	}
+	if got := summary.ActiveDecodeTPS; got < 18 || got > 19 {
+		t.Fatalf("活跃 decode 聚合吞吐错误: %v", got)
+	}
+}
+
 // 12.3：末轮实测深度取最后一个非零 prompt 轮——失败轮（0）不计入，避免名义对照
 // 拿到 0/NaN；全零时保持 0（观测缺失语义，由 Python 侧标注）。
 func TestFillLastPromptTokens(t *testing.T) {

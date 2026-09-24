@@ -350,15 +350,6 @@ func avg(xs []float64) float64 {
 	return s / float64(len(xs))
 }
 
-// percentile 线性插值分位（偶数样本的 P50 自动等于两中值平均）。
-// 与外部分析的中位数口径一致——
-// 之前的 floor 取整口径在偶数样本时系统性偏低半步。
-func percentile(xs []float64, p float64) float64 {
-	s := append([]float64(nil), xs...)
-	sort.Float64s(s)
-	return percentileSorted(s, p)
-}
-
 func percentileSorted(s []float64, p float64) float64 {
 	n := len(s)
 	if n == 0 {

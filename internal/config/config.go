@@ -167,13 +167,12 @@ func (t Thinking) ProbeExtraBodies() (on, off map[string]any) {
 
 // VariantNames 返回全部变体名（忽略 CLI 过滤）——CLI --thinking 校验用。
 func (t Thinking) VariantNames() []string {
-	saved := t.filter
-	t.filter = ""
+	all := t
+	all.filter = ""
 	var names []string
-	for _, v := range t.Variants() {
+	for _, v := range all.Variants() {
 		names = append(names, v.Name)
 	}
-	t.filter = saved
 	return names
 }
 
@@ -213,7 +212,7 @@ func (t Thinking) Variants() []ThinkingVariant {
 	var vs []ThinkingVariant
 	if len(t.Levels) > 0 {
 		for _, lv := range t.Levels {
-			vs = append(vs, ThinkingVariant{Name: lv.Name, Enabled: lv.Enabled, ExtraBody: lv.ExtraBody})
+			vs = append(vs, ThinkingVariant(lv))
 		}
 	} else {
 		switch t.Mode {

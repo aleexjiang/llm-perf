@@ -76,26 +76,54 @@ func requestRunner(ctx context.Context, e *env, model string, v config.ThinkingV
 	return m
 }
 
-// finishLevel 汇总一个档位的吞吐/成败计数。
-func finishLevel(lv *report.ConcurrentLevel) {
+// finishLevel 汇总一个档位的吞吐、成败计数与 SLO goodput。
+func finishLevel(e *env, lv *report.ConcurrentLevel) {
 	wall := lv.WallSeconds
 	completed, failed, cancelled, tokens := 0, 0, 0, 0.0
+	meet, total, goodTokens := 0, 0, 0.0
+	var decodeIntervals [][2]time.Time
+	activeTokens := 0.0
+	sloEnabled := e.cfg.EffGoodput() != nil
 	for _, m := range lv.Requests {
 		switch {
 		case m.Cancelled:
 			cancelled++
 		case m.Error != "":
 			failed++
+			if sloEnabled {
+				total++
+			}
 		default:
 			completed++
 			tokens += float64(m.CompletionTokens)
+			if m.Stream && m.TTFT > 0 && m.E2EMS > m.TTFT && !m.SentAt.IsZero() && !m.EndAt.IsZero() {
+				start := m.SentAt.Add(time.Duration(m.TTFT * float64(time.Millisecond)))
+				if m.EndAt.After(start) {
+					decodeIntervals = append(decodeIntervals, [2]time.Time{start, m.EndAt})
+					activeTokens += float64(m.CompletionTokens)
+				}
+			}
+			if sloEnabled {
+				total++
+				if goodputOf(e, m) {
+					meet++
+					goodTokens += float64(m.CompletionTokens)
+				}
+			}
 		}
 	}
 	lv.CompletedRequests = completed
 	lv.FailedRequests = failed
 	lv.CancelledRequests = cancelled
+	lv.SLOMeet = meet
+	lv.SLOTotal = total
 	if wall > 0 {
 		lv.ThroughputTPS = tokens / wall
+		lv.GoodputRPS = float64(meet) / wall
+		lv.GoodputTPS = goodTokens / wall
+	}
+	if secs := report.UnionSeconds(decodeIntervals); secs > 0 {
+		lv.ActiveDecodeTPS = activeTokens / secs
 	}
 }
 
@@ -170,6 +198,13 @@ func RPSScenario(ctx context.Context, cfg *config.Config, client *engine.Client,
 			}
 		}
 	}
+	var allReqs []*engine.TurnMetrics
+	var wall float64
+	for _, lv := range rep.Concurrent {
+		wall += lv.WallSeconds
+		allReqs = append(allReqs, lv.Requests...)
+	}
+	rep.Throughput = report.BuildThroughputSummary(allReqs, wall)
 	return rep, nil
 }
 
@@ -178,6 +213,7 @@ func runRequestArrival(ctx context.Context, e *env, model string, v config.Think
 	samples []engine.RequestSample, rate float64, maxConcurrency int, burstiness float64) report.ConcurrentLevel {
 
 	lv := report.ConcurrentLevel{Model: model, Thinking: v.Name, Level: 0, RequestRate: rate}
+	waitStart, runningStart := e.gaugeSampleStarts()
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	arrivals := poissonDelays(len(samples), rate, burstiness, rng)
 	base := time.Now()
@@ -223,7 +259,8 @@ func runRequestArrival(ctx context.Context, e *env, model string, v config.Think
 	}
 	wg.Wait()
 	lv.WallSeconds = time.Since(start).Seconds()
-	finishLevel(&lv)
+	e.applyGaugePeaks(&lv, waitStart, runningStart)
+	finishLevel(e, &lv)
 	return lv
 }
 
@@ -284,6 +321,13 @@ func ConcurrencyScenario(ctx context.Context, cfg *config.Config, client *engine
 			}
 		}
 	}
+	var allReqs []*engine.TurnMetrics
+	var wall float64
+	for _, lv := range rep.Concurrent {
+		wall += lv.WallSeconds
+		allReqs = append(allReqs, lv.Requests...)
+	}
+	rep.Throughput = report.BuildThroughputSummary(allReqs, wall)
 	return rep, nil
 }
 
@@ -295,6 +339,7 @@ func runRequestBarrier(ctx context.Context, e *env, model string, v config.Think
 	samples []engine.RequestSample, level int, requestRate, burstiness float64) report.ConcurrentLevel {
 
 	lv := report.ConcurrentLevel{Model: model, Thinking: v.Name, Level: level}
+	waitStart, runningStart := e.gaugeSampleStarts()
 	if requestRate > 0 {
 		lv.RequestRate = requestRate
 	}
@@ -360,6 +405,7 @@ func runRequestBarrier(ctx context.Context, e *env, model string, v config.Think
 	}
 	wg.Wait()
 	lv.WallSeconds = time.Since(start).Seconds()
-	finishLevel(&lv)
+	e.applyGaugePeaks(&lv, waitStart, runningStart)
+	finishLevel(e, &lv)
 	return lv
 }

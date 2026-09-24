@@ -264,16 +264,3 @@ func SelectBook(lang string, seed int64) *Book {
 	_, _ = h.Write(buf[:])
 	return bs[h.Sum64()%uint64(len(bs))]
 }
-
-// LibraryInfo 语料库概览（日志用）：每语言的书目数与估算 token 总量。
-func LibraryInfo(lang string) string {
-	bs := Library(lang)
-	if len(bs) == 0 {
-		return ""
-	}
-	total := 0
-	for _, b := range bs {
-		total += b.EstimateTokens()
-	}
-	return fmt.Sprintf("library[%s] %d books ≈ %d tokens", lang, len(bs), total)
-}

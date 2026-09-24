@@ -26,13 +26,6 @@ func LoadCorpus(spec, lang string) error {
 	return nil
 }
 
-// UnloadCorpus 注销语料（测试隔离用），Filler 回退合成词表。
-func UnloadCorpus(lang string) {
-	corpusRegistryMu.Lock()
-	delete(corpusRegistry, lang)
-	corpusRegistryMu.Unlock()
-}
-
 // CorpusInfo 返回已注册语料的信息（日志用）。
 func CorpusInfo(lang string) string {
 	corpusRegistryMu.RLock()

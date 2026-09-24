@@ -5,6 +5,13 @@ import (
 	"testing"
 )
 
+// UnloadCorpus 注销语料（测试隔离用），Filler 回退合成词表。
+func UnloadCorpus(lang string) {
+	corpusRegistryMu.Lock()
+	delete(corpusRegistry, lang)
+	corpusRegistryMu.Unlock()
+}
+
 func TestFillerCorpusMode(t *testing.T) {
 	if err := LoadCorpus("en", "en"); err != nil {
 		t.Skip("内置语料不可用:", err)

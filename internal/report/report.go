@@ -5,8 +5,10 @@ package report
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/aleexjiang/llm-perf/internal/engine"
@@ -69,7 +71,8 @@ type ConcurrentLevel struct {
 	Requests          []*engine.TurnMetrics `json:"requests,omitempty"`
 	Sessions          []MultiturnRun        `json:"sessions,omitempty"`
 	WallSeconds       float64               `json:"wall_seconds"`
-	ThroughputTPS     float64               `json:"throughput_tps"` // 完整成功请求的 completion tokens/s
+	ThroughputTPS     float64               `json:"throughput_tps"`              // 完整成功请求的 completion tokens/s
+	ActiveDecodeTPS   float64               `json:"active_decode_tps,omitempty"` // Σ completion / decode 区间并集
 	CompletedRequests int                   `json:"completed_requests"`
 	FailedRequests    int                   `json:"failed_requests"`
 	CancelledRequests int                   `json:"cancelled_requests"`
@@ -217,7 +220,8 @@ type ServerMetricsSummary struct {
 	Available bool   `json:"available"`
 	Note      string `json:"note,omitempty"`
 
-	// counter 窗口差值（并发窗口内为混合贡献；命中率 = hit/query）
+	// counter 窗口差值（并发窗口内为混合贡献；vLLM 命中率 = hit/query）。
+	// SGLang 不暴露 hit/query counter，其 cache_hit_rate 作为 gauge 落在 Gauges。
 	CacheHitTokens   float64 `json:"cache_hit_tokens,omitempty"`
 	CacheQueryTokens float64 `json:"cache_query_tokens,omitempty"`
 	// 刻意不加 omitempty：0 表示「窗口内没有发生抢占」这一**有意义的好结果**。
@@ -227,7 +231,10 @@ type ServerMetricsSummary struct {
 	SpecDrafts         float64 `json:"spec_drafts,omitempty"`
 	SpecAcceptedTokens float64 `json:"spec_accepted_tokens,omitempty"`
 
-	// GenerationTokens 窗口内服务端自报的生成 token 数（counter 差值；0 = 引擎未暴露该指标）。
+	// PromptTokens / GenerationTokens：窗口内服务端自报的 prefill / 生成 token 数
+	// （counter 差值；0 = 引擎未暴露该指标；SGLang 两者均提供）。
+	PromptTokens float64 `json:"prompt_tokens,omitempty"`
+	// GenerationTokens 服务端自报的生成 token 数用于两源一致性交叉校验，不参与评测指标。
 	// 服务端观测面的原始事实，报告侧据此做两源一致性交叉校验；不参与任何评测指标。
 	GenerationTokens float64 `json:"generation_tokens,omitempty"`
 
@@ -270,6 +277,181 @@ type SourceCheck struct {
 	Note      string  `json:"note,omitempty"` // 不可比原因（NA 口径）
 }
 
+// ThroughputSummary 是场景级总吞吐与单流速度的稳定入口。
+// 不把 user 的会话展开成并发档位：user 的墙钟由场景层记录，rps/concurrency
+// 可由各档位汇总；分层单流速度避免把 stop 正常完成轮与 length 截断轮混成一个中位数。
+type ThroughputSummary struct {
+	WallSeconds       float64 `json:"wall_seconds"`
+	CompletedRequests int     `json:"completed_requests"`
+	FailedRequests    int     `json:"failed_requests"`
+	CancelledRequests int     `json:"cancelled_requests"`
+	CompletionTokens  int     `json:"completion_tokens"`
+	ThroughputTPS     float64 `json:"throughput_tps"` // completion_tokens / wall_seconds
+
+	// ActiveDecode 是时间对齐后的“活跃 decode 聚合”：把每条成功流式请求的
+	// [TTFT, E2E] 区间投影到同一时间轴，只在至少一个请求处于 decode 时统计。
+	// ActiveDecodeTPS = ActiveDecodeTokens / ActiveDecodeSeconds。
+	ActiveDecodeTokens  int     `json:"active_decode_tokens,omitempty"`
+	ActiveDecodeSeconds float64 `json:"active_decode_seconds,omitempty"`
+	ActiveDecodeTPS     float64 `json:"active_decode_tps,omitempty"`
+
+	// 流式单流速度按完成类型分层；加权值 = 分层总 completion / 分层总 decode 时间。
+	// P50/P95 只作分布参照，不能替代加权值。
+	Streaming struct {
+		All    ThroughputClass `json:"all"`
+		Stop   ThroughputClass `json:"stop"`
+		Length ThroughputClass `json:"length"`
+	} `json:"streaming"`
+}
+
+// ThroughputClass 一层请求/轮次的单流统计。
+type ThroughputClass struct {
+	Count               int     `json:"count"`
+	CompletionTokens    int     `json:"completion_tokens"`
+	DecodeSeconds       float64 `json:"decode_seconds"`
+	WeightedTPS         float64 `json:"weighted_tps"` // completion_tokens / decode_seconds
+	ActiveDecodeTokens  int     `json:"active_decode_tokens,omitempty"`
+	ActiveDecodeSeconds float64 `json:"active_decode_seconds,omitempty"`
+	ActiveDecodeTPS     float64 `json:"active_decode_tps,omitempty"`
+	P50TPS              float64 `json:"p50_tps,omitempty"`
+	P95TPS              float64 `json:"p95_tps,omitempty"`
+	P99TPS              float64 `json:"p99_tps,omitempty"`
+	P50TTFTMS           float64 `json:"p50_ttft_ms,omitempty"`
+	P95TTFTMS           float64 `json:"p95_ttft_ms,omitempty"`
+	P50TPOTMS           float64 `json:"p50_tpot_ms,omitempty"`
+	P95TPOTMS           float64 `json:"p95_tpot_ms,omitempty"`
+}
+
+// BuildThroughputSummary 汇总场景内所有 TurnMetrics。
+// wallSeconds 由调用方提供：user 用场景起止时间，rps/concurrency 用各档位墙钟之和。
+func BuildThroughputSummary(ms []*engine.TurnMetrics, wallSeconds float64) *ThroughputSummary {
+	out := &ThroughputSummary{WallSeconds: wallSeconds}
+	type bucket struct {
+		count        int
+		tokens       int
+		decodeS      float64
+		activeTokens int
+		intervals    [][2]time.Time
+		tps          []float64
+		ttft         []float64
+		tpot         []float64
+	}
+	var all, stop, length bucket
+
+	add := func(m *engine.TurnMetrics, b *bucket) {
+		b.count++
+		b.tokens += m.CompletionTokens
+		if ttft := m.TTFT; m.Stream && ttft > 0 {
+			b.ttft = append(b.ttft, ttft)
+		}
+		if tpot := m.TPOTMS; m.Stream && tpot > 0 {
+			b.tpot = append(b.tpot, tpot)
+		}
+		if !m.Stream || m.TTFT <= 0 || m.E2EMS <= m.TTFT || m.CompletionTokens <= 0 {
+			return
+		}
+		decode := (m.E2EMS - m.TTFT) / 1000
+		b.decodeS += decode
+		b.tps = append(b.tps, float64(m.CompletionTokens)/decode)
+		if !m.SentAt.IsZero() && !m.EndAt.IsZero() {
+			start := m.SentAt.Add(time.Duration(m.TTFT * float64(time.Millisecond)))
+			if m.EndAt.After(start) {
+				b.intervals = append(b.intervals, [2]time.Time{start, m.EndAt})
+				b.activeTokens += m.CompletionTokens
+			}
+		}
+	}
+
+	for _, m := range ms {
+		if m == nil {
+			continue
+		}
+		switch {
+		case m.Cancelled:
+			out.CancelledRequests++
+			continue
+		case m.Error != "":
+			out.FailedRequests++
+			continue
+		default:
+			out.CompletedRequests++
+			out.CompletionTokens += m.CompletionTokens
+			add(m, &all)
+			switch m.FinishReason {
+			case "stop":
+				add(m, &stop)
+			case "length":
+				add(m, &length)
+			}
+		}
+	}
+	if wallSeconds > 0 {
+		out.ThroughputTPS = float64(out.CompletionTokens) / wallSeconds
+	}
+	finalize := func(b bucket) ThroughputClass {
+		c := ThroughputClass{Count: b.count, CompletionTokens: b.tokens, DecodeSeconds: b.decodeS}
+		if b.decodeS > 0 {
+			c.WeightedTPS = float64(b.tokens) / b.decodeS
+		}
+		c.ActiveDecodeTokens = b.activeTokens
+		c.ActiveDecodeSeconds = UnionSeconds(b.intervals)
+		if c.ActiveDecodeSeconds > 0 {
+			c.ActiveDecodeTPS = float64(c.ActiveDecodeTokens) / c.ActiveDecodeSeconds
+		}
+		c.P50TPS = percentileOrZero(b.tps, 0.50)
+		c.P95TPS = percentileOrZero(b.tps, 0.95)
+		c.P99TPS = percentileOrZero(b.tps, 0.99)
+		c.P50TTFTMS = percentileOrZero(b.ttft, 0.50)
+		c.P95TTFTMS = percentileOrZero(b.ttft, 0.95)
+		c.P50TPOTMS = percentileOrZero(b.tpot, 0.50)
+		c.P95TPOTMS = percentileOrZero(b.tpot, 0.95)
+		return c
+	}
+	out.Streaming.All = finalize(all)
+	out.Streaming.Stop = finalize(stop)
+	out.Streaming.Length = finalize(length)
+	out.ActiveDecodeTokens = out.Streaming.All.ActiveDecodeTokens
+	out.ActiveDecodeSeconds = out.Streaming.All.ActiveDecodeSeconds
+	out.ActiveDecodeTPS = out.Streaming.All.ActiveDecodeTPS
+	return out
+}
+
+// UnionSeconds 返回时间区间并集总秒数（供场景层与报告层复用）。
+func UnionSeconds(intervals [][2]time.Time) float64 {
+	if len(intervals) == 0 {
+		return 0
+	}
+	sorted := append([][2]time.Time(nil), intervals...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i][0].Before(sorted[j][0]) })
+	start, end := sorted[0][0], sorted[0][1]
+	total := 0.0
+	for _, iv := range sorted[1:] {
+		if !iv[0].After(end) {
+			if iv[1].After(end) {
+				end = iv[1]
+			}
+			continue
+		}
+		total += end.Sub(start).Seconds()
+		start, end = iv[0], iv[1]
+	}
+	return total + end.Sub(start).Seconds()
+}
+
+func percentileOrZero(xs []float64, p float64) float64 {
+	if len(xs) == 0 {
+		return 0
+	}
+	s := append([]float64(nil), xs...)
+	sort.Float64s(s)
+	idx := p * float64(len(s)-1)
+	lo, hi := int(math.Floor(idx)), int(math.Ceil(idx))
+	if lo == hi {
+		return s[lo]
+	}
+	return s[lo] + (s[hi]-s[lo])*(idx-float64(lo))
+}
+
 // Version 是工具版本，随每个 JSON 输出落盘（报告追溯用）。
 // 默认 dev；Makefile 构建时用 -ldflags 注入 git describe 版本号。
 var Version = "llm-perf/dev"
@@ -277,7 +459,7 @@ var Version = "llm-perf/dev"
 // SchemaVersionCurrent 数据契约版本：JSON 结构变更时递增，外部消费方据此做兼容判断。
 // 契约唯一权威文档 docs/data-contract.md，与本值同步维护（2026-09-17 报告层剥离后，
 // 这份 JSON 契约就是工具的对外接口）。
-const SchemaVersionCurrent = 5
+const SchemaVersionCurrent = 7
 
 // Report 是一次场景执行的完整数据，整体落盘为单个 JSON 文件。
 type Report struct {
@@ -305,6 +487,8 @@ type Report struct {
 	KVCapacity *smetrics.KVCapacity `json:"kv_capacity,omitempty"`
 	// SourceCheck 两源一致性（10.1，仅并发场景计算）：客户端 vs 服务端生成吞吐。
 	SourceCheck *SourceCheck `json:"source_check,omitempty"`
+	// Throughput 场景级总吞吐与分层单流速度；user 也统一从这里看总吞吐。
+	Throughput *ThroughputSummary `json:"throughput,omitempty"`
 
 	// 环境存档：几周后回看数据时"当时是什么引擎/什么配置跑的"必须有据可查。
 	Environment *engine.ProbeResult `json:"environment,omitempty"`
@@ -376,6 +560,7 @@ func (r *Report) PartitionByModel() []*Report {
 			Server:         r.Server,
 			KVCapacity:     r.KVCapacity,
 			SourceCheck:    r.SourceCheck,
+			Throughput:     r.Throughput,
 			Environment:    r.Environment,
 			ConfigRaw:      r.ConfigRaw,
 			PartitionModel: model,

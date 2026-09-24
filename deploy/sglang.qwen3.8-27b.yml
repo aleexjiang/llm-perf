@@ -17,7 +17,7 @@
 # bench 侧注意点：
 #   - 换引擎先跑 ./bench probe -c <bench 配置>，确认思考字段名与 usage 回传
 #   - 端口 8849:8000 与 vLLM 基线一致，bench 配置 endpoint 不用改
-#   - SGLang 自带 /metrics Prometheus 指标，server_metrics: true 可开观测层
+#   - SGLang 需显式 --enable-metrics 才暴露 /metrics；server_metrics: true 可开观测层
 
 services:
   qwen3.8:
@@ -53,6 +53,7 @@ services:
       --max-running-requests 4
       --mem-fraction-static 0.9
       --reasoning-parser qwen3
+      --enable-metrics
       --host 0.0.0.0
       --port 8000
 

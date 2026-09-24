@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"fmt"
 	"math/rand"
 	"strings"
 
@@ -76,26 +75,4 @@ func Filler(targetTokens int, seed int64, lang string) string {
 		}
 		return strings.TrimSpace(b.String())
 	}
-}
-
-// UserMsg 构造一条指定近似 token 数的 user 消息。
-func UserMsg(targetTokens int, seed int64, lang string) Message {
-	return Message{Role: "user", Content: Filler(targetTokens, seed, lang)}
-}
-
-// SystemMsg 构造 system 消息，可包含模拟的 tool definitions 段落。
-func SystemMsg(sysTokens, toolDefsTokens int, seed int64, lang string) Message {
-	var b strings.Builder
-	if sysTokens > 0 {
-		b.WriteString("You are a helpful assistant. Follow the operating guidelines below.\n")
-		b.WriteString(Filler(sysTokens, seed, lang))
-	}
-	if toolDefsTokens > 0 {
-		b.WriteString("\n\n# Available tools\n")
-		for i := 0; i < 10 && i < toolDefsTokens/200+1; i++ {
-			b.WriteString(fmt.Sprintf("- tool_%d(name, params): perform operation %d on the target resource.\n", i, i))
-		}
-		b.WriteString(Filler(toolDefsTokens, seed+1, lang))
-	}
-	return Message{Role: "system", Content: b.String()}
 }

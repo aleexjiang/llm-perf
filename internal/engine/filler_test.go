@@ -22,8 +22,12 @@ func TestFiller_Deterministic(t *testing.T) {
 	if Filler(5000, 43, "en") == a {
 		t.Fatal("different seed produced identical text — 并发实验会伪缓存命中")
 	}
-	if Filler(2000, 42, "zh") != Filler(2000, 42, "zh") {
+	zhA := Filler(2000, 42, "zh")
+	if zhA != Filler(2000, 42, "zh") {
 		t.Fatal("zh filler not deterministic")
+	}
+	if Filler(2000, 43, "zh") == zhA {
+		t.Fatal("zh filler ignored seed")
 	}
 }
 

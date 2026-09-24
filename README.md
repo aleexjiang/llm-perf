@@ -200,7 +200,12 @@ server_metrics: true   # 有 /metrics 就多采一份（vLLM 默认暴露）；�
 
 指标命名经 `MetricsProvider` 抽象，**按抓取样本的指标名前缀自动识别引擎**（`vllm:` → vLLM、
 `sglang:` → SGLang；无法识别时日志显式告警"按 vLLM 命名尝试，服务端指标大概率拿不到数"，
-不静默套错——自研网关属预期）；SGLang 的缓存 counter 命名待真机校准。
+不静默套错——自研网关属预期）。SGLang 需以 `--enable-metrics` 启动；其官方指标提供
+prompt/generation token counter、running/queue/KV/cache-hit-rate gauge，以及 TTFT / E2E /
+TPOT histogram。SGLang 当前不提供 vLLM 式的 preemption counter，因此该项按缺失处理，
+不会伪造为 0。`cache_hit_rate` 是 SGLang 的瞬时 gauge，工具在 `gauges.cache_hit_rate`
+给出轮询窗口的 max/avg；它不等于“本次请求窗口的 hit/query 命中率”，不要与 vLLM 的
+`cache_hit_tokens/cache_query_tokens` 直接混用。
 **/metrics 抓取带认证头**（`auth_scheme`/`auth_header` 对探测、场景快照与 gauge 轮询同样生效）——
 网关把 metrics 端点与业务接口用同一套认证保护时不会误判不可用。
 gauge 轮询自带健康度：从未成功或连续失败 ≥5 时 JSON 标记 `observation_degraded`，报告出红色警示。
@@ -320,4 +325,6 @@ deploy/             # 推理服务 compose 存档：vLLM 基线 + SGLang / Tenso
 - [docs/latency-baselines.md](docs/latency-baselines.md) — 体验基线 3 档制的依据与原文链接
 - [docs/testing-architecture.md](docs/testing-architecture.md) — 评测体系架构：指标第一性原理与冻结、四层模型、三类测试、trace/filler 分工、客户端计时立场、减法纪律（2026-09-12 定稿）
 - [AGENTS.md](AGENTS.md) — 统一项目指南：项目边界、运行方式、设计拍板、验证纪律与工程陷阱
-- [docs/real-machine-28.39.118.57-20260921.md](docs/real-machine-28.39.118.57-20260921.md) — 最新真机全量测试记录
+
+> 真机测试配置、原始产物和分析记录统一放在 gitignored 的 `llm-perf-test/`；
+> 真机测试记录位于 `llm-perf-test/docs/`，不进入仓库发布面。

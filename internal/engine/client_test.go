@@ -9,11 +9,21 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+// percentile 线性插值分位（偶数样本的 P50 自动等于两中值平均）。
+// 与外部分析的中位数口径一致——
+// 之前的 floor 取整口径在偶数样本时系统性偏低半步。
+func percentile(xs []float64, p float64) float64 {
+	s := append([]float64(nil), xs...)
+	sort.Float64s(s)
+	return percentileSorted(s, p)
+}
 
 // ── 重试策略：只对连接层瞬时失败重试，计时窗口干净，重试本身留痕 ──
 

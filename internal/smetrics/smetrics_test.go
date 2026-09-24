@@ -222,18 +222,26 @@ func TestDetectProvider(t *testing.T) {
 
 func TestSGLangGaugeNames(t *testing.T) {
 	sg := SGLang()
-	if _, ok := sg.CounterNames()["prefix_cache_hits"]; ok {
-		t.Fatal("sglang 缓存 counter 应为空（草案，接真机校准）")
+	if _, ok := sg.CounterNames()["generation_tokens"]; !ok {
+		t.Fatal("sglang 应采集 generation_tokens 用于两源一致性")
 	}
 	cands := sg.GaugeNames()["running"]
 	if len(cands) == 0 || cands[0] != "sglang:num_running_reqs" {
 		t.Fatalf("sglang running 候选名错误: %v", cands)
 	}
+	if cands := sg.GaugeNames()["cache_hit_rate"]; len(cands) == 0 || cands[0] != "sglang:cache_hit_rate" {
+		t.Fatalf("sglang cache_hit_rate 候选名错误: %v", cands)
+	}
+	hists := sg.HistNames()
+	if len(hists) != 3 || hists[0] != "sglang:time_to_first_token_seconds" {
+		t.Fatalf("sglang histogram 候选名错误: %v", hists)
+	}
 }
 
 func TestPollerSGLangNaming(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, "sglang:num_running_reqs 3\nsglang:num_queue_reqs 1\nsglang:token_usage 0.5\n")
+		fmt.Fprint(w, "sglang:num_running_reqs 3\nsglang:num_queue_reqs 1\n"+
+			"sglang:token_usage 0.5\nsglang:num_used_tokens 123859\nsglang:cache_hit_rate 0.42\n")
 	}))
 	defer srv.Close()
 
@@ -248,6 +256,72 @@ func TestPollerSGLangNaming(t *testing.T) {
 	sum := g.Summary()
 	if sum["running"].Max != 3 || sum["waiting"].Max != 1 || sum["kv_usage"].Max != 0.5 {
 		t.Fatalf("sglang gauge 取值错误: %+v", sum)
+	}
+	if sum["kv_used_tokens"].Max != 123859 || sum["cache_hit_rate"].Max != 0.42 {
+		t.Fatalf("sglang cache/kv gauge 取值错误: %+v", sum)
+	}
+}
+
+const sglangSampleText = `# HELP sglang:prompt_tokens_total Number of prefill tokens processed.
+# TYPE sglang:prompt_tokens_total counter
+sglang:prompt_tokens_total{model_name="qwen3.8-27b"} 8128902
+# HELP sglang:generation_tokens_total Number of generation tokens processed.
+# TYPE sglang:generation_tokens_total counter
+sglang:generation_tokens_total{model_name="qwen3.8-27b"} 7557572
+# HELP sglang:token_usage The token usage
+# TYPE sglang:token_usage gauge
+sglang:token_usage{model_name="qwen3.8-27b"} 0.28
+# HELP sglang:num_used_tokens The number of used tokens
+# TYPE sglang:num_used_tokens gauge
+sglang:num_used_tokens{model_name="qwen3.8-27b"} 123859
+# HELP sglang:cache_hit_rate The cache hit rate
+# TYPE sglang:cache_hit_rate gauge
+sglang:cache_hit_rate{model_name="qwen3.8-27b"} 0.62
+# HELP sglang:time_to_first_token_seconds Histogram of time to first token in seconds.
+# TYPE sglang:time_to_first_token_seconds histogram
+sglang:time_to_first_token_seconds_bucket{le="0.1",model_name="qwen3.8-27b"} 4
+sglang:time_to_first_token_seconds_bucket{le="1.0",model_name="qwen3.8-27b"} 8
+sglang:time_to_first_token_seconds_bucket{le="+Inf",model_name="qwen3.8-27b"} 10
+sglang:time_to_first_token_seconds_sum{model_name="qwen3.8-27b"} 2.0
+sglang:time_to_first_token_seconds_count{model_name="qwen3.8-27b"} 10
+# HELP sglang:e2e_request_latency_seconds Histogram of End-to-end request latency in seconds
+# TYPE sglang:e2e_request_latency_seconds histogram
+sglang:e2e_request_latency_seconds_bucket{le="1.0",model_name="qwen3.8-27b"} 4
+sglang:e2e_request_latency_seconds_bucket{le="10.0",model_name="qwen3.8-27b"} 8
+sglang:e2e_request_latency_seconds_bucket{le="+Inf",model_name="qwen3.8-27b"} 10
+sglang:e2e_request_latency_seconds_sum{model_name="qwen3.8-27b"} 20.0
+sglang:e2e_request_latency_seconds_count{model_name="qwen3.8-27b"} 10
+# HELP sglang:time_per_output_token_seconds Histogram of time per output token in seconds.
+# TYPE sglang:time_per_output_token_seconds histogram
+sglang:time_per_output_token_seconds_bucket{le="0.05",model_name="qwen3.8-27b"} 4
+sglang:time_per_output_token_seconds_bucket{le="0.5",model_name="qwen3.8-27b"} 8
+sglang:time_per_output_token_seconds_bucket{le="+Inf",model_name="qwen3.8-27b"} 10
+sglang:time_per_output_token_seconds_sum{model_name="qwen3.8-27b"} 1.0
+sglang:time_per_output_token_seconds_count{model_name="qwen3.8-27b"} 10
+`
+
+func TestSGLangCountersAndHistograms(t *testing.T) {
+	before := Parse(sglangSampleText)
+	after := Parse(strings.NewReplacer(
+		"sglang:prompt_tokens_total{model_name=\"qwen3.8-27b\"} 8128902", "sglang:prompt_tokens_total{model_name=\"qwen3.8-27b\"} 8129902",
+		"sglang:generation_tokens_total{model_name=\"qwen3.8-27b\"} 7557572", "sglang:generation_tokens_total{model_name=\"qwen3.8-27b\"} 7558572",
+		"sglang:time_to_first_token_seconds_bucket{le=\"0.1\",model_name=\"qwen3.8-27b\"} 4", "sglang:time_to_first_token_seconds_bucket{le=\"0.1\",model_name=\"qwen3.8-27b\"} 14",
+		"sglang:time_to_first_token_seconds_bucket{le=\"1.0\",model_name=\"qwen3.8-27b\"} 8", "sglang:time_to_first_token_seconds_bucket{le=\"1.0\",model_name=\"qwen3.8-27b\"} 28",
+		"sglang:time_to_first_token_seconds_bucket{le=\"+Inf\",model_name=\"qwen3.8-27b\"} 10", "sglang:time_to_first_token_seconds_bucket{le=\"+Inf\",model_name=\"qwen3.8-27b\"} 30",
+		"sglang:time_to_first_token_seconds_sum{model_name=\"qwen3.8-27b\"} 2.0", "sglang:time_to_first_token_seconds_sum{model_name=\"qwen3.8-27b\"} 3.0",
+		"sglang:time_to_first_token_seconds_count{model_name=\"qwen3.8-27b\"} 10", "sglang:time_to_first_token_seconds_count{model_name=\"qwen3.8-27b\"} 30",
+	).Replace(sglangSampleText))
+	d := DiffCounters(before, after, SGLang())
+	if d.PromptTokens != 1000 || d.GenerationTokens != 1000 {
+		t.Fatalf("sglang counter delta 错误: prompt=%v generation=%v", d.PromptTokens, d.GenerationTokens)
+	}
+	h := HistDeltas(before, after, SGLang())
+	ttft := h["sglang:time_to_first_token_seconds"]
+	if ttft.Count != 20 || ttft.Mean != 0.05 || ttft.P50 != 0.1 {
+		t.Fatalf("sglang TTFT histogram 错误: %+v", ttft)
+	}
+	if _, ok := h["sglang:e2e_request_latency_seconds"]; ok {
+		t.Fatalf("无增量的 SGLang E2E histogram 不应出现: %+v", h)
 	}
 }
 
@@ -344,44 +418,5 @@ func TestScrapeTruncatedBodyRejected(t *testing.T) {
 	sc := &Scraper{URL: srv.URL, Client: srv.Client()}
 	if _, err := sc.Scrape(context.Background()); err == nil || !strings.Contains(err.Error(), "截断") {
 		t.Fatalf("超限响应应报截断错误, got %v", err)
-	}
-}
-
-// LatestWaiting：饱和止损取实时排队深度用——最后一次成功采样的值，从未采到时 ok=false。
-func TestPollerLatestWaiting(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, "vllm:num_requests_running 2\nvllm:num_requests_waiting 7\n")
-	}))
-	defer srv.Close()
-
-	ctx := context.Background()
-	g := StartGaugePoller(ctx, NewScraperAt(srv.URL, "/metrics"), 5*time.Millisecond, VLLM())
-	defer g.Stop()
-
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if w, ok := g.LatestWaiting(); ok {
-			if w != 7 {
-				t.Fatalf("LatestWaiting = %v, want 7", w)
-			}
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatal("轮询成功后 LatestWaiting 应可取值")
-}
-
-func TestPollerLatestWaitingNeverSampled(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, "vllm:num_requests_running 2\n") // 无 waiting 指标
-	}))
-	defer srv.Close()
-
-	ctx := context.Background()
-	g := StartGaugePoller(ctx, NewScraperAt(srv.URL, "/metrics"), 5*time.Millisecond, VLLM())
-	defer g.Stop()
-	time.Sleep(60 * time.Millisecond)
-	if _, ok := g.LatestWaiting(); ok {
-		t.Fatal("引擎不暴露 waiting 指标时 LatestWaiting 应 ok=false")
 	}
 }
