@@ -86,7 +86,7 @@ def load_all(name):
     base = os.path.join(root, name)
     for current, _, files in os.walk(base):
         for fn in files:
-            if fn.endswith(".json"):
+            if fn.endswith(".json") and ".checkpoint-" not in fn:
                 with open(os.path.join(current, fn), encoding="utf-8") as f:
                     out.append(json.load(f))
     return out
@@ -132,6 +132,7 @@ check([lv.get("level") for lv in conc_levels] == [1, 2], "concurrency 两档位�
 check(all(len(lv.get("requests") or []) == 6 for lv in conc_levels), "每档位 6 条请求全部落盘")
 check(all(lv.get("completed_requests") == 6 and lv.get("failed_requests") == 0 for lv in conc_levels), "concurrency completed/failed 计数正确")
 check(all(lv.get("total_tps") for lv in conc_levels), "concurrency 档位落盘 total_tps 时间序列")
+check(any(".checkpoint-" in fn for current, _, files in os.walk(os.path.join(root, "out-conc")) for fn in files), "concurrency checkpoint 落盘")
 
 # ── probe ──
 probe = json.load(open(os.path.join(root, "probe.json"), encoding="utf-8"))

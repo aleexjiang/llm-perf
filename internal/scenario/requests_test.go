@@ -50,7 +50,7 @@ func TestRPSScenario(t *testing.T) {
 	cfg := rpsTestCfg(t, srv.URL)
 	cfg.RPS = config.RPS{Rates: []float64{60}, MaxConcurrency: 0}
 
-	rep, err := RPSScenario(context.Background(), cfg, engine.NewClient(srv.URL, "", 10*time.Second, true), "")
+	rep, err := RPSScenario(context.Background(), cfg, engine.NewClient(srv.URL, "", 10*time.Second, true), "", RunOptions{})
 	if err != nil {
 		t.Fatalf("RPSScenario: %v", err)
 	}
@@ -86,7 +86,7 @@ func TestConcurrencyScenario(t *testing.T) {
 	cfg := rpsTestCfg(t, srv.URL)
 	cfg.Concurrency = config.ConcurrencyCfg{Levels: []int{1, 2}}
 
-	rep, err := ConcurrencyScenario(context.Background(), cfg, engine.NewClient(srv.URL, "", 10*time.Second, true), "")
+	rep, err := ConcurrencyScenario(context.Background(), cfg, engine.NewClient(srv.URL, "", 10*time.Second, true), "", RunOptions{})
 	if err != nil {
 		t.Fatalf("ConcurrencyScenario: %v", err)
 	}
@@ -109,11 +109,11 @@ func TestRequestScenariosSourceCheck(t *testing.T) {
 	for name, run := range map[string]func(*config.Config, *engine.Client) (*report.Report, error){
 		"rps": func(cfg *config.Config, c *engine.Client) (*report.Report, error) {
 			cfg.RPS = config.RPS{Rates: []float64{60}, MaxConcurrency: 0}
-			return RPSScenario(context.Background(), cfg, c, "")
+			return RPSScenario(context.Background(), cfg, c, "", RunOptions{})
 		},
 		"concurrency": func(cfg *config.Config, c *engine.Client) (*report.Report, error) {
 			cfg.Concurrency = config.ConcurrencyCfg{Levels: []int{1}}
-			return ConcurrencyScenario(context.Background(), cfg, c, "")
+			return ConcurrencyScenario(context.Background(), cfg, c, "", RunOptions{})
 		},
 	} {
 		t.Run(name, func(t *testing.T) {

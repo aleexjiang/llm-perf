@@ -58,6 +58,9 @@ chunk 数、字符数、ITL、原始时间、回复文本和 reasoning 协议细
 `decode_requests` 是请求数。user 结果写在 `throughput.total_tps[]`，
 rps/concurrency 结果写在各档位 `total_tps[]`。
 
+场景每完成一个档位就通过 `RunOptions.Checkpoint` 通知 CLI，CLI 写累计 checkpoint JSON；
+请求完成时 rps/concurrency 同时输出 progress 日志。最终场景返回后再写正式 JSON。
+
 ## 服务端观测
 
 `setupServerMetrics` 装配 `/metrics`，`startWindow/finishWindow` 负责场景窗口采集。

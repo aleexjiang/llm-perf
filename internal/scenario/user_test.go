@@ -68,7 +68,7 @@ func TestUserScenario(t *testing.T) {
 		MaxTokens:   config.IntList{16},
 	}
 
-	rep, err := UserScenario(context.Background(), cfg, engine.NewClient(srv.URL, "", 30*time.Second, true), "")
+	rep, err := UserScenario(context.Background(), cfg, engine.NewClient(srv.URL, "", 30*time.Second, true), "", RunOptions{})
 	if err != nil {
 		t.Fatalf("UserScenario: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestUserScenario(t *testing.T) {
 func TestUserScenarioRequiresProfile(t *testing.T) {
 	srv := sseStub(t, &stubState{})
 	cfg := testCfg(t, srv.URL)
-	if _, err := UserScenario(context.Background(), cfg, engine.NewClient(srv.URL, "", 5*time.Second, true), ""); err == nil {
+	if _, err := UserScenario(context.Background(), cfg, engine.NewClient(srv.URL, "", 5*time.Second, true), "", RunOptions{}); err == nil {
 		t.Fatal("缺 profile_path 应报错")
 	}
 }
@@ -126,7 +126,7 @@ func TestUserScenarioRunsConfiguredLevels(t *testing.T) {
 		MaxTokens:   config.IntList{16},
 	}
 
-	rep, err := UserScenario(context.Background(), cfg, engine.NewClient(srv.URL, "", 30*time.Second, true), "")
+	rep, err := UserScenario(context.Background(), cfg, engine.NewClient(srv.URL, "", 30*time.Second, true), "", RunOptions{})
 	if err != nil {
 		t.Fatalf("UserScenario: %v", err)
 	}
@@ -156,7 +156,7 @@ func TestUserScenarioStopsWithinTokenBudget(t *testing.T) {
 	}
 	cfg.MaxPromptTokens = 35000 // 首轮实测可达 35-40K，因此至少第二轮会在请求前止损
 
-	rep, err := UserScenario(context.Background(), cfg, engine.NewClient(srv.URL, "", 30*time.Second, true), "")
+	rep, err := UserScenario(context.Background(), cfg, engine.NewClient(srv.URL, "", 30*time.Second, true), "", RunOptions{})
 	if err != nil {
 		t.Fatalf("UserScenario: %v", err)
 	}

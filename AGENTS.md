@@ -77,6 +77,7 @@ schema 不保留旧字段兼容逻辑。分析可以从单轮样本重算的派�
 - `user` 的 session 只描述多轮上下文和 cache，不用 session TPS 代替单轮 TPS 或总 TPS。
 - `running`、`waiting`、KV、cache 命中、preemption 和 source check 是诊断数据，不是新的性能指标。
 - `probe` 的 tool-call 只验证协议能力，不进入压测样本。
+- 长场景必须支持进度日志和档位 checkpoint；不能等整个场景结束才第一次产生可分析数据。
 
 ## 修改纪律
 

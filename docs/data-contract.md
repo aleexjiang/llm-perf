@@ -19,6 +19,9 @@ schema 变更直接更新结构和版本，不保留旧字段兼容逻辑，不�
 
 `probe` 输出独立的 `probe.json`，不与场景 JSON 共用顶层结构。
 
+长场景会在最终 JSON 旁边写入 `*.checkpoint-NNN.json`。checkpoint 使用同一 schema，内容是截至
+该档位的累计结果；最终 JSON 是完整场景结果。checkpoint 不是另一种数据格式，也不需要迁移。
+
 ## 顶层结构
 
 ```text

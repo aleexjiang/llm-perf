@@ -93,6 +93,8 @@ completion token 对账，不把共享 counter 差值挂到单条请求。
 - chunk 计数、字符数、ITL、原始 chunk 时间、首帧时间、思考协议字段只在内存或 debug 中使用。
 - 失败、取消、usage 缺失和不完整流保留原始记录，但不进入成功聚合。
 - `warmup` 和 `correctness` 进入 `auxiliary_requests[]`，不进入 benchmark KPI。
+- 长场景运行中会打印请求进度；每完成一个 user level、RPS rate 或 concurrency level，
+  会先写一个累计 checkpoint JSON，场景全部完成后再写最终 JSON。
 - `stop` 和 `length` 分层；P95 是主报告口径，P50 只作分布参考。
 
 ## 构建与验证

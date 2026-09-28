@@ -45,7 +45,7 @@ func init() {
 }
 
 // UserScenario user 模式：profile 驱动的生成式多轮会话。
-func UserScenario(ctx context.Context, cfg *config.Config, client *engine.Client, modelFilter string) (*report.Report, error) {
+func UserScenario(ctx context.Context, cfg *config.Config, client *engine.Client, modelFilter string, options RunOptions) (*report.Report, error) {
 	if cfg.User.ProfilePath == "" {
 		return nil, fmt.Errorf("user 模式需要 user.profile_path（scripts/profile_build.py 产出的 profile.json）")
 	}
@@ -136,6 +136,10 @@ func UserScenario(ctx context.Context, cfg *config.Config, client *engine.Client
 					}
 					rep.UserLevels = append(rep.UserLevels, level)
 					allTurns = append(allTurns, levelTurns...)
+					rep.Throughput = report.BuildThroughputSummary(allTurns, time.Since(scenarioStart).Seconds())
+					if options.Checkpoint != nil {
+						options.Checkpoint(rep)
+					}
 				}
 			}
 		}

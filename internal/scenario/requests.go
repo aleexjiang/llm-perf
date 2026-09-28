@@ -129,7 +129,7 @@ func init() {
 }
 
 // RPSScenario rps 模式：冻结请求快照的开环到达（到达率控制节奏）。
-func RPSScenario(ctx context.Context, cfg *config.Config, client *engine.Client, modelFilter string) (*report.Report, error) {
+func RPSScenario(ctx context.Context, cfg *config.Config, client *engine.Client, modelFilter string, options RunOptions) (*report.Report, error) {
 	samples, err := loadRequestSamples(cfg)
 	if err != nil {
 		return nil, err
@@ -178,6 +178,10 @@ func RPSScenario(ctx context.Context, cfg *config.Config, client *engine.Client,
 				log.Printf("[rps] %s thinking=%s rate=%.1f/s: total_tps_points=%d wall=%.1fs ok=%d fail=%d",
 					model, v.Name, rate, len(lv.TotalTPS), lv.WallSeconds, lv.CompletedRequests, lv.FailedRequests)
 				rep.Concurrent = append(rep.Concurrent, lv)
+				refreshReportThroughput(rep)
+				if options.Checkpoint != nil {
+					options.Checkpoint(rep)
+				}
 				if lv.Aborted != "" {
 					log.Printf("🛑 %s——停止后续到达率档位", lv.Aborted)
 					aborted = true
@@ -212,6 +216,7 @@ func runRequestArrival(ctx context.Context, e *env, model string, v config.Think
 	}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
+	var completed atomic.Int64
 	for i, delay := range arrivals {
 		if interrupted(ctx) {
 			break
@@ -238,7 +243,11 @@ func runRequestArrival(ctx context.Context, e *env, model string, v config.Think
 					return // 排队中放弃：cancelled 语义（未发即弃）
 				}
 			}
+			log.Printf("[rps] rate=%.1f request start id=%s", rate, sample.ID)
 			m := requestRunner(ctx, e, model, v, sample.OutputTokens, sample)
+			n := completed.Add(1)
+			log.Printf("[rps] rate=%.1f progress=%d/%d id=%s error=%t ttft=%.0fms e2e=%.0fms tps=%.1f",
+				rate, n, len(samples), sample.ID, m.Error != "", m.TTFT, m.E2EMS, m.TokensPerSec)
 			mu.Lock()
 			lv.Requests = append(lv.Requests, m)
 			mu.Unlock()
@@ -252,7 +261,7 @@ func runRequestArrival(ctx context.Context, e *env, model string, v config.Think
 }
 
 // ConcurrencyScenario concurrency 模式：固定在飞上限齐射（对齐 vLLM bench serve）。
-func ConcurrencyScenario(ctx context.Context, cfg *config.Config, client *engine.Client, modelFilter string) (*report.Report, error) {
+func ConcurrencyScenario(ctx context.Context, cfg *config.Config, client *engine.Client, modelFilter string, options RunOptions) (*report.Report, error) {
 	samples, err := loadRequestSamples(cfg)
 	if err != nil {
 		return nil, err
@@ -301,6 +310,10 @@ func ConcurrencyScenario(ctx context.Context, cfg *config.Config, client *engine
 				log.Printf("[concurrency] %s thinking=%s level=%d: total_tps_points=%d wall=%.1fs ok=%d fail=%d",
 					model, v.Name, level, len(lv.TotalTPS), lv.WallSeconds, lv.CompletedRequests, lv.FailedRequests)
 				rep.Concurrent = append(rep.Concurrent, lv)
+				refreshReportThroughput(rep)
+				if options.Checkpoint != nil {
+					options.Checkpoint(rep)
+				}
 				if lv.Aborted != "" {
 					log.Printf("🛑 %s——停止后续并发档位", lv.Aborted)
 					aborted = true
@@ -316,6 +329,16 @@ func ConcurrencyScenario(ctx context.Context, cfg *config.Config, client *engine
 	}
 	rep.Throughput = report.BuildThroughputSummary(allReqs, wall)
 	return rep, nil
+}
+
+func refreshReportThroughput(rep *report.Report) {
+	var requests []*engine.TurnMetrics
+	var wall float64
+	for _, level := range rep.Concurrent {
+		requests = append(requests, level.Requests...)
+		wall += level.WallSeconds
+	}
+	rep.Throughput = report.BuildThroughputSummary(requests, wall)
 }
 
 // runRequestBarrier 固定在飞一轮：level 个 worker 从共享游标拉请求；
@@ -361,8 +384,13 @@ func runRequestBarrier(ctx context.Context, e *env, model string, v config.Think
 		}()
 	}
 
+	var completed atomic.Int64
 	runReq := func(sample engine.RequestSample) {
+		log.Printf("[concurrency] level=%d request start id=%s", level, sample.ID)
 		m := requestRunner(ctx, e, model, v, sample.OutputTokens, sample)
+		n := completed.Add(1)
+		log.Printf("[concurrency] level=%d progress=%d/%d id=%s error=%t ttft=%.0fms e2e=%.0fms tps=%.1f",
+			level, n, len(samples), sample.ID, m.Error != "", m.TTFT, m.E2EMS, m.TokensPerSec)
 		mu.Lock()
 		lv.Requests = append(lv.Requests, m)
 		mu.Unlock()

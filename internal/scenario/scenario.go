@@ -33,18 +33,23 @@ import (
 // Scenario 是评测场景的统一抽象：注册表分发——新增场景实现该接口并 Register 即可。
 type Scenario interface {
 	Name() string
-	Run(ctx context.Context, cfg *config.Config, client *engine.Client, modelFilter string) (*report.Report, error)
+	Run(ctx context.Context, cfg *config.Config, client *engine.Client, modelFilter string, options RunOptions) (*report.Report, error)
+}
+
+// RunOptions controls observable execution events without adding output policy to the scenarios.
+type RunOptions struct {
+	Checkpoint func(*report.Report)
 }
 
 type funcScenario struct {
 	name string
-	fn   func(context.Context, *config.Config, *engine.Client, string) (*report.Report, error)
+	fn   func(context.Context, *config.Config, *engine.Client, string, RunOptions) (*report.Report, error)
 }
 
 func (s funcScenario) Name() string { return s.name }
 
-func (s funcScenario) Run(ctx context.Context, cfg *config.Config, c *engine.Client, filter string) (*report.Report, error) {
-	return s.fn(ctx, cfg, c, filter)
+func (s funcScenario) Run(ctx context.Context, cfg *config.Config, c *engine.Client, filter string, options RunOptions) (*report.Report, error) {
+	return s.fn(ctx, cfg, c, filter, options)
 }
 
 var scenarioRegistry = map[string]Scenario{}

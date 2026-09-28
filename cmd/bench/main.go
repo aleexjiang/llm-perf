@@ -88,7 +88,7 @@ benchmark、失败和主动取消请求都保留完整原始指标（按 phase �
 	os.Exit(2)
 }
 
-// resolveOutPath 解析输出路径：
+// resolveOutPath 解析最终输出路径：
 //   - 空 → outputDir/<scenario>-<ts>.json
 //   - 以 .json 结尾 → 原样
 //   - 其他 → 视为目录，拼默认文件名
@@ -126,6 +126,30 @@ func modelDirName(model string) string {
 		return "unknown"
 	}
 	return name
+}
+
+func saveReportPartitions(rep *report.Report, outPath, configRaw string, singleFile bool) error {
+	rep.ConfigRaw = configRaw
+	parts := rep.PartitionByModel()
+	if len(parts) == 0 {
+		parts = []*report.Report{rep}
+	}
+	if len(parts) > 1 && singleFile {
+		return fmt.Errorf("本次跑了多个模型，输出路径必须是目录: %s", outPath)
+	}
+	write := func(p *report.Report, path string) error {
+		return p.SaveJSON(path)
+	}
+	if len(parts) == 1 {
+		return write(parts[0], outPath)
+	}
+	dir := filepath.Dir(outPath)
+	for _, p := range parts {
+		if err := write(p, filepath.Join(dir, modelDirName(p.PartitionModel), filepath.Base(outPath))); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // applyThinkingCLI 统一处理 --thinking：语义是"按变体名过滤"（合并各模型生效变体后筛选），
@@ -319,40 +343,22 @@ func main() {
 			fmt.Fprintf(os.Stderr, "[%s] 失败: %v\n", name, err)
 			os.Exit(1)
 		}
-		// 配置原文随每份分区落盘，环境 probe 结果由独立 probe JSON 提供。
-		rep.ConfigRaw = cfg.Raw
-		// 按模型分区落盘：多模型测试各落 <output_dir>/<模型>/，重测/作废单模型不纠缠；
-		// 单模型（或 -m 过滤后只剩一个）直接落 output_dir。
-		parts := rep.PartitionByModel()
-		if len(parts) == 0 {
-			parts = []*report.Report{rep}
-		}
-		if len(parts) > 1 && strings.HasSuffix(*outFlag, ".json") {
-			fmt.Fprintln(os.Stderr, "本次跑了多个模型（数据按模型分区落盘），-o 请给目录而不是单个 .json 文件")
+		if err := saveReportPartitions(rep, outPath, cfg.Raw, strings.HasSuffix(*outFlag, ".json")); err != nil {
+			fmt.Fprintf(os.Stderr, "[%s] 写出 JSON 失败: %v\n", name, err)
 			os.Exit(1)
 		}
-		write := func(p *report.Report, path string) {
-			if err := p.SaveJSON(path); err != nil {
-				fmt.Fprintf(os.Stderr, "[%s] 写出 JSON 失败: %v\n", name, err)
-				os.Exit(1)
-			}
-		}
-		if len(parts) == 1 {
-			write(parts[0], outPath)
-		} else {
-			dir := filepath.Dir(outPath)
-			for _, p := range parts {
-				write(p, filepath.Join(dir, modelDirName(p.PartitionModel), filepath.Base(outPath)))
-			}
+		partCount := len(rep.PartitionByModel())
+		if partCount == 0 {
+			partCount = 1
 		}
 		if ctx.Err() != nil {
 			fmt.Printf("[%s] ⚠️ 中断——已完成的 %d 组数据已保存: %s\n",
 				name, len(rep.UserLevels)+len(rep.Concurrent), outPath)
 			return
 		}
-		if len(parts) > 1 {
+		if partCount > 1 {
 			var dirs []string
-			for _, p := range parts {
+			for _, p := range rep.PartitionByModel() {
 				dirs = append(dirs, modelDirName(p.PartitionModel)+"/")
 			}
 			fmt.Printf("[%s] 完成，用时 %s，输出: %s（按模型分区: %s）\n",
@@ -488,7 +494,18 @@ func main() {
 	}
 	outPath := resolveOutPath(*outFlag, cfg.OutputDir, mode)
 	log.Printf("执行计划: %s 模式", mode)
+	checkpointNo := 0
+	checkpoint := scenario.RunOptions{Checkpoint: func(rep *report.Report) {
+		checkpointNo++
+		base := strings.TrimSuffix(outPath, ".json")
+		checkpointPath := fmt.Sprintf("%s.checkpoint-%03d.json", base, checkpointNo)
+		if err := saveReportPartitions(rep, checkpointPath, cfg.Raw, false); err != nil {
+			log.Printf("[%s] checkpoint 写出失败: %v", mode, err)
+			return
+		}
+		log.Printf("[%s] checkpoint 已保存: %s", mode, checkpointPath)
+	}}
 	run(mode, outPath, func() (*report.Report, error) {
-		return sc.Run(ctx, cfg, client, *modelFilter)
+		return sc.Run(ctx, cfg, client, *modelFilter, checkpoint)
 	})
 }
