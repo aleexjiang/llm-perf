@@ -130,6 +130,10 @@ func TestRequestScenariosSourceCheck(t *testing.T) {
 			if rep.SourceCheck.ClientTokens <= 0 || rep.SourceCheck.ServerTokens <= 0 {
 				t.Fatalf("%s source_check 数据不完整: %+v", name, rep.SourceCheck)
 			}
+			if rep.Server == nil || rep.SourceCheck.ServerTokens != rep.Server.GenerationTokens {
+				t.Fatalf("%s source_check 未复用场景结束快照: source=%+v server=%+v",
+					name, rep.SourceCheck, rep.Server)
+			}
 		})
 	}
 }

@@ -339,6 +339,9 @@ func BuildThroughputSummary(ms []*engine.TurnMetrics, wallSeconds float64) *Thro
 	var all, stop, length bucket
 
 	add := func(m *engine.TurnMetrics, b *bucket) {
+		if m.Error != "" || m.Cancelled {
+			return
+		}
 		b.count++
 		if ttft := m.TTFT; m.Stream && ttft > 0 {
 			b.ttft = append(b.ttft, ttft)

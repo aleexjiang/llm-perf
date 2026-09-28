@@ -278,11 +278,19 @@ func finalScrapeCtx() (context.Context, context.CancelFunc) {
 // 这样报告侧能如实区分「已采集 / 已启用但未取到 / 未提供」，不会把一次失败渲染成全零面板。
 func finishWindow(e *env, before *smetrics.Sample,
 	poller *smetrics.GaugePoller, start time.Time) *report.ServerMetricsSummary {
+	summary, _, _ := finishWindowWithSample(e, before, poller, start)
+	return summary
+}
+
+// finishWindowWithSample 与 finishWindow 同口径，但把结束快照一并返回给 source_check 复用，
+// 避免同一个场景窗口结束后再抓一次 /metrics，把窗口外流量算进服务端 token 差值。
+func finishWindowWithSample(e *env, before *smetrics.Sample,
+	poller *smetrics.GaugePoller, start time.Time) (*report.ServerMetricsSummary, *smetrics.Sample, error) {
 	if e.srv == nil || before == nil {
 		if poller != nil {
 			poller.Stop()
 		}
-		return nil
+		return nil, nil, nil
 	}
 	summary := &report.ServerMetricsSummary{}
 	if poller != nil {
@@ -298,7 +306,7 @@ func finishWindow(e *env, before *smetrics.Sample,
 	cancel()
 	if err != nil {
 		summary.Note = "结束快照抓取失败（本场景无窗口差值）: " + err.Error()
-		return summary
+		return summary, nil, err
 	}
 	summary.Available = true
 	if !start.IsZero() {
@@ -313,7 +321,17 @@ func finishWindow(e *env, before *smetrics.Sample,
 	summary.PromptTokens = d.PromptTokens
 	summary.GenerationTokens = d.GenerationTokens
 	summary.Hists = smetrics.HistDeltas(before, after, e.provider)
-	return summary
+	return summary, after, nil
+}
+
+// finishWindowAndSourceCheck 结束 rps/concurrency 场景窗口：服务端摘要和两源对账共用
+// 同一份结束快照，保证 source_check.server_tokens 与 server_metrics.generation_tokens 一致。
+func finishWindowAndSourceCheck(e *env, rep *report.Report, before *smetrics.Sample,
+	poller *smetrics.GaugePoller, start time.Time) {
+	var after *smetrics.Sample
+	var afterErr error
+	rep.Server, after, afterErr = finishWindowWithSample(e, before, poller, start)
+	applySourceCheck(e, rep, before, after, afterErr)
 }
 
 // applySourceCheck 两源一致性（10.1）：客户端实测聚合吞吐 vs 服务端生成吞吐。
@@ -323,7 +341,7 @@ func finishWindow(e *env, before *smetrics.Sample,
 //
 // 两边同分母：本场景各档位墙钟之和（客户端侧吞吐本就是这个口径），因此比较等价于 token 量比较。
 // 观测层缺失 / 引擎不暴露生成 token 数 / 无有效档位 → 只写 Note 记 NA，不改任何结论。
-func applySourceCheck(e *env, rep *report.Report, before *smetrics.Sample) {
+func applySourceCheck(e *env, rep *report.Report, before, after *smetrics.Sample, afterErr error) {
 	if rep == nil || len(rep.Concurrent) == 0 {
 		return
 	}
@@ -351,11 +369,13 @@ func applySourceCheck(e *env, rep *report.Report, before *smetrics.Sample) {
 		rep.SourceCheck = sc
 		return
 	}
-	sctx, cancel := finalScrapeCtx() // 12.11：中断场景同样要保住两源一致性差值（独立 ctx）
-	after, err := e.srv.Scrape(sctx)
-	cancel()
-	if err != nil {
-		sc.Note = "末档位后快照抓取失败：" + err.Error()
+	if afterErr != nil {
+		sc.Note = "末档位后快照抓取失败：" + afterErr.Error()
+		rep.SourceCheck = sc
+		return
+	}
+	if after == nil {
+		sc.Note = "末档位后快照不可用"
 		rep.SourceCheck = sc
 		return
 	}

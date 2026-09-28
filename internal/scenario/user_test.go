@@ -143,6 +143,32 @@ func TestUserScenarioRunsConfiguredLevels(t *testing.T) {
 	}
 }
 
+func TestUserScenarioUsesModelOverrideTokenBudget(t *testing.T) {
+	srv := sseStub(t, &stubState{})
+	cfg := testCfg(t, srv.URL)
+	cfg.MaxPromptTokens = 35000
+	cfg.User = config.User{
+		ProfilePath: writeProfile(t, testProfileJSON),
+		Levels:      []int{1},
+		MaxTokens:   config.IntList{16},
+	}
+	overrideBudget := 40000
+	cfg.ModelOverrides = map[string]*config.ModelOverride{
+		"stub-model": {MaxPromptTokens: &overrideBudget},
+	}
+
+	rep, err := UserScenario(context.Background(), cfg, engine.NewClient(srv.URL, "", 30*time.Second, true), "", RunOptions{})
+	if err != nil {
+		t.Fatalf("UserScenario: %v", err)
+	}
+	if len(rep.UserLevels) != 1 || len(rep.UserLevels[0].Sessions) != 1 {
+		t.Fatalf("user level/session 数量错误: %+v", rep.UserLevels)
+	}
+	if got := rep.UserLevels[0].Sessions[0].TokenBudget; got != overrideBudget {
+		t.Fatalf("model override token budget=%d, want %d", got, overrideBudget)
+	}
+}
+
 // TestUserScenarioStopsWithinTokenBudget 回归：max_prompt_tokens 是 prompt+output 总预算。
 // 上一轮实测历史 + 本轮计划增量 + max_tokens 超过预算时，必须在发出请求前止损，
 // 不能像真机 r1-r3 那样用 400 消耗最后一轮。
@@ -171,6 +197,9 @@ func TestUserScenarioStopsWithinTokenBudget(t *testing.T) {
 	for _, m := range run.Turns {
 		if m.Error != "" {
 			t.Fatalf("预算止损后不应发出失败请求: %+v", m)
+		}
+		if m.Cancelled && !m.SentAt.Equal(m.EndAt) {
+			t.Fatalf("预算止损标记不应伪造请求墙钟: %+v", m)
 		}
 		for _, w := range m.Warnings {
 			if strings.Contains(w, "token_budget_exhausted") {

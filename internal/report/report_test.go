@@ -207,6 +207,27 @@ func TestBuildThroughputSummary(t *testing.T) {
 	}
 }
 
+func TestBuildThroughputSummaryDropsRejectedRecordsFromBuckets(t *testing.T) {
+	summary := BuildThroughputSummary([]*engine.TurnMetrics{
+		{
+			Stream: true, Error: "HTTP 500",
+			SentAt: time.Unix(100, 0), EndAt: time.Unix(101, 0),
+			CompletionTokens: 20, FinishReason: "stop",
+		},
+		{
+			Stream: true, Cancelled: true,
+			SentAt: time.Unix(101, 0), EndAt: time.Unix(102, 0),
+			CompletionTokens: 20, FinishReason: "stop",
+		},
+	}, 2)
+	if summary.Streaming.All.Count != 0 || summary.Streaming.Stop.Count != 0 {
+		t.Fatalf("失败/取消样本不应进入 streaming 分层: %+v", summary.Streaming)
+	}
+	if summary.CompletedRequests != 0 || summary.FailedRequests != 1 || summary.CancelledRequests != 1 {
+		t.Fatalf("失败/取消计数错误: %+v", summary)
+	}
+}
+
 func TestBuildTotalTPSTimeAxis(t *testing.T) {
 	base := time.Unix(100, 0)
 	series := BuildTotalTPS([]*engine.TurnMetrics{

@@ -60,27 +60,6 @@ func UserScenario(ctx context.Context, cfg *config.Config, client *engine.Client
 	if corpus.Library(lang) == nil {
 		return nil, fmt.Errorf("user 模式语料库为空（lang=%s）——检查 corpus_lang/filler_lang 配置", lang)
 	}
-	// TokenBudget 是 max_prompt_tokens 的准确语义：单请求 prompt + output 总预算。
-	// 上一轮真机只按 prompt 截止，最后在 max_model_len 处撞上 256 输出预算（r1-r3 heavy）。
-	// 这里用最大 max_tokens 计算会话窗口，避免输出扫描中只有小档位受控、大档位仍然 400。
-	var tokenBudget int
-	maxOutput := 0
-	for _, mt := range cfg.User.MaxTokens {
-		if mt > maxOutput {
-			maxOutput = mt
-		}
-	}
-	if maxOutput <= 0 {
-		maxOutput = 256
-	}
-	if cfg.MaxPromptTokens > 0 {
-		tokenBudget = cfg.MaxPromptTokens
-		if est := estMaxContext(prof); est > tokenBudget {
-			log.Printf("⚠️ profile 形状预计最大上下文 ≈%dtk > token_budget=%d——长会话会在预算内提前止损；建议下调轮次/增量或调高 max_prompt_tokens",
-				est, tokenBudget)
-		}
-	}
-
 	e := &env{cfg: cfg, client: client}
 	// 服务端观测层：之前漏装配导致 user 场景 JSON 恒无 server_metrics（真机发现 1.3），
 	// cache hit/preemption 等归因数据全部缺失——与 rps/concurrency 同口径装配。
@@ -107,6 +86,9 @@ func UserScenario(ctx context.Context, cfg *config.Config, client *engine.Client
 			continue
 		}
 		em, mc := forModel(e, cfg, model)
+		// TokenBudget 是当前模型生效的 max_prompt_tokens：单请求 prompt + output 总预算。
+		// 放在 forModel 之后计算，model_overrides 的上下文上限才真正生效。
+		tokenBudget := userTokenBudget(mc, prof, model)
 		th := mc.Thinking
 		if len(th.Variants()) == 0 {
 			log.Printf("  %s: 无匹配的思考变体，跳过", model)
@@ -123,7 +105,9 @@ func UserScenario(ctx context.Context, cfg *config.Config, client *engine.Client
 						break
 					}
 					before, poller, winStart := startWindow(ctx, e)
+					levelStart := time.Now()
 					runs := runUserSessions(ctx, em, prof, lang, model, v, maxTok, tokenBudget, users)
+					levelWall := time.Since(levelStart).Seconds()
 					server := finishWindow(e, before, poller, winStart)
 					var levelTurns []*engine.TurnMetrics
 					for _, run := range runs {
@@ -132,7 +116,7 @@ func UserScenario(ctx context.Context, cfg *config.Config, client *engine.Client
 					level := report.UserLevel{
 						Model: model, Thinking: v.Name, Users: users, MaxTokens: maxTok,
 						Sessions: runs, Server: server,
-						Throughput: report.BuildThroughputSummary(levelTurns, levelWallSeconds(levelTurns)),
+						Throughput: report.BuildThroughputSummary(levelTurns, levelWall),
 					}
 					rep.UserLevels = append(rep.UserLevels, level)
 					allTurns = append(allTurns, levelTurns...)
@@ -148,23 +132,15 @@ func UserScenario(ctx context.Context, cfg *config.Config, client *engine.Client
 	return rep, nil
 }
 
-func levelWallSeconds(turns []*engine.TurnMetrics) float64 {
-	var start, end time.Time
-	for _, turn := range turns {
-		if turn == nil || turn.SentAt.IsZero() || turn.EndAt.IsZero() {
-			continue
-		}
-		if start.IsZero() || turn.SentAt.Before(start) {
-			start = turn.SentAt
-		}
-		if end.IsZero() || turn.EndAt.After(end) {
-			end = turn.EndAt
-		}
-	}
-	if start.IsZero() || !end.After(start) {
+func userTokenBudget(cfg *config.Config, prof *Profile, model string) int {
+	if cfg.MaxPromptTokens <= 0 {
 		return 0
 	}
-	return end.Sub(start).Seconds()
+	if est := estMaxContext(prof); est > cfg.MaxPromptTokens {
+		log.Printf("⚠️ %s profile 形状预计最大上下文 ≈%dtk > token_budget=%d——长会话会在预算内提前止损；建议下调轮次/增量或调高 max_prompt_tokens",
+			model, est, cfg.MaxPromptTokens)
+	}
+	return cfg.MaxPromptTokens
 }
 
 // runUserSessions 并行执行 users 条生成式会话（每用户一条，模型串行保证 e.cfg 不被并发改写）。
@@ -309,12 +285,13 @@ func runOneUserSession(ctx context.Context, e *env, prof *Profile, lang, model s
 		}
 		estimate := nextPrompt + planIncrement
 		if tokenBudget > 0 && estimate > 0 && estimate+maxTok > tokenBudget {
+			now := time.Now()
 			m := &engine.TurnMetrics{
 				Model: model, Stream: e.cfg.StreamEnabled(), Thinking: v.Enabled, Phase: "benchmark",
+				SentAt: now, EndAt: now, Cancelled: true,
 				Warnings: []string{fmt.Sprintf(
 					"token_budget_exhausted: estimated_prompt=%d + max_tokens=%d > %d——停止本轮，避免 context 400",
 					estimate, maxTok, tokenBudget)},
-				EndAt: time.Now(),
 			}
 			m.Finalize()
 			run.Turns = append(run.Turns, m)
