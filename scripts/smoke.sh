@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # llm-perf 冒烟：覆盖四个子命令（probe / user / rps / concurrency）与数据契约。
-# 2026-09-18 新架构：filler/旧 multiturn+concurrent 入口已下线，请求/会话形状
-# 来自 request_set.sharegpt_path（冻结快照）与 user.profile_path（profile 特征）。
+# 请求形状来自 request_set.sharegpt_path（冻结快照）与 user.profile_path（profile 特征）。
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -97,7 +96,7 @@ user = load_all("out-user")
 check(len(user) == 1, f"user 产物按模型落盘（{len(user)} 份）")
 rep = user[0]
 check(rep.get("scenario") == "user", "报告 scenario=user")
-check(rep.get("schema_version") == 7, "数据契约版本为 7")
+check(rep.get("schema_version") == 8, "数据契约版本为 8")
 sessions = rep.get("multiturn") or []
 check(len(sessions) == 2, f"users=2 应有 2 条会话（{len(sessions)}）")
 check(all(s.get("profile") in ("light", "medium", "heavy") for s in sessions), "会话带 profile 档位标签")
@@ -112,6 +111,9 @@ first_ok = all((s.get("turns") or [{}])[0].get("prompt_tokens", 0) >= 35000 for 
 check(first_ok, "首轮 prompt ≥35K token（agent 形状硬约束）")
 metrics_user = [t for s in sessions for t in (s.get("turns") or [])]
 check(metrics_user and all(m.get("phase") == "benchmark" for m in metrics_user), "主压测 TurnMetrics 标记 phase=benchmark")
+check(rep.get("throughput", {}).get("total_tps"), "user 场景落盘 total_tps 时间序列")
+removed = {"total_tokens", "ttft_reasoning_ms", "ttft_content_ms", "server_counter_delta"}
+check(not any(key in m for m in metrics_user for key in removed), "单轮 JSON 不落盘裁剪字段")
 
 # ── rps：开环到达 + 冻结快照 ──
 rps = load_all("out-rps")
@@ -126,6 +128,7 @@ conc_levels = [lv for rep2 in conc for lv in rep2.get("concurrent", [])]
 check([lv.get("level") for lv in conc_levels] == [1, 2], "concurrency 两档位按序落盘（level 1,2）")
 check(all(len(lv.get("requests") or []) == 6 for lv in conc_levels), "每档位 6 条请求全部落盘")
 check(all(lv.get("completed_requests") == 6 and lv.get("failed_requests") == 0 for lv in conc_levels), "concurrency completed/failed 计数正确")
+check(all(lv.get("total_tps") for lv in conc_levels), "concurrency 档位落盘 total_tps 时间序列")
 
 # ── probe ──
 probe = json.load(open(os.path.join(root, "probe.json"), encoding="utf-8"))

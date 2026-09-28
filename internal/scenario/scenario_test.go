@@ -95,9 +95,7 @@ func sseStub(t *testing.T, state *stubState) *httptest.Server {
 			prompt = ov
 		}
 		state.mu.Unlock()
-		usage := map[string]any{
-			"prompt_tokens": prompt, "completion_tokens": 4, "total_tokens": prompt + 4,
-		}
+		usage := map[string]any{"prompt_tokens": prompt, "completion_tokens": 8}
 		if !body.Stream {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]any{
@@ -183,7 +181,7 @@ func TestCtxLimitHit(t *testing.T) {
 // TestRunOneNilMetrics 集成：请求构造失败（nil metrics）必须收口为失败指标，不 panic。
 func TestRunOneNilMetrics(t *testing.T) {
 	// chat URL 非法 → NewRequest 失败 → Chat 返回 (nil, err)
-	e := &env{cfg: testCfg(t, "http://127.0.0.1:1"), client: engine.NewClient("http://127.0.0.1:1", "", time.Second, false), perReqSrv: false}
+	e := &env{cfg: testCfg(t, "http://127.0.0.1:1"), client: engine.NewClient("http://127.0.0.1:1", "", time.Second, false)}
 	e.cfg.TimeoutSeconds = 1
 	m := runOne(context.Background(), e, "m", []engine.Message{{Role: "user", Content: "x"}}, 8, config.ThinkingVariant{})
 	if m == nil {

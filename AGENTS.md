@@ -1,182 +1,106 @@
-# AGENTS.md — llm-perf 项目与工作指南
+# llm-perf 维护指南
 
-本文件是给维护者和 AI 助手的统一入口：先说明项目边界与运行方式，再记录设计拍板、
-负载口径、验证纪律和工程陷阱。指标方法论、JSON 字段与内部模块边界分别见
-`docs/testing-architecture.md`、`docs/data-contract.md` 和 `docs/architecture.md`。
+## 项目边界
 
-## 项目定位
+llm-perf 只负责采集自部署 LLM 服务的性能原始数据，Go 二进制输出 schema v8 JSON。
+报告、分位统计、容量判定和可视化在工具外完成；`llm-perf-test/` 是本地真机测试工作区，
+被 `.gitignore` 忽略，不把真实端点、密钥、业务数据和测试产物提交到仓库。
 
-项目只负责采集客户自部署 LLM 推理服务的原始性能数据；Go 侧交付单二进制，
-不生成 HTML 报告。聚合、分位、判级和呈现由 pandas、notebook、客户 BI 或其他分析工具完成。
+核心文档：
 
-- 核心契约：输入 YAML 配置，输出自描述的 JSON 原始数据。
-- 对外交付面：`schema_version` + `docs/data-contract.md`；结构变更必须递增版本。
-- 面向堡垒机/内网交付：本机交叉编译 linux/amd64，把二进制和配置模板带到客户环境运行，
-  跑完后只回传 JSON 与日志。
-- 本仓库模板默认把测试产物写入 `llm-perf-test/output`；客户环境可按需覆盖 `output_dir`。
+- [docs/data-contract.md](docs/data-contract.md)：JSON 数据契约。
+- [docs/report-metrics.md](docs/report-metrics.md)：单轮指标和总 TPS 时间轴口径。
+- [docs/architecture.md](docs/architecture.md)：模块边界。
+- [docs/testing-architecture.md](docs/testing-architecture.md)：测试形态和控制变量。
 
-## 命令入口
+## 命令
 
-2026-09-18 起使用显式子命令。公共入口只有四个场景：
+公共入口只有四个子命令：
 
 ```bash
-./bench probe        -c example.yaml    # 引擎、认证、thinking、tool-call、usage、/metrics 探测
-./bench user         -c example.yaml    # profile 驱动的生成式多轮用户会话
-./bench rps          -c example.yaml    # 冻结请求快照的开环 Poisson 到达
-./bench concurrency  -c example.yaml    # 冻结请求快照的固定在飞齐射
+./bench probe -c configs/example.yaml
+./bench user -c configs/example.yaml
+./bench rps -c configs/example.yaml
+./bench concurrency -c configs/example.yaml
 ```
 
-常用覆盖参数包括 `-m`（按模型子串过滤）、`-o`（JSON 文件或目录）、`-seed-salt`、
-`--thinking on|off` 和 `--max-ctx`；`user` 还支持 `--users`。场景参数放在 YAML 中，
-不在 CLI 中重新发明调度旋钮。
+常用覆盖项：`-m`、`-o`、`--seed-salt`、`--thinking`、`--max-ctx`；`user` 还支持 `--users`。
+场景参数放在 YAML，不为单次测试在 CLI 增加临时调度参数。
 
-**user** 需要先离线生成 profile：
+`user` 使用 `user.profile_path` 生成多轮动态会话；`rps` 和 `concurrency` 使用
+`request_set.sharegpt_path` 的冻结请求集。两类负载的 cache 和时间行为不同，分析时不要混表。
 
-```bash
-python3 scripts/profile_build.py --trace <raw-trace> --out <profile.json>
-./bench user -c customer.yaml --users 8
+真机运行顺序：先 `probe` 确认模型、认证、usage、思考能力和 `/metrics`，再跑目标场景。
+重跑或切换思考模式时使用新的 `--seed-salt`。
+
+## 当前数据模型
+
+`TurnMetrics` 是一轮模型请求的核心样本，所有模式使用同一组单轮字段：
+
+```text
+sent_at / end_at
+prompt_tokens / completion_tokens / reasoning_tokens / cached_tokens
+ttft_ms / think_ms / tpot_ms / tokens_per_sec / e2e_ms
+finish_reason / error / cancelled / warnings
 ```
 
-**rps/concurrency** 直接读取 `request_set.sharegpt_path`。请求源相同，只差调度器：
-rps 用到达率控制节奏，适合回答“敢承诺多少请求/秒”；concurrency 用在飞数量打满服务端，
-适合回答“系统最多能装多少”。user 的 prefix cache 是真实生成链形成的动态 cache；
-rps/concurrency 是冻结快照 cache。两类结果不能混表。
+单轮 TPS：
 
-### 客户环境运行顺序
+```text
+tokens_per_sec = completion_tokens / ((e2e_ms - ttft_ms) / 1000)
+```
 
-1. `make build-linux` 生成 `bin/bench-linux-amd64`。
-2. 复制二进制和不含敏感信息的配置模板到客户环境。
-3. 先跑 `./bench probe -c customer.yaml`，确认标准面可用后再压测。
-4. 按目标选择 user、rps 或 concurrency；思考模式另起测试时更换 `seed_salt`。
+总 TPS 是时间轴序列。每个成功请求的 decode 区间为
+`[sent_at + ttft_ms, end_at)`；每个一秒点的 `tps` 是该秒中点正在 decode 的请求的
+`tokens_per_sec` 之和，`decode_requests` 是请求数。输出字段为 `total_tps[]`。
 
-## 输出与配置
+服务端 `/metrics` 是独立的场景级观测源，只写入 `server_metrics`；客户端 completion token
+与服务端 generation token 通过 `source_check` 对账，不把共享 counter 差值挂到单条请求。
 
-场景 JSON 的主数组是 `multiturn[]`（user）和 `concurrent[]`（rps/concurrency）；
-probe JSON 是独立结构。warmup、correctness、失败和主动取消都保留完整
-`TurnMetrics`，warmup/correctness 位于 `auxiliary_requests[]`，不进入主 KPI。
-`run.log` 追加不覆盖；`raw/` 只在显式 `debug: true` 或请求失败时留证据。
-多模型输出必须使用目录，结果按模型子目录分区。
+## 数据删减原则
 
-端点、API key 和客户生产参数只放本地配置：
+schema 不保留旧字段兼容逻辑。分析可以从单轮样本重算的派生值不进入 JSON：
 
-- `configs/customer*.yaml` 和 `docs/customer-*.md` 已被 gitignore。
-- 自有环境测试配置和测试产物放在 `llm-perf-test/`，整目录不入库。
-- 仓库只保留 `configs/example.yaml`、`configs/benchmark.yaml`、smoke 配置和测试 fixture。
+- 不落 `total_tokens`、`throughput_tps`、`weighted_tps` 和旧 active-decode 聚合字段。
+- 不落 `ttft_reasoning_ms`、`ttft_content_ms`、`reasoning_field`、`new_tokens`。
+- 不落 chunk 计数、字符数、ITL、原始 chunk 时间和首帧时间；这些只在内存/debug 中使用。
+- 不落逐请求 `/metrics` counter；服务端数据按场景窗口单独采集。
 
-## 真机报告要求（2026-09-21 拍板）
+字段结构变化时直接更新 schema 和消费文档，递增 `SchemaVersionCurrent`，不同时落新旧字段。
 
-除 `probe` 外，`user`、`rps`、`concurrency` 每个真机场景都必须产出 HTML 报告。
-报告以原始 JSON 为唯一输入；Go 采集器仍只负责采集 JSON，HTML 渲染放在外部分析流程。
+## 负载与指标纪律
 
-每个场景报告必须覆盖以下内容，不得只给汇总数字：
+- 主指标是单轮 TTFT、TPOT、TPS、E2E、think_ms 和总 TPS 时间轴。
+- 延迟和单轮 TPS 的主报告口径使用 P95，并同时报告样本数；P50 只作分布参考。
+- `stop` 和 `length` 分层展示，不能混成一个结论。
+- 失败、取消和 usage 缺失样本保留原始记录，但不进入成功样本聚合。
+- `user` 的 session 只描述多轮上下文和 cache，不用 session TPS 代替单轮 TPS 或总 TPS。
+- `running`、`waiting`、KV、cache 命中、preemption 和 source check 是诊断数据，不是新的性能指标。
+- `probe` 的 tool-call 只验证协议能力，不进入压测样本。
 
-1. **吞吐**：总吞吐 tok/s；有多个档位/速率时给出完整曲线或对照表。
-2. **单流速度**：tokens per second 分布，至少给 P50/P95/P99；说明口径是否含思考 token。
-3. **TTFT**：P50/P95/P99（必要时 max），按档位/档次/请求构成分列，避免长短上下文混报。
-4. **TPOT**：P50/P95/P99；只使用 `tpot_ms`，不用 ITL 分位替代。
-5. **Goodput@SLO**：满足配置 SLO 的请求比例、goodput req/s 和 goodput tok/s；
-   未配置 SLO 时在报告中显式标 NA，不得用普通吞吐替代。
-6. **E2E 延迟**：P50/P95/P99；结合 TTFT、TPOT 和输出长度解释长尾来源。
-7. **TTFT 分解 + 服务端排队/KV 画像**：结合 `/metrics` 报告 queue、prefill、decode 的窗口分解，
-   以及 running/waiting 峰值均值、KV usage 和 preemptions；区分排队、prefill 竞争和 KV 压力。
-8. **请求构成**：场景、thinking、stream、采样参数、模型/档位、prompt token 分布、
-   输出预算、成功/失败/取消数量，以及 user 的会话/轮次与 rps/concurrency 的请求源和样本构成。
-9. **数据解读**：解释拐点、排队、缓存、失败和告警对结论的影响；两源一致性、`/metrics`
-   观测与客户端口径不一致时必须显式说明。
-10. **可承诺用户数估算**：按目标 SLO 折算支持的用户/并发数；给出一到多档用户规模假设
-    （在线用户、并发会话、请求到达率或平均输出形状），区分“可承诺容量”“尽力而为容量”
-    和“饱和探索容量”。估算必须注明换算假设，不得把饱和峰值直接当成可承诺容量。
+## 修改纪律
 
-报告文件放在本轮测试输出目录，与原始 JSON 同批保存；外发前检查是否包含敏感配置或业务数据。
+- 先读现有实现和数据契约，再编辑；保持改动集中，不做无关重构。
+- 手工编辑使用 `apply_patch`；默认 ASCII，新注释只解释非显然逻辑。
+- 不回滚用户已有改动，不使用破坏性 Git 命令。
+- 真机端点、密钥和输出只放 `llm-perf-test/` 或本地配置。
 
-## 设计拍板
+## 交付验证
 
-- **采集器边界（2026-09-17）**：报告层已整体剥离。Go 只保证原始数据可信、完整、自描述；
-  “分析侧能算的不碰 Go”。
-- **原始请求一条不丢（2026-09-17）**：warmup、benchmark、correctness、失败和主动取消都采集完整
-  `TurnMetrics`。用途用 `phase` 标记，统计隔离与完整落盘是两条独立规则，不能因为“不进统计”就丢数据。
-- **受控变量优先**：每个维度可隔离、可归因。真实感来自测试设计与配置组合，不来自把真实因素揉进一次跑分。
-- **体验优先（2026-09-16）**：判据先看单流速度、用户可感知的 TTFT/排队和容量拐点；
-  服务端聚合吞吐与资源指标只作归因诊断，不充当体验结论。
-- **RPS 是默认主路径（2026-09-17）**：开环 `request_rate` 表示到达率；闭环 `levels` 是辅助诊断。
-  不引入 `ramp/ramp_factor`，避免两套加压节奏和失败止损语义混入采集器。
-  会话起点用错峰启动实现，不通过开局注入历史伪造分布。
-- **轮间思考时间不做**：TTFT/TPOT 是 per-request 指标；用户思考间隔不改变被测服务的工作点。
-  到达节奏用开环 `request_rate` 控制，比模拟用户发呆更直接、可复现。
-- **冷、暖 prefill 分开测、分开标注**：真实 agent 长上下文多为暖前缀，冷大 prompt 是少数路径。
-  混报会让 TTFT 差一个数量级的两条路径不可解读。
-- **TTFT 体验判据以 30–40K 输入档为准**：现代 agent 基线上下文约 35K，短输入徽章代表不了 agent 体验。
-  三档阈值和方法论出处见 `docs/latency-baselines.md`。
-- **tool-call 只落 probe 健康检查**：默认开启，不进压测路径。agent 主导业务用纯推理压测汇报吞吐时，
-  必须主动说明该边界。
-- **user 首轮按 agent 形状约束在约 35K token**：轻中重档按会话分派，SWRR 确定性分配；
-  不做会话内逐轮换档。会话档位标签随 `MultiturnRun` 落盘。
-- **配置 schema 不保向后兼容**：迭代期改字段直接改类型，不做双轨兼容。
-- **告警必须附可核实证据**：包含请求摘要、响应片段和 capture 范围；判据保守化，
-  不确定降 WARN；capture 只在显式指定目录时落盘。
-- **指标层冻结（2026-09-12）**：评测指标只有 TTFT、decode 速度、goodput@SLO、正确性 canary 四个数。
-  `TurnMetrics` 核心字段封版；新增字段必须指认四数之一，否则用 `json:"-"` 只进诊断面。
-  新功能必须指认控制层或诊断层价值，指认不出不做。配置面不开新顶层旋钮；
-  新能力优先做成预设配置或文档指南，必要的模型差异放 `model_overrides`。
-- **trace 与 filler 分工；多模型隔离优先（2026-09-12）**：trace 的第一交付物是离线画像；
-  filler 是受控变量仪器。多模型默认逐模型隔离测试加组合归因，混合回放只在体感失配且已排除
-  客户端/网络因素时复活。
-- **同目标多路径必须同口径（2026-09-12）**：语料换算、prompt 构造、抽样、分位和吞吐口径统一后才能比较。
-  口径系数要可实测；`probe` 的 `filler_fidelity` 偏离超过 25% 告警。
-- **客户端计时是测量点选择，不是缺陷（2026-09-12）**：网络路径属于用户体验真值。工具开销与被测间隔
-  差几个数量级；两源一致性检查用于发现客户端瓶颈，不做计时架构重构。
-- **`test:` 只切表达层，不切测量（2026-09-13）**：`benchmark|performance|soak` 共用同一套数据与判据，
-  不为类别复制管线或另立判据。跨部署可比依赖同一组格、同一口径和同一判据。
-
-## 负载形态矩阵
-
-| 路径 | 场景 | 状态 |
-|---|---|---|
-| 暖（真实 agent 典型体验） | 错峰开环 user/multiturn，逐轮共享前缀 | 已有能力 |
-| 冷（最坏角落） | 冻结大 prompt，换 seed 击败缓存 | 已有能力 |
-| 缓存收益量化 | `fixed_seed` 对照 + server_metrics 命中率 | 已有能力 |
-| 稳态 soak | 会话续跑，时长制采样 | 已有能力 |
-
-## 验证纪律
-
-交付前至少执行：
+代码或契约变化后执行：
 
 ```bash
-gofmt -l internal/ cmd/
+gofmt -w internal/ cmd/
+test -z "$(gofmt -l internal/ cmd/)"
 go build ./...
 go vet ./...
 go test ./... -count=1
-```
-
-`gofmt` 必须无输出。CLI、config 或场景交互逻辑改动后，还必须运行：
-
-```bash
 scripts/smoke.sh
 ```
 
-`smoke.sh` 启动 local mock OpenAI 兼容服务，验证 probe、user、rps、concurrency、thinking、
-warmup/correctness 完整采集、模型分区和数据契约。HTML 报告层已移除；新增报告面应放进外部分析流程，
-不要回到 Go 或仓库脚本里。
+提交前检查：
 
-文档与代码同步的硬规则：
-
-1. 改 `TurnMetrics` 或 `Report` 结构时同步 `docs/data-contract.md`，并递增 `SchemaVersionCurrent`。
-2. 改模块边界或扩展点时同步 `docs/architecture.md`。
-3. 改指标定义、阈值或测试形态时同步 `docs/testing-architecture.md` / `docs/latency-baselines.md`。
-4. 新增设计拍板写进本文件，操作口径写进对应 `docs/` 文档，不在会话里只留口头结论。
-
-## 工程陷阱
-
-- 同一文件并行编辑会互相覆盖；串行修改，改完用搜索复核。
-- shell `grep` 对部分模式可能静默返回空；关键结论要用结构化搜索并交叉验证。
-- bench CLI 配置用 `-c`；输出不要用 `head` 截断，SIGPIPE 会杀进程，重定向到文件。
-- `TurnMetrics` 新增字段默认考虑 `json:"-"`，避免污染压测 JSON 契约。
-- 展示口径必须等于执行口径：测试画像复用 `ClampLadder` 和现有估算函数，不另写一套估算；
-  reach 是估算值，输出带 `~`。
-- prefix cache 两条硬约束：synthetic context 只能尾部注入，严禁进 system；system 基座会话开始后冻结，
-  不放时间戳或随机数。
-- thinking 关闭必须显式。`Variants()` 和 probe 的关闭态兜底注入 `enable_thinking=false`；
-  修改时不要丢失显式值优先逻辑。
-- 三套 seed 公式加 `-seed-salt` 负责测试隔离；重跑对照必须换盐或清服务端缓存。
-- 截断必须走 `TruncateRunes`，不能按字节切中文。
-- `run.log` 追加不覆盖，多轮测试日志都要留得住。
+```bash
+git diff --check
+git status --short --branch
+```

@@ -6,9 +6,6 @@
 //   - user：生成式多轮用户会话（profile 驱动 + 经典书语料 + 被测模型真实回复）
 //   - request_set：冻结独立请求快照数据源（rps/concurrency 共用，ShareGPT 直接读取）
 //   - rps：开环到达参数；concurrency：固定在飞参数
-//
-// 旧的 single/multiturn/concurrent/dataset/filler/saturation_guard 配置段已随
-// filler 正式路径下线删除（schema 不保向后兼容，拍板见 AGENTS.md）。
 package config
 
 import (
@@ -62,7 +59,6 @@ func (l IntList) Max() int {
 }
 
 // GoodputCfg SLO 约束（goodput 口径）：同时满足 TTFT 与 TPOT 上限的请求才算有效吞吐。
-// 挂在 slo.goodput 下（原顶层 goodput: 已合流进 slo:，schema 不保兼容）。
 type GoodputCfg struct {
 	TTFTMS float64 `yaml:"ttft_ms"` // 如 2000
 	TPOTMS float64 `yaml:"tpot_ms"` // 如 100
@@ -396,11 +392,9 @@ type Config struct {
 	// CorpusPath 自定义语料文件（.txt/.txt.gz，probe 的 filler_fidelity 校准用）；
 	// "" = 使用内置 12 本公版书语料库。user 模式一律走内置语料库（一用户一书）。
 	CorpusPath string `yaml:"corpus_path"`
-	Stream     *bool  `yaml:"stream"` // 默认 true；false 时 TTFT/ITL/思考拆分不可测（N/A）
+	Stream     *bool  `yaml:"stream"` // 默认 true；false 时 TTFT/思考拆分不可测（N/A）
 	Debug      bool   `yaml:"debug"`  // true: 每个请求的原始响应留存到 <output_dir>/raw/，日志同步写 run.log（排查魔改引擎用）
-	// RawTimings 原始 chunk 序列落盘（nil = 默认开）：流式请求把每个含 token chunk 的时刻
-	// 记入 content_times_ms（相对 sent_at 的毫秒偏移）。峰值秒桶吞吐、ITL 抖动等外部分析
-	// 都依赖这份原始序列；体积随输出 token 数线性增长，超长 soak 可置 false 关闭。
+	// RawTimings debug 时保留原始 chunk 序列（nil = 默认开）；性能 JSON 不落盘该序列。
 	RawTimings *bool    `yaml:"raw_timings"`
 	Models     []string `yaml:"models"`
 

@@ -7,7 +7,7 @@
 //   - 首个 content chunk      -> 可见输出开始（= prefill + 思考）
 //   - 最后一个 chunk          -> 请求结束
 //
-// 由此拆出：TTFT、思考时长、decode 时长、ITL 分位数，token 数取自响应 usage 字段。
+// 由此拆出：TTFT、思考时长、TPOT 和单轮 TPS，token 数取自响应 usage 字段。
 // 非流式请求（stream=false）只能测端到端延迟与 usage，TTFT/思考拆分不可测（N/A）。
 package engine
 
@@ -28,7 +28,6 @@ import (
 	"time"
 
 	"github.com/aleexjiang/llm-perf/internal/auth"
-	"github.com/aleexjiang/llm-perf/internal/smetrics"
 )
 
 // Message 是一条对话消息。ToolCallID 仅 role=tool 时使用（OpenAI 协议必填，
@@ -58,9 +57,7 @@ type Client struct {
 	DebugDir     string       // 非空时留存每个请求的原始响应到该目录（排查魔改引擎）
 	Retry        *RetryPolicy // nil = 不重试（压测默认）
 
-	// RawTimings 原始 chunk 序列落盘：流式请求把每个含 token chunk 的时刻记进
-	// content_times_ms（相对 sent_at 的毫秒偏移）。峰值秒桶吞吐、ITL 抖动等外部分析
-	// 都依赖这份原始序列；体积随输出 token 数线性增长，超长 soak 可关。
+	// RawTimings 保留原始 chunk 序列供 debug；性能 JSON 不落 content_times_ms。
 	RawTimings bool
 
 	seq atomic.Int64 // 原始流量转储文件序号
@@ -116,62 +113,47 @@ type TurnMetrics struct {
 
 	// 原始时间戳（仅流式填充）
 	SentAt           time.Time  `json:"sent_at"`
-	FirstChunkAt     *time.Time `json:"first_chunk_at,omitempty"`
-	FirstReasoningAt *time.Time `json:"first_reasoning_at,omitempty"`
-	FirstContentAt   *time.Time `json:"first_content_at,omitempty"`
+	FirstChunkAt     *time.Time `json:"-"`
+	FirstReasoningAt *time.Time `json:"-"`
+	FirstContentAt   *time.Time `json:"-"`
 	EndAt            time.Time  `json:"end_at"`
 
 	// chunk 统计（仅流式）
-	Chunks          int    `json:"chunks"`
-	ReasoningChunks int    `json:"reasoning_chunks"`
-	ContentChunks   int    `json:"content_chunks"`
-	ReasoningChars  int    `json:"reasoning_chars"`
-	ContentChars    int    `json:"content_chars"`
-	ReplyText       string `json:"reply_text,omitempty"`
-	// 预览字段（Finalize 填充）：长文本掐头 120 + 掐尾 120，报告与排错用，全量不入 JSON
-	ContentPreview   string `json:"content_preview,omitempty"`
-	ReasoningPreview string `json:"reasoning_preview,omitempty"`
-	Error            string `json:"error,omitempty"`
+	Chunks          int    `json:"-"`
+	ReasoningChunks int    `json:"-"`
+	ContentChunks   int    `json:"-"`
+	ReasoningChars  int    `json:"-"`
+	ContentChars    int    `json:"-"`
+	ReplyText       string `json:"-"`
+	Error           string `json:"error,omitempty"`
 
 	// usage（服务端精确值）
 	PromptTokens     int    `json:"prompt_tokens"`
 	CompletionTokens int    `json:"completion_tokens"`
 	ReasoningTokens  int    `json:"reasoning_tokens,omitempty"`
-	TotalTokens      int    `json:"total_tokens"`
-	CachedTokens     int    `json:"cached_tokens,omitempty"`   // usage.prompt_tokens_details.cached_tokens（引擎不回传时缺省）
-	FinishReason     string `json:"finish_reason,omitempty"`   // stop / length / ...（思考吃光预算时为 length 且无 content）
-	ReasoningField   string `json:"reasoning_field,omitempty"` // 思考增量字段名：reasoning / reasoning_content（引擎口径证据）
+	CachedTokens     int    `json:"cached_tokens,omitempty"` // usage.prompt_tokens_details.cached_tokens（引擎不回传时缺省）
+	FinishReason     string `json:"finish_reason,omitempty"` // stop / length / ...（思考吃光预算时为 length 且无 content）
+	// reasoningField 仅用于解析协议差异，不进入性能数据契约。
 
-	// NewTokens 多轮场景专用：本轮相对上一轮新增的 prompt tokens（scenario 层在响应返回后填）。
-	// 与增量 prefill 速率（TTFT/新增 tokens）配合，量化"上下文越滚越贵"。
-	NewTokens int `json:"new_tokens,omitempty"`
+	// 派生指标（Finalize 后填充），单位 ms；非流式时 TTFT/思考为 0（N/A）
+	E2EMS         float64 `json:"e2e_ms"`             // 请求发出 -> 结束（两种模式都有）
+	TTFT          float64 `json:"ttft_ms,omitempty"`  // 首个含 token 的 chunk（主流口径，空首 chunk 不算；原始首 chunk 在 first_chunk_at）
+	TTFTReasoning float64 `json:"-"`                  // 首个 reasoning chunk，内部计算 think_ms
+	TTFTContent   float64 `json:"-"`                  // 首个 content chunk，内部计算 think_ms
+	ThinkMS       float64 `json:"think_ms,omitempty"` // reasoning 首包 -> content 首包
+	DecodeMS      float64 `json:"-"`                  // content 首包 -> 结束，仅日志/诊断使用
+	ITLAvg        float64 `json:"-"`
+	ITLP50        float64 `json:"-"`
+	ITLP90        float64 `json:"-"`
+	ITLP95        float64 `json:"-"`
+	ITLP99        float64 `json:"-"`
+	ITLMax        float64 `json:"-"`
 
-	// 派生指标（Finalize 后填充），单位 ms；非流式时 TTFT/思考/ITL 为 0（N/A）
-	E2EMS         float64 `json:"e2e_ms"`                      // 请求发出 -> 结束（两种模式都有）
-	TTFT          float64 `json:"ttft_ms,omitempty"`           // 首个含 token 的 chunk（主流口径，空首 chunk 不算；原始首 chunk 在 first_chunk_at）
-	TTFTReasoning float64 `json:"ttft_reasoning_ms,omitempty"` // 首个 reasoning chunk ≈ prefill 完成
-	TTFTContent   float64 `json:"ttft_content_ms,omitempty"`   // 首个 content chunk = prefill + 思考
-	ThinkMS       float64 `json:"think_ms,omitempty"`          // reasoning 首包 -> content 首包
-	DecodeMS      float64 `json:"decode_ms,omitempty"`         // content 首包 -> 结束；无 content（思考吃光预算）时清 0，键消失 = 不可测
-	ITLAvg        float64 `json:"itl_avg_ms,omitempty"`
-	ITLP50        float64 `json:"itl_p50_ms,omitempty"`
-	ITLP90        float64 `json:"itl_p90_ms,omitempty"`
-	ITLP95        float64 `json:"itl_p95_ms,omitempty"`
-	ITLP99        float64 `json:"itl_p99_ms,omitempty"`
-	ITLMax        float64 `json:"itl_max_ms,omitempty"`
-
-	// ContentTimesMS 每个 content chunk 相对 sent_at 的毫秒偏移（原始序列，raw_timings
-	// 开启时落盘）：外部分析据此重建 chunk 到达时刻、间隔抖动和 chunk 级峰值。
-	// 一个 chunk 可能含多个 token，不能据此无损重建逐 token 时刻；非流式/关闭时缺键。
-	ContentTimesMS []float64 `json:"content_times_ms,omitempty"`
-	// TPOT 每 output token 时间（GenAI-Perf 口径：(E2E−TTFT)/(completion−1)，含思考 token），
-	// 横评常用；与 ITL（仅 content chunk 间隔）互补
+	// ContentTimesMS 只在内存/debug 中保留原始 chunk 时间；一个 chunk 可能含多个 token。
+	ContentTimesMS []float64 `json:"-"`
+	// TPOT 每 output token 时间，含思考 token。
 	TPOTMS       float64 `json:"tpot_ms,omitempty"`
 	TokensPerSec float64 `json:"tokens_per_sec"` // 流式 = completion/(E2E−TTFT)，与 TPOT 同窗（含思考段）；非流式 = completion/E2E
-
-	// SrvDelta 服务端 /metrics counter 增量（前缀缓存命中、preemptions、MTP 接受率）；
-	// server_metrics 开启时由 scenario 层在请求前后抓取差值填入
-	SrvDelta *smetrics.CounterDelta `json:"server_counter_delta,omitempty"`
 
 	// 思考吃光输出预算标记：Thinking + 流式 + 全程无 content + finish_reason=length。
 	// 此时 ThinkMS/DecodeMS/ITL 均不可测，分析时应剔除或调大 max_tokens 重跑。
@@ -244,8 +226,6 @@ func (m *TurnMetrics) warn(format string, args ...any) {
 
 // Finalize 根据 raw 时间戳计算派生指标。必须在请求结束后调用。
 func (m *TurnMetrics) Finalize() {
-	m.ContentPreview = PreviewHeadTail(m.ReplyText)
-	m.ReasoningPreview = PreviewHeadTail(m.reasoningBuf)
 	m.E2EMS = ms(m.SentAt, m.EndAt)
 	if !m.Stream {
 		// 非流式：只有端到端延迟可测

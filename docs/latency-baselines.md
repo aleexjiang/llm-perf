@@ -228,6 +228,6 @@ slo:                      # 体验基线评估（3 档制徽章 + 结论段）
 
 ### 8.3 口径三条
 
-- **output speed 只计首 token 之后**（与 TPOT/ITL、Artificial Analysis methodology 一致，不含 TTFT）；
+- **output speed 只计首 token 之后**（与 TPOT 和 Artificial Analysis methodology 一致，不含 TTFT）；
 - **客户端是评测基线**，服务端 `/metrics` 的聚合吞吐只作参考和归因；
 - **含思考增量**：推理模型的 reasoning chunk 也是服务端产出、也占用户等待。

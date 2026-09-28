@@ -217,7 +217,7 @@ func TestStreamToolCallMultiIndex(t *testing.T) {
 
 // 非流式 message.tool_calls 解析（applyWholeBody）
 func TestWholeBodyToolCalls(t *testing.T) {
-	body := `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"北京\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`
+	body := `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"北京\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`
 	m := &TurnMetrics{}
 	m.applyWholeBody([]byte(body))
 	if len(m.ToolCalls) != 1 || m.ToolCalls[0].Name != "get_weather" || m.ToolCalls[0].Arguments != `{"city":"北京"}` {

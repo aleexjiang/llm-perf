@@ -48,7 +48,7 @@ data: {"id":"c1","choices":[{"index":0,"delta":{"reasoning":" asks"},"finish_rea
 
 data: {"id":"c1","choices":[{"index":0,"delta":{"content":"\n\n2"},"finish_reason":"stop"}]}
 
-data: {"id":"c1","choices":[],"usage":{"prompt_tokens":62,"total_tokens":106,"completion_tokens":44}}
+data: {"id":"c1","choices":[],"usage":{"prompt_tokens":62,"completion_tokens":44}}
 
 data: [DONE]
 `
@@ -60,7 +60,7 @@ data: {"id":"c2","choices":[{"index":0,"delta":{"reasoning_content":"让我想�
 
 data: {"id":"c2","choices":[{"index":0,"delta":{"content":"答案是 2"},"finish_reason":"stop"}]}
 
-data: {"id":"c2","choices":[],"usage":{"prompt_tokens":10,"total_tokens":30,"completion_tokens":20,"completion_tokens_details":{"reasoning_tokens":9}}}
+data: {"id":"c2","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":20,"completion_tokens_details":{"reasoning_tokens":9}}}
 
 data: [DONE]
 `
@@ -113,12 +113,6 @@ func TestIngestSSE_VLLM027_ReasoningField(t *testing.T) {
 	if m.FirstChunkAt == nil || ms(m.SentAt, *m.FirstChunkAt) != 100 {
 		t.Errorf("first_chunk_at 应保留原始首 chunk 时刻（+100ms）: %v", m.FirstChunkAt)
 	}
-	if m.TTFTReasoning != 110 {
-		t.Errorf("TTFTReasoning = %v, want 110", m.TTFTReasoning)
-	}
-	if m.TTFTContent != 130 {
-		t.Errorf("TTFTContent = %v, want 130", m.TTFTContent)
-	}
 	if m.ThinkMS != 20 {
 		t.Errorf("ThinkMS = %v, want 20", m.ThinkMS)
 	}
@@ -134,8 +128,8 @@ func TestIngestSSE_LegacyReasoningContent(t *testing.T) {
 	if m.ReasoningTokens != 9 {
 		t.Errorf("ReasoningTokens = %d, want 9", m.ReasoningTokens)
 	}
-	if m.TTFTReasoning != 110 || m.TTFTContent != 120 {
-		t.Errorf("timing: ttft_reasoning=%v ttft_content=%v", m.TTFTReasoning, m.TTFTContent)
+	if m.ThinkMS <= 0 {
+		t.Errorf("think_ms should be measurable: %v", m.ThinkMS)
 	}
 	if len(m.Warnings) != 0 {
 		t.Errorf("unexpected warnings: %v", m.Warnings)
@@ -189,9 +183,8 @@ func TestIngestSSE_ThinkingNoContent(t *testing.T) {
 	// 全程无 content 时 DecodeMS 会被填成 first_chunk→end（那其实是整段 reasoning 的
 	// 生成时长）。留在 JSON 里报告 decode 列照常出数，与「思考段不可界定」的结论相反，
 	// 也和日志侧打的「—」矛盾——必须与 ThinkMS 一起清 0，让键消失。
-	if m.ThinkMS != 0 || m.DecodeMS != 0 || m.TTFTContent != 0 {
-		t.Errorf("ThinkMS/DecodeMS/TTFTContent should be 0, got %v/%v/%v",
-			m.ThinkMS, m.DecodeMS, m.TTFTContent)
+	if m.ThinkMS != 0 || m.DecodeMS != 0 {
+		t.Errorf("ThinkMS/DecodeMS should be 0, got %v/%v", m.ThinkMS, m.DecodeMS)
 	}
 }
 
@@ -210,7 +203,7 @@ func TestIngestSSE_ErrorChunk(t *testing.T) {
 func TestApplyWholeBody(t *testing.T) {
 	t.Run("openai_style", func(t *testing.T) {
 		m := &TurnMetrics{}
-		m.applyWholeBody([]byte(`{"choices":[{"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}}`))
+		m.applyWholeBody([]byte(`{"choices":[{"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":1}}`))
 		if m.ReplyText != "OK" || m.FinishReason != "stop" || m.PromptTokens != 5 {
 			t.Errorf("got reply=%q finish=%q prompt=%d", m.ReplyText, m.FinishReason, m.PromptTokens)
 		}
@@ -249,7 +242,7 @@ func TestFinalize_ITLPercentiles(t *testing.T) {
 
 func TestFinalize_NoTokenDeltaDoesNotProduceTTFT(t *testing.T) {
 	raw := "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n" +
-		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":0,\"total_tokens\":10}}\n" +
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":0}}\n" +
 		"data: [DONE]\n"
 	m := &TurnMetrics{Stream: true}
 	feed(t, m, raw, true)
@@ -301,7 +294,7 @@ func TestTTFTSkipsEmptyFirstChunk(t *testing.T) {
 	// 非思考模型：首 chunk 为 role-only 空 content，第二个 chunk 才有正文
 	raw := "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n" +
 		"data: {\"choices\":[{\"delta\":{\"content\":\"你好\"},\"finish_reason\":null}]}\n" +
-		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n" +
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n" +
 		"data: [DONE]\n"
 	m := &TurnMetrics{Stream: true}
 	feed(t, m, raw, true)
@@ -309,9 +302,6 @@ func TestTTFTSkipsEmptyFirstChunk(t *testing.T) {
 	// 空首 chunk t0+100ms，正文首包 t0+110ms → TTFT=110 而非 100
 	if m.TTFT != 110 {
 		t.Errorf("TTFT = %v, want 110（空首 chunk 不算 token）", m.TTFT)
-	}
-	if m.TTFTContent != 110 {
-		t.Errorf("TTFTContent = %v, want 110", m.TTFTContent)
 	}
 	// TPOT 用同一口径：(E2E−TTFT)/(completion−1)
 	if m.TPOTMS <= 0 {
@@ -326,8 +316,8 @@ func TestTTFTContentOnlyFallback(t *testing.T) {
 		"data: [DONE]\n"
 	m := &TurnMetrics{Stream: true}
 	feed(t, m, raw, true)
-	if m.TTFT != m.TTFTContent {
-		t.Errorf("无 reasoning 时 TTFT 应等于 TTFTContent: %v vs %v", m.TTFT, m.TTFTContent)
+	if m.TTFT <= 0 {
+		t.Errorf("无 reasoning 时 TTFT 应可测: %v", m.TTFT)
 	}
 }
 
@@ -360,7 +350,7 @@ func TestTokensPerSecNonThinkingUnchanged(t *testing.T) {
 	// 非思考流：TTFT=content 首包 → E2E−TTFT == DecodeMS，数值与旧口径完全一致
 	raw := "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n" +
 		"data: {\"choices\":[{\"delta\":{\"content\":\"你好世界\"},\"finish_reason\":null}]}\n" +
-		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":8,\"total_tokens\":18}}\n" +
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":8}}\n" +
 		"data: [DONE]\n"
 	m := &TurnMetrics{Stream: true}
 	feed(t, m, raw, true)

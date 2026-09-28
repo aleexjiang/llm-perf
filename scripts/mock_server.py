@@ -113,7 +113,6 @@ class H(BaseHTTPRequestHandler):
         usage = {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": n_reason + n_content,
-            "total_tokens": prompt_tokens + n_reason + n_content,
             "completion_tokens_details": {"reasoning_tokens": n_reason},
         }
         # 服务端自身的产出统计（/metrics 口径）：与 usage 一致，便于两源一致性检查对得上，

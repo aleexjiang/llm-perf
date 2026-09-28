@@ -10,8 +10,6 @@
 //   - runOne：单请求执行 + 完整指标（失败/取消一条不丢）
 //   - 服务端观测窗口（startWindow/finishWindow）与两源一致性（applySourceCheck）
 //   - SLO / KV 容量画像挂载
-//
-// 旧的 filler/trace 回放路径与 --turns × --concurrency 组合入口已于 2026-09-18 下线。
 package scenario
 
 import (
@@ -73,11 +71,6 @@ type env struct {
 	kv *smetrics.KVCapacity
 	// gauge 是场景窗口的后台 gauge 轮询器；档位级 running/waiting 峰值从它读取。
 	gauge *smetrics.GaugePoller
-	// perReqSrv 逐请求 /metrics 前后抓取（SrvDelta）开关：仅串行路径启用。
-	// 并发/开环下每请求抓取落在计时窗口内（压低 wall_seconds 口径的吞吐）、
-	// 各请求差值窗口互相重叠无归因意义，且给服务端叠加可观测负载——
-	// 并发路径只保留场景窗口级差分（startWindow/finishWindow），口径更干净。
-	perReqSrv bool
 }
 
 // setupServerMetrics 装配服务端观测层（server_metrics: true 时）：probe 同口径判定
@@ -142,15 +135,11 @@ func ctxLimitHit(m *engine.TurnMetrics) string {
 	return "未知"
 }
 
-// runOne 发起一次请求（流式/非流式、思考变体由 opts 决定），并做 /metrics counter 前后差值。
+// runOne 发起一次请求（流式/非流式、思考变体由 opts 决定）。
 // 契约：任何路径都返回非 nil 的 TurnMetrics——失败/取消也是数据（"原始请求一条不丢"）。
 func runOne(ctx context.Context, e *env, model string,
 	msgs []engine.Message, maxTokens int, v config.ThinkingVariant) *engine.TurnMetrics {
 
-	var before *smetrics.Sample
-	if e.srv != nil && e.perReqSrv {
-		before, _ = e.srv.Scrape(ctx)
-	}
 	m, err := e.client.Chat(ctx, engine.ChatOptions{
 		Model:       model,
 		Messages:    msgs,
@@ -215,11 +204,6 @@ func runOne(ctx context.Context, e *env, model string,
 				m.TTFT, think, decode, m.TokensPerSec, m.FinishReason)
 		} else {
 			log.Printf("    E2E=%.0fms tok/s=%.0f（非流式，TTFT/思考拆分 N/A）", m.E2EMS, m.TokensPerSec)
-		}
-	}
-	if e.srv != nil && e.perReqSrv && before != nil {
-		if after, err := e.srv.Scrape(ctx); err == nil {
-			m.SrvDelta = smetrics.DiffCounters(before, after, e.provider)
 		}
 	}
 	return m
@@ -343,7 +327,11 @@ func applySourceCheck(e *env, rep *report.Report, before *smetrics.Sample) {
 	for i := range rep.Concurrent {
 		lv := &rep.Concurrent[i]
 		wall += lv.WallSeconds
-		tokens += lv.ThroughputTPS * lv.WallSeconds
+		for _, m := range lv.Requests {
+			if m != nil && m.Error == "" && !m.Cancelled {
+				tokens += float64(m.CompletionTokens)
+			}
+		}
 	}
 	if wall <= 0 || tokens <= 0 {
 		sc.Note = "客户端侧无可比吞吐（本轮无有效档位数据）"

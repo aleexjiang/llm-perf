@@ -143,7 +143,7 @@ func TestPartitionByModelAuxiliaryRequests(t *testing.T) {
 
 // preemptions 的 JSON tag 刻意不带 omitempty：0 表示「窗口内没有发生抢占」这一
 // 有意义的结果（健康态），键一旦消失，读数据的人会把「实测 0」误读成「没采到这一项」。
-// 真机上 vllm:num_preemptions_total 存在且为 0，旧产物里却查无此键，正是这个坑。
+// vllm:num_preemptions_total 为 0 时也必须明确落盘，便于区分健康状态和未采集。
 func TestServerMetricsPreemptionsZeroKept(t *testing.T) {
 	b, err := json.Marshal(ServerMetricsSummary{Available: true})
 	if err != nil {
@@ -168,48 +168,90 @@ func TestServerMetricsTokenCountersKept(t *testing.T) {
 	}
 }
 
-// user/rps/concurrency 共用总吞吐入口：吞吐只看完整成功请求；
-// stop/length 分层的加权单流速度不能混成一个中位数。
+// user/rps/concurrency 共用总 TPS 入口；总 TPS 由单轮 decode 区间的时间轴序列构成。
 func TestBuildThroughputSummary(t *testing.T) {
 	base := time.Unix(100, 0)
 	summary := BuildThroughputSummary([]*engine.TurnMetrics{
-		{Stream: true, SentAt: base, EndAt: base.Add(1100 * time.Millisecond), TTFT: 100, E2EMS: 1100, CompletionTokens: 100, TPOTMS: 10, FinishReason: "stop"},
-		{Stream: true, SentAt: base, EndAt: base.Add(2200 * time.Millisecond), TTFT: 200, E2EMS: 2200, CompletionTokens: 100, TPOTMS: 20, FinishReason: "length"},
+		{Stream: true, SentAt: base, EndAt: base.Add(1100 * time.Millisecond), TTFT: 100, E2EMS: 1100, CompletionTokens: 100, TokensPerSec: 100, TPOTMS: 10, FinishReason: "stop"},
+		{Stream: true, SentAt: base, EndAt: base.Add(2200 * time.Millisecond), TTFT: 200, E2EMS: 2200, CompletionTokens: 100, TokensPerSec: 50, TPOTMS: 20, FinishReason: "length"},
 		{Stream: true, Error: "HTTP 500", CompletionTokens: 50, FinishReason: "stop"},
 		{Stream: true, Cancelled: true, CompletionTokens: 50},
 	}, 2)
 	if summary.CompletedRequests != 2 || summary.FailedRequests != 1 || summary.CancelledRequests != 1 {
 		t.Fatalf("完成/失败/取消计数错误: %+v", summary)
 	}
-	if summary.CompletionTokens != 200 || summary.ThroughputTPS != 100 {
-		t.Fatalf("总吞吐错误: tokens=%d tps=%v", summary.CompletionTokens, summary.ThroughputTPS)
+	if summary.CompletionTokens != 200 {
+		t.Fatalf("完成 token 汇总错误: tokens=%d", summary.CompletionTokens)
 	}
-	if summary.Streaming.All.Count != 2 || summary.Streaming.All.WeightedTPS != 200.0/3.0 {
+	if summary.Streaming.All.Count != 2 || summary.Streaming.All.P95TPS <= 0 {
 		t.Fatalf("全成功分层错误: %+v", summary.Streaming.All)
 	}
-	if summary.ActiveDecodeTokens != 200 || summary.ActiveDecodeTPS <= 0 {
-		t.Fatalf("活跃 decode 聚合错误: %+v", summary)
-	}
-	if summary.Streaming.Stop.Count != 1 || summary.Streaming.Stop.WeightedTPS != 100 {
+	if summary.Streaming.Stop.Count != 1 {
 		t.Fatalf("stop 分层错误: %+v", summary.Streaming.Stop)
 	}
-	if summary.Streaming.Length.Count != 1 || summary.Streaming.Length.WeightedTPS != 50 {
+	if summary.Streaming.Length.Count != 1 {
 		t.Fatalf("length 分层错误: %+v", summary.Streaming.Length)
+	}
+	if len(summary.TotalTPS) == 0 || summary.TotalTPS[0].TPS <= 0 {
+		t.Fatalf("总 TPS 时间序列错误: %+v", summary.TotalTPS)
+	}
+	b, err := json.Marshal(summary)
+	if err != nil {
+		t.Fatalf("marshal throughput: %v", err)
+	}
+	serialized := string(b)
+	if !strings.Contains(serialized, `"total_tps"`) ||
+		strings.Contains(serialized, `"throughput_tps"`) ||
+		strings.Contains(serialized, `"weighted_tps"`) {
+		t.Fatalf("聚合 schema v8 字段错误: %s", serialized)
 	}
 }
 
-func TestBuildThroughputSummaryActiveDecodeUnion(t *testing.T) {
+func TestBuildTotalTPSTimeAxis(t *testing.T) {
 	base := time.Unix(100, 0)
-	summary := BuildThroughputSummary([]*engine.TurnMetrics{
-		{Stream: true, SentAt: base, TTFT: 100, E2EMS: 1000, EndAt: base.Add(time.Second), CompletionTokens: 10, FinishReason: "stop"},
-		{Stream: true, SentAt: base.Add(200 * time.Millisecond), TTFT: 100, E2EMS: 1000, EndAt: base.Add(1200 * time.Millisecond), CompletionTokens: 10, FinishReason: "stop"},
-	}, 2)
-	// 两条 decode 区间并集 = [100ms,1200ms] = 1.1s；重叠区应相加，而不是把两条单流速率平均。
-	if summary.ActiveDecodeSeconds < 1.09 || summary.ActiveDecodeSeconds > 1.11 {
-		t.Fatalf("活跃 decode 并集时间错误: %v", summary.ActiveDecodeSeconds)
+	series := BuildTotalTPS([]*engine.TurnMetrics{
+		{Stream: true, SentAt: base, TTFT: 100, E2EMS: 1000, EndAt: base.Add(time.Second), CompletionTokens: 10, TokensPerSec: 11.111111, FinishReason: "stop"},
+		{Stream: true, SentAt: base.Add(200 * time.Millisecond), TTFT: 100, E2EMS: 1000, EndAt: base.Add(1200 * time.Millisecond), CompletionTokens: 10, TokensPerSec: 11.111111, FinishReason: "stop"},
+	})
+	if len(series) != 2 {
+		t.Fatalf("应按 decode 时间轴生成 2 个一秒点: %+v", series)
 	}
-	if got := summary.ActiveDecodeTPS; got < 18 || got > 19 {
-		t.Fatalf("活跃 decode 聚合吞吐错误: %v", got)
+	if series[0].DecodeRequests != 2 || series[0].TPS < 22 || series[0].TPS > 23 {
+		t.Fatalf("第一秒总 TPS 错误: %+v", series[0])
+	}
+	if series[1].DecodeRequests != 0 || series[1].TPS != 0 {
+		t.Fatalf("第二秒总 TPS 错误: %+v", series[1])
+	}
+}
+
+func TestSchemaV8RemovesDerivedAndDebugFields(t *testing.T) {
+	m := &engine.TurnMetrics{
+		Model: "m", Stream: true, Thinking: true,
+		PromptTokens: 10, CompletionTokens: 8, ReasoningTokens: 3,
+		CachedTokens: 4, E2EMS: 100, TTFT: 20, ThinkMS: 5,
+		TokensPerSec: 100, TPOTMS: 10, FinishReason: "stop",
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal TurnMetrics: %v", err)
+	}
+	s := string(b)
+	for _, removed := range []string{
+		`"total_tokens"`, `"ttft_reasoning_ms"`, `"ttft_content_ms"`,
+		`"decode_ms"`, `"itl_p95_ms"`, `"content_times_ms"`,
+		`"reasoning_field"`, `"new_tokens"`, `"server_counter_delta"`,
+	} {
+		if strings.Contains(s, removed) {
+			t.Fatalf("schema v8 不应落盘 %s: %s", removed, s)
+		}
+	}
+	for _, kept := range []string{`"prompt_tokens"`, `"completion_tokens"`, `"ttft_ms"`, `"think_ms"`, `"tpot_ms"`, `"tokens_per_sec"`} {
+		if !strings.Contains(s, kept) {
+			t.Fatalf("schema v8 应落盘 %s: %s", kept, s)
+		}
+	}
+	if SchemaVersionCurrent != 8 {
+		t.Fatalf("schema version = %d, want 8", SchemaVersionCurrent)
 	}
 }
 

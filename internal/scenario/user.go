@@ -1,7 +1,6 @@
 // user.go：user 模式——生成式多轮用户会话（docs/workload-refactor-plan.md 13）。
 //
-// 与旧 multiturn/filler 的本质区别：
-//   - 会话形状来自外置 profile.json（trace 特征提炼），默认权重 6:3:1 可调；
+// 会话形状来自外置 profile.json（trace 特征提炼），默认权重 6:3:1 可调；
 //   - 运行时文本（system 基座 / user 输入 / 合成 context）全部取自经典书语料库，
 //     窗口起点由 (session_seed, turn) 派生，内容确定可复现；
 //   - 每轮把**被测模型真实生成的 assistant 回复**追加进下一轮 history——
@@ -82,7 +81,7 @@ func UserScenario(ctx context.Context, cfg *config.Config, client *engine.Client
 		}
 	}
 
-	e := &env{cfg: cfg, client: client, perReqSrv: false}
+	e := &env{cfg: cfg, client: client}
 	// 服务端观测层：之前漏装配导致 user 场景 JSON 恒无 server_metrics（真机发现 1.3），
 	// cache hit/preemption 等归因数据全部缺失——与 rps/concurrency 同口径装配。
 	if err := setupServerMetrics(ctx, e, cfg); err != nil {
@@ -238,7 +237,6 @@ func runOneUserSession(ctx context.Context, e *env, prof *Profile, lang, model s
 
 	firstTotal := sample(prof.FirstTurnTokens)
 	msgs := []engine.Message{baseMsg}
-	prevPrompt := 0 // new_tokens 基准：上一成功轮的实测 prompt（发现 1.4：旧实现恒 0）
 	// lastBaseline 是下一轮 prompt 的下限估计：上一轮实测 prompt + assistant 回复 token。
 	// usage 缺失时置 0，只保留原有的运行时兜底，不做错误截断。
 	lastBaseline := 0
@@ -297,12 +295,6 @@ func runOneUserSession(ctx context.Context, e *env, prof *Profile, lang, model s
 		msgs = append(msgs, engine.Message{Role: "user", Content: content.String()})
 
 		m := runOne(ctx, e, model, msgs, maxTok, v)
-		// new_tokens：本轮相对上一成功轮新增的 prompt tokens（增量 prefill 速率的分母，
-		// "越聊越贵"曲线的一级变量）。失败/异常轮 usage 缺失，跳过推进、下轮与上成功轮比。
-		if m.PromptTokens > 0 {
-			m.NewTokens = m.PromptTokens - prevPrompt
-			prevPrompt = m.PromptTokens
-		}
 		if tokenBudget > 0 && m.PromptTokens > 0 && m.Error == "" && !m.Cancelled {
 			nextPromptBase := m.PromptTokens + m.CompletionTokens
 			if m.ReplyText == "" {

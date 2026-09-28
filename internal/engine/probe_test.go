@@ -134,13 +134,13 @@ func TestProbe_FillerFidelityWarnsOnDeviation(t *testing.T) {
 		if !req.Stream {
 			w.Header().Set("Content-Type", "application/json")
 			fmt.Fprintf(w, `{"choices":[{"finish_reason":"stop","message":{"content":"OK"}}],`+
-				`"usage":{"prompt_tokens":%d,"completion_tokens":1,"total_tokens":%d}}`, usage, usage+1)
+				`"usage":{"prompt_tokens":%d,"completion_tokens":1}}`, usage)
 			return true
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"想一想\"}}]}\n\n"+
 			"data: {\"choices\":[{\"delta\":{\"content\":\"OK\"},\"finish_reason\":\"stop\"}]}\n\n")
-		fmt.Fprintf(w, "data: {\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":1,\"total_tokens\":%d}}\n\n", usage, usage+1)
+		fmt.Fprintf(w, "data: {\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":1}}\n\n", usage)
 		_, _ = io.WriteString(w, "data: [DONE]\n\n")
 		return true
 	})

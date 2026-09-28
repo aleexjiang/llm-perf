@@ -72,8 +72,8 @@ func TestRPSScenario(t *testing.T) {
 			t.Fatalf("usage 缺失（stub 应回 prompt_tokens）")
 		}
 	}
-	if lv.CompletedRequests != 6 || lv.ThroughputTPS <= 0 {
-		t.Fatalf("汇总错误: completed=%d tps=%.1f", lv.CompletedRequests, lv.ThroughputTPS)
+	if lv.CompletedRequests != 6 || len(lv.TotalTPS) == 0 {
+		t.Fatalf("汇总错误: completed=%d total_tps_points=%d", lv.CompletedRequests, len(lv.TotalTPS))
 	}
 	if lv.SLOTotal != 0 || lv.SLOMeet != 0 || lv.GoodputRPS != 0 || lv.GoodputTPS != 0 {
 		t.Fatalf("未配置 SLO 时 goodput 应保持零值: %+v", lv)
@@ -163,30 +163,32 @@ func TestFinishLevelGoodput(t *testing.T) {
 	}
 }
 
-// rps/concurrency 的档位级活跃 decode 聚合必须由场景层落盘，
+// rps/concurrency 的档位级总 TPS 时间序列必须由场景层落盘，
 // 不能只在报告脚本里临时重算。
-func TestFinishLevelActiveDecodeTPS(t *testing.T) {
+func TestFinishLevelTotalTPSSeries(t *testing.T) {
 	e := &env{cfg: &config.Config{}}
 	base := time.Now()
 	lv := report.ConcurrentLevel{
 		WallSeconds: 3,
 		Requests: []*engine.TurnMetrics{
-			{Stream: true, SentAt: base, TTFT: 100, E2EMS: 2100, EndAt: base.Add(2100 * time.Millisecond), CompletionTokens: 100},
-			{Stream: true, SentAt: base.Add(500 * time.Millisecond), TTFT: 100, E2EMS: 1600, EndAt: base.Add(2100 * time.Millisecond), CompletionTokens: 100},
+			{Stream: true, SentAt: base, TTFT: 100, E2EMS: 2100, EndAt: base.Add(2100 * time.Millisecond), CompletionTokens: 100, TokensPerSec: 50},
+			{Stream: true, SentAt: base.Add(500 * time.Millisecond), TTFT: 100, E2EMS: 1600, EndAt: base.Add(2100 * time.Millisecond), CompletionTokens: 100, TokensPerSec: 50},
 		},
 	}
 	finishLevel(e, &lv)
-	if lv.ActiveDecodeTPS <= 0 {
-		t.Fatalf("active_decode_tps 未写入: %+v", lv)
+	if len(lv.TotalTPS) == 0 {
+		t.Fatalf("total_tps 未写入: %+v", lv)
 	}
-	if lv.ActiveDecodeTPS <= lv.ThroughputTPS {
-		t.Fatalf("重叠 decode 的活跃聚合应高于 batch 平均: active=%.1f batch=%.1f", lv.ActiveDecodeTPS, lv.ThroughputTPS)
+	if lv.TotalTPS[0].DecodeRequests != 2 || lv.TotalTPS[0].TPS <= 0 {
+		t.Fatalf("总 TPS 时间序列首点错误: %+v", lv.TotalTPS[0])
+	}
+	if len(lv.TotalTPS) < 2 || lv.TotalTPS[1].DecodeRequests != 2 {
+		t.Fatalf("重叠 decode 未反映到时间轴: %+v", lv.TotalTPS)
 	}
 }
 
 // TestBarrierOpenLoopRateIndependentOfLatency 开环到达率与处理耗时解耦（review H3 回归）：
-// 旧实现 worker 处理完上一请求才按间隔 sleep——处理慢于到达间隔时实际发射率被拉长，
-// 变成"带节奏的闭环"，测不到过载排队。新实现由独立发射时钟按泊松过程注入。
+// 开环发射时钟必须与请求处理耗时解耦，才能测到过载排队。
 // 构造：4 请求、rate=100/s（间隔 10ms）、每请求处理 300ms——
 // 解耦后 wall ≈ 首请求处理 300ms + 少量发射窗口；耦合实现 wall ≈ 4×300ms = 1.2s。
 func TestBarrierOpenLoopRateIndependentOfLatency(t *testing.T) {
@@ -195,14 +197,14 @@ func TestBarrierOpenLoopRateIndependentOfLatency(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n"+
 			"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n"+
-			"data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11}}\n\n")
+			"data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":8}}\n\n")
 	}))
 	defer srv.Close()
 
 	cfg := testCfg(t, srv.URL)
 	cfg.RequestSet = config.RequestSet{NumPrompts: 4, Seed: 42}
 	cfg.Thinking = config.Thinking{Mode: "off"}
-	e := &env{cfg: cfg, client: engine.NewClient(srv.URL, "", 10*time.Second, true), perReqSrv: false}
+	e := &env{cfg: cfg, client: engine.NewClient(srv.URL, "", 10*time.Second, true)}
 	em, _ := forModel(e, cfg, "stub-model")
 
 	samples := make([]engine.RequestSample, 4)

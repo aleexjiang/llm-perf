@@ -327,7 +327,7 @@ func main() {
 		// 配置原文随每份分区落盘，环境 probe 结果由独立 probe JSON 提供。
 		rep.ConfigRaw = cfg.Raw
 		// 按模型分区落盘：多模型测试各落 <output_dir>/<模型>/，重测/作废单模型不纠缠；
-		// 单模型（或 -m 过滤后只剩一个）保持原布局直接落 output_dir，报告工具兼容两种布局
+		// 单模型（或 -m 过滤后只剩一个）直接落 output_dir。
 		parts := rep.PartitionByModel()
 		if len(parts) == 0 {
 			parts = []*report.Report{rep}
@@ -398,7 +398,7 @@ func main() {
 			Timeout:         cfg.Timeout(),
 			ToolCall:        !*noToolCallFlag,
 			CaptureDir:      *captureFlag,
-			XVPromptTokens:  10000, // 引擎识别探测的 prompt 规模（与旧默认值一致）
+			XVPromptTokens:  10000, // 引擎识别探测的 prompt 规模
 			XVMaxTokens:     256,   // probe 上下文探测按最大输出预算（prompt+output 最坏组合）
 			ThinkingBudget:  th.MaxTokensFloorValue(),
 			CacheCheck:      *cacheFlag,

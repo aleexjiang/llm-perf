@@ -35,7 +35,7 @@ func TestFiller_Deterministic(t *testing.T) {
 // 的字符/token 换算，断言锚在**字符数**上。
 //
 // 回归防护：早期按「1.33 词/token」（假设 1 词 ≈ 0.75 token，方向性错误）构造，真机实测
-// 500tk 档实际发出 1246 token（3.99 chars/token，偏差 2.49×）。旧断言只数词数
+// 500tk 档实际发出约 1246 token，验证生成侧长度按 token 口径处理。
 // （12000~15000 词），换算系数错得再离谱也恒过——必须锚字符数才能抓住这类偏差。
 func TestFiller_TokenApproximation(t *testing.T) {
 	// en ≈4 字符/token：10000tk → ~40000 字符（追加式构造，末词最多溢出 ~8 字符）

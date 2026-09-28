@@ -44,8 +44,6 @@ func CharsPerToken(lang string) float64 {
 	return 4.0 // 英文散文（含空格标点）约 4 字符/token
 }
 
-// ── 旧接口（filler 遗留路径；filler 从正式压测下线后将一并移除） ──
-
 // Corpus 一份已加载的语料（rune 切片，保证多字节安全切片）。
 type Corpus struct {
 	lang string

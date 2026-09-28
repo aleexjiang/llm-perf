@@ -92,7 +92,6 @@ type chunkChoice struct {
 type usageInfo struct {
 	PromptTokens            int `json:"prompt_tokens"`
 	CompletionTokens        int `json:"completion_tokens"`
-	TotalTokens             int `json:"total_tokens"`
 	CompletionTokensDetails *struct {
 		ReasoningTokens int `json:"reasoning_tokens"`
 	} `json:"completion_tokens_details"`
@@ -144,7 +143,6 @@ func (m *TurnMetrics) applyUsage(u *usageInfo) {
 	}
 	m.PromptTokens = u.PromptTokens
 	m.CompletionTokens = u.CompletionTokens
-	m.TotalTokens = u.TotalTokens
 	if u.CompletionTokensDetails != nil {
 		m.ReasoningTokens = u.CompletionTokensDetails.ReasoningTokens
 	}
@@ -322,7 +320,7 @@ func (m *TurnMetrics) closeOutWarnings(includeUsage bool) {
 	if includeUsage && !m.usageSeen {
 		m.warn("usage_missing") // 服务端未回 usage → token 数全 0，性能数据不可信
 	}
-	if m.usageSeen && m.PromptTokens == 0 && m.CompletionTokens == 0 && m.TotalTokens == 0 {
+	if m.usageSeen && m.PromptTokens == 0 && m.CompletionTokens == 0 {
 		m.warn("usage_incomplete") // usage 对象存在但没有任何可用 token 数
 	}
 }

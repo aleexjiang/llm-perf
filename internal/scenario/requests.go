@@ -79,10 +79,8 @@ func requestRunner(ctx context.Context, e *env, model string, v config.ThinkingV
 // finishLevel 汇总一个档位的吞吐、成败计数与 SLO goodput。
 func finishLevel(e *env, lv *report.ConcurrentLevel) {
 	wall := lv.WallSeconds
-	completed, failed, cancelled, tokens := 0, 0, 0, 0.0
+	completed, failed, cancelled := 0, 0, 0
 	meet, total, goodTokens := 0, 0, 0.0
-	var decodeIntervals [][2]time.Time
-	activeTokens := 0.0
 	sloEnabled := e.cfg.EffGoodput() != nil
 	for _, m := range lv.Requests {
 		switch {
@@ -95,14 +93,6 @@ func finishLevel(e *env, lv *report.ConcurrentLevel) {
 			}
 		default:
 			completed++
-			tokens += float64(m.CompletionTokens)
-			if m.Stream && m.TTFT > 0 && m.E2EMS > m.TTFT && !m.SentAt.IsZero() && !m.EndAt.IsZero() {
-				start := m.SentAt.Add(time.Duration(m.TTFT * float64(time.Millisecond)))
-				if m.EndAt.After(start) {
-					decodeIntervals = append(decodeIntervals, [2]time.Time{start, m.EndAt})
-					activeTokens += float64(m.CompletionTokens)
-				}
-			}
 			if sloEnabled {
 				total++
 				if goodputOf(e, m) {
@@ -118,18 +108,15 @@ func finishLevel(e *env, lv *report.ConcurrentLevel) {
 	lv.SLOMeet = meet
 	lv.SLOTotal = total
 	if wall > 0 {
-		lv.ThroughputTPS = tokens / wall
 		lv.GoodputRPS = float64(meet) / wall
 		lv.GoodputTPS = goodTokens / wall
 	}
-	if secs := report.UnionSeconds(decodeIntervals); secs > 0 {
-		lv.ActiveDecodeTPS = activeTokens / secs
-	}
+	lv.TotalTPS = report.BuildTotalTPS(lv.Requests)
 }
 
 // newEnvSilent 构造不带 trace 的场景 env（请求快照模式不用 dataset/filler）。
 func newEnvSilent(ctx context.Context, cfg *config.Config, client *engine.Client) (*env, error) {
-	e := &env{cfg: cfg, client: client, perReqSrv: false}
+	e := &env{cfg: cfg, client: client}
 	if err := setupServerMetrics(ctx, e, cfg); err != nil {
 		return nil, err
 	}
@@ -188,8 +175,8 @@ func RPSScenario(ctx context.Context, cfg *config.Config, client *engine.Client,
 				}
 				lv := runRequestArrival(ctx, em, model, v, samples, rate,
 					cfg.RPS.MaxConcurrency, cfg.RPS.GetBurstiness())
-				log.Printf("[rps] %s thinking=%s rate=%.1f/s: wall=%.1fs throughput=%.0f tok/s ok=%d fail=%d",
-					model, v.Name, rate, lv.WallSeconds, lv.ThroughputTPS, lv.CompletedRequests, lv.FailedRequests)
+				log.Printf("[rps] %s thinking=%s rate=%.1f/s: total_tps_points=%d wall=%.1fs ok=%d fail=%d",
+					model, v.Name, rate, len(lv.TotalTPS), lv.WallSeconds, lv.CompletedRequests, lv.FailedRequests)
 				rep.Concurrent = append(rep.Concurrent, lv)
 				if lv.Aborted != "" {
 					log.Printf("🛑 %s——停止后续到达率档位", lv.Aborted)
@@ -311,8 +298,8 @@ func ConcurrencyScenario(ctx context.Context, cfg *config.Config, client *engine
 				}
 				lv := runRequestBarrier(ctx, em, model, v, samples, level,
 					cfg.Concurrency.RequestRate, cfg.Concurrency.GetBurstiness())
-				log.Printf("[concurrency] %s thinking=%s level=%d: wall=%.1fs throughput=%.0f tok/s ok=%d fail=%d",
-					model, v.Name, level, lv.WallSeconds, lv.ThroughputTPS, lv.CompletedRequests, lv.FailedRequests)
+				log.Printf("[concurrency] %s thinking=%s level=%d: total_tps_points=%d wall=%.1fs ok=%d fail=%d",
+					model, v.Name, level, len(lv.TotalTPS), lv.WallSeconds, lv.CompletedRequests, lv.FailedRequests)
 				rep.Concurrent = append(rep.Concurrent, lv)
 				if lv.Aborted != "" {
 					log.Printf("🛑 %s——停止后续并发档位", lv.Aborted)
