@@ -15,8 +15,7 @@ import (
 	"github.com/aleexjiang/llm-perf/internal/smetrics"
 )
 
-// MultiturnRun：一个模型的一次多轮会话（每 turn 均含思考时长）。
-// user 模式复用本结构：Session = 用户序号；Profile = 会话档位（light/medium/heavy）。
+// MultiturnRun：一个模型的一次多轮会话。
 type MultiturnRun struct {
 	Model     string `json:"model"`
 	Thinking  string `json:"thinking"` // "on" / "off"
@@ -45,6 +44,17 @@ type MultiturnRun struct {
 	// `max_prompt_tokens` 语义修正后即该预算，剩余空间不足以容纳下一轮 prompt + max_tokens
 	// 时提前止损，不再发出必然 400 的请求。0 = 未启用预算控制。
 	TokenBudget int `json:"token_budget,omitempty"`
+}
+
+// UserLevel：user 模式的一个并行用户数档位。每个档位独立采集会话、总 TPS 和服务端观测。
+type UserLevel struct {
+	Model      string                `json:"model"`
+	Thinking   string                `json:"thinking"`
+	Users      int                   `json:"users"`
+	MaxTokens  int                   `json:"max_tokens"`
+	Sessions   []MultiturnRun        `json:"sessions"`
+	Throughput *ThroughputSummary    `json:"throughput"`
+	Server     *ServerMetricsSummary `json:"server_metrics,omitempty"`
 }
 
 // FillLastPromptTokens 12.3：从轮次数据回填末轮实测 prompt_tokens（倒序找第一个 >0 的成功轮，
@@ -473,7 +483,7 @@ var Version = "llm-perf/dev"
 // SchemaVersionCurrent 数据契约版本：JSON 结构变更时递增；本项目不保留旧字段兼容逻辑。
 // 契约唯一权威文档 docs/data-contract.md，与本值同步维护（2026-09-17 报告层剥离后，
 // 这份 JSON 契约就是工具的对外接口）。
-const SchemaVersionCurrent = 8
+const SchemaVersionCurrent = 9
 
 // Report 是一次场景执行的完整数据，整体落盘为单个 JSON 文件。
 type Report struct {
@@ -490,7 +500,7 @@ type Report struct {
 	SLO               *SLO                  `json:"slo,omitempty"`
 	SLOBaseline       *SLOBaseline          `json:"slo_baseline,omitempty"`
 	Plan              *Plan                 `json:"plan,omitempty"`
-	Multiturn         []MultiturnRun        `json:"multiturn,omitempty"`
+	UserLevels        []UserLevel           `json:"user_levels,omitempty"`
 	Concurrent        []ConcurrentLevel     `json:"concurrent,omitempty"`
 	Correctness       []CorrectnessRow      `json:"correctness,omitempty"`
 	AuxiliaryRequests []AuxiliaryRequest    `json:"auxiliary_requests,omitempty"`
@@ -552,7 +562,7 @@ func DefaultName(scenario string) string {
 }
 
 // PartitionByModel 按模型把报告拆成每模型一份（数据落盘以模型为单位：output/<model>/）。
-// Single/Multiturn/Concurrent/Correctness 按各行 Model 字段分桶；Endpoint 级的
+// UserLevels/Concurrent/Correctness 按各行 Model 字段分桶；Endpoint 级的
 // Note/SLO/Server 原样带入每个分区。分区顺序按模型首次出现的顺序。
 func (r *Report) PartitionByModel() []*Report {
 	order := []string{}
@@ -583,9 +593,9 @@ func (r *Report) PartitionByModel() []*Report {
 		order = append(order, model)
 		return p
 	}
-	for i := range r.Multiturn {
-		p := get(r.Multiturn[i].Model)
-		p.Multiturn = append(p.Multiturn, r.Multiturn[i])
+	for i := range r.UserLevels {
+		p := get(r.UserLevels[i].Model)
+		p.UserLevels = append(p.UserLevels, r.UserLevels[i])
 	}
 	for i := range r.Concurrent {
 		p := get(r.Concurrent[i].Model)

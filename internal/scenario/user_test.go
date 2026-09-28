@@ -64,7 +64,7 @@ func TestUserScenario(t *testing.T) {
 	cfg := testCfg(t, srv.URL)
 	cfg.User = config.User{
 		ProfilePath: writeProfile(t, testProfileJSON),
-		Users:       10,
+		Levels:      []int{10},
 		MaxTokens:   config.IntList{16},
 	}
 
@@ -75,12 +75,13 @@ func TestUserScenario(t *testing.T) {
 	if rep.Scenario != "user" {
 		t.Fatalf("scenario = %q, want user", rep.Scenario)
 	}
-	if len(rep.Multiturn) != 10 {
-		t.Fatalf("应有 10 个用户会话，得到 %d", len(rep.Multiturn))
+	if len(rep.UserLevels) != 1 || rep.UserLevels[0].Users != 10 {
+		t.Fatalf("应有 1 个 user level=10，得到 %+v", rep.UserLevels)
 	}
+	sessions := rep.UserLevels[0].Sessions
 
 	dist := map[string]int{}
-	for _, run := range rep.Multiturn {
+	for _, run := range sessions {
 		if run.Profile == "" {
 			t.Fatalf("会话缺 profile 标签: %+v", run)
 		}
@@ -116,6 +117,32 @@ func TestUserScenarioRequiresProfile(t *testing.T) {
 	}
 }
 
+func TestUserScenarioRunsConfiguredLevels(t *testing.T) {
+	srv := sseStub(t, &stubState{})
+	cfg := testCfg(t, srv.URL)
+	cfg.User = config.User{
+		ProfilePath: writeProfile(t, testProfileJSON),
+		Levels:      []int{2, 3},
+		MaxTokens:   config.IntList{16},
+	}
+
+	rep, err := UserScenario(context.Background(), cfg, engine.NewClient(srv.URL, "", 30*time.Second, true), "")
+	if err != nil {
+		t.Fatalf("UserScenario: %v", err)
+	}
+	if len(rep.UserLevels) != 2 || rep.UserLevels[0].Users != 2 || rep.UserLevels[1].Users != 3 {
+		t.Fatalf("user levels 顺序或数量错误: %+v", rep.UserLevels)
+	}
+	if len(rep.UserLevels[0].Sessions) != 2 || len(rep.UserLevels[1].Sessions) != 3 {
+		t.Fatalf("user level 会话数量错误: %+v", rep.UserLevels)
+	}
+	for _, level := range rep.UserLevels {
+		if level.Throughput == nil || len(level.Throughput.TotalTPS) == 0 {
+			t.Fatalf("user level 缺少独立 total_tps: %+v", level)
+		}
+	}
+}
+
 // TestUserScenarioStopsWithinTokenBudget 回归：max_prompt_tokens 是 prompt+output 总预算。
 // 上一轮实测历史 + 本轮计划增量 + max_tokens 超过预算时，必须在发出请求前止损，
 // 不能像真机 r1-r3 那样用 400 消耗最后一轮。
@@ -124,7 +151,7 @@ func TestUserScenarioStopsWithinTokenBudget(t *testing.T) {
 	cfg := testCfg(t, srv.URL)
 	cfg.User = config.User{
 		ProfilePath: writeProfile(t, testProfileJSON),
-		Users:       1,
+		Levels:      []int{1},
 		MaxTokens:   config.IntList{256},
 	}
 	cfg.MaxPromptTokens = 35000 // 首轮实测可达 35-40K，因此至少第二轮会在请求前止损
@@ -133,10 +160,10 @@ func TestUserScenarioStopsWithinTokenBudget(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UserScenario: %v", err)
 	}
-	if len(rep.Multiturn) != 1 {
-		t.Fatalf("应有 1 个会话，实际 %d", len(rep.Multiturn))
+	if len(rep.UserLevels) != 1 || len(rep.UserLevels[0].Sessions) != 1 {
+		t.Fatalf("应有 1 个 level 和 1 个会话，实际 %+v", rep.UserLevels)
 	}
-	run := rep.Multiturn[0]
+	run := rep.UserLevels[0].Sessions[0]
 	if run.TokenBudget != cfg.MaxPromptTokens {
 		t.Fatalf("token_budget=%d，want %d", run.TokenBudget, cfg.MaxPromptTokens)
 	}

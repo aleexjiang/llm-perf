@@ -398,8 +398,8 @@ user:
 		t.Fatalf("应有排序去重提示: %v", cfg.Warnings)
 	}
 	// users 缺省 = 1；shared_base 缺省 = true
-	if cfg.User.GetUsers() != 1 || !cfg.User.GetSharedBase() {
-		t.Fatalf("user 默认值错误: users=%d shared=%v", cfg.User.GetUsers(), cfg.User.GetSharedBase())
+	if len(cfg.User.Levels) != 1 || cfg.User.Levels[0] != 1 || !cfg.User.GetSharedBase() {
+		t.Fatalf("user 默认值错误: levels=%v shared=%v", cfg.User.Levels, cfg.User.GetSharedBase())
 	}
 }
 

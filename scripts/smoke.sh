@@ -96,8 +96,11 @@ user = load_all("out-user")
 check(len(user) == 1, f"user 产物按模型落盘（{len(user)} 份）")
 rep = user[0]
 check(rep.get("scenario") == "user", "报告 scenario=user")
-check(rep.get("schema_version") == 8, "数据契约版本为 8")
-sessions = rep.get("multiturn") or []
+check(rep.get("schema_version") == 9, "数据契约版本为 9")
+levels = rep.get("user_levels") or []
+level_users = [level.get("users") for level in levels]
+check(level_users == [2], f"user levels 应有 users=2（{level_users}）")
+sessions = levels[0].get("sessions") if levels else []
 check(len(sessions) == 2, f"users=2 应有 2 条会话（{len(sessions)}）")
 check(all(s.get("profile") in ("light", "medium", "heavy") for s in sessions), "会话带 profile 档位标签")
 check(all(len(s.get("turns") or []) >= 2 for s in sessions), "user 会话均为多轮（≥2 轮）")
@@ -111,7 +114,7 @@ first_ok = all((s.get("turns") or [{}])[0].get("prompt_tokens", 0) >= 35000 for 
 check(first_ok, "首轮 prompt ≥35K token（agent 形状硬约束）")
 metrics_user = [t for s in sessions for t in (s.get("turns") or [])]
 check(metrics_user and all(m.get("phase") == "benchmark" for m in metrics_user), "主压测 TurnMetrics 标记 phase=benchmark")
-check(rep.get("throughput", {}).get("total_tps"), "user 场景落盘 total_tps 时间序列")
+check(levels and levels[0].get("throughput", {}).get("total_tps"), "user level 落盘 total_tps 时间序列")
 removed = {"total_tokens", "ttft_reasoning_ms", "ttft_content_ms", "server_counter_delta"}
 check(not any(key in m for m in metrics_user for key in removed), "单轮 JSON 不落盘裁剪字段")
 

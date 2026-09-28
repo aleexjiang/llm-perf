@@ -6,7 +6,7 @@
 #   bench rps          # 冻结请求快照的开环到达（request_set: + rps: 段）
 #   bench concurrency  # 固定在飞齐射（request_set: + concurrency: 段）
 #
-# filler / 旧 multiturn/concurrent/single 配置已下线。
+# user.levels 是 user 并行用户数阶梯，一次 bench user 按顺序执行。
 
 endpoint: "http://<客户路由IP>:30082/router/v1"
 api_key: ""                      # 字面量 key（仅用于不入库的本地配置）；也可改用 api_key_env
@@ -44,7 +44,7 @@ thinking:
 # 文本由内置 12 本公版书语料按 seed 生成（一用户一书）；assistant 用被测模型真实回复。
 user:
   profile_path: "profiles/agent-v1.json"  # 相对配置目录解析
-  users: 8                       # 并行用户数（每用户一条完整多轮会话）
+  levels: [4, 8, 16, 32]         # 并行用户数阶梯
   max_tokens: 256                # 输出预算（标量或列表）
   shared_base: true              # 全部用户同一 system 基座（测跨用户共享前缀 cache 收益）
 

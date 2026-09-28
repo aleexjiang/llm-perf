@@ -1,11 +1,12 @@
 # 报告指标口径
 
-本文定义 schema v8 JSON 的外部分析口径。Go 负责采集单轮数据和总 TPS 时间轴，
+本文定义 schema v9 JSON 的外部分析口径。Go 负责采集单轮数据和总 TPS 时间轴，
 报告工具负责分位统计、分层、可视化和容量判断。
 
 ## 1. 单轮指标
 
-当前工具的基本性能样本是一轮模型请求，即一条 `TurnMetrics`。
+当前工具的基本性能样本是一轮模型请求，即一条 `TurnMetrics`。user 场景的 `user_levels[]`
+保存不同用户数档位，每个档位内部再保存 `sessions[]`。
 `user` 的 session 只负责关联多轮上下文，不产生另一套 TPS 定义。
 
 ### TTFT
@@ -145,7 +146,7 @@ server_metrics.histograms
 
 这些是解释维度，不是新的 TPS 定义。
 
-## 7. 不进入 schema v8 的内容
+## 7. 不进入 schema v9 的内容
 
 分析可以从单轮数据重算的派生值不进入 JSON，旧字段不回填：
 

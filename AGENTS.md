@@ -2,7 +2,7 @@
 
 ## 项目边界
 
-llm-perf 只负责采集自部署 LLM 服务的性能原始数据，Go 二进制输出 schema v8 JSON。
+llm-perf 只负责采集自部署 LLM 服务的性能原始数据，Go 二进制输出 schema v9 JSON。
 报告、分位统计、容量判定和可视化在工具外完成；`llm-perf-test/` 是本地真机测试工作区，
 被 `.gitignore` 忽略，不把真实端点、密钥、业务数据和测试产物提交到仓库。
 
@@ -24,10 +24,10 @@ llm-perf 只负责采集自部署 LLM 服务的性能原始数据，Go 二进制
 ./bench concurrency -c configs/example.yaml
 ```
 
-常用覆盖项：`-m`、`-o`、`--seed-salt`、`--thinking`、`--max-ctx`；`user` 还支持 `--users`。
+常用覆盖项：`-m`、`-o`、`--seed-salt`、`--thinking`、`--max-ctx`。
 场景参数放在 YAML，不为单次测试在 CLI 增加临时调度参数。
 
-`user` 使用 `user.profile_path` 生成多轮动态会话；`rps` 和 `concurrency` 使用
+`user` 使用 `user.profile_path` 和 `user.levels` 生成多轮动态会话阶梯；`rps` 和 `concurrency` 使用
 `request_set.sharegpt_path` 的冻结请求集。两类负载的 cache 和时间行为不同，分析时不要混表。
 
 真机运行顺序：先 `probe` 确认模型、认证、usage、思考能力和 `/metrics`，再跑目标场景。

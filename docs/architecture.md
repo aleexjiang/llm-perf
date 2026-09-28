@@ -10,10 +10,10 @@ YAML
   -> cmd/bench
   -> scenario
        probe: engine.Probe -> probe JSON
-       user: profile + corpus -> 动态多轮会话
+       user: user.levels + profile + corpus -> 串行用户阶梯
        rps/concurrency: frozen request set -> 调度请求
   -> engine.Client.Chat -> TurnMetrics
-  -> report.Report -> schema v8 JSON
+  -> report.Report -> schema v9 JSON
        + total_tps[] 时间轴
        + server_metrics 场景观测
        + source_check token 对账
@@ -28,9 +28,9 @@ YAML
 | `internal/auth` | chat 与 `/metrics` 共用的认证方案 |
 | `internal/corpus` | user 模式的内置文本和确定性窗口 |
 | `internal/engine` | OpenAI 兼容客户端、SSE 解析、单轮计时和 probe |
-| `internal/scenario` | user/rps/concurrency 调度、失败处理、SLO、场景观测 |
+| `internal/scenario` | user.levels/rps/concurrency 调度、失败处理、SLO、场景观测 |
 | `internal/smetrics` | 场景级 `/metrics` counter、gauge、histogram 和 KV 画像 |
-| `internal/report` | schema v8 结构、总 TPS 时间轴和 JSON 落盘 |
+| `internal/report` | schema v9 结构、总 TPS 时间轴和 JSON 落盘 |
 
 ## 单轮采集
 
@@ -44,7 +44,7 @@ finish_reason / error / cancelled / stream_broken / retry_count / warnings
 ```
 
 chunk 数、字符数、ITL、原始时间、回复文本和 reasoning 协议细节只保留在内存或 debug 中。
-`total_tokens`、`new_tokens`、逐请求 `/metrics` counter 和旧聚合字段不属于 schema v8。
+`total_tokens`、`new_tokens`、逐请求 `/metrics` counter 和旧聚合字段不属于 schema v9。
 
 ## 总 TPS
 

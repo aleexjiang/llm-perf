@@ -21,9 +21,12 @@ func TestSaveJSONAnyRoundtrip(t *testing.T) {
 		Scenario:    "user",
 		GeneratedAt: time.Now(),
 		Endpoint:    "http://stub/v1",
-		Multiturn: []MultiturnRun{{
-			Model: "m1", Thinking: "off", Session: 1,
-			Turns: []*engine.TurnMetrics{{Model: "m1", PromptTokens: 4096}},
+		UserLevels: []UserLevel{{
+			Model: "m1", Thinking: "off", Users: 1,
+			Sessions: []MultiturnRun{{
+				Model: "m1", Thinking: "off", Session: 1,
+				Turns: []*engine.TurnMetrics{{Model: "m1", PromptTokens: 4096}},
+			}},
 		}},
 	}
 
@@ -41,8 +44,8 @@ func TestSaveJSONAnyRoundtrip(t *testing.T) {
 	if out.Tool != "llm-perf/test" || out.Scenario != "user" || out.Endpoint != "http://stub/v1" {
 		t.Fatalf("字段保真失败: %+v", out)
 	}
-	if len(out.Multiturn) != 1 || out.Multiturn[0].Model != "m1" || len(out.Multiturn[0].Turns) != 1 || out.Multiturn[0].Turns[0].PromptTokens != 4096 {
-		t.Fatalf("嵌套字段保真失败: %+v", out.Multiturn)
+	if len(out.UserLevels) != 1 || out.UserLevels[0].Model != "m1" || len(out.UserLevels[0].Sessions) != 1 || out.UserLevels[0].Sessions[0].Turns[0].PromptTokens != 4096 {
+		t.Fatalf("嵌套字段保真失败: %+v", out.UserLevels)
 	}
 	info, err := os.Stat(p)
 	if err != nil {
@@ -93,10 +96,10 @@ func TestVersionNonEmpty(t *testing.T) {
 func TestPartitionByModel(t *testing.T) {
 	r := &Report{
 		Tool: "t", Scenario: "user", Endpoint: "http://stub/v1",
-		Multiturn: []MultiturnRun{
-			{Model: "m1", Session: 1},
-			{Model: "m2", Session: 1},
-			{Model: "m1", Session: 2},
+		UserLevels: []UserLevel{
+			{Model: "m1", Users: 1, Sessions: []MultiturnRun{{Model: "m1", Session: 1}}},
+			{Model: "m2", Users: 1, Sessions: []MultiturnRun{{Model: "m2", Session: 1}}},
+			{Model: "m1", Users: 2, Sessions: []MultiturnRun{{Model: "m1", Session: 2}}},
 		},
 		Correctness: []CorrectnessRow{
 			{Model: "m2", Number: "12345", Match: true},
@@ -110,11 +113,8 @@ func TestPartitionByModel(t *testing.T) {
 	if parts[0].PartitionModel != "m1" || parts[1].PartitionModel != "m2" {
 		t.Fatalf("分区应按首次出现顺序: %s, %s", parts[0].PartitionModel, parts[1].PartitionModel)
 	}
-	if len(parts[0].Multiturn) != 2 {
-		t.Fatalf("m1 分区数据错误: %+v", parts[0])
-	}
-	if len(parts[1].Multiturn) != 1 {
-		t.Fatalf("m2 分区数据错误: %+v", parts[1])
+	if len(parts[0].UserLevels) != 2 || len(parts[1].UserLevels) != 1 {
+		t.Fatalf("user level 分区数据错误: %+v", parts)
 	}
 	if len(parts[0].Correctness) != 1 || len(parts[1].Correctness) != 1 {
 		t.Fatalf("correctness 归属错误: m1=%d m2=%d", len(parts[0].Correctness), len(parts[1].Correctness))
@@ -203,7 +203,7 @@ func TestBuildThroughputSummary(t *testing.T) {
 	if !strings.Contains(serialized, `"total_tps"`) ||
 		strings.Contains(serialized, `"throughput_tps"`) ||
 		strings.Contains(serialized, `"weighted_tps"`) {
-		t.Fatalf("聚合 schema v8 字段错误: %s", serialized)
+		t.Fatalf("聚合 schema v9 字段错误: %s", serialized)
 	}
 }
 
@@ -242,16 +242,16 @@ func TestSchemaV8RemovesDerivedAndDebugFields(t *testing.T) {
 		`"reasoning_field"`, `"new_tokens"`, `"server_counter_delta"`,
 	} {
 		if strings.Contains(s, removed) {
-			t.Fatalf("schema v8 不应落盘 %s: %s", removed, s)
+			t.Fatalf("schema v9 不应落盘 %s: %s", removed, s)
 		}
 	}
 	for _, kept := range []string{`"prompt_tokens"`, `"completion_tokens"`, `"ttft_ms"`, `"think_ms"`, `"tpot_ms"`, `"tokens_per_sec"`} {
 		if !strings.Contains(s, kept) {
-			t.Fatalf("schema v8 应落盘 %s: %s", kept, s)
+			t.Fatalf("schema v9 应落盘 %s: %s", kept, s)
 		}
 	}
-	if SchemaVersionCurrent != 8 {
-		t.Fatalf("schema version = %d, want 8", SchemaVersionCurrent)
+	if SchemaVersionCurrent != 9 {
+		t.Fatalf("schema version = %d, want 9", SchemaVersionCurrent)
 	}
 }
 

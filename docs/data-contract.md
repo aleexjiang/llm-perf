@@ -5,7 +5,7 @@
 
 ## 版本
 
-场景 JSON 的 `schema_version` 当前为 **8**，由 `report.SchemaVersionCurrent` 写入。
+场景 JSON 的 `schema_version` 当前为 **9**，由 `report.SchemaVersionCurrent` 写入。
 schema 变更直接更新结构和版本，不保留旧字段兼容逻辑，不同时落新旧字段。
 
 ## 落盘结构
@@ -25,7 +25,7 @@ schema 变更直接更新结构和版本，不保留旧字段兼容逻辑，不�
 Report
 ├── schema_version / tool / scenario / generated_at / test / endpoint / note
 ├── slo / slo_baseline / plan
-├── multiturn[]                 # user：会话及 turns[]
+├── user_levels[]               # user：用户数档位、会话及该档位摘要
 ├── concurrent[]                # rps/concurrency：档位及 requests[]
 ├── correctness[]               # 正确性金丝雀结果
 ├── auxiliary_requests[]        # warmup/correctness 的完整样本
@@ -37,15 +37,16 @@ Report
 └── config_raw
 ```
 
-### `multiturn[]`
+### `user_levels[]`
 
 ```text
-model / thinking / session / max_tokens / profile
-turns[] -> TurnMetrics
-start_offset_s / last_prompt_tokens / nominal_last_prompt / token_budget
+model / thinking / users / max_tokens
+sessions[] -> MultiturnRun
+throughput -> total_tps[] 和单轮分布
+server_metrics -> 该档位的服务端窗口观测
 ```
 
-`session` 只用于关联多轮上下文；主性能指标来自每个 `turn`，不使用 session 平均 TPS。
+`user.levels` 按配置顺序串行执行；`session` 只用于关联多轮上下文，主性能指标来自每个 `turn`。
 
 ### `concurrent[]`
 
@@ -167,7 +168,7 @@ observation_degraded / observation_note
 
 ## 已移除字段
 
-以下字段不属于 schema v8，不回填、不兼容：
+以下字段不属于 schema v9，不回填、不兼容：
 
 ```text
 total_tokens

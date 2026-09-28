@@ -93,15 +93,14 @@ func UserScenario(ctx context.Context, cfg *config.Config, client *engine.Client
 		GeneratedAt: time.Now(),
 		Test:        cfg.TestKind(),
 		Endpoint:    cfg.Endpoint,
-		Note: fmt.Sprintf("生成式多轮用户会话 users=%d profile=%s（权重 %s）语料=%s shared_base=%v stream=%v thinking=%s；首轮≥%dtk；assistant=被测模型真实回复（动态 prefix cache）%s",
-			cfg.User.GetUsers(), prof.Source, weightsDesc(prof), lang, cfg.User.GetSharedBase(),
+		Note: fmt.Sprintf("生成式多轮用户会话 levels=%v profile=%s（权重 %s）语料=%s shared_base=%v stream=%v thinking=%s；首轮≥%dtk；assistant=被测模型真实回复（动态 prefix cache）%s",
+			cfg.User.Levels, prof.Source, weightsDesc(prof), lang, cfg.User.GetSharedBase(),
 			cfg.StreamEnabled(), cfg.Thinking.Mode, prof.FirstTurnTokens[0], thinkingNoteSuffix(cfg)),
 	}
 	applySLO(e, rep)
 
 	scenarioStart := time.Now()
-	before, poller, winStart := startWindow(ctx, e)
-	defer func() { rep.Server = finishWindow(e, before, poller, winStart) }()
+	var allTurns []*engine.TurnMetrics
 
 	for _, model := range cfg.ActiveModels() {
 		if modelFilter != "" && !strings.Contains(model, modelFilter) {
@@ -119,27 +118,55 @@ func UserScenario(ctx context.Context, cfg *config.Config, client *engine.Client
 		}
 		for _, v := range th.Variants() {
 			for _, maxTok := range th.MaxTokensList(maxToks, v) {
-				if interrupted(ctx) {
-					break
+				for _, users := range mc.User.Levels {
+					if interrupted(ctx) {
+						break
+					}
+					before, poller, winStart := startWindow(ctx, e)
+					runs := runUserSessions(ctx, em, prof, lang, model, v, maxTok, tokenBudget, users)
+					server := finishWindow(e, before, poller, winStart)
+					var levelTurns []*engine.TurnMetrics
+					for _, run := range runs {
+						levelTurns = append(levelTurns, run.Turns...)
+					}
+					level := report.UserLevel{
+						Model: model, Thinking: v.Name, Users: users, MaxTokens: maxTok,
+						Sessions: runs, Server: server,
+						Throughput: report.BuildThroughputSummary(levelTurns, levelWallSeconds(levelTurns)),
+					}
+					rep.UserLevels = append(rep.UserLevels, level)
+					allTurns = append(allTurns, levelTurns...)
 				}
-				runs := runUserSessions(ctx, em, prof, lang, model, v, maxTok, tokenBudget)
-				rep.Multiturn = append(rep.Multiturn, runs...)
 			}
 		}
-	}
-	var allTurns []*engine.TurnMetrics
-	for _, run := range rep.Multiturn {
-		allTurns = append(allTurns, run.Turns...)
 	}
 	rep.Throughput = report.BuildThroughputSummary(allTurns, time.Since(scenarioStart).Seconds())
 	return rep, nil
 }
 
+func levelWallSeconds(turns []*engine.TurnMetrics) float64 {
+	var start, end time.Time
+	for _, turn := range turns {
+		if turn == nil || turn.SentAt.IsZero() || turn.EndAt.IsZero() {
+			continue
+		}
+		if start.IsZero() || turn.SentAt.Before(start) {
+			start = turn.SentAt
+		}
+		if end.IsZero() || turn.EndAt.After(end) {
+			end = turn.EndAt
+		}
+	}
+	if start.IsZero() || !end.After(start) {
+		return 0
+	}
+	return end.Sub(start).Seconds()
+}
+
 // runUserSessions 并行执行 users 条生成式会话（每用户一条，模型串行保证 e.cfg 不被并发改写）。
 func runUserSessions(ctx context.Context, e *env, prof *Profile, lang, model string,
-	v config.ThinkingVariant, maxTok, tokenBudget int) []report.MultiturnRun {
+	v config.ThinkingVariant, maxTok, tokenBudget, users int) []report.MultiturnRun {
 
-	users := e.cfg.User.GetUsers()
 	stagger := time.Duration(e.cfg.User.GetStaggerMS()) * time.Millisecond
 	selector := newSWRR(prof)
 	labels := make([]string, users)

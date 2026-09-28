@@ -1,6 +1,6 @@
 # llm-perf
 
-客户自部署 LLM 推理服务性能采集工具。Go 编译为单二进制，无运行时依赖；输出 schema v8 JSON，
+客户自部署 LLM 推理服务性能采集工具。Go 编译为单二进制，无运行时依赖；输出 schema v9 JSON，
 报告和容量分析由外部工具完成。
 
 详细契约见 [docs/data-contract.md](docs/data-contract.md)，指标口径见
@@ -25,7 +25,10 @@
 `user` 需要 `user.profile_path`；`rps` 和 `concurrency` 需要
 `request_set.sharegpt_path`。它们的请求构成和 cache 行为不同，不混合解释。
 
-常用 CLI 覆盖项：`-m`、`-o`、`--seed-salt`、`--thinking`、`--max-ctx`；`user` 支持 `--users`。
+`user.levels` 配置用户数阶梯；一次 `bench user` 会按配置顺序串行执行全部 user 档位，
+每个档位独立落盘会话、总 TPS 和服务端观测。
+
+常用 CLI 覆盖项：`-m`、`-o`、`--seed-salt`、`--thinking`、`--max-ctx`。
 
 ## 单轮指标
 
@@ -86,7 +89,7 @@ completion token 对账，不把共享 counter 差值挂到单条请求。
 ## 数据规则
 
 - schema 结构变化直接更新版本，不保留旧字段兼容逻辑，不同时落新旧字段。
-- `total_tokens`、全场景 `throughput_tps`、旧 active-decode 聚合、`weighted_tps` 不属于 schema v8。
+- `total_tokens`、全场景 `throughput_tps`、旧 active-decode 聚合、`weighted_tps` 不属于 schema v9。
 - chunk 计数、字符数、ITL、原始 chunk 时间、首帧时间、思考协议字段只在内存或 debug 中使用。
 - 失败、取消、usage 缺失和不完整流保留原始记录，但不进入成功聚合。
 - `warmup` 和 `correctness` 进入 `auxiliary_requests[]`，不进入 benchmark KPI。

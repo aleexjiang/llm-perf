@@ -55,7 +55,6 @@ func usage() {
   --max-ctx N                   上下文截止（tokens）：user 多轮到顶停轮；probe 上下文预警基准（默认 40000）
 
 user 选项:
-  --users N                     并行用户数（每用户一条生成式多轮会话）；>0 覆盖配置 user.users
   配置段: user.profile_path（profile_build.py 产出）、user.max_tokens、user.shared_base
 
 rps/concurrency 选项（请求源 = request_set.sharegpt_path，与 vLLM bench serve 同口径）:
@@ -82,7 +81,7 @@ benchmark、失败和主动取消请求都保留完整原始指标（按 phase �
 
 示例:
   bench probe -c configs/customer.yaml
-  bench user -c configs/customer.yaml --users 8 --thinking off --seed-salt 1
+  bench user -c configs/customer.yaml --thinking off --seed-salt 1
   bench rps -c configs/customer.yaml -o output/
   bench concurrency -c configs/customer.yaml -o output/
 `)
@@ -197,7 +196,6 @@ func main() {
 	maxCtxFlag := fs.Int("max-ctx", 0, "上下文截止（tokens）：user 多轮到顶停轮；probe 上下文预警基准；覆盖配置 max_prompt_tokens")
 	saltFlag := fs.Int("seed-salt", 0, "种子盐值：测试隔离（服务端 prefix cache 未清空时重测用）；覆盖配置 seed_salt")
 	thinkingFlag := fs.String("thinking", "", "只跑某个思考变体：on/off（开思考费 token，建议 off/on 分开两轮跑，互不连坐）；按变体名过滤，模型无该变体则跳过；both=全部")
-	usersFlag := fs.Int("users", 0, "user: 并行用户数（每用户一条生成式多轮会话）；>0 覆盖配置 user.users")
 	noToolCallFlag := fs.Bool("no-toolcall", false, "probe: 关闭 tool-call 健康检查（默认开启，多 4 次请求秒级）")
 	captureFlag := fs.String("probe-capture", "", "probe: tool-call 检查原始响应落盘目录（排障证据/判据 fixture；含业务数据外发前脱敏）")
 	cacheFlag := fs.Bool("cache", false, "probe: 开启前缀缓存定性检查（默认关；同 prompt 连发 3 次 + 乱序冷基线各 1 次，长上下文请求）")
@@ -212,9 +210,6 @@ func main() {
 	// 子命令前置校验：各自的必需配置段在开跑前确认，现场跑完才发现没生效是最贵的错误
 	switch mode {
 	case "user":
-		if *usersFlag > 0 {
-			cfg.User.Users = *usersFlag
-		}
 		if cfg.User.ProfilePath == "" {
 			fmt.Fprintln(os.Stderr, "user 模式需要在配置里指定 user.profile_path（scripts/profile_build.py 产出）")
 			os.Exit(1)
@@ -352,7 +347,7 @@ func main() {
 		}
 		if ctx.Err() != nil {
 			fmt.Printf("[%s] ⚠️ 中断——已完成的 %d 组数据已保存: %s\n",
-				name, len(rep.Multiturn)+len(rep.Concurrent), outPath)
+				name, len(rep.UserLevels)+len(rep.Concurrent), outPath)
 			return
 		}
 		if len(parts) > 1 {

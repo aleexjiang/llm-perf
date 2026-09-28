@@ -508,8 +508,8 @@ func (c ConcurrencyCfg) GetBurstiness() float64 {
 type User struct {
 	// ProfilePath profile.json 路径（scripts/profile_build.py 产出；相对路径以配置目录为基准）。
 	ProfilePath string `yaml:"profile_path"`
-	// Users 并行用户数（每个用户独立一条生成式多轮会话），0 = 1。
-	Users int `yaml:"users"`
+	// Levels user 并行用户数阶梯；一次 bench user 按顺序执行所有档位。
+	Levels []int `yaml:"levels"`
 	// MaxTokens 输出长度（标量或列表；列表 = 输出长度扫描维度）。
 	MaxTokens IntList `yaml:"max_tokens"`
 	// SharedBase 基座是否跨用户共享（默认 true）：true = 全部用户同一 system 基座（同一
@@ -522,14 +522,6 @@ type User struct {
 
 // GetStaggerMS 会话启动错峰毫秒数（0 = 同时启动）。
 func (u User) GetStaggerMS() int { return u.StaggerMS }
-
-// GetUsers 用户数（0/未配置 = 1）。
-func (u User) GetUsers() int {
-	if u.Users <= 0 {
-		return 1
-	}
-	return u.Users
-}
 
 // GetSharedBase 基座是否跨用户共享（未配置默认 true）。
 func (u User) GetSharedBase() bool { return u.SharedBase == nil || *u.SharedBase }
@@ -743,6 +735,23 @@ func Load(path string) (*Config, error) {
 	}
 	// user 模式默认输出长度 + 归一化（仅在启用 user 场景时填充，避免无关场景被误警告）
 	if cfg.User.ProfilePath != "" {
+		if len(cfg.User.Levels) == 0 {
+			cfg.User.Levels = []int{1}
+		}
+		seenUsers := map[int]bool{}
+		dedupedUsers := cfg.User.Levels[:0]
+		for _, users := range cfg.User.Levels {
+			if users <= 0 {
+				return nil, fmt.Errorf("user.levels 含非正值 %d——用户数必须是正整数", users)
+			}
+			if seenUsers[users] {
+				cfg.Warnings = append(cfg.Warnings, fmt.Sprintf("user.levels 重复档位 %d 已去重", users))
+				continue
+			}
+			seenUsers[users] = true
+			dedupedUsers = append(dedupedUsers, users)
+		}
+		cfg.User.Levels = dedupedUsers
 		if len(cfg.User.MaxTokens) == 0 {
 			cfg.User.MaxTokens = IntList{256}
 		}
