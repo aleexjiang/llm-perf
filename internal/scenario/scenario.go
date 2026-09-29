@@ -435,7 +435,7 @@ func attachKVCapacity(e *env, rep *report.Report) {
 // TTFT 不可测（N/A），不应凭 0 值白拿达标。非流式在配置了 TPOT 阈值时天然不达标。
 func goodputOf(e *env, m *engine.TurnMetrics) bool {
 	g := e.cfg.EffGoodput()
-	if g == nil || m == nil || m.Error != "" {
+	if g == nil || m == nil || m.Error != "" || m.Cancelled || m.CompletionTokens <= 0 {
 		return false
 	}
 	if g.TTFTMS > 0 && (m.TTFT <= 0 || m.TTFT > g.TTFTMS) {

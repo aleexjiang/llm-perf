@@ -40,7 +40,8 @@ thinking:
   #   - {name: low, enabled: true, extra_body: {reasoning_effort: low}}
 
 # ── user 模式：生成式多轮用户会话（bench user）──
-# 形状来自 profile.json（scripts/profile_build.py 从 raw trace 提取特征，不含消息文本）；
+# 形状来自 profile.json（scripts/profile_build.py 从 raw trace 提取特征，不含消息文本；
+# 需要单调 workload 梯度时用 --preset controlled-agent 生成）；
 # 文本由内置 12 本公版书语料按 seed 生成（一用户一书）；assistant 用被测模型真实回复。
 user:
   profile_path: "profiles/agent-v1.json"  # 相对配置目录解析

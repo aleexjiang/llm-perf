@@ -139,7 +139,7 @@ func TestRequestScenariosSourceCheck(t *testing.T) {
 }
 
 // TestFinishLevelGoodput 回归：数据契约承诺的档位级 goodput 字段必须接线。
-// 已配置 SLO 时失败请求计入分母且不达标，主动取消不计入分母；
+// 已配置 SLO 时只把 token 有效的成功请求计入分母；失败、取消和 usage 无效样本不进入；
 // goodput_rps 是达标请求数/墙钟，goodput_tps 只累计达标请求的 completion tokens。
 func TestFinishLevelGoodput(t *testing.T) {
 	e := &env{cfg: &config.Config{
@@ -152,18 +152,19 @@ func TestFinishLevelGoodput(t *testing.T) {
 			{TTFT: 120, TPOTMS: 40, CompletionTokens: 200},
 			{Error: "HTTP 500", CompletionTokens: 300},
 			{Cancelled: true, CompletionTokens: 400},
+			{TTFT: 80, TPOTMS: 40, CompletionTokens: 0},
 		},
 	}
 	finishLevel(e, &lv)
-	if lv.SLOMeet != 1 || lv.SLOTotal != 3 {
+	if lv.SLOMeet != 1 || lv.SLOTotal != 2 {
 		t.Fatalf("SLO 计数错误: meet=%d total=%d", lv.SLOMeet, lv.SLOTotal)
 	}
 	if lv.GoodputRPS != 0.5 || lv.GoodputTPS != 50 {
 		t.Fatalf("goodput 汇总错误: rps=%v tps=%v", lv.GoodputRPS, lv.GoodputTPS)
 	}
-	if lv.CompletedRequests != 2 || lv.FailedRequests != 1 || lv.CancelledRequests != 1 {
-		t.Fatalf("成败计数错误: completed=%d failed=%d cancelled=%d",
-			lv.CompletedRequests, lv.FailedRequests, lv.CancelledRequests)
+	if lv.CompletedRequests != 2 || lv.FailedRequests != 1 || lv.CancelledRequests != 1 || lv.InvalidRequests != 1 {
+		t.Fatalf("请求计数错误: completed=%d failed=%d cancelled=%d invalid=%d",
+			lv.CompletedRequests, lv.FailedRequests, lv.CancelledRequests, lv.InvalidRequests)
 	}
 }
 
@@ -183,10 +184,10 @@ func TestFinishLevelTotalTPSSeries(t *testing.T) {
 	if len(lv.TotalTPS) == 0 {
 		t.Fatalf("total_tps 未写入: %+v", lv)
 	}
-	if lv.TotalTPS[0].DecodeRequests != 2 || lv.TotalTPS[0].TPS <= 0 {
+	if lv.TotalTPS[0].AvgDecodeRequests < 1.49 || lv.TotalTPS[0].AvgDecodeRequests > 1.51 || lv.TotalTPS[0].TPS <= 0 {
 		t.Fatalf("总 TPS 时间序列首点错误: %+v", lv.TotalTPS[0])
 	}
-	if len(lv.TotalTPS) < 2 || lv.TotalTPS[1].DecodeRequests != 2 {
+	if len(lv.TotalTPS) < 2 || lv.TotalTPS[1].AvgDecodeRequests < 1.99 || lv.TotalTPS[1].AvgDecodeRequests > 2.01 {
 		t.Fatalf("重叠 decode 未反映到时间轴: %+v", lv.TotalTPS)
 	}
 }

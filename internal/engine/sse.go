@@ -262,16 +262,15 @@ func ingestSSEBody(m *TurnMetrics, body io.Reader, clock func() time.Time, inclu
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		m.appendRaw(line + "\n")
-		if m.doneSeen {
-			continue // [DONE] 后继续消费到 EOF，确保响应连接可复用
-		}
 		data, ok := splitSSEData(line)
 		if !ok {
 			continue // 非 SSE data 行（注释、BOM 等魔改迹象留存在 raw 转储里）
 		}
 		if data == "[DONE]" {
 			m.doneSeen = true
-			continue
+			t := clock()
+			m.logicalEndAt = &t
+			break // 逻辑流已结束；等待代理 EOF 会污染 E2E 与档位墙钟
 		}
 		chunkAt := clock()
 		ev, err := parseSSEData([]byte(data))

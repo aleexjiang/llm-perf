@@ -1,233 +1,136 @@
-# LLM 推理体验基线参考（对外解释依据）
+# LLM 推理体验基线参考
 
-用途：为压测报告的"体验基线评估"提供**有出处的判据**。对外解释时引用本文件所列原文链接，不凭印象报数。
-整理方式：所有核心数字均于 2026-09-08 抓取原文逐字核实，关键句附英文原文引用。**补充参考**一节除外（未逐字核实，引用前需先查原文）。
+本文为报告中的“体验基线评估”提供有出处的判据。核心数字于 2026-09-08 从原始页面核实；
+补充参考一节未逐字核实，引用前先查原文。
 
----
+## 权威锚点
 
-## 1. MLPerf / MLCommons（行业基准，判据最硬）
+### MLPerf / MLCommons
 
-MLPerf Inference 是推理性能的行业事实标准，其 server 场景延迟约束即"可接受的体验上限"。
+| 档位 | 输入/模型 | TTFT p99 | TPOT p99 |
+|---|---|---|---|
+| Server | Llama2-70B | ≤ 2s | ≤ 200ms |
+| Interactive | Llama2-Chat-70B | ≤ 450ms | ≤ 40ms |
+| 长上下文 | Llama3.1-405B，128K | ≤ 6s | ≤ 175ms |
 
-### 1.1 Server 档（Llama2-70B，2024-03 定）
+MLPerf Server 的约束以阅读速度为锚：
 
-| 指标 | 约束（p99） |
-|---|---|
-| TTFT | ≤ 2 秒 |
-| TPOT | ≤ 200 毫秒 |
+> "Using the typical human reading speed as a logical anchor, these latency constraints were set as:
+> **TTFT: <= 2 seconds, TPOT: <= 200 milliseconds**."
 
-原文依据与锚定逻辑：
+Interactive 档来自 ChatGPT / Perplexity 实测和用户调研：
 
-> "Using the typical human reading speed as a logical anchor, these latency constraints were set as: **TTFT: <= 2 seconds, TPOT: <= 200 milliseconds**. A TPOT of 200 ms translates to a maximum allowed generation latency that maps to ~240 words per minute (depending on the tokenizer), which is often cited as the average human reading speed."
+> "a 50th percentile token generation rate of **20–50 tokens per second (TPOT of 20-50ms)
+> is critical for seamless user experience**."
 
-> "While reading speed is a good yardstick for generation tasks such as LLM-based chat or tech support, other use cases have tighter latency constraints. For example, code generation, real-time slide generation, and smart agents all require much faster response times."
+长上下文档说明基线会随模型和上下文变化：
 
-（注意官方自己声明：**agent 场景需要比这更紧的约束**——这档只能当"及格线"。）
+> "we set a 99th percentile TTFT of **6 seconds** and a 99th percentile TPOT of **175ms**."
 
-- 来源：[Llama 2 70B: An MLPerf Inference Benchmark for Large Language Models](https://mlcommons.org/2024/03/mlperf-llama2-70b/)（MLCommons 官方博客，2024-03-27）
+来源：
 
-### 1.2 Interactive 档（Llama2-Chat-70B，v5.0 新增，2025-04 定）
+- [Llama 2 70B MLPerf](https://mlcommons.org/2024/03/mlperf-llama2-70b/)
+- [MLPerf Inference v5.0](https://mlcommons.org/2025/04/llm-inference-v5/)
 
-| 指标 | 约束（p99） |
-|---|---|
-| TTFT | ≤ 450 毫秒 |
-| TPOT | ≤ 40 毫秒（25 tok/s） |
+### 场景目标
 
-原文依据（2024 年底基于 ChatGPT / Perplexity 实测数据与用户调研修订）：
+particula.tech 基于云端约 10K token 输入、72 小时滚动采样给出以下参考。该文明确说明
+数字是建议而非标准，且不含用户到端点的网络往返：
 
-> "Our findings indicated that a 50th percentile token generation rate of **20–50 tokens per second (TPOT of 20-50ms) is critical for seamless user experience**. To prioritize reliability under peak demand, MLPerf adopts a stricter 99th percentile threshold of **25 tokens/second (TPOT of 40ms)**, ensuring consistent responsiveness even during high-load scenarios. Additionally, we set a **99th percentile TTFT limit of 450ms** to minimize initial latency, aligning with user expectations for near-instantaneous query response."
-
-- 来源：[MLPerf Inference v5.0 Advances Language Model Capabilities for GenAI](https://mlcommons.org/2025/04/llm-inference-v5/)（2025-04-02）
-
-### 1.3 大模型长上下文档（Llama3.1-405B，128K 上下文）
-
-| 指标 | 约束（p99） |
-|---|---|
-| TTFT | ≤ 6 秒 |
-| TPOT | ≤ 175 毫秒 |
-
-> "To balance the demands of long-context processing with real-world usability, we set a 99th percentile TTFT of **6 seconds** and a 99th percentile TPOT of **175ms**. These thresholds reflect the computational challenges of deploying large models with long context, while maintaining reasonable responsiveness."
-
-含义：**基线随模型规模与上下文长度浮动**——大模型长上下文的 TTFT 预算是小模型的 13 倍，跨档比较 TTFT 绝对值无意义。
-
-- 来源：同 v5.0 博客（见 1.2）
-
----
-
-## 2. 场景化目标（particula.tech 实测 + 人因研究推导，2026）
-
-该文为公开实测报告（云端区域内 ~10K token 输入，72 小时滚动采样），数字前需声明其前提：
-
-> "These are our recommendations, derived from the measurements above plus human-perception research. **They are not a published standard and no provider commits to them.**"
-> "Treat them as a floor, not a forecast."（所有数字不含用户到端点的网络往返）
-
-### 2.1 场景目标表（Table A 摘要）
-
-| 场景 | TTFT P50 | TTFT P95 | 输出速度下限 | 端到端 P95 |
-|---|---|---|---|---|
+| 场景 | TTFT P50 | TTFT P95 | 输出速度下限 | E2E P95 |
+|---|---:|---:|---:|---:|
 | Chat 流式 UI | 800ms | 2s | 30 tok/s | 10s |
-| Voice agent（仅 LLM 环节） | 300ms | 500ms | 50 tok/s | — |
-| Voice agent（完整对话轮次） | 600ms | 1s | — | 1.2s |
-| **Agentic（每步）** | **2s** | **5s** | 50 tok/s | 单步预算 × 步数 |
-| 深度推理 | 不设 TTFT 目标，显示进度 | — | 50 tok/s | 30s–3min |
+| Voice agent（LLM 环节） | 300ms | 500ms | 50 tok/s | — |
+| Voice agent（完整轮次） | 600ms | 1s | — | 1.2s |
+| Agentic（每步） | 2s | 5s | 50 tok/s | 步数 × 单步预算 |
+| 深度推理 | 不设 TTFT，显示进度 | — | 50 tok/s | 30s–3min |
 
-> "For agentic multi-step work, **budget 2s per step at P50 and multiply by step count**."
+关键结论：
 
-### 2.2 关键实测结论（对外解释可直接引用）
+- 10K 输入下快速非推理配置 TTFT 约 0.75–1.6s；亚秒可做到但非常态。
+- 专业推理服务商输出速度差异很大，TTFT 仍收敛在约 0.7–1.0s。
+- reasoning effort 是延迟旋钮；同一家族 low → max 可使 TTFT 放大 44 倍。
+- 面向人的流式输出超过约 30–50 tok/s 后感知趋平，剩余优化应优先给 TTFT。
+- 机器消费者和超长生成仍可从更高输出速度获益。
 
-- 快速非推理配置 TTFT 0.75–1.6s（10K 输入，云区域内）；"Sub-second first token is achievable. It is not the norm."
-- 专业推理服务商输出速度差异巨大（35–578 tok/s），但 **TTFT 收敛在 0.7–1.0s**："Buying a specialist serving stack buys output speed. It does not buy TTFT."
-- 推理模型的 reasoning effort 是延迟旋钮：同一家族 low→max effort，TTFT 2.97s→129.47s（44 倍），输出速度不变
-- 面向人的流式输出 30–50 tok/s 已到感知上限，多余预算应投给 TTFT："For human-facing streamed output, above roughly **30 to 50 tok/s the extra speed is invisible**, and every remaining perceived-latency gain has to come from TTFT."
-- 例外（输出速度仍重要）：机器消费者（agent 循环、工具链）与超长生成——"machine consumers (agent loops, tool-call chains, extraction pipelines where nobody reads the tokens)"
+来源：[LLM Latency Targets: TTFT & Tokens Per Second](https://particula.tech/blog/llm-latency-targets-ttft-tokens-per-second-2026)
 
-- 来源：[LLM Latency Targets: TTFT & Tokens Per Second](https://particula.tech/blog/llm-latency-targets-ttft-tokens-per-second-2026)
+### 人因与方法论
 
----
+- Brysbaert 2019 对 18,573 名被试的元分析：成人默读非虚构文本约 238 wpm，
+  按英文约 0.75 词/token 折算约 **5.3 token/s**。
+  [DOI](https://doi.org/10.1016/j.jml.2019.104047)
+- Nielsen 响应时间阈值：0.1s 近似即时，1s 保持思路不断，10s 保持注意力。
+  [NN/g](https://www.nngroup.com/articles/response-times-3-important-limits/)
+- Azure 延迟分解：`TTLT = TTFT + (TBT × Tokens Generated)`；影响延迟的四类因素是模型、
+  prompt token、生成 token、部署负载。“Latency without token context isn't actionable.”
+  [Microsoft Learn](https://learn.microsoft.com/en-us/azure/ai-services/openai/how-to/latency)
+- OTel GenAI 语义约定采用 `gen_ai.server.time_to_first_token` 和
+  `gen_ai.server.time_per_output_token`。
+  [OpenTelemetry](https://opentelemetry.io/docs/specs/semconv/gen-ai/)
 
-## 3. 人因研究（阈值的物理依据）
+## llm-perf 三档判据
 
-### 3.1 阅读速度（decode 速度下限的锚）
+现代 agent 产品常见输入约 30–40K（system、工具定义、RAG 注入）。短输入徽章不代表
+agent 体验，因此基线显式覆盖长输入，但 long 档用的是冷 prefill 最坏角落；prefix cache
+命中后的暖路径另行解释。
 
-> 2019 年对 190 项阅读速率研究、18,573 名被试的元分析：成人默读非虚构文本约 **238 wpm**。按英文 ~0.75 词/token 折算约 **5.3 token/秒**。
+| 档位 | 适用输入 | TTFT p99 | TPOT p99 | 性质 |
+|---|---:|---:|---:|---|
+| 优（短输入） | ≤ 4K | ≤ 450ms | ≤ 40ms | MLPerf Interactive |
+| 及格（短输入） | ≤ 4K | ≤ 2s | ≤ 200ms | MLPerf Server |
+| agent 大上下文 | 30–40K | 优 ≤ 3s / 及格 ≤ 6s | 40ms / 200ms | 推导值 |
 
-- 来源：Brysbaert, M. (2019). *How many words do we read per minute?* Journal of Memory and Language, 109, 104047. [https://doi.org/10.1016/j.jml.2019.104047](https://doi.org/10.1016/j.jml.2019.104047)
-- 注：以上折算引用自 particula.tech（见 2）；MLPerf Server 档用的是 ~240 wpm 同源口径（见 1.1）。
+long 档 TTFT 的推导：
 
-### 3.2 响应时间感知阈值（TTFT 上限的锚）
+1. 10K 输入实测 TTFT 0.75–1.6s；冷 prefill 近似随输入线性增长，35K 外推约 2.6–5.6s。
+   因此取优 ≤ 3s、及格 ≤ 6s。
+2. MLPerf 405B 档在约 9.4K 输入下为 6s p99；小模型在 35K 输入下取 6s 作为及格上限
+   是宽松且安全的。
 
-> "0.1 seconds is about the limit for having the user feel that the system is reacting instantaneously, 1 second is about the limit for having the user's flow of thought stay uninterrupted, 10 seconds is about the limit for keeping the user's attention on the dialogue."
+TPOT 沿用短输入档：输入长度主要影响 prefill/TTFT，不改变逐 token 生成速度。
 
-- 来源：Nielsen, J. (1993). *Usability Engineering*；网络版 [Response Times: The 3 Important Limits](https://www.nngroup.com/articles/response-times-3-important-limits/)（Nielsen Norman Group）
-- particula 对此的落点："For a streaming chat UI, target 800ms at P50 and 2s at P95, which keeps you inside the classic one-second limit for uninterrupted flow of thought."
+归组规则：
 
-### 3.3 推论：decode 速度存在"天花板效应"
+- `prompt_tokens ≤ 4K`：短输入优/及格档；
+- `prompt_tokens ≥ 24K`：agent 大上下文档；
+- 4K–24K：不打徽章，只报数值和 prefill 斜率。
 
-输出 > 20–30 tok/s 已快过所有读者（5.3 tok/s 的 4–6 倍），再快无感；**TTFT 每一毫秒用户都在盯着等，没有天花板**。这是"优先优化 TTFT 而非 tok/s"的人因依据。
+配置通过 `slo.baseline` 透出，判级由分析侧完成，不进入退出码，不污染原始 JSON。
+thinking=on 单独分组，不与 off 共用基线。
 
----
+## Decode 速度参考
 
-## 4. 方法论标准（怎么测，而非测多少）
+英语无声阅读约 4 tok/s，中文约 5–8 字/s。低于阅读速度时用户会明显“等输出”：
 
-### 4.1 Azure OpenAI 官方延迟文档（测量与归因框架）
+| 单流输出速度 | 体验 |
+|---:|---|
+| < 5 tok/s | 差，低于阅读速度 |
+| 5–10 tok/s | 勉强，可感知偏慢 |
+| 10–25 tok/s | 够用到良好 |
+| 25–80 tok/s | 良好，主流托管模型区间 |
+| > 80 tok/s | 优秀；面向人时感知已趋平 |
 
-**注意：该文档不含基准数字**（无 TTFT 毫秒范围、无 tok/s 参考值、无吞吐承诺），定位是"如何测量和归因"，对外引用时不能拿它当基线出处。可用内容：
+报告 `slo.baseline.pass_tps=10 / good_tps=25` 来自本表：10 是阅读速度约 2 倍的安全线，
+25 是舒适区上沿。`bench probe` 的 `decode_speed` 只作部署健康参考，不自动熔断或改变后续
+采集。
 
-- 延迟分解公式：`TTLT = TTFT + (TBT × Tokens Generated)`
-- 四大归因因素："Latency of a completion request can vary based on four primary factors: (1) the model, (2) the number of tokens in the prompt, (3) the number of tokens generated, and (4) the overall load on the deployment and system."
-- 对报告口径最重要的一句："A 5-second TTLT that generates 2,000 tokens is very different from a 5-second TTLT that generates 50 tokens. **Latency without token context isn't actionable.**"（报延迟必须连带 token 上下文，否则不可解读）
-- 混合负载损伤缓存："Mixing different workloads on the same endpoint can negatively affect latency… mixing the calls can reduce your cache hit rate"（我们 5.6 混合负载的场景依据）
+## 引用共识
 
-- 来源：[Azure OpenAI latency](https://learn.microsoft.com/en-us/azure/ai-services/openai/how-to/latency)（Microsoft Learn）
+1. 判断 tail，不判均值；MLPerf 用 p99，场景表用 P50/P95。
+2. TTFT 绝对基线只适用于短输入；长输入看 prefill 吞吐斜率。
+3. goodput 优于平均延迟；达标率才是容量口径。
+4. thinking on/off 必须分开，reasoning effort 对延迟影响巨大。
+5. 延迟必须带 prompt/completion token 上下文。
+6. 基线随模型规模和上下文浮动，跨档比较绝对值无意义。
 
-### 4.2 OpenTelemetry GenAI 语义约定（指标命名标准化）
+## 补充参考
 
-TTFT（`gen_ai.server.time_to_first_token`）与 TPOT（`gen_ai.server.time_per_output_token`）已被 OTel GenAI 语义约定定为标准 histogram 指标——我们 server_metrics 采集口径与之一致。
+以下来源未逐字核实，引用前先查原文：
 
-- 来源：[OpenTelemetry GenAI Semantic Conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/)
-
----
-
-## 5. 补充参考（未逐字核实，引用前必须先查原文）
-
-| 来源 | 内容要点 | 链接 |
-|---|---|---|
-| ecitis 推理 SLO 分析 | agent 工具步（非流式）只设 TTFT <1s；TPOT 对非流式不是体验指标 | https://blog.ecitis.org/inference-slos |
-| CSDN「Agent SLO 设计」 | 中文实践口径：chat agent TTFT≤1s/P95≤3s；办公 1.5s/5s；代码 2s/10s；长文档 3s/30s | https://agi-way.blog.csdn.net/article/details/161825785 |
-| MLPerf Inference 官方文档 | 基准套件全貌、场景定义（server/offline/interactive） | https://docs.mlcommons.org/inference/ |
-| Azure OpenAI 监控指标参考 | `AzureOpenAITimeToResponse`、`AzureOpenAINormalizedTBTInMS` 等指标定义 | https://learn.microsoft.com/en-us/azure/foundry/openai/monitor-openai-reference |
-
----
-
-## 6. 方法论共识（多来源一致，构成报告判据设计原则）
-
-1. **判 tail 不判均值**：一律用 p95/p99 对基线（MLPerf 用 p99；particula 表分 P50/P95）。均值会被长短请求混合抹平。
-2. **TTFT 绝对基线只适用短输入**：TTFT 随输入长度线性涨（Azure 四因素之（2）），32K 输入对 450ms 基线必然全红；长输入应看 **prefill 吞吐斜率**而非绝对 TTFT。
-3. **goodput 优于平均延迟**：达标率（满足 SLO 的请求占比）才是容量口径。
-4. **思考模型单列**：reasoning effort 是延迟旋钮（2.2 节，44 倍差异），thinking=on 不能与 off 共用基线。
-5. **延迟必须带 token 上下文**："Latency without token context isn't actionable"（4.1）。
-6. **基线随模型规模/上下文浮动**：70B 与 405B 的官方预算差 13 倍（1.1 vs 1.3），报告基线应按模型档位分列。
-
----
-
-## 7. 与 llm-perf 数据的映射（3 档制）
-
-**为什么 agent 场景重点看 30–40K 输入档**：现代 agent 产品基线上下文即 ~35K（系统提示 + 工具定义 + RAG 注入，用户发一句"你好"请求就已带 35K 上下文），短输入档的徽章代表不了 agent 体验。TTFT 判据必须显式覆盖 30–40K 输入段。
-
-### 7.1 三档阈值
-
-| 档位 | 适用输入 | TTFT p99 | TPOT p99 | 出处 |
-|---|---|---|---|---|
-| 档1 优（短输入） | ≤ 4K | ≤ 450ms | ≤ 40ms | MLPerf Interactive（1.2） |
-| 档2 及格（短输入） | ≤ 4K | ≤ 2s | ≤ 200ms | MLPerf Server（1.1） |
-| 档3 agent 大上下文 | 30–40K | 优 ≤ 3s / 及格 ≤ 6s | 沿用 40ms / 200ms | **推导值**，见 7.2 |
-
-档3 的 TPOT 沿用短输入档：decode 速度与输入长度基本无关，输入变长只影响 prefill（TTFT），不影响逐 token 生成。
-
-### 7.2 档3 阈值的推导过程（无权威直引，须标注"推导值"）
-
-没有任何权威来源直接给出 35K 输入的 TTFT 基线，档3 数字由两条独立证据夹出：
-
-1. **行业现状外推**：particula 实测云端产品 10K 输入 TTFT 0.75–1.6s（2.2 节）；冷 prefill 是 compute-bound，TTFT 随输入长度近似线性涨（Azure 四因素之（2），4.1 节）→ 35K ≈ 3.5×，得 **2.6–5.6s** 行业现状区间。取优 ≤ 3s（对应端到端 prefill ≥ ~12K tok/s）、及格 ≤ 6s。
-2. **MLPerf 405B 档佐证上限**：官方 6s p99 TTFT @ 数据集均值 9.4K 输入（1.3）——那是 405B 大模型的口径，同输入下小模型的 prefill 应显著更快，故 35K 输入 6s 作为"及格上限"是宽松且安全的。
-
-暖路径（prefix cache 命中）下 35K 输入的 TTFT 只由新增 token 决定，会远好于档3——**档3 判的是冷 prefill 最坏角落，暖路径另行解读**（见冷/暖分测原则）。
-
-### 7.3 档位归组规则
-
-- `prompt_tokens ≤ 4K` → 打档1/档2 徽章（✅ 优 / ⚠️ 及格 / ❌ 差）
-- `prompt_tokens ≥ 24K`（默认边界，可配）→ 打档3 徽章
-- 4K–24K 之间 → 不打徽章，只报数值与 prefill 斜率（两档之间无权威锚点，不硬造）
-
-### 7.4 配置形态（与 goodput 合流）
-
-```yaml
-slo:                      # 体验基线评估（3 档制徽章 + 结论段）
-  baseline: true          # 默认开
-  goodput:                # 原有达标口径迁入，与徽章共用一套阈值
-    ttft_ms: ...
-    tpot_ms: ...
-  # 以下可选覆盖内置默认（均为 p99）：
-  # tiers:
-  #   short_max_tokens: 4000     # 短输入档上界
-  #   long_min_tokens: 24000     # 大上下文档下界
-  #   ttft_ms: {short_good: 450, short_pass: 2000, long_good: 3000, long_pass: 6000}
-```
-
-落地形态（2026-09-17 报告层剥离后）：阈值随 JSON `slo_baseline` 透出、判级由分析侧实现（本文件是阈值的方法论依据，单一来源）；基线不进退出码、不污染原始 JSON；thinking=on 单独分组不打短输入档徽章（共识 4）。
-
----
-
-## 8. 输出速度（decode tok/s）UX 参考线（2026-09-11 定）
-
-锚点：英语无声阅读 ~250 wpm ≈ **4 tok/s**（1 token ≈ 0.75 word）；中文无声阅读 ~5-8 字/s
-（中文 1 字 ≈ 1 token，Qwen 系词表）。**低于阅读速度时用户"追得上"输出、感知死等**——
-这是体验下限的物理来源（r/LocalLLaMA 社区共识 + HN 多次讨论，2023-2025）。
-
-| 单流输出速度 | 体验 | 依据 |
-|---|---|---|
-| < 5 tok/s | ❌ 差 | 低于阅读速度（4 tok/s），明显死等 |
-| 5–10 tok/s | ⚠️ 勉强 | 高于阅读速度但与阅读竞争，可感知偏慢 |
-| 10–25 tok/s | ✅ 够用→良好 | 超过阅读速度 2-6×，流式舒适（社区共识 comfortable 区间） |
-| 25–80 tok/s | ✅ 良好 | 主流托管模型中位区间（Artificial Analysis median 40-80）；27B 本地部署单流实测 55 tok/s（本仓库真机 2026-09-05） |
-| > 80 tok/s | ✅ 优秀 | 即时感；单请求再快用户已无感（>30-50 后感知趋平） |
-
-### 8.1 与报告三档评级的关系
-
-报告 5.8 体验基线单元的 TPS 阈值（`SLO_TIERS.pass_tps=10 / good_tps=25`）即出自本表：
-**pass=10 = 阅读速度（4）×2 安全系数**（勉强区的上沿，低于它必然可感知偏慢）；
-**good=25 = comfortable 区上沿**（进入主流托管体验带）。产品侧的经验值与此吻合：
-"算力紧张底限 20 / 可用 30-40"落在 good 带内——底限评级偏低是因为它同时承担
-"客户降配采购时的最低可交付线"，语义是商业下限而非体验分界。
-
-### 8.2 外部分析与容量采集的关系
-
-本工具不再根据 decode 速度自动熔断或启动恢复探针。`bench probe` 的 `decode_speed` 仅提供部署级健康参考数据，
-不自动生成阈值，也不改变后续多轮/RPS 采集。服务变慢、排队增长和请求失败都应保留在 JSON 中，
-由外部分析结合 `completed_requests`、`failed_requests`、`cancelled_requests`、TTFT、TPOT、waiting 与 drain 时间判断容量。
-
-### 8.3 口径三条
-
-- **output speed 只计首 token 之后**（与 TPOT 和 Artificial Analysis methodology 一致，不含 TTFT）；
-- **客户端是评测基线**，服务端 `/metrics` 的聚合吞吐只作参考和归因；
-- **含思考增量**：推理模型的 reasoning chunk 也是服务端产出、也占用户等待。
+| 来源 | 内容 |
+|---|---|
+| [ecitis 推理 SLO](https://blog.ecitis.org/inference-slos) | agent 工具步 TTFT <1s；TPOT 对非流式不是体验指标 |
+| [CSDN Agent SLO](https://agi-way.blog.csdn.net/article/details/161825785) | 中文实践口径：chat、办公、代码、长文档分档 |
+| [MLPerf Inference](https://docs.mlcommons.org/inference/) | server / offline / interactive 场景 |
+| [Azure OpenAI monitoring](https://learn.microsoft.com/en-us/azure/foundry/openai/monitor-openai-reference) | Azure TTFT、TBT 等指标定义 |

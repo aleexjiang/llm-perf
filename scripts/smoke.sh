@@ -96,7 +96,7 @@ user = load_all("out-user")
 check(len(user) == 1, f"user 产物按模型落盘（{len(user)} 份）")
 rep = user[0]
 check(rep.get("scenario") == "user", "报告 scenario=user")
-check(rep.get("schema_version") == 9, "数据契约版本为 9")
+check(rep.get("schema_version") == 11, "数据契约版本为 11")
 levels = rep.get("user_levels") or []
 level_users = [level.get("users") for level in levels]
 check(level_users == [2], f"user levels 应有 users=2（{level_users}）")
@@ -115,6 +115,9 @@ check(first_ok, "首轮 prompt ≥35K token（agent 形状硬约束）")
 metrics_user = [t for s in sessions for t in (s.get("turns") or [])]
 check(metrics_user and all(m.get("phase") == "benchmark" for m in metrics_user), "主压测 TurnMetrics 标记 phase=benchmark")
 check(levels and levels[0].get("throughput", {}).get("total_tps"), "user level 落盘 total_tps 时间序列")
+user_tps = [p for lv in levels for p in (lv.get("throughput", {}).get("total_tps") or [])]
+check(user_tps and all("avg_decode_requests" in p and "decode_requests" not in p for p in user_tps),
+      "total_tps 使用桶积分平均 decode 并行度")
 removed = {"total_tokens", "ttft_reasoning_ms", "ttft_content_ms", "server_counter_delta"}
 check(not any(key in m for m in metrics_user for key in removed), "单轮 JSON 不落盘裁剪字段")
 

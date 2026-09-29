@@ -2,6 +2,7 @@ package report
 
 import (
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -176,15 +177,19 @@ func TestBuildThroughputSummary(t *testing.T) {
 		{Stream: true, SentAt: base, EndAt: base.Add(2200 * time.Millisecond), TTFT: 200, E2EMS: 2200, CompletionTokens: 100, TokensPerSec: 50, TPOTMS: 20, FinishReason: "length"},
 		{Stream: true, Error: "HTTP 500", CompletionTokens: 50, FinishReason: "stop"},
 		{Stream: true, Cancelled: true, CompletionTokens: 50},
+		{Stream: true, FinishReason: "stop"},
 	}, 2)
-	if summary.CompletedRequests != 2 || summary.FailedRequests != 1 || summary.CancelledRequests != 1 {
+	if summary.CompletedRequests != 2 || summary.FailedRequests != 1 || summary.CancelledRequests != 1 || summary.InvalidRequests != 1 {
 		t.Fatalf("完成/失败/取消计数错误: %+v", summary)
 	}
 	if summary.CompletionTokens != 200 {
 		t.Fatalf("完成 token 汇总错误: tokens=%d", summary.CompletionTokens)
 	}
-	if summary.Streaming.All.Count != 2 || summary.Streaming.All.P95TPS <= 0 {
+	if summary.Streaming.All.Count != 2 || summary.Streaming.All.P5TPS <= 0 || summary.Streaming.All.P95TPS <= 0 {
 		t.Fatalf("全成功分层错误: %+v", summary.Streaming.All)
+	}
+	if summary.Streaming.All.P5TPS >= summary.Streaming.All.P95TPS {
+		t.Fatalf("TPS P5 应表示低速尾部: %+v", summary.Streaming.All)
 	}
 	if summary.Streaming.Stop.Count != 1 {
 		t.Fatalf("stop 分层错误: %+v", summary.Streaming.Stop)
@@ -203,7 +208,7 @@ func TestBuildThroughputSummary(t *testing.T) {
 	if !strings.Contains(serialized, `"total_tps"`) ||
 		strings.Contains(serialized, `"throughput_tps"`) ||
 		strings.Contains(serialized, `"weighted_tps"`) {
-		t.Fatalf("聚合 schema v9 字段错误: %s", serialized)
+		t.Fatalf("聚合 schema v11 字段错误: %s", serialized)
 	}
 }
 
@@ -231,21 +236,39 @@ func TestBuildThroughputSummaryDropsRejectedRecordsFromBuckets(t *testing.T) {
 func TestBuildTotalTPSTimeAxis(t *testing.T) {
 	base := time.Unix(100, 0)
 	series := BuildTotalTPS([]*engine.TurnMetrics{
-		{Stream: true, SentAt: base, TTFT: 100, E2EMS: 1000, EndAt: base.Add(time.Second), CompletionTokens: 10, TokensPerSec: 11.111111, FinishReason: "stop"},
-		{Stream: true, SentAt: base.Add(200 * time.Millisecond), TTFT: 100, E2EMS: 1000, EndAt: base.Add(1200 * time.Millisecond), CompletionTokens: 10, TokensPerSec: 11.111111, FinishReason: "stop"},
+		{Stream: true, SentAt: base, TTFT: 100, E2EMS: 1000, EndAt: base.Add(time.Second), CompletionTokens: 10, FinishReason: "stop"},
+		{Stream: true, SentAt: base.Add(200 * time.Millisecond), TTFT: 100, E2EMS: 1000, EndAt: base.Add(1200 * time.Millisecond), CompletionTokens: 10, FinishReason: "stop"},
 	})
 	if len(series) != 2 {
 		t.Fatalf("应按 decode 时间轴生成 2 个一秒点: %+v", series)
 	}
-	if series[0].DecodeRequests != 2 || series[0].TPS < 22 || series[0].TPS > 23 {
+	if math.Abs(series[0].AvgDecodeRequests-1.7) > 1e-9 || math.Abs(series[0].TPS-19) > 1e-9 {
 		t.Fatalf("第一秒总 TPS 错误: %+v", series[0])
 	}
-	if series[1].DecodeRequests != 0 || series[1].TPS != 0 {
+	if math.Abs(series[1].AvgDecodeRequests-0.1) > 1e-9 || math.Abs(series[1].TPS-1) > 1e-9 {
 		t.Fatalf("第二秒总 TPS 错误: %+v", series[1])
+	}
+	if got := series[0].TPS + series[1].TPS; math.Abs(got-20) > 1e-9 {
+		t.Fatalf("桶积分必须守恒 completion tokens: got=%v want=20", got)
 	}
 }
 
-func TestSchemaV8RemovesDerivedAndDebugFields(t *testing.T) {
+func TestBuildTotalTPSKeepsSub500MSShortOutput(t *testing.T) {
+	base := time.Unix(100, 0)
+	series := BuildTotalTPS([]*engine.TurnMetrics{{
+		Stream: true, SentAt: base, TTFT: 100, E2EMS: 400,
+		EndAt: base.Add(400 * time.Millisecond), CompletionTokens: 4,
+		TokensPerSec: 0, FinishReason: "stop",
+	}})
+	if len(series) != 1 {
+		t.Fatalf("短请求应进入一个时间桶: %+v", series)
+	}
+	if math.Abs(series[0].TPS-4) > 1e-9 || math.Abs(series[0].AvgDecodeRequests-0.3) > 1e-9 {
+		t.Fatalf("短请求 token 或平均 decode 并行度丢失: %+v", series[0])
+	}
+}
+
+func TestSchemaV11RemovesDerivedAndDebugFields(t *testing.T) {
 	m := &engine.TurnMetrics{
 		Model: "m", Stream: true, Thinking: true,
 		PromptTokens: 10, CompletionTokens: 8, ReasoningTokens: 3,
@@ -263,16 +286,16 @@ func TestSchemaV8RemovesDerivedAndDebugFields(t *testing.T) {
 		`"reasoning_field"`, `"new_tokens"`, `"server_counter_delta"`,
 	} {
 		if strings.Contains(s, removed) {
-			t.Fatalf("schema v9 不应落盘 %s: %s", removed, s)
+			t.Fatalf("schema v11 不应落盘 %s: %s", removed, s)
 		}
 	}
 	for _, kept := range []string{`"prompt_tokens"`, `"completion_tokens"`, `"ttft_ms"`, `"think_ms"`, `"tpot_ms"`, `"tokens_per_sec"`} {
 		if !strings.Contains(s, kept) {
-			t.Fatalf("schema v9 应落盘 %s: %s", kept, s)
+			t.Fatalf("schema v11 应落盘 %s: %s", kept, s)
 		}
 	}
-	if SchemaVersionCurrent != 9 {
-		t.Fatalf("schema version = %d, want 9", SchemaVersionCurrent)
+	if SchemaVersionCurrent != 11 {
+		t.Fatalf("schema version = %d, want 11", SchemaVersionCurrent)
 	}
 }
 

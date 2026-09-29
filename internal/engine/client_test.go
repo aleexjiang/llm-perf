@@ -275,6 +275,30 @@ func TestStreamEOFWithoutDoneIsFailure(t *testing.T) {
 	}
 }
 
+func TestStreamMetricsEndAtDoneInsteadOfEOF(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"abcdefgh\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":8}}\n\n"+
+			"data: [DONE]\n\n")
+		w.(http.Flusher).Flush()
+		time.Sleep(200 * time.Millisecond) // 模拟代理在逻辑结束后延迟关闭响应体
+	}))
+	defer srv.Close()
+
+	start := time.Now()
+	m, err := NewClient(srv.URL, "", time.Second, true).Chat(context.Background(), retryOpts(true))
+	wall := time.Since(start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wall >= 150*time.Millisecond {
+		t.Fatalf("客户端不应等待 [DONE] 后延迟到达的 EOF: wall=%v", wall)
+	}
+	if m.E2EMS >= 150 {
+		t.Fatalf("E2E 不应包含 [DONE] 后等待 EOF 的时间: e2e=%.1fms wall=%v", m.E2EMS, wall)
+	}
+}
+
 // ── ThinkMS 负值钳 0：reasoning 块晚于 content 首包（魔改引擎时序异常）不污染中位数 ──
 
 func TestThinkMSNegativeClamped(t *testing.T) {

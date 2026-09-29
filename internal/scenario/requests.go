@@ -79,7 +79,7 @@ func requestRunner(ctx context.Context, e *env, model string, v config.ThinkingV
 // finishLevel 汇总一个档位的吞吐、成败计数与 SLO goodput。
 func finishLevel(e *env, lv *report.ConcurrentLevel) {
 	wall := lv.WallSeconds
-	completed, failed, cancelled := 0, 0, 0
+	completed, failed, cancelled, invalid := 0, 0, 0, 0
 	meet, total, goodTokens := 0, 0, 0.0
 	sloEnabled := e.cfg.EffGoodput() != nil
 	for _, m := range lv.Requests {
@@ -88,9 +88,8 @@ func finishLevel(e *env, lv *report.ConcurrentLevel) {
 			cancelled++
 		case m.Error != "":
 			failed++
-			if sloEnabled {
-				total++
-			}
+		case m.CompletionTokens <= 0:
+			invalid++
 		default:
 			completed++
 			if sloEnabled {
@@ -105,6 +104,7 @@ func finishLevel(e *env, lv *report.ConcurrentLevel) {
 	lv.CompletedRequests = completed
 	lv.FailedRequests = failed
 	lv.CancelledRequests = cancelled
+	lv.InvalidRequests = invalid
 	lv.SLOMeet = meet
 	lv.SLOTotal = total
 	if wall > 0 {

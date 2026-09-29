@@ -117,6 +117,7 @@ type TurnMetrics struct {
 	FirstReasoningAt *time.Time `json:"-"`
 	FirstContentAt   *time.Time `json:"-"`
 	EndAt            time.Time  `json:"end_at"`
+	logicalEndAt     *time.Time // [DONE] 到达时刻；代理 EOF 不属于请求延迟
 
 	// chunk 统计（仅流式）
 	Chunks          int    `json:"-"`
@@ -153,7 +154,7 @@ type TurnMetrics struct {
 	ContentTimesMS []float64 `json:"-"`
 	// TPOT 每 output token 时间，含思考 token。
 	TPOTMS       float64 `json:"tpot_ms,omitempty"`
-	TokensPerSec float64 `json:"tokens_per_sec"` // 流式 = completion/(E2E−TTFT)，与 TPOT 同窗（含思考段）；非流式 = completion/E2E
+	TokensPerSec float64 `json:"tokens_per_sec"` // 流式 = (completion-1)/(E2E−TTFT)，与 TPOT 互逆；非流式 = completion/E2E
 
 	// 思考吃光输出预算标记：Thinking + 流式 + 全程无 content + finish_reason=length。
 	// 此时 ThinkMS/DecodeMS/ITL 均不可测，分析时应剔除或调大 max_tokens 重跑。
@@ -311,12 +312,13 @@ func (m *TurnMetrics) Finalize() {
 		m.TPOTMS = (m.E2EMS - m.TTFT) / float64(m.CompletionTokens-1)
 	}
 
-	// 吞吐（per 请求）：分母 = E2E−TTFT（首 token 后的全部生成时段，含思考段），
-	// 与 TPOT 同窗互逆（≈ 1000/TPOT）。不能用 DecodeMS：思考模型的 completion_tokens
-	// 含 reasoning token，而 DecodeMS 只覆盖 content 时段——思考 token 计入分子、
+	// 吞吐（per 请求）：首 token 已在区间起点产生，E2E−TTFT 覆盖后续 n−1 个 token
+	// 间隔，因此分子也必须是 completion_tokens−1，严格等于 1000/TPOT。
+	// 不能用 DecodeMS：思考模型的 completion_tokens 含 reasoning token，而 DecodeMS
+	// 只覆盖 content 时段——思考 token 计入分子、
 	// 思考耗时不在分母，tok/s 会被显著虚高。非思考模型 E2E−TTFT == DecodeMS，数值不变。
-	if m.CompletionTokens > 0 && m.TTFT > 0 && m.E2EMS > m.TTFT {
-		m.TokensPerSec = float64(m.CompletionTokens) / ((m.E2EMS - m.TTFT) / 1000)
+	if m.CompletionTokens > 1 && m.TTFT > 0 && m.E2EMS > m.TTFT {
+		m.TokensPerSec = float64(m.CompletionTokens-1) / ((m.E2EMS - m.TTFT) / 1000)
 	}
 }
 
@@ -483,6 +485,9 @@ func (c *Client) attempt(ctx context.Context, o ChatOptions) (m *TurnMetrics, er
 		bodyErr = c.readWhole(resp, m)
 	}
 	m.EndAt = time.Now()
+	if m.logicalEndAt != nil {
+		m.EndAt = *m.logicalEndAt
+	}
 	m.Finalize()
 	c.dumpIfNeeded(m, payload, resp.StatusCode, resp.Header, o.Stream)
 	if bodyErr != nil {

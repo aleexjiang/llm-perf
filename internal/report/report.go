@@ -85,8 +85,10 @@ type ConcurrentLevel struct {
 	CompletedRequests int                   `json:"completed_requests"`
 	FailedRequests    int                   `json:"failed_requests"`
 	CancelledRequests int                   `json:"cancelled_requests"`
+	InvalidRequests   int                   `json:"invalid_requests"`
 
-	// goodput（SLO 约束吞吐，配置了 goodput 时填充）：SLOMeet/SLOTotal 为达标/总请求数（多轮按 turn 计）。
+	// goodput（SLO 约束吞吐，配置了 goodput 时填充）：SLOMeet/SLOTotal 为达标/有效请求数。
+	// 失败、取消和 usage 无效请求不进入分母。
 	// 刻意不带 omitempty（12.2）：0 是有意义的结果——slo_total>0 时 slo_meet=0 =「整档 0 达标」；
 	// slo_total=0 = 未配置 slo.goodput（未统计）。加 omitempty 后两种情况键都消失，
 	// 消费方无法区分「0 达标」与「没测」。对齐 SourceCheck.Deviation 的先例。
@@ -294,10 +296,11 @@ type ThroughputSummary struct {
 	CompletedRequests int             `json:"completed_requests"`
 	FailedRequests    int             `json:"failed_requests"`
 	CancelledRequests int             `json:"cancelled_requests"`
+	InvalidRequests   int             `json:"invalid_requests"`
 	CompletionTokens  int             `json:"completion_tokens"`
 	TotalTPS          []TotalTPSPoint `json:"total_tps,omitempty"`
 
-	// 流式单轮速度按完成类型分层；P50/P95/P99 只描述单轮样本分布。
+	// 流式单轮速度按完成类型分层；P5 是低速尾部，其他分位描述整体分布。
 	Streaming struct {
 		All    ThroughputClass `json:"all"`
 		Stop   ThroughputClass `json:"stop"`
@@ -305,17 +308,18 @@ type ThroughputSummary struct {
 	} `json:"streaming"`
 }
 
-// TotalTPSPoint 是总 TPS 时间轴的一秒采样点。
-// Second 从本场景第一条有效 decode 区间开始计，TPS 和 decode_requests 取该秒中点状态。
+// TotalTPSPoint 是总 TPS 时间轴的一秒桶。
+// TPS 按请求 decode 区间与桶的重叠时长积分；AvgDecodeRequests 是桶内平均 decode 并行度。
 type TotalTPSPoint struct {
-	Second         int     `json:"second"`
-	DecodeRequests int     `json:"decode_requests"`
-	TPS            float64 `json:"tps"`
+	Second            int     `json:"second"`
+	AvgDecodeRequests float64 `json:"avg_decode_requests"`
+	TPS               float64 `json:"tps"`
 }
 
 // ThroughputClass 一层请求/轮次的单流统计。
 type ThroughputClass struct {
 	Count     int     `json:"count"`
+	P5TPS     float64 `json:"p5_tps,omitempty"`
 	P50TPS    float64 `json:"p50_tps,omitempty"`
 	P95TPS    float64 `json:"p95_tps,omitempty"`
 	P99TPS    float64 `json:"p99_tps,omitempty"`
@@ -349,19 +353,11 @@ func BuildThroughputSummary(ms []*engine.TurnMetrics, wallSeconds float64) *Thro
 		if tpot := m.TPOTMS; m.Stream && tpot > 0 {
 			b.tpot = append(b.tpot, tpot)
 		}
-		if !m.Stream || m.TTFT <= 0 || m.E2EMS <= m.TTFT || m.CompletionTokens <= 0 || m.TokensPerSec <= 0 {
-			return
+		if m.Stream && m.TokensPerSec > 0 {
+			b.tps = append(b.tps, m.TokensPerSec)
 		}
-		b.tps = append(b.tps, m.TokensPerSec)
-		if !m.SentAt.IsZero() && !m.EndAt.IsZero() {
-			start := m.SentAt.Add(time.Duration(m.TTFT * float64(time.Millisecond)))
-			if m.EndAt.After(start) {
-				b.spans = append(b.spans, tpsSpan{
-					start: start,
-					end:   m.EndAt,
-					tps:   m.TokensPerSec,
-				})
-			}
+		if span, ok := metricTPSSpan(m); ok {
+			b.spans = append(b.spans, span)
 		}
 	}
 
@@ -375,6 +371,9 @@ func BuildThroughputSummary(ms []*engine.TurnMetrics, wallSeconds float64) *Thro
 			continue
 		case m.Error != "":
 			out.FailedRequests++
+			continue
+		case m.CompletionTokens <= 0:
+			out.InvalidRequests++
 			continue
 		default:
 			out.CompletedRequests++
@@ -390,6 +389,7 @@ func BuildThroughputSummary(ms []*engine.TurnMetrics, wallSeconds float64) *Thro
 	}
 	finalize := func(b bucket) ThroughputClass {
 		c := ThroughputClass{Count: b.count}
+		c.P5TPS = percentileOrZero(b.tps, 0.05)
 		c.P50TPS = percentileOrZero(b.tps, 0.50)
 		c.P95TPS = percentileOrZero(b.tps, 0.95)
 		c.P99TPS = percentileOrZero(b.tps, 0.99)
@@ -407,30 +407,35 @@ func BuildThroughputSummary(ms []*engine.TurnMetrics, wallSeconds float64) *Thro
 }
 
 type tpsSpan struct {
-	start time.Time
-	end   time.Time
-	tps   float64
+	start     time.Time
+	end       time.Time
+	decodeTPS float64
 }
 
-// BuildTotalTPS 从成功流式请求的 decode 区间重建一秒粒度总 TPS。
-// 每个点取相对第一条有效 decode 区间起点的 1 秒桶中点状态。
+func metricTPSSpan(m *engine.TurnMetrics) (tpsSpan, bool) {
+	if m == nil || m.Error != "" || m.Cancelled || !m.Stream || m.TTFT <= 0 ||
+		m.E2EMS <= m.TTFT || m.CompletionTokens <= 0 || m.SentAt.IsZero() || m.EndAt.IsZero() {
+		return tpsSpan{}, false
+	}
+	start := m.SentAt.Add(time.Duration(m.TTFT * float64(time.Millisecond)))
+	if !m.EndAt.After(start) {
+		return tpsSpan{}, false
+	}
+	span := tpsSpan{start: start, end: m.EndAt}
+	if m.CompletionTokens > 1 {
+		span.decodeTPS = float64(m.CompletionTokens-1) / m.EndAt.Sub(start).Seconds()
+	}
+	return span, true
+}
+
+// BuildTotalTPS 从成功流式请求的 decode 区间重建一秒桶积分时间轴。
+// 首 token 计入 decode_start 所在桶，其余 token 按 decode 区间与桶的重叠时长分配。
 func BuildTotalTPS(ms []*engine.TurnMetrics) []TotalTPSPoint {
 	spans := make([]tpsSpan, 0, len(ms))
 	for _, m := range ms {
-		if m == nil || m.Error != "" || m.Cancelled || !m.Stream || m.TTFT <= 0 ||
-			m.E2EMS <= m.TTFT || m.CompletionTokens <= 0 || m.TokensPerSec <= 0 ||
-			m.SentAt.IsZero() || m.EndAt.IsZero() {
-			continue
+		if span, ok := metricTPSSpan(m); ok {
+			spans = append(spans, span)
 		}
-		start := m.SentAt.Add(time.Duration(m.TTFT * float64(time.Millisecond)))
-		if !m.EndAt.After(start) {
-			continue
-		}
-		spans = append(spans, tpsSpan{
-			start: start,
-			end:   m.EndAt,
-			tps:   m.TokensPerSec,
-		})
 	}
 	return buildTotalTPS(spans)
 }
@@ -452,12 +457,25 @@ func buildTotalTPS(spans []tpsSpan) []TotalTPSPoint {
 	seconds := int(math.Ceil(end.Sub(start).Seconds()))
 	points := make([]TotalTPSPoint, 0, seconds)
 	for second := 0; second < seconds; second++ {
-		at := start.Add(time.Duration(second)*time.Second + 500*time.Millisecond)
+		bucketStart := start.Add(time.Duration(second) * time.Second)
+		bucketEnd := bucketStart.Add(time.Second)
 		point := TotalTPSPoint{Second: second}
 		for _, span := range spans {
-			if !at.Before(span.start) && at.Before(span.end) {
-				point.DecodeRequests++
-				point.TPS += span.tps
+			overlapStart := bucketStart
+			if span.start.After(overlapStart) {
+				overlapStart = span.start
+			}
+			overlapEnd := bucketEnd
+			if span.end.Before(overlapEnd) {
+				overlapEnd = span.end
+			}
+			if overlapEnd.After(overlapStart) {
+				overlapSeconds := overlapEnd.Sub(overlapStart).Seconds()
+				point.AvgDecodeRequests += overlapSeconds
+				point.TPS += span.decodeTPS * overlapSeconds
+			}
+			if !span.start.Before(bucketStart) && span.start.Before(bucketEnd) {
+				point.TPS++ // 首 token 在 decode_start 时已经产生
 			}
 		}
 		points = append(points, point)
@@ -486,7 +504,7 @@ var Version = "llm-perf/dev"
 // SchemaVersionCurrent 数据契约版本：JSON 结构变更时递增；本项目不保留旧字段兼容逻辑。
 // 契约唯一权威文档 docs/data-contract.md，与本值同步维护（2026-09-17 报告层剥离后，
 // 这份 JSON 契约就是工具的对外接口）。
-const SchemaVersionCurrent = 9
+const SchemaVersionCurrent = 11
 
 // Report 是一次场景执行的完整数据，整体落盘为单个 JSON 文件。
 type Report struct {

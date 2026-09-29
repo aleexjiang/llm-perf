@@ -1,107 +1,67 @@
 # llm-perf
 
-客户自部署 LLM 推理服务性能采集工具。Go 编译为单二进制，无运行时依赖；输出 schema v9 JSON，
-报告和容量分析由外部工具完成。
+自部署 OpenAI 兼容 LLM 服务的性能采集器。Go 单二进制，输出 schema v11 JSON；
+报告、分位统计和容量判断由外部工具完成。
 
-详细契约见 [docs/data-contract.md](docs/data-contract.md)，指标口径见
-[docs/report-metrics.md](docs/report-metrics.md)。
+权威文档：
 
-## 场景
+- [数据契约](docs/data-contract.md)：JSON 结构和字段语义。
+- [指标口径](docs/report-metrics.md)：TTFT、TPOT、TPS 和总 TPS。
+- [架构](docs/architecture.md)：模块边界和数据流。
+- [测试架构](docs/testing-architecture.md)：负载、变量隔离和报告要求。
+
+## 快速开始
 
 ```bash
-./bench probe -c configs/example.yaml
-./bench user -c configs/example.yaml
-./bench rps -c configs/example.yaml
+make build
+./bench probe       -c configs/example.yaml
+./bench user        -c configs/example.yaml
+./bench rps         -c configs/example.yaml
 ./bench concurrency -c configs/example.yaml
 ```
 
 | 场景 | 负载 | 用途 |
 |---|---|---|
-| `probe` | 最小能力请求 | 模型、认证、usage、thinking、tool-call、`/metrics` 探测 |
-| `user` | profile 驱动的动态多轮会话 | 长上下文、prefix cache 和单轮体验 |
-| `rps` | ShareGPT 冻结请求集、Poisson 到达 | 到达率、排队和体验拐点 |
-| `concurrency` | ShareGPT 冻结请求集、固定在飞 | 并发、总 TPS 和饱和拐点 |
+| `probe` | 最小能力请求 | 模型、认证、usage、thinking、tool-call、`/metrics` |
+| `user` | profile 驱动的动态多轮 | 长上下文、prefix cache、单轮体验 |
+| `rps` | 冻结请求集、Poisson 到达 | 到达率、排队和体验拐点 |
+| `concurrency` | 冻结请求集、固定在飞 | 总 TPS 和饱和拐点 |
 
-`user` 需要 `user.profile_path`；`rps` 和 `concurrency` 需要
-`request_set.sharegpt_path`。它们的请求构成和 cache 行为不同，不混合解释。
+`user` 需要 `user.profile_path`；`rps` / `concurrency` 需要
+`request_set.sharegpt_path`。user 的动态 cache 与冻结请求集的 cache 行为必须分开解释。
+profile 可用 `scripts/profile_build.py --preset controlled-agent` 生成单调
+light/medium/heavy 梯度，并让 heavy 持续到 `context_budget_tokens` 的安全边界。
 
-`user.levels` 配置用户数阶梯；一次 `bench user` 会按配置顺序串行执行全部 user 档位，
-每个档位独立落盘会话、总 TPS 和服务端观测。
+常用覆盖项：`-m`、`-o`、`--seed-salt`、`--thinking`、`--max-ctx`。
+重跑或切换 thinking 变体时使用新的 `--seed-salt`。
 
-常用 CLI 覆盖项：`-m`、`-o`、`--seed-salt`、`--thinking`、`--max-ctx`。
+## 关键口径
 
-## 单轮指标
-
-每条 `TurnMetrics` 是一轮模型请求的核心样本：
-
-```text
-sent_at / end_at
-prompt_tokens / completion_tokens / reasoning_tokens / cached_tokens
-ttft_ms / think_ms / tpot_ms / tokens_per_sec / e2e_ms
-finish_reason / error / cancelled / warnings
-```
-
-核心公式：
+每条 `TurnMetrics` 是一轮请求：
 
 ```text
+ttft_ms = 首个含 token 的 reasoning/content chunk - sent_at
 tpot_ms = (e2e_ms - ttft_ms) / (completion_tokens - 1)
-tokens_per_sec = completion_tokens / ((e2e_ms - ttft_ms) / 1000)
+tokens_per_sec = (completion_tokens - 1) / ((e2e_ms - ttft_ms) / 1000)
 ```
 
-`tokens_per_sec` 是首 token 之后的单轮平均输出速度；TTFT 包含排队和 prefill；E2E 包含完整请求时间。
+成功流式请求的 decode 区间为 `[sent_at + ttft_ms, end_at)`。总 TPS 使用统一的一秒桶积分：
+首 token 计入所在桶，其余 token 按 decode 区间与桶的重叠时长分配。
 
-## 总 TPS
-
-成功请求的 decode 区间为：
-
-```text
-[sent_at + ttft_ms, end_at)
-```
-
-任意时刻的总 TPS 是该时刻正在 decode 的请求的 `tokens_per_sec` 之和。
-JSON 以一秒时间轴落盘：
-
-```json
-{
-  "second": 0,
-  "decode_requests": 3,
-  "tps": 612.4
-}
-```
-
-user 放在 `throughput.total_tps[]`；rps/concurrency 放在各档位的 `total_tps[]`。
-不使用 session 平均 TPS 推导总 TPS。
-
-## 服务端观测
-
-启用配置：
-
-```yaml
-server_metrics: true
-```
-
-`/metrics` 只按场景窗口独立采集到 `server_metrics`，用于 running/waiting、KV、cache、
-preemption、服务端 token 和 histogram 归因。`source_check` 用服务端 generation token 与客户端
-completion token 对账，不把共享 counter 差值挂到单条请求。
-
-`/metrics` 不可用时，客户端单轮指标和总 TPS 仍然是主口径，不改变采集流程。
+`user.levels` 按配置顺序串行执行，每个档位独立保存 `throughput` 和 `server_metrics`。
+`rps` / `concurrency` 的档位数据保存在 `concurrent[]`。
 
 ## 数据规则
 
-- schema 结构变化直接更新版本，不保留旧字段兼容逻辑，不同时落新旧字段。
-- `total_tokens`、全场景 `throughput_tps`、旧 active-decode 聚合、`weighted_tps` 不属于 schema v9。
-- chunk 计数、字符数、ITL、原始 chunk 时间、首帧时间、思考协议字段只在内存或 debug 中使用。
+- schema 变更直接递增 `schema_version`，不保留旧字段兼容逻辑。
 - 失败、取消、usage 缺失和不完整流保留原始记录，但不进入成功聚合。
-- `warmup` 和 `correctness` 进入 `auxiliary_requests[]`，不进入 benchmark KPI。
-- 长场景运行中会打印请求进度；每完成一个 user level、RPS rate 或 concurrency level，
-  会先写一个累计 checkpoint JSON，场景全部完成后再写最终 JSON。
-- `stop` 和 `length` 分层；P95 是主报告口径，P50 只作分布参考。
+- `warmup` / `correctness` 只进入 `auxiliary_requests[]`，不进入 benchmark KPI。
+- 长场景每完成一个档位写出累计 `*.checkpoint-NNN.json`，全部结束后写最终 JSON。
+- `stop` 与 `length` 分层；延迟/TPOT 看 P95，TPS 低尾看 P5，P50 只作分布参考。
 
-## 构建与验证
+## 验证
 
 ```bash
-make build
-make test
 gofmt -w internal/ cmd/
 go build ./...
 go vet ./...
@@ -109,5 +69,5 @@ go test ./... -count=1
 scripts/smoke.sh
 ```
 
-真机配置、二进制、原始 JSON、日志和分析记录统一放在 gitignored 的 `llm-perf-test/`。
-客户端点和 API key 不提交到仓库。
+真机配置、二进制、原始 JSON、日志和分析记录统一放在 gitignored 的
+`llm-perf-test/`。客户端点和 API key 不提交到仓库。

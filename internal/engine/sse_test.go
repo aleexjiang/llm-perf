@@ -27,6 +27,9 @@ func feed(t *testing.T, m *TurnMetrics, raw string, includeUsage bool) {
 	}
 	m.closeOutWarnings(includeUsage)
 	m.EndAt = clock()
+	if m.logicalEndAt != nil {
+		m.EndAt = *m.logicalEndAt
+	}
 	m.Finalize()
 }
 
@@ -330,18 +333,17 @@ func TestTokensPerSecThinkingWindow(t *testing.T) {
 	m := &TurnMetrics{Stream: true, Thinking: true}
 	feed(t, m, sseVLLM027, true)
 
-	want := float64(m.CompletionTokens) / ((m.E2EMS - m.TTFT) / 1000)
+	want := float64(m.CompletionTokens-1) / ((m.E2EMS - m.TTFT) / 1000)
 	if m.TokensPerSec != want {
-		t.Errorf("TokensPerSec = %v, want %v（completion/(E2E−TTFT) 同窗口径）", m.TokensPerSec, want)
+		t.Errorf("TokensPerSec = %v, want %v（(completion-1)/(E2E−TTFT) 同窗口径）", m.TokensPerSec, want)
 	}
-	if old := float64(m.CompletionTokens) / (m.DecodeMS / 1000); m.TokensPerSec >= old {
+	if old := float64(m.CompletionTokens-1) / (m.DecodeMS / 1000); m.TokensPerSec >= old {
 		t.Errorf("思考流新口径应低于旧口径（新=%v 旧=%v，旧口径虚高）", m.TokensPerSec, old)
 	}
-	// 与 TPOT 同窗互逆：tps×tpot_ms/1000 == n/(n−1)（同一时间窗，差一个 −1）
+	// 与 TPOT 严格互逆：tps×tpot_ms/1000 == 1
 	if m.TPOTMS > 0 {
-		want := float64(m.CompletionTokens) / float64(m.CompletionTokens-1)
-		if r := m.TokensPerSec * m.TPOTMS / 1000; r < want*0.999 || r > want*1.001 {
-			t.Errorf("tok/s 与 TPOT 应同窗互逆: r=%v want≈%v", r, want)
+		if r := m.TokensPerSec * m.TPOTMS / 1000; r < 0.999 || r > 1.001 {
+			t.Errorf("tok/s 与 TPOT 应严格互逆: r=%v", r)
 		}
 	}
 }
@@ -354,8 +356,21 @@ func TestTokensPerSecNonThinkingUnchanged(t *testing.T) {
 		"data: [DONE]\n"
 	m := &TurnMetrics{Stream: true}
 	feed(t, m, raw, true)
-	want := float64(m.CompletionTokens) / (m.DecodeMS / 1000)
+	want := float64(m.CompletionTokens-1) / (m.DecodeMS / 1000)
 	if m.TokensPerSec != want {
 		t.Errorf("非思考流 tok/s 应与旧口径一致: %v vs %v", m.TokensPerSec, want)
+	}
+}
+
+func TestTokensPerSecRequiresPostFirstTokenInterval(t *testing.T) {
+	base := time.Unix(1700000000, 0)
+	first := base.Add(100 * time.Millisecond)
+	m := &TurnMetrics{
+		Stream: true, SentAt: base, EndAt: base.Add(time.Second),
+		FirstContentAt: &first, CompletionTokens: 1, FinishReason: "length",
+	}
+	m.Finalize()
+	if m.TPOTMS != 0 || m.TokensPerSec != 0 {
+		t.Fatalf("只有首 token 时没有后续 token 间隔，TPOT/TPS 应不可测: %+v", m)
 	}
 }
