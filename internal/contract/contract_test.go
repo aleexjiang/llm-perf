@@ -1,4 +1,4 @@
-package report
+package contract
 
 import (
 	"encoding/json"
@@ -170,11 +170,12 @@ func TestServerMetricsTokenCountersKept(t *testing.T) {
 }
 
 // user/rps/concurrency 共用总 TPS 入口；总 TPS 由单轮 decode 区间的时间轴序列构成。
-func TestBuildThroughputSummary(t *testing.T) {
+func TestBuildMetricsSummary(t *testing.T) {
 	base := time.Unix(100, 0)
-	summary := BuildThroughputSummary([]*engine.TurnMetrics{
-		{Stream: true, SentAt: base, EndAt: base.Add(1100 * time.Millisecond), TTFT: 100, E2EMS: 1100, CompletionTokens: 100, TokensPerSec: 100, TPOTMS: 10, FinishReason: "stop"},
-		{Stream: true, SentAt: base, EndAt: base.Add(2200 * time.Millisecond), TTFT: 200, E2EMS: 2200, CompletionTokens: 100, TokensPerSec: 50, TPOTMS: 20, FinishReason: "length"},
+	base10ms, base60ms, base20ms, base120ms := base.Add(10*time.Millisecond), base.Add(60*time.Millisecond), base.Add(20*time.Millisecond), base.Add(120*time.Millisecond)
+	summary := BuildMetricsSummary([]*engine.TurnMetrics{
+		{Stream: true, SentAt: base, EndAt: base.Add(1100 * time.Millisecond), TTFT: 100, E2EMS: 1100, PromptTokens: 1000, CachedTokens: 500, CompletionTokens: 100, TokensPerSec: 100, TPOTMS: 10, FinishReason: "stop", ThinkMS: 50, FirstReasoningAt: &base10ms, FirstContentAt: &base60ms},
+		{Stream: true, SentAt: base, EndAt: base.Add(2200 * time.Millisecond), TTFT: 200, E2EMS: 2200, PromptTokens: 2000, CompletionTokens: 100, TokensPerSec: 50, TPOTMS: 20, FinishReason: "length", ThinkMS: 100, FirstReasoningAt: &base20ms, FirstContentAt: &base120ms},
 		{Stream: true, Error: "HTTP 500", CompletionTokens: 50, FinishReason: "stop"},
 		{Stream: true, Cancelled: true, CompletionTokens: 50},
 		{Stream: true, FinishReason: "stop"},
@@ -197,23 +198,37 @@ func TestBuildThroughputSummary(t *testing.T) {
 	if summary.Streaming.Length.Count != 1 {
 		t.Fatalf("length 分层错误: %+v", summary.Streaming.Length)
 	}
-	if len(summary.TotalTPS) == 0 || summary.TotalTPS[0].TPS <= 0 {
-		t.Fatalf("总 TPS 时间序列错误: %+v", summary.TotalTPS)
+	if len(summary.TPSSeries) == 0 || summary.TPSSeries[0].TPS <= 0 {
+		t.Fatalf("总 TPS 时间序列错误: %+v", summary.TPSSeries)
+	}
+	if summary.TPSMean <= 0 || summary.TPSP95 <= 0 || summary.TPSPeak <= 0 {
+		t.Fatalf("摘要必须包含桶均值/P95/峰值 TPS: %+v", summary)
+	}
+	if summary.Streaming.All.P95E2EMS <= 0 {
+		t.Fatalf("摘要必须包含 E2E P95: %+v", summary.Streaming.All)
+	}
+	if summary.Thinking.EnabledRequests != 2 || summary.Thinking.Count != 2 ||
+		summary.Thinking.P50ThinkMS <= 0 || summary.Thinking.P95ThinkMS < summary.Thinking.P50ThinkMS {
+		t.Fatalf("摘要必须包含思考时间分布: %+v", summary.Thinking)
+	}
+	if summary.RequestShape.Count != 2 || summary.RequestShape.P95PromptTokens <= 0 ||
+		summary.RequestShape.P50CompletionTokens <= 0 {
+		t.Fatalf("摘要必须包含请求 token 形状分布: %+v", summary.RequestShape)
 	}
 	b, err := json.Marshal(summary)
 	if err != nil {
-		t.Fatalf("marshal throughput: %v", err)
+		t.Fatalf("marshal metrics: %v", err)
 	}
 	serialized := string(b)
-	if !strings.Contains(serialized, `"total_tps"`) ||
-		strings.Contains(serialized, `"throughput_tps"`) ||
+	if !strings.Contains(serialized, `"bucket_tps"`) ||
+		strings.Contains(serialized, `"metrics_tps_legacy_removed"`) ||
 		strings.Contains(serialized, `"weighted_tps"`) {
-		t.Fatalf("聚合 schema v11 字段错误: %s", serialized)
+		t.Fatalf("聚合 schema v13 字段错误: %s", serialized)
 	}
 }
 
-func TestBuildThroughputSummaryDropsRejectedRecordsFromBuckets(t *testing.T) {
-	summary := BuildThroughputSummary([]*engine.TurnMetrics{
+func TestBuildMetricsSummaryDropsRejectedRecordsFromBuckets(t *testing.T) {
+	summary := BuildMetricsSummary([]*engine.TurnMetrics{
 		{
 			Stream: true, Error: "HTTP 500",
 			SentAt: time.Unix(100, 0), EndAt: time.Unix(101, 0),
@@ -231,11 +246,15 @@ func TestBuildThroughputSummaryDropsRejectedRecordsFromBuckets(t *testing.T) {
 	if summary.CompletedRequests != 0 || summary.FailedRequests != 1 || summary.CancelledRequests != 1 {
 		t.Fatalf("失败/取消计数错误: %+v", summary)
 	}
+	if summary.Thinking.EnabledRequests != 0 || summary.Thinking.Count != 0 ||
+		summary.Thinking.P50ThinkMS != 0 || summary.Thinking.P95ThinkMS != 0 {
+		t.Fatalf("无思考样本的 thinking 摘要应为 0: %+v", summary.Thinking)
+	}
 }
 
-func TestBuildTotalTPSTimeAxis(t *testing.T) {
+func TestBuildTPSSeriesTimeAxis(t *testing.T) {
 	base := time.Unix(100, 0)
-	series := BuildTotalTPS([]*engine.TurnMetrics{
+	series := BuildTPSSeries([]*engine.TurnMetrics{
 		{Stream: true, SentAt: base, TTFT: 100, E2EMS: 1000, EndAt: base.Add(time.Second), CompletionTokens: 10, FinishReason: "stop"},
 		{Stream: true, SentAt: base.Add(200 * time.Millisecond), TTFT: 100, E2EMS: 1000, EndAt: base.Add(1200 * time.Millisecond), CompletionTokens: 10, FinishReason: "stop"},
 	})
@@ -253,9 +272,9 @@ func TestBuildTotalTPSTimeAxis(t *testing.T) {
 	}
 }
 
-func TestBuildTotalTPSKeepsSub500MSShortOutput(t *testing.T) {
+func TestBuildTPSSeriesKeepsSub500MSShortOutput(t *testing.T) {
 	base := time.Unix(100, 0)
-	series := BuildTotalTPS([]*engine.TurnMetrics{{
+	series := BuildTPSSeries([]*engine.TurnMetrics{{
 		Stream: true, SentAt: base, TTFT: 100, E2EMS: 400,
 		EndAt: base.Add(400 * time.Millisecond), CompletionTokens: 4,
 		TokensPerSec: 0, FinishReason: "stop",
@@ -268,7 +287,7 @@ func TestBuildTotalTPSKeepsSub500MSShortOutput(t *testing.T) {
 	}
 }
 
-func TestSchemaV11RemovesDerivedAndDebugFields(t *testing.T) {
+func TestSchemaV12RemovesDerivedAndDebugFields(t *testing.T) {
 	m := &engine.TurnMetrics{
 		Model: "m", Stream: true, Thinking: true,
 		PromptTokens: 10, CompletionTokens: 8, ReasoningTokens: 3,
@@ -286,16 +305,16 @@ func TestSchemaV11RemovesDerivedAndDebugFields(t *testing.T) {
 		`"reasoning_field"`, `"new_tokens"`, `"server_counter_delta"`,
 	} {
 		if strings.Contains(s, removed) {
-			t.Fatalf("schema v11 不应落盘 %s: %s", removed, s)
+			t.Fatalf("schema v13 不应落盘 %s: %s", removed, s)
 		}
 	}
 	for _, kept := range []string{`"prompt_tokens"`, `"completion_tokens"`, `"ttft_ms"`, `"think_ms"`, `"tpot_ms"`, `"tokens_per_sec"`} {
 		if !strings.Contains(s, kept) {
-			t.Fatalf("schema v11 应落盘 %s: %s", kept, s)
+			t.Fatalf("schema v13 应落盘 %s: %s", kept, s)
 		}
 	}
-	if SchemaVersionCurrent != 11 {
-		t.Fatalf("schema version = %d, want 11", SchemaVersionCurrent)
+	if SchemaVersionCurrent != 14 {
+		t.Fatalf("schema version = %d, want 14", SchemaVersionCurrent)
 	}
 }
 

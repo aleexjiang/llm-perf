@@ -4,9 +4,9 @@
   "source": "smoke-fixture",
   "first_turn_tokens": [35000, 40000],
   "profiles": {
-    "light":  {"weight": 0.6, "turns_range": [2, 3], "user_input_tokens": [80, 300], "context_tokens": [500, 1500]},
-    "medium": {"weight": 0.3, "turns_range": [4, 5], "user_input_tokens": [80, 300], "context_tokens": [500, 1500]},
-    "heavy":  {"weight": 0.1, "turns_range": [6, 6], "user_input_tokens": [80, 300], "context_tokens": [500, 1500]}
+    "light":  {"weight": 0.6, "turns_range": [2, 3], "user_input_tokens": [20, 120], "context_tokens": [0, 0], "attachment_probability": 0.01, "attachment_tokens": [8000, 30000]},
+    "medium": {"weight": 0.3, "turns_range": [4, 5], "user_input_tokens": [30, 200], "context_tokens": [0, 0], "attachment_probability": 0.05, "attachment_tokens": [3000, 8000]},
+    "heavy":  {"weight": 0.1, "turns_range": [6, 6], "user_input_tokens": [30, 200], "context_tokens": [0, 0], "attachment_probability": 0.10, "attachment_tokens": [10000, 25000]}
   },
   "cleaning": {}
 }

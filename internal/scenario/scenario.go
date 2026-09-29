@@ -25,30 +25,30 @@ import (
 
 	"github.com/aleexjiang/llm-perf/internal/auth"
 	"github.com/aleexjiang/llm-perf/internal/config"
+	"github.com/aleexjiang/llm-perf/internal/contract"
 	"github.com/aleexjiang/llm-perf/internal/engine"
-	"github.com/aleexjiang/llm-perf/internal/report"
 	"github.com/aleexjiang/llm-perf/internal/smetrics"
 )
 
 // Scenario 是评测场景的统一抽象：注册表分发——新增场景实现该接口并 Register 即可。
 type Scenario interface {
 	Name() string
-	Run(ctx context.Context, cfg *config.Config, client *engine.Client, modelFilter string, options RunOptions) (*report.Report, error)
+	Run(ctx context.Context, cfg *config.Config, client *engine.Client, modelFilter string, options RunOptions) (*contract.Report, error)
 }
 
 // RunOptions controls observable execution events without adding output policy to the scenarios.
 type RunOptions struct {
-	Checkpoint func(*report.Report)
+	Checkpoint func(*contract.Report)
 }
 
 type funcScenario struct {
 	name string
-	fn   func(context.Context, *config.Config, *engine.Client, string, RunOptions) (*report.Report, error)
+	fn   func(context.Context, *config.Config, *engine.Client, string, RunOptions) (*contract.Report, error)
 }
 
 func (s funcScenario) Name() string { return s.name }
 
-func (s funcScenario) Run(ctx context.Context, cfg *config.Config, c *engine.Client, filter string, options RunOptions) (*report.Report, error) {
+func (s funcScenario) Run(ctx context.Context, cfg *config.Config, c *engine.Client, filter string, options RunOptions) (*contract.Report, error) {
 	return s.fn(ctx, cfg, c, filter, options)
 }
 
@@ -252,7 +252,7 @@ func (e *env) gaugeSampleStarts() (waiting, running int) {
 }
 
 // applyGaugePeaks 将本档位区间内的 running/waiting 峰值写回档位结果。
-func (e *env) applyGaugePeaks(lv *report.ConcurrentLevel, waitingStart, runningStart int) {
+func (e *env) applyGaugePeaks(lv *contract.ConcurrentLevel, waitingStart, runningStart int) {
 	if e.gauge == nil || lv == nil {
 		return
 	}
@@ -275,9 +275,9 @@ func finalScrapeCtx() (context.Context, context.CancelFunc) {
 //
 // Available 的语义严格限定为「**窗口差值**（counter/hist）是否取到」：结束快照失败时窗口差值
 // 无从计算，此时 Available=false 并保留 Note 说明原因——已轮询到的 gauges 仍然有效，照常挂回。
-// 这样报告侧能如实区分「已采集 / 已启用但未取到 / 未提供」，不会把一次失败渲染成全零面板。
+// 这样外部分析侧能如实区分「已采集 / 已启用但未取到 / 未提供」，不会把一次失败渲染成全零面板。
 func finishWindow(e *env, before *smetrics.Sample,
-	poller *smetrics.GaugePoller, start time.Time) *report.ServerMetricsSummary {
+	poller *smetrics.GaugePoller, start time.Time) *contract.ServerMetricsSummary {
 	summary, _, _ := finishWindowWithSample(e, before, poller, start)
 	return summary
 }
@@ -285,14 +285,14 @@ func finishWindow(e *env, before *smetrics.Sample,
 // finishWindowWithSample 与 finishWindow 同口径，但把结束快照一并返回给 source_check 复用，
 // 避免同一个场景窗口结束后再抓一次 /metrics，把窗口外流量算进服务端 token 差值。
 func finishWindowWithSample(e *env, before *smetrics.Sample,
-	poller *smetrics.GaugePoller, start time.Time) (*report.ServerMetricsSummary, *smetrics.Sample, error) {
+	poller *smetrics.GaugePoller, start time.Time) (*contract.ServerMetricsSummary, *smetrics.Sample, error) {
 	if e.srv == nil || before == nil {
 		if poller != nil {
 			poller.Stop()
 		}
 		return nil, nil, nil
 	}
-	summary := &report.ServerMetricsSummary{}
+	summary := &contract.ServerMetricsSummary{}
 	if poller != nil {
 		summary.Gauges = poller.Summary() // Summary 内部会 Stop
 		if h := poller.Health(); h.Degraded() {
@@ -326,7 +326,7 @@ func finishWindowWithSample(e *env, before *smetrics.Sample,
 
 // finishWindowAndSourceCheck 结束 rps/concurrency 场景窗口：服务端摘要和两源对账共用
 // 同一份结束快照，保证 source_check.server_tokens 与 server_metrics.generation_tokens 一致。
-func finishWindowAndSourceCheck(e *env, rep *report.Report, before *smetrics.Sample,
+func finishWindowAndSourceCheck(e *env, rep *contract.Report, before *smetrics.Sample,
 	poller *smetrics.GaugePoller, start time.Time) {
 	var after *smetrics.Sample
 	var afterErr error
@@ -341,11 +341,11 @@ func finishWindowAndSourceCheck(e *env, rep *report.Report, before *smetrics.Sam
 //
 // 两边同分母：本场景各档位墙钟之和（客户端侧吞吐本就是这个口径），因此比较等价于 token 量比较。
 // 观测层缺失 / 引擎不暴露生成 token 数 / 无有效档位 → 只写 Note 记 NA，不改任何结论。
-func applySourceCheck(e *env, rep *report.Report, before, after *smetrics.Sample, afterErr error) {
+func applySourceCheck(e *env, rep *contract.Report, before, after *smetrics.Sample, afterErr error) {
 	if rep == nil || len(rep.Concurrent) == 0 {
 		return
 	}
-	sc := &report.SourceCheck{}
+	sc := &contract.SourceCheck{}
 	var wall, tokens float64
 	for i := range rep.Concurrent {
 		lv := &rep.Concurrent[i]
@@ -398,14 +398,14 @@ func applySourceCheck(e *env, rep *report.Report, before, after *smetrics.Sample
 	rep.SourceCheck = sc
 }
 
-// applySLO 把 goodput 配置与基线评估阈值挂到 Report（报告侧按 turn 级 TTFT/TPOT 计算达标率；
+// applySLO 把 goodput 配置与基线评估阈值挂到 Report（外部分析侧按 turn 级 TTFT/TPOT 计算达标率；
 // 基线阈值随 JSON 透出供外部报告替代内置默认，未配置时不透出 = 报告用内置 SLO_TIERS）。
-func applySLO(e *env, rep *report.Report) {
+func applySLO(e *env, rep *contract.Report) {
 	if g := e.cfg.EffGoodput(); g != nil {
-		rep.SLO = &report.SLO{TTFTMS: g.TTFTMS, TPOTMS: g.TPOTMS}
+		rep.SLO = &contract.SLO{TTFTMS: g.TTFTMS, TPOTMS: g.TPOTMS}
 	}
 	if b := e.cfg.EffBaseline(); b != nil {
-		rep.SLOBaseline = &report.SLOBaseline{
+		rep.SLOBaseline = &contract.SLOBaseline{
 			Enabled:        b.BaselineEnabled(),
 			ShortMaxTokens: b.ShortMaxTokens,
 			LongMinTokens:  b.LongMinTokens,
@@ -422,9 +422,9 @@ func applySLO(e *env, rep *report.Report) {
 }
 
 // attachKVCapacity 把 KV 容量画像挂到 Report（12.12）：观测层可用且引擎暴露
-// vllm:cache_config_info 时填充，其余情况省略（报告侧并列项自然消失）。
+// vllm:cache_config_info 时填充，其余情况省略（外部分析侧并列项自然消失）。
 // 与 applySLO 同为「env → rep 的横切挂载」，各场景统一。
-func attachKVCapacity(e *env, rep *report.Report) {
+func attachKVCapacity(e *env, rep *contract.Report) {
 	if e.kv != nil {
 		rep.KVCapacity = e.kv
 	}

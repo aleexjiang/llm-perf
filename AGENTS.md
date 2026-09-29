@@ -9,7 +9,7 @@ llm-perf 只负责采集自部署 LLM 服务的性能原始数据，Go 二进制
 权威文档：
 
 - [docs/data-contract.md](docs/data-contract.md)：JSON 结构和字段语义。
-- [docs/report-metrics.md](docs/report-metrics.md)：TTFT、TPOT、TPS 和总 TPS。
+- [docs/metrics-semantics.md](docs/metrics-semantics.md)：TTFT、TPOT、TPS 和总 TPS。
 - [docs/architecture.md](docs/architecture.md)：模块边界。
 - [docs/testing-architecture.md](docs/testing-architecture.md)：测试形态和控制变量。
 

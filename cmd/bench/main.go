@@ -1,6 +1,6 @@
 // llm-perf：客户自部署 LLM 推理服务性能评测工具。
 //
-// 契约：输入 YAML 配置，输出 JSON 原始数据；报告呈现由外部工具基于 JSON 二次加工。
+// 契约：输入 YAML 配置，输出 JSON 原始数据；报告呈现/分析呈现由外部工具基于 JSON 二次加工。
 //
 // 用法（显式子命令，见 docs/workload-refactor-plan.md）：
 //
@@ -25,8 +25,8 @@ import (
 
 	"github.com/aleexjiang/llm-perf/internal/auth"
 	"github.com/aleexjiang/llm-perf/internal/config"
+	"github.com/aleexjiang/llm-perf/internal/contract"
 	"github.com/aleexjiang/llm-perf/internal/engine"
-	"github.com/aleexjiang/llm-perf/internal/report"
 	"github.com/aleexjiang/llm-perf/internal/scenario"
 )
 
@@ -93,7 +93,7 @@ benchmark、失败和主动取消请求都保留完整原始指标（按 phase �
 //   - 以 .json 结尾 → 原样
 //   - 其他 → 视为目录，拼默认文件名
 func resolveOutPath(o, outputDir, scenarioName string) string {
-	def := report.DefaultName(scenarioName)
+	def := contract.DefaultName(scenarioName)
 	switch {
 	case o == "":
 		return filepath.Join(outputDir, def)
@@ -128,16 +128,16 @@ func modelDirName(model string) string {
 	return name
 }
 
-func saveReportPartitions(rep *report.Report, outPath, configRaw string, singleFile bool) error {
+func saveContractPartitions(rep *contract.Report, outPath, configRaw string, singleFile bool) error {
 	rep.ConfigRaw = configRaw
 	parts := rep.PartitionByModel()
 	if len(parts) == 0 {
-		parts = []*report.Report{rep}
+		parts = []*contract.Report{rep}
 	}
 	if len(parts) > 1 && singleFile {
 		return fmt.Errorf("本次跑了多个模型，输出路径必须是目录: %s", outPath)
 	}
-	write := func(p *report.Report, path string) error {
+	write := func(p *contract.Report, path string) error {
 		return p.SaveJSON(path)
 	}
 	if len(parts) == 1 {
@@ -331,19 +331,19 @@ func main() {
 		fmt.Fprintf(os.Stderr, "run.log 打开失败: %v\n", err)
 	} else {
 		_ = lf.Chmod(0o600)
-		fmt.Fprintf(lf, "\n===== test run %s（tool %s）=====\n", time.Now().Format(time.RFC3339), report.Version)
+		fmt.Fprintf(lf, "\n===== test run %s（tool %s）=====\n", time.Now().Format(time.RFC3339), contract.Version)
 		log.SetOutput(io.MultiWriter(os.Stderr, lf))
 		defer lf.Close()
 	}
 
-	run := func(name, outPath string, fn func() (*report.Report, error)) {
+	run := func(name, outPath string, fn func() (*contract.Report, error)) {
 		start := time.Now()
 		rep, err := fn()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[%s] 失败: %v\n", name, err)
 			os.Exit(1)
 		}
-		if err := saveReportPartitions(rep, outPath, cfg.Raw, strings.HasSuffix(*outFlag, ".json")); err != nil {
+		if err := saveContractPartitions(rep, outPath, cfg.Raw, strings.HasSuffix(*outFlag, ".json")); err != nil {
 			fmt.Fprintf(os.Stderr, "[%s] 写出 JSON 失败: %v\n", name, err)
 			os.Exit(1)
 		}
@@ -411,7 +411,7 @@ func main() {
 			// 按模型分区落盘：probe 结果归到模型子目录（显式 -o xxx.json 尊重用户路径）
 			outPath = filepath.Join(filepath.Dir(outPath), modelDirName(model), filepath.Base(outPath))
 		}
-		if err := report.SaveJSONAny(res, outPath); err != nil {
+		if err := contract.SaveJSONAny(res, outPath); err != nil {
 			fmt.Fprintln(os.Stderr, "写出探针 JSON 失败:", err)
 			os.Exit(1)
 		}
@@ -495,17 +495,17 @@ func main() {
 	outPath := resolveOutPath(*outFlag, cfg.OutputDir, mode)
 	log.Printf("执行计划: %s 模式", mode)
 	checkpointNo := 0
-	checkpoint := scenario.RunOptions{Checkpoint: func(rep *report.Report) {
+	checkpoint := scenario.RunOptions{Checkpoint: func(rep *contract.Report) {
 		checkpointNo++
 		base := strings.TrimSuffix(outPath, ".json")
 		checkpointPath := fmt.Sprintf("%s.checkpoint-%03d.json", base, checkpointNo)
-		if err := saveReportPartitions(rep, checkpointPath, cfg.Raw, false); err != nil {
+		if err := saveContractPartitions(rep, checkpointPath, cfg.Raw, false); err != nil {
 			log.Printf("[%s] checkpoint 写出失败: %v", mode, err)
 			return
 		}
 		log.Printf("[%s] checkpoint 已保存: %s", mode, checkpointPath)
 	}}
-	run(mode, outPath, func() (*report.Report, error) {
+	run(mode, outPath, func() (*contract.Report, error) {
 		return sc.Run(ctx, cfg, client, *modelFilter, checkpoint)
 	})
 }

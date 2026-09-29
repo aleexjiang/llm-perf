@@ -4,7 +4,7 @@
 //   - rps：到达率控制（Poisson/burstiness），可选在飞上限——测排队-延迟曲线；
 //   - concurrency：在飞上限控制（request_rate=inf 时齐射）——测总吞吐拐点，对齐 vLLM bench serve。
 //
-// 数据契约：输出复用 report.ConcurrentLevel（Level/RequestRate/Requests/...），
+// 数据契约：输出复用 contract.ConcurrentLevel（Level/RequestRate/Requests/...），
 // scenario 字段区分 "rps" / "concurrency"。
 package scenario
 
@@ -19,8 +19,8 @@ import (
 	"time"
 
 	"github.com/aleexjiang/llm-perf/internal/config"
+	"github.com/aleexjiang/llm-perf/internal/contract"
 	"github.com/aleexjiang/llm-perf/internal/engine"
-	"github.com/aleexjiang/llm-perf/internal/report"
 )
 
 // loadRequestSamples 加载冻结请求集（rps/concurrency 共用）。
@@ -77,7 +77,7 @@ func requestRunner(ctx context.Context, e *env, model string, v config.ThinkingV
 }
 
 // finishLevel 汇总一个档位的吞吐、成败计数与 SLO goodput。
-func finishLevel(e *env, lv *report.ConcurrentLevel) {
+func finishLevel(e *env, lv *contract.ConcurrentLevel) {
 	wall := lv.WallSeconds
 	completed, failed, cancelled, invalid := 0, 0, 0, 0
 	meet, total, goodTokens := 0, 0, 0.0
@@ -111,7 +111,8 @@ func finishLevel(e *env, lv *report.ConcurrentLevel) {
 		lv.GoodputRPS = float64(meet) / wall
 		lv.GoodputTPS = goodTokens / wall
 	}
-	lv.TotalTPS = report.BuildTotalTPS(lv.Requests)
+	lv.TPSSeries = contract.BuildTPSSeries(lv.Requests)
+	lv.Metrics = contract.BuildMetricsSummary(lv.Requests, wall)
 }
 
 // newEnvSilent 构造不带 trace 的场景 env（请求快照模式不用 dataset/filler）。
@@ -129,7 +130,7 @@ func init() {
 }
 
 // RPSScenario rps 模式：冻结请求快照的开环到达（到达率控制节奏）。
-func RPSScenario(ctx context.Context, cfg *config.Config, client *engine.Client, modelFilter string, options RunOptions) (*report.Report, error) {
+func RPSScenario(ctx context.Context, cfg *config.Config, client *engine.Client, modelFilter string, options RunOptions) (*contract.Report, error) {
 	samples, err := loadRequestSamples(cfg)
 	if err != nil {
 		return nil, err
@@ -141,8 +142,8 @@ func RPSScenario(ctx context.Context, cfg *config.Config, client *engine.Client,
 	if err != nil {
 		return nil, err
 	}
-	rep := &report.Report{
-		Tool:        report.Version,
+	rep := &contract.Report{
+		Tool:        contract.Version,
 		Scenario:    "rps",
 		GeneratedAt: time.Now(),
 		Test:        cfg.TestKind(),
@@ -174,10 +175,10 @@ func RPSScenario(ctx context.Context, cfg *config.Config, client *engine.Client,
 				}
 				lv := runRequestArrival(ctx, em, model, v, samples, rate,
 					cfg.RPS.MaxConcurrency, cfg.RPS.GetBurstiness())
-				log.Printf("[rps] %s thinking=%s rate=%.1f/s: total_tps_points=%d wall=%.1fs ok=%d fail=%d",
-					model, v.Name, rate, len(lv.TotalTPS), lv.WallSeconds, lv.CompletedRequests, lv.FailedRequests)
+				log.Printf("[rps] %s thinking=%s rate=%.1f/s: bucket_tps_points=%d wall=%.1fs ok=%d fail=%d",
+					model, v.Name, rate, len(lv.TPSSeries), lv.WallSeconds, lv.CompletedRequests, lv.FailedRequests)
 				rep.Concurrent = append(rep.Concurrent, lv)
-				refreshReportThroughput(rep)
+				refreshContractMetrics(rep)
 				if options.Checkpoint != nil {
 					options.Checkpoint(rep)
 				}
@@ -194,15 +195,15 @@ func RPSScenario(ctx context.Context, cfg *config.Config, client *engine.Client,
 		wall += lv.WallSeconds
 		allReqs = append(allReqs, lv.Requests...)
 	}
-	rep.Throughput = report.BuildThroughputSummary(allReqs, wall)
+	rep.Metrics = contract.BuildMetricsSummary(allReqs, wall)
 	return rep, nil
 }
 
 // runRequestArrival 开环到达一轮：arrivals 决定发射时刻，可选在飞上限（信号量）。
 func runRequestArrival(ctx context.Context, e *env, model string, v config.ThinkingVariant,
-	samples []engine.RequestSample, rate float64, maxConcurrency int, burstiness float64) report.ConcurrentLevel {
+	samples []engine.RequestSample, rate float64, maxConcurrency int, burstiness float64) contract.ConcurrentLevel {
 
-	lv := report.ConcurrentLevel{Model: model, Thinking: v.Name, Level: 0, RequestRate: rate}
+	lv := contract.ConcurrentLevel{Model: model, Thinking: v.Name, Level: 0, RequestRate: rate}
 	waitStart, runningStart := e.gaugeSampleStarts()
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	arrivals := poissonDelays(len(samples), rate, burstiness, rng)
@@ -260,7 +261,7 @@ func runRequestArrival(ctx context.Context, e *env, model string, v config.Think
 }
 
 // ConcurrencyScenario concurrency 模式：固定在飞上限齐射（对齐 vLLM bench serve）。
-func ConcurrencyScenario(ctx context.Context, cfg *config.Config, client *engine.Client, modelFilter string, options RunOptions) (*report.Report, error) {
+func ConcurrencyScenario(ctx context.Context, cfg *config.Config, client *engine.Client, modelFilter string, options RunOptions) (*contract.Report, error) {
 	samples, err := loadRequestSamples(cfg)
 	if err != nil {
 		return nil, err
@@ -272,8 +273,8 @@ func ConcurrencyScenario(ctx context.Context, cfg *config.Config, client *engine
 	if err != nil {
 		return nil, err
 	}
-	rep := &report.Report{
-		Tool:        report.Version,
+	rep := &contract.Report{
+		Tool:        contract.Version,
 		Scenario:    "concurrency",
 		GeneratedAt: time.Now(),
 		Test:        cfg.TestKind(),
@@ -305,10 +306,10 @@ func ConcurrencyScenario(ctx context.Context, cfg *config.Config, client *engine
 				}
 				lv := runRequestBarrier(ctx, em, model, v, samples, level,
 					cfg.Concurrency.RequestRate, cfg.Concurrency.GetBurstiness())
-				log.Printf("[concurrency] %s thinking=%s level=%d: total_tps_points=%d wall=%.1fs ok=%d fail=%d",
-					model, v.Name, level, len(lv.TotalTPS), lv.WallSeconds, lv.CompletedRequests, lv.FailedRequests)
+				log.Printf("[concurrency] %s thinking=%s level=%d: bucket_tps_points=%d wall=%.1fs ok=%d fail=%d",
+					model, v.Name, level, len(lv.TPSSeries), lv.WallSeconds, lv.CompletedRequests, lv.FailedRequests)
 				rep.Concurrent = append(rep.Concurrent, lv)
-				refreshReportThroughput(rep)
+				refreshContractMetrics(rep)
 				if options.Checkpoint != nil {
 					options.Checkpoint(rep)
 				}
@@ -325,18 +326,18 @@ func ConcurrencyScenario(ctx context.Context, cfg *config.Config, client *engine
 		wall += lv.WallSeconds
 		allReqs = append(allReqs, lv.Requests...)
 	}
-	rep.Throughput = report.BuildThroughputSummary(allReqs, wall)
+	rep.Metrics = contract.BuildMetricsSummary(allReqs, wall)
 	return rep, nil
 }
 
-func refreshReportThroughput(rep *report.Report) {
+func refreshContractMetrics(rep *contract.Report) {
 	var requests []*engine.TurnMetrics
 	var wall float64
 	for _, level := range rep.Concurrent {
 		requests = append(requests, level.Requests...)
 		wall += level.WallSeconds
 	}
-	rep.Throughput = report.BuildThroughputSummary(requests, wall)
+	rep.Metrics = contract.BuildMetricsSummary(requests, wall)
 }
 
 // runRequestBarrier 固定在飞一轮：level 个 worker 从共享游标拉请求；
@@ -344,9 +345,9 @@ func refreshReportThroughput(rep *report.Report) {
 // review H3 / vLLM 语义）：旧实现 worker 处理完上一请求才 sleep 下一间隔，处理变慢时
 // 实际到达率被拉长（变成带节奏的闭环），测不到过载下的真实排队。
 func runRequestBarrier(ctx context.Context, e *env, model string, v config.ThinkingVariant,
-	samples []engine.RequestSample, level int, requestRate, burstiness float64) report.ConcurrentLevel {
+	samples []engine.RequestSample, level int, requestRate, burstiness float64) contract.ConcurrentLevel {
 
-	lv := report.ConcurrentLevel{Model: model, Thinking: v.Name, Level: level}
+	lv := contract.ConcurrentLevel{Model: model, Thinking: v.Name, Level: level}
 	waitStart, runningStart := e.gaugeSampleStarts()
 	if requestRate > 0 {
 		lv.RequestRate = requestRate

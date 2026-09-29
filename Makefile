@@ -1,8 +1,8 @@
 # 构建产物统一落 bin/，命名 bench-<os>-<arch>（禁止无架构后缀的裸名，避免混淆平台）。
-# 版本号经 -ldflags 注入 report.Version（git describe），随 JSON 落盘可追溯。
+# 版本号经 -ldflags 注入 contract.Version（git describe），随 JSON 落盘可追溯。
 
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-LDFLAGS := -X github.com/aleexjiang/llm-perf/internal/report.Version=llm-perf/$(VERSION)
+LDFLAGS := -X github.com/aleexjiang/llm-perf/internal/contract.Version=llm-perf/$(VERSION)
 
 # 交叉构建参数（build-os / build-linux 消费）：默认 linux/amd64（客户堡垒机主目标）。
 GOOS   ?= linux

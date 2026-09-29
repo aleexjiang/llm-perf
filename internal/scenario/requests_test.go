@@ -11,8 +11,8 @@ import (
 	"time"
 
 	"github.com/aleexjiang/llm-perf/internal/config"
+	"github.com/aleexjiang/llm-perf/internal/contract"
 	"github.com/aleexjiang/llm-perf/internal/engine"
-	"github.com/aleexjiang/llm-perf/internal/report"
 )
 
 const requestSetFixture = `[
@@ -72,8 +72,8 @@ func TestRPSScenario(t *testing.T) {
 			t.Fatalf("usage 缺失（stub 应回 prompt_tokens）")
 		}
 	}
-	if lv.CompletedRequests != 6 || len(lv.TotalTPS) == 0 {
-		t.Fatalf("汇总错误: completed=%d total_tps_points=%d", lv.CompletedRequests, len(lv.TotalTPS))
+	if lv.CompletedRequests != 6 || len(lv.TPSSeries) == 0 {
+		t.Fatalf("汇总错误: completed=%d bucket_tps_points=%d", lv.CompletedRequests, len(lv.TPSSeries))
 	}
 	if lv.SLOTotal != 0 || lv.SLOMeet != 0 || lv.GoodputRPS != 0 || lv.GoodputTPS != 0 {
 		t.Fatalf("未配置 SLO 时 goodput 应保持零值: %+v", lv)
@@ -106,12 +106,12 @@ func TestConcurrencyScenario(t *testing.T) {
 // TestRequestScenariosSourceCheck 回归：数据契约承诺 rps/concurrency 输出 source_check
 // （真机发现：applySourceCheck 已实现但场景未接线，字段在真实 vLLM JSON 中恒缺失）。
 func TestRequestScenariosSourceCheck(t *testing.T) {
-	for name, run := range map[string]func(*config.Config, *engine.Client) (*report.Report, error){
-		"rps": func(cfg *config.Config, c *engine.Client) (*report.Report, error) {
+	for name, run := range map[string]func(*config.Config, *engine.Client) (*contract.Report, error){
+		"rps": func(cfg *config.Config, c *engine.Client) (*contract.Report, error) {
 			cfg.RPS = config.RPS{Rates: []float64{60}, MaxConcurrency: 0}
 			return RPSScenario(context.Background(), cfg, c, "", RunOptions{})
 		},
-		"concurrency": func(cfg *config.Config, c *engine.Client) (*report.Report, error) {
+		"concurrency": func(cfg *config.Config, c *engine.Client) (*contract.Report, error) {
 			cfg.Concurrency = config.ConcurrencyCfg{Levels: []int{1}}
 			return ConcurrencyScenario(context.Background(), cfg, c, "", RunOptions{})
 		},
@@ -145,7 +145,7 @@ func TestFinishLevelGoodput(t *testing.T) {
 	e := &env{cfg: &config.Config{
 		SLO: &config.SLOCfg{Goodput: &config.GoodputCfg{TTFTMS: 100, TPOTMS: 50}},
 	}}
-	lv := report.ConcurrentLevel{
+	lv := contract.ConcurrentLevel{
 		WallSeconds: 2,
 		Requests: []*engine.TurnMetrics{
 			{TTFT: 80, TPOTMS: 40, CompletionTokens: 100},
@@ -170,10 +170,10 @@ func TestFinishLevelGoodput(t *testing.T) {
 
 // rps/concurrency 的档位级总 TPS 时间序列必须由场景层落盘，
 // 不能只在报告脚本里临时重算。
-func TestFinishLevelTotalTPSSeries(t *testing.T) {
+func TestFinishLevelTPSSeriesSeries(t *testing.T) {
 	e := &env{cfg: &config.Config{}}
 	base := time.Now()
-	lv := report.ConcurrentLevel{
+	lv := contract.ConcurrentLevel{
 		WallSeconds: 3,
 		Requests: []*engine.TurnMetrics{
 			{Stream: true, SentAt: base, TTFT: 100, E2EMS: 2100, EndAt: base.Add(2100 * time.Millisecond), CompletionTokens: 100, TokensPerSec: 50},
@@ -181,14 +181,14 @@ func TestFinishLevelTotalTPSSeries(t *testing.T) {
 		},
 	}
 	finishLevel(e, &lv)
-	if len(lv.TotalTPS) == 0 {
-		t.Fatalf("total_tps 未写入: %+v", lv)
+	if len(lv.TPSSeries) == 0 {
+		t.Fatalf("bucket_tps 未写入: %+v", lv)
 	}
-	if lv.TotalTPS[0].AvgDecodeRequests < 1.49 || lv.TotalTPS[0].AvgDecodeRequests > 1.51 || lv.TotalTPS[0].TPS <= 0 {
-		t.Fatalf("总 TPS 时间序列首点错误: %+v", lv.TotalTPS[0])
+	if lv.TPSSeries[0].AvgDecodeRequests < 1.49 || lv.TPSSeries[0].AvgDecodeRequests > 1.51 || lv.TPSSeries[0].TPS <= 0 {
+		t.Fatalf("总 TPS 时间序列首点错误: %+v", lv.TPSSeries[0])
 	}
-	if len(lv.TotalTPS) < 2 || lv.TotalTPS[1].AvgDecodeRequests < 1.99 || lv.TotalTPS[1].AvgDecodeRequests > 2.01 {
-		t.Fatalf("重叠 decode 未反映到时间轴: %+v", lv.TotalTPS)
+	if len(lv.TPSSeries) < 2 || lv.TPSSeries[1].AvgDecodeRequests < 1.99 || lv.TPSSeries[1].AvgDecodeRequests > 2.01 {
+		t.Fatalf("重叠 decode 未反映到时间轴: %+v", lv.TPSSeries)
 	}
 }
 

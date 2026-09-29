@@ -24,7 +24,7 @@ server_metrics: true             # 服务端观测层（缓存命中率/排队/p
 metrics_interval_ms: 500         # gauge 轮询间隔
 debug: false                     # true: 原始响应 → <output_dir>/raw/，日志 → run.log
 raw_timings: true                # 原始 chunk 序列落盘（raw_timings）；超长测试可关
-context_budget_tokens: 0         # 统一上下文预算基准，建议填模型 max_model_len；自动预留 max_tokens 和 2048 安全余量
+context_budget_tokens: 0         # 统一上下文预算基准，建议填模型 max_model_len；自动预留 max_tokens 和 4096 安全余量
 models:
   - "/models/Qwen3.8-27B"        # served name（/models 列表里的 ID）
 

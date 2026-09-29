@@ -96,7 +96,7 @@ user = load_all("out-user")
 check(len(user) == 1, f"user 产物按模型落盘（{len(user)} 份）")
 rep = user[0]
 check(rep.get("scenario") == "user", "报告 scenario=user")
-check(rep.get("schema_version") == 11, "数据契约版本为 11")
+check(rep.get("schema_version") == 14, "数据契约版本为 14")
 levels = rep.get("user_levels") or []
 level_users = [level.get("users") for level in levels]
 check(level_users == [2], f"user levels 应有 users=2（{level_users}）")
@@ -110,14 +110,21 @@ for s in sessions:
     if len(ts) > 1 and ts[-1].get("prompt_tokens", 0) <= ts[0].get("prompt_tokens", 0):
         ok_growth = False
 check(ok_growth, "assistant 回复进 history：prompt 逐轮增长（动态 prefix cache）")
-first_ok = all((s.get("turns") or [{}])[0].get("prompt_tokens", 0) >= 35000 for s in sessions)
-check(first_ok, "首轮 prompt ≥35K token（agent 形状硬约束）")
+first_ok = all((s.get("turns") or [{}])[0].get("prompt_tokens", 0) >= 26000 for s in sessions)
+check(first_ok, "共享 system 基座已进入首轮 prompt")
 metrics_user = [t for s in sessions for t in (s.get("turns") or [])]
 check(metrics_user and all(m.get("phase") == "benchmark" for m in metrics_user), "主压测 TurnMetrics 标记 phase=benchmark")
-check(levels and levels[0].get("throughput", {}).get("total_tps"), "user level 落盘 total_tps 时间序列")
-user_tps = [p for lv in levels for p in (lv.get("throughput", {}).get("total_tps") or [])]
+check(levels and levels[0].get("metrics", {}).get("bucket_tps"), "user level 落盘 bucket_tps 时间序列")
+user_tps = [p for lv in levels for p in (lv.get("metrics", {}).get("bucket_tps") or [])]
 check(user_tps and all("avg_decode_requests" in p and "decode_requests" not in p for p in user_tps),
-      "total_tps 使用桶积分平均 decode 并行度")
+      "bucket_tps 使用桶积分平均 decode 并行度")
+user_th = levels[0].get("metrics", {})
+check(all(k in user_th for k in ("bucket_tps_mean", "bucket_tps_p95", "bucket_tps_peak")),
+      "user 摘要包含桶均值/P95/峰值 TPS")
+check("p95_e2e_ms" in user_th.get("streaming", {}).get("all", {}), "user 摘要包含 E2E P95")
+shape = user_th.get("request_shape", {})
+check(all(k in shape for k in ("count", "p50_prompt_tokens", "p95_prompt_tokens", "p50_completion_tokens", "p95_completion_tokens")),
+      "user 摘要包含请求 token 形状分布")
 removed = {"total_tokens", "ttft_reasoning_ms", "ttft_content_ms", "server_counter_delta"}
 check(not any(key in m for m in metrics_user for key in removed), "单轮 JSON 不落盘裁剪字段")
 
@@ -127,6 +134,9 @@ rps_levels = [lv for rep2 in rps for lv in rep2.get("concurrent", [])]
 check(rps_levels and all(lv.get("request_rate", 0) > 0 for lv in rps_levels), "RPS 档位 request_rate 落盘")
 check(rps_levels and all(len(lv.get("requests") or []) == 6 for lv in rps_levels), "RPS 档位 6 条冻结请求全部落盘")
 check(rps_levels and all(lv.get("completed_requests") == 6 for lv in rps_levels), "RPS 档位 completed 计数正确")
+rps_th = [lv.get("metrics") or {} for lv in rps_levels]
+check(rps_th and all(all(k in th for k in ("bucket_tps_mean", "bucket_tps_p95", "bucket_tps_peak", "bucket_tps", "request_shape")) for th in rps_th),
+      "RPS 档位 metrics 摘要完整")
 
 # ── concurrency：固定在飞齐射，多档位 ──
 conc = load_all("out-conc")
@@ -134,7 +144,10 @@ conc_levels = [lv for rep2 in conc for lv in rep2.get("concurrent", [])]
 check([lv.get("level") for lv in conc_levels] == [1, 2], "concurrency 两档位按序落盘（level 1,2）")
 check(all(len(lv.get("requests") or []) == 6 for lv in conc_levels), "每档位 6 条请求全部落盘")
 check(all(lv.get("completed_requests") == 6 and lv.get("failed_requests") == 0 for lv in conc_levels), "concurrency completed/failed 计数正确")
-check(all(lv.get("total_tps") for lv in conc_levels), "concurrency 档位落盘 total_tps 时间序列")
+check(all(lv.get("bucket_tps") for lv in conc_levels), "concurrency 档位落盘 bucket_tps 时间序列")
+conc_th = [lv.get("metrics") or {} for lv in conc_levels]
+check(conc_th and all(all(k in th for k in ("bucket_tps_mean", "bucket_tps_p95", "bucket_tps_peak", "bucket_tps", "request_shape")) for th in conc_th),
+      "concurrency 档位 metrics 摘要完整")
 check(any(".checkpoint-" in fn for current, _, files in os.walk(os.path.join(root, "out-conc")) for fn in files), "concurrency checkpoint 落盘")
 
 # ── probe ──

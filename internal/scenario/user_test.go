@@ -19,9 +19,9 @@ const testProfileJSON = `{
   "source": "test",
   "first_turn_tokens": [35000, 40000],
   "profiles": {
-    "light":  {"weight": 0.6, "turns_range": [2, 4], "user_input_tokens": [80, 300], "context_tokens": [500, 2000]},
-    "medium": {"weight": 0.3, "turns_range": [5, 8], "user_input_tokens": [80, 300], "context_tokens": [500, 2000]},
-    "heavy":  {"weight": 0.1, "turns_range": [9],    "user_input_tokens": [80, 300], "context_tokens": [500, 2000]}
+    "light":  {"weight": 0.6, "turns_range": [2, 4], "user_input_tokens": [20, 120], "context_tokens": [0, 0], "attachment_probability": 0.01, "attachment_tokens": [8000, 30000]},
+    "medium": {"weight": 0.3, "turns_range": [5, 8], "user_input_tokens": [30, 200], "context_tokens": [0, 0], "attachment_probability": 0.05, "attachment_tokens": [3000, 8000]},
+    "heavy":  {"weight": 0.1, "turns_range": [9],    "user_input_tokens": [30, 200], "context_tokens": [0, 0], "attachment_probability": 0.10, "attachment_tokens": [10000, 25000]}
   },
   "cleaning": {}
 }`
@@ -45,8 +45,9 @@ func TestLoadProfile(t *testing.T) {
 		t.Fatalf("profile 解析错误: %+v", p)
 	}
 	bad := []string{
-		`{"version":1,"first_turn_tokens":[35000,40000],"profiles":{"light":{"weight":1,"turns_range":[1,2],"user_input_tokens":[1,2],"context_tokens":[1,2]}}}`,
-		`{"version":1,"first_turn_tokens":[1000,2000],"profiles":{"light":{"weight":1,"turns_range":[2,3],"user_input_tokens":[1,2],"context_tokens":[1,2]}}}`,
+		`{"version":1,"first_turn_tokens":[35000,40000],"profiles":{"light":{"weight":1,"turns_range":[1,2],"user_input_tokens":[1,2],"context_tokens":[1,2],"attachment_probability":0,"attachment_tokens":[1,2]}}}`,
+		`{"version":1,"first_turn_tokens":[35000,40000],"profiles":{"light":{"weight":1,"turns_range":[1,2],"user_input_tokens":[1,2],"context_tokens":[1,2],"attachment_probability":0,"attachment_tokens":[1,2]}}}`,
+		`{"version":1,"first_turn_tokens":[35000,40000],"profiles":{"light":{"weight":1,"turns_range":[2,3],"user_input_tokens":[1,2],"context_tokens":[0,0],"attachment_probability":1.5,"attachment_tokens":[1,2]}}}`,
 		`{"version":1,"first_turn_tokens":[35000,40000],"profiles":{}}`,
 	}
 	for i, b := range bad {
@@ -57,8 +58,8 @@ func TestLoadProfile(t *testing.T) {
 }
 
 // TestUserScenario 集成：profile 驱动的生成式多轮会话。
-// 断言：权重 6:3:1 的 SWRR 分派、轮次范围、真实 assistant 进 history（prompt 逐轮增长）、
-// 首轮 ≥35K（agent 形状硬约束）、报告 scenario=user 且 Profile 标签落盘。
+// 断言：权重 6:3:1 的 SWRR 分派、轮次范围、真实 assistant 进 history、Profile 标签落盘。
+// fixture 的 first_turn_tokens 是共享基座尺寸；普通轮由 profile 输入长度决定。
 func TestUserScenario(t *testing.T) {
 	srv := sseStub(t, &stubState{})
 	cfg := testCfg(t, srv.URL)
@@ -91,9 +92,9 @@ func TestUserScenario(t *testing.T) {
 		if len(run.Turns) < want[0] || len(run.Turns) > want[1] {
 			t.Fatalf("profile=%s 轮次 %d 超出 [%d,%d]", run.Profile, len(run.Turns), want[0], want[1])
 		}
-		// 首轮 prompt ≥35K（stub usage = 字符数/4，包含 system 基座 + 首轮 user/context）
-		if first := run.Turns[0].PromptTokens; first < 35000 {
-			t.Fatalf("profile=%s 首轮 prompt %dtk < 35K（agent 形状约束被破坏）", run.Profile, first)
+		// fixture 基座 27K（stub usage=chars/4）；首轮不应固定填满 35K。
+		if first := run.Turns[0].PromptTokens; first < 26000 {
+			t.Fatalf("profile=%s 首轮 prompt %dtk 少于共享基座预期", run.Profile, first)
 		}
 		// 真实 assistant 回复进 history：turn2 的 prompt 必须大于 turn1
 		if len(run.Turns) > 1 {
@@ -137,12 +138,12 @@ func TestUserScenarioRunsConfiguredLevels(t *testing.T) {
 		t.Fatalf("user level 会话数量错误: %+v", rep.UserLevels)
 	}
 	for _, level := range rep.UserLevels {
-		if level.Throughput == nil || len(level.Throughput.TotalTPS) == 0 {
-			t.Fatalf("user level 缺少独立 total_tps: %+v", level)
+		if level.Metrics == nil || len(level.Metrics.TPSSeries) == 0 {
+			t.Fatalf("user level 缺少独立 bucket_tps: %+v", level)
 		}
 	}
-	if rep.Throughput != nil {
-		t.Fatalf("user 不应再写顶层重复 throughput: %+v", rep.Throughput)
+	if rep.Metrics != nil {
+		t.Fatalf("user 不应再写顶层重复 metrics: %+v", rep.Metrics)
 	}
 }
 
@@ -202,7 +203,8 @@ func TestUserScenarioStopsWithinTokenBudget(t *testing.T) {
 		Levels:      []int{1},
 		MaxTokens:   config.IntList{256},
 	}
-	cfg.ContextBudgetTokens = 35000 // 首轮实测可达 35-40K，因此至少第二轮会在请求前止损
+	// fixture 共享基座约 27K；预算 30K 扣掉输出和安全余量后首轮就稳定触发。
+	cfg.ContextBudgetTokens = 30000
 
 	rep, err := UserScenario(context.Background(), cfg, engine.NewClient(srv.URL, "", 30*time.Second, true), "", RunOptions{})
 	if err != nil {

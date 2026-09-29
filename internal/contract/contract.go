@@ -1,6 +1,6 @@
-// Package report 定义各场景的 JSON 输出结构。
-// 本工具只负责产出原始 JSON；HTML/图表等报告呈现由外部工具（如 WorkBuddy）基于 JSON 二次加工。
-package report
+// Package contract 定义各场景的 JSON 输出结构。
+// 本工具只负责产出原始 JSON；HTML/图表等报告呈现/分析呈现由外部工具（如 WorkBuddy）基于 JSON 二次加工。
+package contract
 
 import (
 	"encoding/json"
@@ -34,7 +34,7 @@ type MultiturnRun struct {
 	// 12.3 multiturn 深度实测校验：
 	// LastPromptTokens 末轮（最后一个 usage.prompt_tokens>0 的成功轮）实测 prompt_tokens——
 	//   名义外推（turn_tokens×turns）系统性偏乐观 10–15%（filler 语料抽样去重/边界不足额），
-	//   落盘实测值供报告侧画像区对照，偏差 >10% 告警。
+	//   落盘实测值供外部分析侧画像区对照，偏差 >10% 告警。
 	// NominalLastPrompt 名义末轮上下文（filler 口径：基座+轮数×每轮增量，×1.07 模板开销）；
 	//   0 = trace 模式（轮次来自回放会话，名义值无意义，实测深度即原会话深度）。
 	LastPromptTokens  int `json:"last_prompt_tokens,omitempty"`
@@ -48,13 +48,23 @@ type MultiturnRun struct {
 
 // UserLevel：user 模式的一个并行用户数档位。每个档位独立采集会话、总 TPS 和服务端观测。
 type UserLevel struct {
-	Model      string                `json:"model"`
-	Thinking   string                `json:"thinking"`
-	Users      int                   `json:"users"`
-	MaxTokens  int                   `json:"max_tokens"`
-	Sessions   []MultiturnRun        `json:"sessions"`
-	Throughput *ThroughputSummary    `json:"throughput"`
-	Server     *ServerMetricsSummary `json:"server_metrics,omitempty"`
+	Model     string                `json:"model"`
+	Thinking  string                `json:"thinking"`
+	Users     int                   `json:"users"`
+	MaxTokens int                   `json:"max_tokens"`
+	Workload  UserWorkload          `json:"workload"`
+	Sessions  []MultiturnRun        `json:"sessions"`
+	Metrics   *MetricsSummary       `json:"metrics"`
+	Server    *ServerMetricsSummary `json:"server_metrics,omitempty"`
+}
+
+// UserWorkload 记录该档位实际生效的 profile 形状，报告不依赖 config_raw 反推。
+type UserWorkload struct {
+	Profile               string         `json:"profile"`
+	Weights               map[string]int `json:"weights,omitempty"`
+	AttachmentProbability float64        `json:"attachment_probability"`
+	AttachmentTokens      []int          `json:"attachment_tokens,omitempty"`
+	ContextBudgetTokens   int            `json:"context_budget_tokens,omitempty"`
 }
 
 // FillLastPromptTokens 12.3：从轮次数据回填末轮实测 prompt_tokens（倒序找第一个 >0 的成功轮，
@@ -81,11 +91,12 @@ type ConcurrentLevel struct {
 	Requests          []*engine.TurnMetrics `json:"requests,omitempty"`
 	Sessions          []MultiturnRun        `json:"sessions,omitempty"`
 	WallSeconds       float64               `json:"wall_seconds"`
-	TotalTPS          []TotalTPSPoint       `json:"total_tps,omitempty"`
+	TPSSeries         []TPSBucket           `json:"bucket_tps,omitempty"`
 	CompletedRequests int                   `json:"completed_requests"`
 	FailedRequests    int                   `json:"failed_requests"`
 	CancelledRequests int                   `json:"cancelled_requests"`
 	InvalidRequests   int                   `json:"invalid_requests"`
+	Metrics           *MetricsSummary       `json:"metrics"`
 
 	// goodput（SLO 约束吞吐，配置了 goodput 时填充）：SLOMeet/SLOTotal 为达标/有效请求数。
 	// 失败、取消和 usage 无效请求不进入分母。
@@ -99,7 +110,7 @@ type ConcurrentLevel struct {
 
 	// WaitingMax 本档位观测到的 waiting 排队深度峰值（服务端 /metrics gauge；0 = 观测层
 	// 不可用或未采样）。与饱和止损是否启用无关，常开记录——它是 saturation_guard.max_waiting
-	// 的标定数据源（建议阈值 = 峰值 × 3–5，报告侧会自动给出建议值）。
+	// 的标定数据源（建议阈值 = 峰值 × 3–5，外部分析侧会自动给出建议值）。
 	WaitingMax float64 `json:"waiting_max,omitempty"`
 
 	// RunningMax 本档位观测到的 running 并发执行数峰值（服务端 /metrics gauge；0 = 观测层
@@ -115,20 +126,20 @@ type ConcurrentLevel struct {
 	Aborted string `json:"aborted,omitempty"`
 
 	// 10.5 时长制 soak 标记（闭环）：DurationSeconds>0 = 时长制档位（runs_per_worker 忽略，
-	// 各 worker 跑满墙钟）；Renew = 会话滚完换新重开（多轮）。报告侧据此标稳态窗口
+	// 各 worker 跑满墙钟）；Renew = 会话滚完换新重开（多轮）。外部分析侧据此标稳态窗口
 	// （首批会话滚完前的暂态剔除）与首末时段漂移分析。
 	DurationSeconds float64 `json:"duration_seconds,omitempty"`
 	Renew           bool    `json:"renew,omitempty"`
 }
 
-// SLO 记录本次评测的 goodput 约束（报告侧据此计算达标口径）。
+// SLO 记录本次评测的 goodput 约束（外部分析侧据此计算达标口径）。
 type SLO struct {
 	TTFTMS float64 `json:"ttft_ms"`
 	TPOTMS float64 `json:"tpot_ms"`
 }
 
 // SLOBaseline 记录本次评测的体验基线评估阈值（slo.baseline，5.8）：键名与报告脚本
-// 内置默认（SLO_TIERS）一致，报告侧直接合流覆盖。数值字段 0/缺省 = 未配置（用内置默认）。
+// 内置默认（SLO_TIERS）一致，外部分析侧直接合流覆盖。数值字段 0/缺省 = 未配置（用内置默认）。
 type SLOBaseline struct {
 	Enabled        bool    `json:"enabled"` // false = 报告跳过基线评估节
 	ShortMaxTokens int     `json:"short_max_tokens,omitempty"`
@@ -246,7 +257,7 @@ type ServerMetricsSummary struct {
 	// （counter 差值；0 = 引擎未暴露该指标；SGLang 两者均提供）。
 	PromptTokens float64 `json:"prompt_tokens,omitempty"`
 	// GenerationTokens 服务端自报的生成 token 数用于两源一致性交叉校验，不参与评测指标。
-	// 服务端观测面的原始事实，报告侧据此做两源一致性交叉校验；不参与任何评测指标。
+	// 服务端观测面的原始事实，外部分析侧据此做两源一致性交叉校验；不参与任何评测指标。
 	GenerationTokens float64 `json:"generation_tokens,omitempty"`
 
 	// WindowSeconds 本场景观测窗口时长（开始快照 → 结束快照，秒）。给两源一致性换算 tok/s 用。
@@ -288,36 +299,72 @@ type SourceCheck struct {
 	Note      string  `json:"note,omitempty"` // 不可比原因（NA 口径）
 }
 
-// ThroughputSummary 是场景级总吞吐与单流速度的稳定入口。
+// MetricsSummary 是场景级总吞吐与单流速度的稳定入口。
 // 不把 user 的会话展开成并发档位：user 的墙钟由场景层记录，rps/concurrency
 // 可由各档位汇总；分层单流速度避免把 stop 正常完成轮与 length 截断轮混成一个中位数。
-type ThroughputSummary struct {
+type MetricsSummary struct {
 	WallSeconds       float64         `json:"wall_seconds"`
 	CompletedRequests int             `json:"completed_requests"`
 	FailedRequests    int             `json:"failed_requests"`
 	CancelledRequests int             `json:"cancelled_requests"`
 	InvalidRequests   int             `json:"invalid_requests"`
 	CompletionTokens  int             `json:"completion_tokens"`
-	TotalTPS          []TotalTPSPoint `json:"total_tps,omitempty"`
+	TPSMean           float64         `json:"bucket_tps_mean"`
+	TPSP95            float64         `json:"bucket_tps_p95"`
+	TPSPeak           float64         `json:"bucket_tps_peak"`
+	TPSSeries         []TPSBucket     `json:"bucket_tps,omitempty"`
+	Thinking          ThinkingSummary `json:"thinking"`
+
+	// RequestShape 描述参与本次摘要的请求 token 形状。prompt_tokens 是服务端 usage
+	// 的完整请求上下文，不是本轮新增；completion_tokens 是实际输出。
+	RequestShape RequestShapeSummary `json:"request_shape"`
 
 	// 流式单轮速度按完成类型分层；P5 是低速尾部，其他分位描述整体分布。
 	Streaming struct {
-		All    ThroughputClass `json:"all"`
-		Stop   ThroughputClass `json:"stop"`
-		Length ThroughputClass `json:"length"`
+		All    MetricClass `json:"all"`
+		Stop   MetricClass `json:"stop"`
+		Length MetricClass `json:"length"`
 	} `json:"streaming"`
 }
 
-// TotalTPSPoint 是总 TPS 时间轴的一秒桶。
+// RequestShapeSummary 汇总请求 token 分布，供报告在开头判断负载形状。
+type RequestShapeSummary struct {
+	Count               int     `json:"count"`
+	PromptTokens        int     `json:"prompt_tokens"`
+	CompletionTokens    int     `json:"completion_tokens"`
+	CachedTokens        int     `json:"cached_tokens,omitempty"`
+	P50PromptTokens     float64 `json:"p50_prompt_tokens"`
+	P95PromptTokens     float64 `json:"p95_prompt_tokens"`
+	P50CompletionTokens float64 `json:"p50_completion_tokens"`
+	P95CompletionTokens float64 `json:"p95_completion_tokens"`
+	PromptMin           int     `json:"prompt_tokens_min"`
+	PromptMax           int     `json:"prompt_tokens_max"`
+	CompletionMin       int     `json:"completion_tokens_min"`
+	CompletionMax       int     `json:"completion_tokens_max"`
+	PromptMean          float64 `json:"prompt_tokens_mean"`
+	CompletionMean      float64 `json:"completion_tokens_mean"`
+}
+
+// ThinkingSummary 汇总思考时间分布。thinking=off 时也落盘为 0，
+// 让报告显式呈现「思考关闭」而不是让消费方猜测。
+type ThinkingSummary struct {
+	EnabledRequests int     `json:"enabled_requests"`
+	Count           int     `json:"count"`
+	P50ThinkMS      float64 `json:"p50_think_ms"`
+	P95ThinkMS      float64 `json:"p95_think_ms"`
+	MaxThinkMS      float64 `json:"max_think_ms"`
+}
+
+// TPSBucket 是总 TPS 时间轴的一秒桶。
 // TPS 按请求 decode 区间与桶的重叠时长积分；AvgDecodeRequests 是桶内平均 decode 并行度。
-type TotalTPSPoint struct {
+type TPSBucket struct {
 	Second            int     `json:"second"`
 	AvgDecodeRequests float64 `json:"avg_decode_requests"`
 	TPS               float64 `json:"tps"`
 }
 
-// ThroughputClass 一层请求/轮次的单流统计。
-type ThroughputClass struct {
+// MetricClass 一层请求/轮次的单流统计。
+type MetricClass struct {
 	Count     int     `json:"count"`
 	P5TPS     float64 `json:"p5_tps,omitempty"`
 	P50TPS    float64 `json:"p50_tps,omitempty"`
@@ -327,18 +374,24 @@ type ThroughputClass struct {
 	P95TTFTMS float64 `json:"p95_ttft_ms,omitempty"`
 	P50TPOTMS float64 `json:"p50_tpot_ms,omitempty"`
 	P95TPOTMS float64 `json:"p95_tpot_ms,omitempty"`
+	P95E2EMS  float64 `json:"p95_e2e_ms,omitempty"`
 }
 
-// BuildThroughputSummary 汇总场景内所有 TurnMetrics。
+// BuildMetricsSummary 汇总场景内所有 TurnMetrics。
 // wallSeconds 由调用方提供：user 用场景起止时间，rps/concurrency 用各档位墙钟之和。
-func BuildThroughputSummary(ms []*engine.TurnMetrics, wallSeconds float64) *ThroughputSummary {
-	out := &ThroughputSummary{WallSeconds: wallSeconds}
+func BuildMetricsSummary(ms []*engine.TurnMetrics, wallSeconds float64) *MetricsSummary {
+	out := &MetricsSummary{WallSeconds: wallSeconds}
 	type bucket struct {
-		count int
-		spans []tpsSpan
-		tps   []float64
-		ttft  []float64
-		tpot  []float64
+		count      int
+		spans      []tpsSpan
+		tps        []float64
+		ttft       []float64
+		tpot       []float64
+		e2e        []float64
+		prompt     []int
+		completion []int
+		cached     []int
+		think      []float64
 	}
 	var all, stop, length bucket
 
@@ -352,6 +405,21 @@ func BuildThroughputSummary(ms []*engine.TurnMetrics, wallSeconds float64) *Thro
 		}
 		if tpot := m.TPOTMS; m.Stream && tpot > 0 {
 			b.tpot = append(b.tpot, tpot)
+		}
+		if e2e := m.E2EMS; e2e > 0 {
+			b.e2e = append(b.e2e, e2e)
+		}
+		if m.PromptTokens > 0 {
+			b.prompt = append(b.prompt, m.PromptTokens)
+		}
+		if m.CompletionTokens > 0 {
+			b.completion = append(b.completion, m.CompletionTokens)
+		}
+		if m.CachedTokens > 0 {
+			b.cached = append(b.cached, m.CachedTokens)
+		}
+		if m.ThinkMS > 0 {
+			b.think = append(b.think, m.ThinkMS)
 		}
 		if m.Stream && m.TokensPerSec > 0 {
 			b.tps = append(b.tps, m.TokensPerSec)
@@ -387,8 +455,8 @@ func BuildThroughputSummary(ms []*engine.TurnMetrics, wallSeconds float64) *Thro
 			}
 		}
 	}
-	finalize := func(b bucket) ThroughputClass {
-		c := ThroughputClass{Count: b.count}
+	finalize := func(b bucket) MetricClass {
+		c := MetricClass{Count: b.count}
 		c.P5TPS = percentileOrZero(b.tps, 0.05)
 		c.P50TPS = percentileOrZero(b.tps, 0.50)
 		c.P95TPS = percentileOrZero(b.tps, 0.95)
@@ -397,12 +465,50 @@ func BuildThroughputSummary(ms []*engine.TurnMetrics, wallSeconds float64) *Thro
 		c.P95TTFTMS = percentileOrZero(b.ttft, 0.95)
 		c.P50TPOTMS = percentileOrZero(b.tpot, 0.50)
 		c.P95TPOTMS = percentileOrZero(b.tpot, 0.95)
+		c.P95E2EMS = percentileOrZero(b.e2e, 0.95)
 		return c
 	}
+	out.RequestShape.Count = len(all.prompt)
+	out.RequestShape.PromptTokens = sumInt(all.prompt)
+	out.RequestShape.CompletionTokens = sumInt(all.completion)
+	out.RequestShape.CachedTokens = sumInt(all.cached)
+	if len(all.prompt) > 0 {
+		out.RequestShape.P50PromptTokens = percentileInt(all.prompt, 0.50)
+		out.RequestShape.P95PromptTokens = percentileInt(all.prompt, 0.95)
+		out.RequestShape.PromptMin = minInt(all.prompt)
+		out.RequestShape.PromptMax = maxInt(all.prompt)
+		out.RequestShape.PromptMean = float64(sumInt(all.prompt)) / float64(len(all.prompt))
+	}
+	if len(all.completion) > 0 {
+		out.RequestShape.P50CompletionTokens = percentileInt(all.completion, 0.50)
+		out.RequestShape.P95CompletionTokens = percentileInt(all.completion, 0.95)
+		out.RequestShape.CompletionMin = minInt(all.completion)
+		out.RequestShape.CompletionMax = maxInt(all.completion)
+		out.RequestShape.CompletionMean = float64(sumInt(all.completion)) / float64(len(all.completion))
+	}
+	out.Thinking.EnabledRequests = len(all.think)
+	out.Thinking.Count = len(all.think)
+	out.Thinking.P50ThinkMS = percentileOrZero(all.think, 0.50)
+	out.Thinking.P95ThinkMS = percentileOrZero(all.think, 0.95)
+	out.Thinking.MaxThinkMS = percentileOrZero(all.think, 1)
 	out.Streaming.All = finalize(all)
 	out.Streaming.Stop = finalize(stop)
 	out.Streaming.Length = finalize(length)
-	out.TotalTPS = buildTotalTPS(all.spans)
+	out.TPSSeries = buildTPSSeries(all.spans)
+	if len(out.TPSSeries) > 0 {
+		bucketTPS := make([]float64, 0, len(out.TPSSeries))
+		for _, p := range out.TPSSeries {
+			bucketTPS = append(bucketTPS, p.TPS)
+		}
+		out.TPSMean = avg(bucketTPS)
+		out.TPSP95 = percentileOrZero(bucketTPS, 0.95)
+		out.TPSPeak = bucketTPS[0]
+		for _, v := range bucketTPS[1:] {
+			if v > out.TPSPeak {
+				out.TPSPeak = v
+			}
+		}
+	}
 	return out
 }
 
@@ -428,19 +534,19 @@ func metricTPSSpan(m *engine.TurnMetrics) (tpsSpan, bool) {
 	return span, true
 }
 
-// BuildTotalTPS 从成功流式请求的 decode 区间重建一秒桶积分时间轴。
+// BuildTPSSeries 从成功流式请求的 decode 区间重建一秒桶积分时间轴。
 // 首 token 计入 decode_start 所在桶，其余 token 按 decode 区间与桶的重叠时长分配。
-func BuildTotalTPS(ms []*engine.TurnMetrics) []TotalTPSPoint {
+func BuildTPSSeries(ms []*engine.TurnMetrics) []TPSBucket {
 	spans := make([]tpsSpan, 0, len(ms))
 	for _, m := range ms {
 		if span, ok := metricTPSSpan(m); ok {
 			spans = append(spans, span)
 		}
 	}
-	return buildTotalTPS(spans)
+	return buildTPSSeries(spans)
 }
 
-func buildTotalTPS(spans []tpsSpan) []TotalTPSPoint {
+func buildTPSSeries(spans []tpsSpan) []TPSBucket {
 	if len(spans) == 0 {
 		return nil
 	}
@@ -455,11 +561,11 @@ func buildTotalTPS(spans []tpsSpan) []TotalTPSPoint {
 		}
 	}
 	seconds := int(math.Ceil(end.Sub(start).Seconds()))
-	points := make([]TotalTPSPoint, 0, seconds)
+	points := make([]TPSBucket, 0, seconds)
 	for second := 0; second < seconds; second++ {
 		bucketStart := start.Add(time.Duration(second) * time.Second)
 		bucketEnd := bucketStart.Add(time.Second)
-		point := TotalTPSPoint{Second: second}
+		point := TPSBucket{Second: second}
 		for _, span := range spans {
 			overlapStart := bucketStart
 			if span.start.After(overlapStart) {
@@ -497,6 +603,62 @@ func percentileOrZero(xs []float64, p float64) float64 {
 	return s[lo] + (s[hi]-s[lo])*(idx-float64(lo))
 }
 
+func avg(xs []float64) float64 {
+	if len(xs) == 0 {
+		return 0
+	}
+	s := 0.0
+	for _, x := range xs {
+		s += x
+	}
+	return s / float64(len(xs))
+}
+
+func sumInt(xs []int) int {
+	s := 0
+	for _, x := range xs {
+		s += x
+	}
+	return s
+}
+
+func minInt(xs []int) int {
+	if len(xs) == 0 {
+		return 0
+	}
+	v := xs[0]
+	for _, x := range xs[1:] {
+		if x < v {
+			v = x
+		}
+	}
+	return v
+}
+
+func maxInt(xs []int) int {
+	if len(xs) == 0 {
+		return 0
+	}
+	v := xs[0]
+	for _, x := range xs[1:] {
+		if x > v {
+			v = x
+		}
+	}
+	return v
+}
+
+func percentileInt(xs []int, p float64) float64 {
+	if len(xs) == 0 {
+		return 0
+	}
+	fs := make([]float64, len(xs))
+	for i, x := range xs {
+		fs[i] = float64(x)
+	}
+	return percentileOrZero(fs, p)
+}
+
 // Version 是工具版本，随每个 JSON 输出落盘（报告追溯用）。
 // 默认 dev；Makefile 构建时用 -ldflags 注入 git describe 版本号。
 var Version = "llm-perf/dev"
@@ -504,7 +666,7 @@ var Version = "llm-perf/dev"
 // SchemaVersionCurrent 数据契约版本：JSON 结构变更时递增；本项目不保留旧字段兼容逻辑。
 // 契约唯一权威文档 docs/data-contract.md，与本值同步维护（2026-09-17 报告层剥离后，
 // 这份 JSON 契约就是工具的对外接口）。
-const SchemaVersionCurrent = 11
+const SchemaVersionCurrent = 14
 
 // Report 是一次场景执行的完整数据，整体落盘为单个 JSON 文件。
 type Report struct {
@@ -532,9 +694,9 @@ type Report struct {
 	KVCapacity *smetrics.KVCapacity `json:"kv_capacity,omitempty"`
 	// SourceCheck 两源一致性（10.1，仅并发场景计算）：客户端 vs 服务端生成吞吐。
 	SourceCheck *SourceCheck `json:"source_check,omitempty"`
-	// Throughput 场景级总吞吐与分层单流速度。user 不写此顶层摘要，
-	// user 的吞吐只保存在各个 user_levels[].throughput 中。
-	Throughput *ThroughputSummary `json:"throughput,omitempty"`
+	// Metrics 场景级总吞吐与分层单流速度。user 不写此顶层摘要，
+	// user 的吞吐只保存在各个 user_levels[].metrics 中。
+	Metrics *MetricsSummary `json:"metrics,omitempty"`
 
 	// 环境存档：几周后回看数据时"当时是什么引擎/什么配置跑的"必须有据可查。
 	Environment *engine.ProbeResult `json:"environment,omitempty"`
@@ -606,7 +768,7 @@ func (r *Report) PartitionByModel() []*Report {
 			Server:         r.Server,
 			KVCapacity:     r.KVCapacity,
 			SourceCheck:    r.SourceCheck,
-			Throughput:     r.Throughput,
+			Metrics:        r.Metrics,
 			Environment:    r.Environment,
 			ConfigRaw:      r.ConfigRaw,
 			PartitionModel: model,

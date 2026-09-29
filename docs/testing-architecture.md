@@ -1,7 +1,7 @@
 # 测试架构
 
 本文记录测试形态、负载梯度、变量隔离和验证命令。字段与公式分别见
-[data-contract.md](data-contract.md) 和 [report-metrics.md](report-metrics.md)。
+[data-contract.md](data-contract.md) 和 [metrics-semantics.md](metrics-semantics.md)。
 
 ## 测量目标
 
@@ -22,9 +22,9 @@ preemption 和 `/metrics` histogram 是诊断数据，不单独定义性能结�
 
 ## 负载与变量隔离
 
-- user profile 的 workload 必须单调：`light` 少轮次且每轮新增少，`medium` 居中，
-  `heavy` 多轮次且每轮新增多。heavy 启用 `fill_context` 时持续到统一上下文预算的安全
-  边界；light / medium 按自身轮次结束，不为填满模型上下文强行加轮。
+- user profile 使用稀疏附件语义：普通轮由 `context_tokens` 控制新增，`attachment_probability`
+  和 `attachment_tokens` 控制大文件注入。所有档位由 `context_budget_tokens` 统一止损，
+  不需要 `fill_context` 特殊逻辑。
 - user 文本来自内置 corpus，assistant 回复使用被测模型真实输出并进入下一轮 history。
 - rps/concurrency 使用 ShareGPT 冻结请求集，保证输入形状和样本顺序可复现。
 - 比较服务端能力时固定模型、thinking、采样、输入形状和输出预算，只改变一个压力维度。
@@ -51,9 +51,10 @@ TPOT 或服务端 `waiting` 明显恶化时，停止更高档位。已完成数�
 
 ## 报告要求
 
-外部报告至少展示：TTFT、TPOT、E2E 的 P95、TPS 的 P5/P50 和样本数；`total_tps[]` 与
-平均 decode request count；成功/失败/取消/无效数量；prompt、completion、reasoning、cache
-构成；以及 running/waiting、KV、cache、preemption 和 source check 诊断。
+外部分析至少展示：请求 token 形状分布；「每秒总吞吐」的桶均值/P95/峰值；TTFT、TPOT、
+E2E 的 P95、TPS 的 P5/P50 和样本数；`bucket_tps[]` 与平均 decode request count；
+成功/失败/取消/无效数量；prompt、completion、reasoning、cache 构成；以及
+running/waiting、KV、cache、preemption 和 source check 诊断。
 
 ## 验证
 

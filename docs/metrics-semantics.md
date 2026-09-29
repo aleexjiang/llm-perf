@@ -1,6 +1,6 @@
-# 报告指标口径
+# 指标口径
 
-本文定义 schema v11 的外部分析口径。Go 负责采集单轮数据和总 TPS 时间轴；报告工具负责
+本文定义 schema v14 的外部分析口径。Go 负责采集单轮数据和总 TPS 时间轴；外部分析工具负责
 分位、分层、可视化和容量判断。
 
 ## 单轮指标
@@ -44,30 +44,42 @@ avg_decode_requests -> 各请求与桶的重叠秒数之和 / 1 秒
 ```
 
 `second` 从该档位第一条有效 decode 区间开始。末桶不足一秒的部分按零吞吐补齐，因此每点
-都是完整一秒桶。桶积分满足 `sum(total_tps[].tps) == sum(completion_tokens)`（允许浮点误差）。
-user 写入各 `user_levels[].throughput.total_tps[]`；rps/concurrency 写入各
-`concurrent[].total_tps[]`。总 TPS 不使用中点抽样、session 平均 TPS 或请求数乘单流平均值。
+都是完整一秒桶。桶积分满足 `sum(bucket_tps[].tps) == sum(completion_tokens)`（允许浮点误差）。
+外部分析报告可把 `bucket_tps` 显示为「每秒总吞吐」；JSON 字段保持机器口径不变。
+user 写入各 `user_levels[].metrics.bucket_tps[]`；rps/concurrency 写入各
+`concurrent[].bucket_tps[]`。总 TPS 不使用中点抽样、session 平均 TPS 或请求数乘单流平均值。
 
 ## 聚合摘要
 
-每个档位的 `throughput` 包含：
+每个档位的 `metrics` 包含：
 
 ```text
 wall_seconds / completed_requests / failed_requests / cancelled_requests / invalid_requests
-completion_tokens / total_tps[]
+completion_tokens / bucket_tps_mean / bucket_tps_p95 / bucket_tps_peak / bucket_tps[]
+request_shape
+thinking
 streaming.all|stop|length
   count
   p5_tps / p50_tps / p95_tps / p99_tps
   p50_ttft_ms / p95_ttft_ms
   p50_tpot_ms / p95_tpot_ms
+  p95_e2e_ms
 ```
 
-user 的摘要只在各 `user_levels[].throughput`；rps/concurrency 另有场景级 `throughput`。
+user 的摘要只在各 `user_levels[].metrics`；rps/concurrency 另有场景级 `metrics`，
+且每个档位也会写入 `metrics`。
 `stop` 和 `length` 必须分层。延迟与 TPOT 以 P95 表示坏尾部；TPS 以 P5 表示低速尾部，
 P50 描述典型值，P95/P99 只表示高速侧分布。每个分层必须显示样本数。
 
-报告可从 `total_tps[]` 计算桶均值、P95 和峰值。时间轴覆盖第一条有效 decode 开始到最后一条
+`bucket_tps_mean/p95/peak` 是 `bucket_tps[]` 的桶摘要。时间轴覆盖第一条有效 decode 开始到最后一条
 有效 decode 所在一秒桶结束；首个 decode 前的 prefill 不在该时间轴内。
+
+`request_shape` 是本次摘要包含的有效请求 token 形状：prompt/completion 的总数、均值、
+P50/P95 和 min/max，以及 cached tokens 总量。报告开头应先用它概述「每次请求的 token 分布」，
+避免把不同输入形状的结果混读。
+
+`thinking` 是思考时间分布；thinking=off 时所有值为 0，报告应写成「思考关闭（0ms）」，
+不能省略。
 
 ## 样本过滤
 
@@ -104,11 +116,11 @@ server_metrics.preemptions / histograms
 thinking/reasoning、prefix cache，以及客户端 decode 请求数与服务端 running/waiting。
 这些是解释维度，不是新的 TPS 定义。
 
-以下旧字段不属于 schema v11，不回填：
+以下旧字段不属于 schema v14，不回填：
 
 ```text
 total_tokens
-throughput_tps
+metrics_tps_legacy_removed
 active_decode_tokens / active_decode_seconds / active_decode_tps
 weighted_tps
 streaming.*.active_decode_*

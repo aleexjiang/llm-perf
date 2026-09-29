@@ -6,7 +6,7 @@
 权威文档：
 
 - [数据契约](docs/data-contract.md)：JSON 结构和字段语义。
-- [指标口径](docs/report-metrics.md)：TTFT、TPOT、TPS 和总 TPS。
+- [指标口径](docs/metrics-semantics.md)：TTFT、TPOT、TPS 和总 TPS。
 - [架构](docs/architecture.md)：模块边界和数据流。
 - [测试架构](docs/testing-architecture.md)：负载、变量隔离和报告要求。
 
@@ -48,7 +48,7 @@ tokens_per_sec = (completion_tokens - 1) / ((e2e_ms - ttft_ms) / 1000)
 成功流式请求的 decode 区间为 `[sent_at + ttft_ms, end_at)`。总 TPS 使用统一的一秒桶积分：
 首 token 计入所在桶，其余 token 按 decode 区间与桶的重叠时长分配。
 
-`user.levels` 按配置顺序串行执行，每个档位独立保存 `throughput` 和 `server_metrics`。
+`user.levels` 按配置顺序串行执行，每个档位独立保存 `metrics` 和 `server_metrics`。
 `rps` / `concurrency` 的档位数据保存在 `concurrent[]`。
 
 ## 数据规则

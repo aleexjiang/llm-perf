@@ -6,12 +6,12 @@ import (
 	"testing"
 
 	"github.com/aleexjiang/llm-perf/internal/config"
-	"github.com/aleexjiang/llm-perf/internal/report"
+	"github.com/aleexjiang/llm-perf/internal/contract"
 )
 
 // resolveOutPath 三种输入形态：空 → outputDir/默认名；.json 后缀 → 原样；其他 → 视为目录拼接默认名。
 func TestResolveOutPath(t *testing.T) {
-	def := report.DefaultName("single")
+	def := contract.DefaultName("single")
 	if def == "" || !strings.HasSuffix(def, ".json") {
 		t.Fatalf("DefaultName 异常: %q", def)
 	}

@@ -15,7 +15,7 @@ type Profile struct {
 	Version         int                     `json:"version"`
 	GeneratedAt     string                  `json:"generated_at"`
 	Source          string                  `json:"source"`
-	FirstTurnTokens []int                   `json:"first_turn_tokens"` // [min,max]：首轮 prompt 总量硬约束（agent 形状 ~30K）
+	FirstTurnTokens []int                   `json:"first_turn_tokens"` // [min,max]：首轮 prompt 总量约束；由配置档定义
 	Profiles        map[string]*ProfileSpec `json:"profiles"`
 	Cleaning        map[string]int          `json:"cleaning"`
 	Notes           []string                `json:"notes"`
@@ -23,12 +23,13 @@ type Profile struct {
 
 // ProfileSpec 单个会话档位（light/medium/heavy）。
 type ProfileSpec struct {
-	Weight          float64 `json:"weight"`                   // 运行比例（默认 6:3:1，人工设定）
-	TurnsRange      []int   `json:"turns_range"`              // [lo] 或 [lo,hi]；单元素 = lo 为下限
-	UserInputTokens []int   `json:"user_input_tokens"`        // [lo,hi] 每轮 user 文本长度（token）
-	ContextTokens   []int   `json:"context_tokens"`           // [lo,hi] 每轮注入的合成上下文（token，尾部 <context> 块）
-	FillContext     bool    `json:"fill_context,omitempty"`   // heavy：有统一预算时持续到上下文预算止损
-	TraceSessions   int     `json:"trace_sessions,omitempty"` // 特征来源的会话数（参考）
+	Weight                float64 `json:"weight"`                   // 运行比例（默认 6:3:1，人工设定）
+	TurnsRange            []int   `json:"turns_range"`              // [lo] 或 [lo,hi]；单元素 = lo 为下限
+	UserInputTokens       []int   `json:"user_input_tokens"`        // [lo,hi] 每轮 user 文本长度（token）
+	ContextTokens         []int   `json:"context_tokens"`           // [lo,hi] 每轮常规新增上下文（token）
+	AttachmentProbability float64 `json:"attachment_probability"`   // 每轮大附件注入概率
+	AttachmentTokens      []int   `json:"attachment_tokens"`        // 命中时附件 token 区间
+	TraceSessions         int     `json:"trace_sessions,omitempty"` // 特征来源的会话数（参考）
 }
 
 // LoadProfile 读取并校验 profile.json。
@@ -61,14 +62,22 @@ func LoadProfile(path string) (*Profile, error) {
 		if len(spec.ContextTokens) != 2 || spec.ContextTokens[0] < 0 || spec.ContextTokens[1] < spec.ContextTokens[0] {
 			return nil, fmt.Errorf("user profile 档位 %s context_tokens 非法", name)
 		}
+		if spec.AttachmentProbability < 0 || spec.AttachmentProbability > 1 {
+			return nil, fmt.Errorf("user profile 档位 %s attachment_probability 必须在 [0,1]", name)
+		}
+		if spec.AttachmentProbability > 0 {
+			if len(spec.AttachmentTokens) != 2 || spec.AttachmentTokens[0] < 0 || spec.AttachmentTokens[1] < spec.AttachmentTokens[0] {
+				return nil, fmt.Errorf("user profile 档位 %s attachment_tokens 非法", name)
+			}
+		}
 		total += spec.Weight
 	}
 	if total <= 0 {
 		return nil, fmt.Errorf("user profile 权重总和为 0")
 	}
-	if len(p.FirstTurnTokens) != 2 || p.FirstTurnTokens[0] < 28000 {
-		// agent 形状硬约束（plan 13.2，2026-09-19 真机校准）：首轮 prompt ≈ 30K（下限 28K）
-		return nil, fmt.Errorf("user profile first_turn_tokens 非法：首轮 prompt 必须 ≥28000 token（agent 形状约束），得到 %v", p.FirstTurnTokens)
+	if len(p.FirstTurnTokens) != 2 || p.FirstTurnTokens[0] < 0 || p.FirstTurnTokens[1] < p.FirstTurnTokens[0] {
+		// 首轮总量由同一 ContextTokens/Attachment 机制决定，允许小首轮；这里只保留区间形状校验。
+		return nil, fmt.Errorf("user profile first_turn_tokens 非法: %v", p.FirstTurnTokens)
 	}
 	return &p, nil
 }

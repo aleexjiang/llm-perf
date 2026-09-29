@@ -925,7 +925,7 @@ func buildSuggestedConfig(res *ProbeResult, o ProbeOptions, effAuth auth.Auth, o
 		fmt.Fprintf(&sb, "model: %s\n", model)
 	}
 	if res.ModelMaxLen > 2048 {
-		fmt.Fprintf(&sb, "# context_budget_tokens: %d   # 按 /models 的 max_model_len=%d 填写；user 自动再预留 max_tokens 和 2048 安全余量\n",
+		fmt.Fprintf(&sb, "# context_budget_tokens: %d   # 按 /models 的 max_model_len=%d 填写；user 自动再预留 max_tokens 和 4096 安全余量\n",
 			res.ModelMaxLen, res.ModelMaxLen)
 	} else {
 		sb.WriteString("# context_budget_tokens: 32000   # 未探测到模型上限（/models 未提供 max_model_len），先用保守的统一预算试探\n")

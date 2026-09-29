@@ -44,9 +44,12 @@ DEFAULT_WEIGHTS = "6,3,1"
 # controlled-agent 把 session length 与 per-turn growth 统一成单调梯度：
 # light=少轮次+小增量，medium=中轮次+中增量，heavy=多轮次+大增量。
 CONTROLLED_AGENT_RANGES = {
-    "light": {"user_input_tokens": [80, 400], "context_tokens": [500, 2000]},
-    "medium": {"user_input_tokens": [80, 400], "context_tokens": [3000, 8000]},
-    "heavy": {"user_input_tokens": [80, 400], "context_tokens": [10000, 25000]},
+    "light": {"user_input_tokens": [20, 120], "context_tokens": [0, 0],
+              "attachment_probability": 0.01, "attachment_tokens": [8000, 30000]},
+    "medium": {"user_input_tokens": [30, 200], "context_tokens": [0, 0],
+               "attachment_probability": 0.05, "attachment_tokens": [3000, 8000]},
+    "heavy": {"user_input_tokens": [30, 200], "context_tokens": [0, 0],
+              "attachment_probability": 0.10, "attachment_tokens": [10000, 25000]},
 }
 
 
@@ -207,7 +210,7 @@ def main() -> None:
             "user_input_tokens": CONTROLLED_AGENT_RANGES[name]["user_input_tokens"] if args.preset == "controlled-agent" else range_of(b["user_inputs"]),
             # 每轮进入下一轮历史的上下文增量（token）：trace 中 assistant+tool 体积的代理
             "context_tokens": CONTROLLED_AGENT_RANGES[name]["context_tokens"] if args.preset == "controlled-agent" else range_of(b["follows"]),
-            **({"fill_context": True} if args.preset == "controlled-agent" and name == "heavy" else {}),
+            **(CONTROLLED_AGENT_RANGES[name] if args.preset == "controlled-agent" else {}),
             "trace_sessions": b["sessions"],
         }
 
@@ -221,7 +224,8 @@ def main() -> None:
         "notes": [
             "weights 为人工设定的运行比例（默认 6:3:1），非 trace 实测占比",
             "turns_range 来自 trace 轮次分布，仅作形状参考",
-            "user_input_tokens/context_tokens 为 controlled-agent 时的单调 workload 梯度；trace 时为原始 follow-up 代理分布",
+            "controlled-agent 使用稀疏附件语义：普通轮只有短输入，按 attachment_probability 注入大附件",
+            "user_input_tokens/context_tokens/attachment_tokens 均为 token 数",
             "运行时文本一律由经典书语料按 seed 生成，profile 不携带任何 trace 消息文本",
         ],
     }
@@ -232,7 +236,8 @@ def main() -> None:
     print(f"profile → {out}")
     for name, p in profiles.items():
         print(f"  {name:7} weight={p['weight']:<6} turns={p['turns_range']} "
-              f"user_input={p['user_input_tokens']}tk context/turn={p['context_tokens']}tk "
+              f"user_input={p['user_input_tokens']}tk "
+              f"attachment={p['attachment_probability']:.0%}x{p['attachment_tokens']}tk "
               f"(trace sessions={p['trace_sessions']})")
     c = cleaning
     print(f"cleaning: raw={c['raw_sessions']} kept={c['kept_sessions']} "
