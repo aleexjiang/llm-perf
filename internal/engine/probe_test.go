@@ -292,7 +292,7 @@ func TestProbe_AbortPathStillSuggestsConfig(t *testing.T) {
 		t.Errorf("已指定的 model 应写成生效项，实际:\n%s", res.Suggested)
 	}
 	// 未探测的扩展面一项都不许出现（中止时它们压根没被探过）
-	for _, bad := range []string{"server_metrics", "max_prompt_tokens", "models_path"} {
+	for _, bad := range []string{"server_metrics", "context_budget_tokens", "models_path"} {
 		if strings.Contains(res.Suggested, bad) {
 			t.Errorf("中止片段不得断言未探测项 %s：\n%s", bad, res.Suggested)
 		}

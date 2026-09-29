@@ -52,7 +52,7 @@ func usage() {
   --seed-salt N                 测试隔离：重跑/换变体必须换盐，否则命中服务端前缀缓存
   -o 路径                       输出 .json 或目录（默认配置 output_dir）
   -m 模型子串                   只测包含该子串的模型
-  --max-ctx N                   上下文截止（tokens）：user 多轮到顶停轮；probe 上下文预警基准（默认 40000）
+  --max-ctx N                   统一上下文预算（tokens）：user 多轮到顶停轮；probe 上下文预警基准（默认 40000）
 
 user 选项:
   配置段: user.profile_path（profile_build.py 产出）、user.max_tokens、user.shared_base
@@ -217,7 +217,7 @@ func main() {
 	modelFilter := fs.String("m", "", "只测包含该子串的模型")
 	outFlag := fs.String("o", "", "输出路径：.json 文件或目录（默认用配置 output_dir）")
 	corpusFlag := fs.String("corpus", "", "语料校准：en/zh（内置）或文件路径（.txt/.txt.gz）；覆盖配置 corpus_path（probe filler_fidelity 用）")
-	maxCtxFlag := fs.Int("max-ctx", 0, "上下文截止（tokens）：user 多轮到顶停轮；probe 上下文预警基准；覆盖配置 max_prompt_tokens")
+	maxCtxFlag := fs.Int("max-ctx", 0, "统一上下文预算（tokens）：user 多轮到顶停轮；probe 上下文预警基准；覆盖配置 context_budget_tokens")
 	saltFlag := fs.Int("seed-salt", 0, "种子盐值：测试隔离（服务端 prefix cache 未清空时重测用）；覆盖配置 seed_salt")
 	thinkingFlag := fs.String("thinking", "", "只跑某个思考变体：on/off（开思考费 token，建议 off/on 分开两轮跑，互不连坐）；按变体名过滤，模型无该变体则跳过；both=全部")
 	noToolCallFlag := fs.Bool("no-toolcall", false, "probe: 关闭 tool-call 健康检查（默认开启，多 4 次请求秒级）")
@@ -264,12 +264,12 @@ func main() {
 		cfg.CorpusPath = *corpusFlag
 	}
 	if *maxCtxFlag > 0 {
-		cfg.MaxPromptTokens = *maxCtxFlag
+		cfg.ContextBudgetTokens = *maxCtxFlag
 		// CLI 显式指定 > model_overrides：同步写进每个模型覆盖，防止 overrides 反超运行时意图
 		for _, ov := range cfg.ModelOverrides {
 			if ov != nil {
 				v := *maxCtxFlag
-				ov.MaxPromptTokens = &v
+				ov.ContextBudgetTokens = &v
 			}
 		}
 		log.Printf("上下文截止（CLI 覆盖，含按模型覆盖）: %d", *maxCtxFlag)

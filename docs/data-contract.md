@@ -35,7 +35,7 @@ Report
 ├── server_metrics              # 场景级 /metrics 观测
 ├── kv_capacity                 # 环境级 KV 画像
 ├── source_check                # 客户端与服务端 token 对账
-├── throughput                  # 总 TPS 时间轴和单轮分布摘要
+├── throughput                  # rps/concurrency 场景级摘要；user 不写此顶层字段
 ├── environment                 # 可选 probe 环境快照
 └── config_raw
 ```
@@ -50,6 +50,7 @@ server_metrics -> 该档位的服务端窗口观测
 ```
 
 `user.levels` 按配置顺序串行执行；`session` 只用于关联多轮上下文，主性能指标来自每个 `turn`。
+user 的总 TPS 和单轮分布只从各个 `user_levels[].throughput` 读取，不再复制到顶层。
 
 ### `concurrent[]`
 

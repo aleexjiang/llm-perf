@@ -141,12 +141,15 @@ func TestUserScenarioRunsConfiguredLevels(t *testing.T) {
 			t.Fatalf("user level 缺少独立 total_tps: %+v", level)
 		}
 	}
+	if rep.Throughput != nil {
+		t.Fatalf("user 不应再写顶层重复 throughput: %+v", rep.Throughput)
+	}
 }
 
 func TestUserScenarioUsesModelOverrideTokenBudget(t *testing.T) {
 	srv := sseStub(t, &stubState{})
 	cfg := testCfg(t, srv.URL)
-	cfg.MaxPromptTokens = 35000
+	cfg.ContextBudgetTokens = 35000
 	cfg.User = config.User{
 		ProfilePath: writeProfile(t, testProfileJSON),
 		Levels:      []int{1},
@@ -154,7 +157,7 @@ func TestUserScenarioUsesModelOverrideTokenBudget(t *testing.T) {
 	}
 	overrideBudget := 40000
 	cfg.ModelOverrides = map[string]*config.ModelOverride{
-		"stub-model": {MaxPromptTokens: &overrideBudget},
+		"stub-model": {ContextBudgetTokens: &overrideBudget},
 	}
 
 	rep, err := UserScenario(context.Background(), cfg, engine.NewClient(srv.URL, "", 30*time.Second, true), "", RunOptions{})
@@ -164,12 +167,31 @@ func TestUserScenarioUsesModelOverrideTokenBudget(t *testing.T) {
 	if len(rep.UserLevels) != 1 || len(rep.UserLevels[0].Sessions) != 1 {
 		t.Fatalf("user level/session 数量错误: %+v", rep.UserLevels)
 	}
-	if got := rep.UserLevels[0].Sessions[0].TokenBudget; got != overrideBudget {
-		t.Fatalf("model override token budget=%d, want %d", got, overrideBudget)
+	if got := rep.UserLevels[0].Sessions[0].TokenBudget; got != overrideBudget-userContextSafetyMargin {
+		t.Fatalf("model override token budget=%d, want %d", got, overrideBudget-userContextSafetyMargin)
 	}
 }
 
-// TestUserScenarioStopsWithinTokenBudget 回归：max_prompt_tokens 是 prompt+output 总预算。
+func TestUserScenarioUsesUnifiedSafetyBudget(t *testing.T) {
+	srv := sseStub(t, &stubState{})
+	cfg := testCfg(t, srv.URL)
+	cfg.ContextBudgetTokens = 40000
+	cfg.User = config.User{
+		ProfilePath: writeProfile(t, testProfileJSON),
+		Levels:      []int{1},
+		MaxTokens:   config.IntList{256},
+	}
+
+	rep, err := UserScenario(context.Background(), cfg, engine.NewClient(srv.URL, "", 30*time.Second, true), "", RunOptions{})
+	if err != nil {
+		t.Fatalf("UserScenario: %v", err)
+	}
+	if got := rep.UserLevels[0].Sessions[0].TokenBudget; got != 40000-userContextSafetyMargin {
+		t.Fatalf("token_budget=%d, want %d", got, 40000-userContextSafetyMargin)
+	}
+}
+
+// TestUserScenarioStopsWithinTokenBudget 回归：context_budget_tokens 是统一 prompt+output 总预算基准。
 // 上一轮实测历史 + 本轮计划增量 + max_tokens 超过预算时，必须在发出请求前止损，
 // 不能像真机 r1-r3 那样用 400 消耗最后一轮。
 func TestUserScenarioStopsWithinTokenBudget(t *testing.T) {
@@ -180,7 +202,7 @@ func TestUserScenarioStopsWithinTokenBudget(t *testing.T) {
 		Levels:      []int{1},
 		MaxTokens:   config.IntList{256},
 	}
-	cfg.MaxPromptTokens = 35000 // 首轮实测可达 35-40K，因此至少第二轮会在请求前止损
+	cfg.ContextBudgetTokens = 35000 // 首轮实测可达 35-40K，因此至少第二轮会在请求前止损
 
 	rep, err := UserScenario(context.Background(), cfg, engine.NewClient(srv.URL, "", 30*time.Second, true), "", RunOptions{})
 	if err != nil {
@@ -190,8 +212,8 @@ func TestUserScenarioStopsWithinTokenBudget(t *testing.T) {
 		t.Fatalf("应有 1 个 level 和 1 个会话，实际 %+v", rep.UserLevels)
 	}
 	run := rep.UserLevels[0].Sessions[0]
-	if run.TokenBudget != cfg.MaxPromptTokens {
-		t.Fatalf("token_budget=%d，want %d", run.TokenBudget, cfg.MaxPromptTokens)
+	if run.TokenBudget != cfg.ContextBudgetTokens-userContextSafetyMargin {
+		t.Fatalf("token_budget=%d，want %d", run.TokenBudget, cfg.ContextBudgetTokens-userContextSafetyMargin)
 	}
 	stopped := false
 	for _, m := range run.Turns {

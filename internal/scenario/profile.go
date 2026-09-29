@@ -27,6 +27,7 @@ type ProfileSpec struct {
 	TurnsRange      []int   `json:"turns_range"`              // [lo] 或 [lo,hi]；单元素 = lo 为下限
 	UserInputTokens []int   `json:"user_input_tokens"`        // [lo,hi] 每轮 user 文本长度（token）
 	ContextTokens   []int   `json:"context_tokens"`           // [lo,hi] 每轮注入的合成上下文（token，尾部 <context> 块）
+	FillContext     bool    `json:"fill_context,omitempty"`   // heavy：有统一预算时持续到上下文预算止损
 	TraceSessions   int     `json:"trace_sessions,omitempty"` // 特征来源的会话数（参考）
 }
 
@@ -80,7 +81,7 @@ const defaultTurnsUpper = 32
 
 // turnBounds 档位轮次上下界。
 // 双元素 [lo,hi]：均匀采样区间；单元素 [lo]：下限采样，上限取 defaultTurnsUpper
-// 再被 maxTurns（max_prompt_tokens 截止派生）进一步收窄。
+// 再被 maxTurns（context_budget_tokens 截止派生）进一步收窄。
 func (s *ProfileSpec) turnBounds(maxTurns int) (int, int) {
 	lo := s.TurnsRange[0]
 	hi := defaultTurnsUpper

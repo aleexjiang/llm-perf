@@ -41,6 +41,14 @@ FIRST_TURN_MAX_TOKENS = 40000
 
 DEFAULT_WEIGHTS = "6,3,1"
 
+# controlled-agent 把 session length 与 per-turn growth 统一成单调梯度：
+# light=少轮次+小增量，medium=中轮次+中增量，heavy=多轮次+大增量。
+CONTROLLED_AGENT_RANGES = {
+    "light": {"user_input_tokens": [80, 400], "context_tokens": [500, 2000]},
+    "medium": {"user_input_tokens": [80, 400], "context_tokens": [3000, 8000]},
+    "heavy": {"user_input_tokens": [80, 400], "context_tokens": [10000, 25000]},
+}
+
 
 def norm_role(msg: dict) -> str:
     role = str(msg.get("from") or msg.get("role") or "").lower()
@@ -158,6 +166,8 @@ def main() -> None:
     ap.add_argument("--chars-per-token-en", type=float, default=4.0)
     ap.add_argument("--chars-per-token-zh", type=float, default=1.4)
     ap.add_argument("--min-turns", type=int, default=2, help="低于该轮数的会话不入 profile")
+    ap.add_argument("--preset", choices=("trace", "controlled-agent"), default="trace",
+                    help="profile 增量口径：trace=从原始 follow-up 提取；controlled-agent=单调 workload 梯度")
     args = ap.parse_args()
 
     weights = [float(x) for x in args.weights.split(",")]
@@ -194,23 +204,24 @@ def main() -> None:
             "weight": round(weight / sum(weights), 4),
             "turns_range": [lo, hi] if hi else [lo],
             # user 输入长度分布（token）：每轮新增的 user 文本
-            "user_input_tokens": range_of(b["user_inputs"]),
+            "user_input_tokens": CONTROLLED_AGENT_RANGES[name]["user_input_tokens"] if args.preset == "controlled-agent" else range_of(b["user_inputs"]),
             # 每轮进入下一轮历史的上下文增量（token）：trace 中 assistant+tool 体积的代理
-            "context_tokens": range_of(b["follows"]),
+            "context_tokens": CONTROLLED_AGENT_RANGES[name]["context_tokens"] if args.preset == "controlled-agent" else range_of(b["follows"]),
+            **({"fill_context": True} if args.preset == "controlled-agent" and name == "heavy" else {}),
             "trace_sessions": b["sessions"],
         }
 
     profile = {
         "version": 1,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "source": str(Path(args.trace).name),
+        "source": "controlled-agent-workload" if args.preset == "controlled-agent" else str(Path(args.trace).name),
         "first_turn_tokens": [FIRST_TURN_MIN_TOKENS, FIRST_TURN_MAX_TOKENS],
         "profiles": profiles,
         "cleaning": {**cleaning, "skipped_short_turns": skipped_short},
         "notes": [
             "weights 为人工设定的运行比例（默认 6:3:1），非 trace 实测占比",
             "turns_range 来自 trace 轮次分布，仅作形状参考",
-            "user_input_tokens/context_tokens 为 trace 字符量按混合 chars-per-token 折算的代理分布",
+            "user_input_tokens/context_tokens 为 controlled-agent 时的单调 workload 梯度；trace 时为原始 follow-up 代理分布",
             "运行时文本一律由经典书语料按 seed 生成，profile 不携带任何 trace 消息文本",
         ],
     }

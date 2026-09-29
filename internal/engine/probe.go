@@ -301,7 +301,7 @@ func Probe(ctx context.Context, o ProbeOptions) *ProbeResult {
 	if res.ModelMaxLen > 0 {
 		checkExt("context_limit", true, fmt.Sprintf("模型 %s max_model_len=%d（引擎扩展字段）", model, res.ModelMaxLen))
 		if o.MaxContext > res.ModelMaxLen {
-			res.Verdicts = append(res.Verdicts, fmt.Sprintf("⚠️ 计划压测的最大上下文 %dtk 超过模型上限 %dtk——超限请求会被服务端拒绝，请用 --max-ctx 或 max_prompt_tokens 截止到 %d 以内", o.MaxContext, res.ModelMaxLen, res.ModelMaxLen))
+			res.Verdicts = append(res.Verdicts, fmt.Sprintf("⚠️ 计划压测的最大上下文 %dtk 超过模型上限 %dtk——超限请求会被服务端拒绝，请用 --max-ctx 或 context_budget_tokens 截止到 %d 以内", o.MaxContext, res.ModelMaxLen, res.ModelMaxLen))
 		} else if o.MaxContext > 0 {
 			res.Verdicts = append(res.Verdicts, fmt.Sprintf("上下文规划 OK：计划最大 %dtk ≤ 模型上限 %dtk（注意预留 max_tokens 输出空间）", o.MaxContext, res.ModelMaxLen))
 		}
@@ -925,13 +925,13 @@ func buildSuggestedConfig(res *ProbeResult, o ProbeOptions, effAuth auth.Auth, o
 		fmt.Fprintf(&sb, "model: %s\n", model)
 	}
 	if res.ModelMaxLen > 2048 {
-		fmt.Fprintf(&sb, "# max_prompt_tokens: %d   # 由 /models 的 max_model_len=%d 减输出预算推得（引擎扩展字段）\n",
-			res.ModelMaxLen-2048, res.ModelMaxLen)
+		fmt.Fprintf(&sb, "# context_budget_tokens: %d   # 按 /models 的 max_model_len=%d 填写；user 自动再预留 max_tokens 和 2048 安全余量\n",
+			res.ModelMaxLen, res.ModelMaxLen)
 	} else {
-		sb.WriteString("# max_prompt_tokens: 32000   # 未探测到模型上限（/models 未提供 max_model_len），先用保守值试探\n")
+		sb.WriteString("# context_budget_tokens: 32000   # 未探测到模型上限（/models 未提供 max_model_len），先用保守的统一预算试探\n")
 	}
 	if metricsOK {
-		// 与 max_prompt_tokens 一致：凡由扩展面推导来的项一律注释掉，让人显式确认后再启用。
+		// 与 context_budget_tokens 一致：凡由扩展面推导来的项一律注释掉，让人显式确认后再启用。
 		// 此前这里写成生效态，与 README「扩展面推导项一律注释」的自述直接矛盾——
 		// 而它开的不过是「多采一份服务端观测」，与任何结论都无关，更没理由默认打开。
 		fmt.Fprintf(&sb, "# server_metrics: true   # %s 可达——扩展面推导项，按约定注释；需要增强观测时取消注释（不开不影响任何结论）\n", metricsPath)

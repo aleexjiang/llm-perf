@@ -30,8 +30,33 @@ llm-perf 只负责采集自部署 LLM 服务的性能原始数据，Go 二进制
 `user` 使用 `user.profile_path` 和 `user.levels` 生成多轮动态会话阶梯；`rps` 和 `concurrency` 使用
 `request_set.sharegpt_path` 的冻结请求集。两类负载的 cache 和时间行为不同，分析时不要混表。
 
+user profile 的档位语义必须单调：`light` 是少轮次/小增量，`medium` 是中轮次/中增量，
+`heavy` 是多轮次/大增量。heavy 在启用 `context_budget_tokens` 时跑到预算安全边界；
+light/medium 不为填满模型上下文而延长会话。
+
 真机运行顺序：先 `probe` 确认模型、认证、usage、思考能力和 `/metrics`，再跑目标场景。
 重跑或切换思考模式时使用新的 `--seed-salt`。
+
+### 真机阶梯测试
+
+真机测试通过 YAML 配置阶梯，不默认跑到最大档位。先用较粗的档位定位拐点，
+再在拐点附近加密；当总 TPS 连续两个档位不再增长或下降，且 P95 延迟、TPOT
+或服务端 `waiting` 明显恶化时，停止更高档位。已完成的数据保留，报告记录饱和档位、
+判定依据和未执行的后续档位。
+
+```yaml
+user:
+  levels: [4, 8, 12, 16, 20, 24, 28, 32]
+rps:
+  rates: [1, 2, 3, 4, 5, 6, 7, 8, 10, 12]
+concurrency:
+  levels: [1, 4, 8, 16, 24, 32, 40, 48, 56, 64]
+```
+
+`user` 以总 TPS 平台和单轮 P95 TTFT/TPOT 为主，`concurrency` 以总 TPS 平台和
+`decode_requests` 不再增加为主，`rps` 以总 TPS 平台和 TTFT P95/排队增长为主。
+配置阶梯决定本次准备测试的档位；若当前实现没有自动饱和判断，执行过程中由测试人员
+根据这些条件停止，并在报告中明确没有继续运行的档位。
 
 ## 当前数据模型
 

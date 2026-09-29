@@ -329,8 +329,8 @@ func (c *Config) ForModel(model string) *Config {
 	v := *c
 	// thinking：ThinkingFor 已按 overrides.thinking 做字段级覆盖
 	v.Thinking = *c.ThinkingFor(model)
-	if ov.MaxPromptTokens != nil {
-		v.MaxPromptTokens = *ov.MaxPromptTokens
+	if ov.ContextBudgetTokens != nil {
+		v.ContextBudgetTokens = *ov.ContextBudgetTokens
 	}
 	if ov.Stream != nil {
 		v.Stream = ov.Stream
@@ -343,8 +343,8 @@ func (c *Config) ForModel(model string) *Config {
 // timeout_seconds/server_metrics）不在此覆盖——一个测试一个端点，超时由 client 统一持有。
 type ModelOverride struct {
 	Thinking *Thinking `yaml:"thinking"` // 覆盖全局 thinking（字段级，未写的继承）
-	// MaxPromptTokens 模型上下文截止：0 = 未写（继承顶层）；指针区分"未写"与"显式写 0（解除上限）"
-	MaxPromptTokens *int `yaml:"max_prompt_tokens"`
+	// ContextBudgetTokens 模型上下文预算：0 = 未写（继承顶层）；指针区分"未写"与"显式写 0（解除上限）"
+	ContextBudgetTokens *int `yaml:"context_budget_tokens"`
 	// Enabled 本次是否测试该模型：分批重测/单模型对照时临时关掉其他模型用。
 	// 指针区分"未写"（默认 true）与显式 false；禁用的模型不进场景循环，probe 也不选它
 	Enabled *bool `yaml:"enabled"`
@@ -403,9 +403,9 @@ type Config struct {
 	// ——类别是表达层的焦点声明，不是第二套管线。缺证据处如实写 NA。
 	Test string `yaml:"test"`
 
-	// MaxPromptTokens 上下文截止（tokens）：>0 时多轮会话 ctx 到顶后停止加轮。0 = 不限制。
-	// CLI --max-ctx 可覆盖。建议同时参考 bench probe 报告的模型 max_model_len。
-	MaxPromptTokens int `yaml:"max_prompt_tokens"`
+	// ContextBudgetTokens user 统一上下文预算基准（tokens）。建议填模型 max_model_len；运行时会
+	// 固定预留安全余量，再为当前 max_tokens 留出输出空间。0 = 不设预算；CLI --max-ctx 可覆盖。
+	ContextBudgetTokens int `yaml:"context_budget_tokens"`
 
 	// ServerMetrics 服务端观测层：抓取推理服务原生 /metrics（vLLM 默认暴露），
 	// 补充前缀缓存命中率、排队深度、prefill/decode 分解、MTP 接受率（不可达时自动记录并继续客户端采集）
@@ -933,12 +933,11 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("seed_salt 不能为负")
 	}
 
-	// max_prompt_tokens 联动：user 模式会话到顶后提前停轮的预告
-	if cfg.MaxPromptTokens > 0 && cfg.MaxPromptTokens < 1000 {
+	// context_budget_tokens 联动：user 模式会话到顶后提前停轮的预告
+	if cfg.ContextBudgetTokens > 0 && cfg.ContextBudgetTokens < 1000 {
 		cfg.Warnings = append(cfg.Warnings, fmt.Sprintf(
-			"max_prompt_tokens=%d 过小（<1k）：多轮会话会被截到该值，确认单位是 token 而非其它", cfg.MaxPromptTokens))
+			"context_budget_tokens=%d 过小（<1k）：多轮会话会被截到该值，确认单位是 token 而非其它", cfg.ContextBudgetTokens))
 	}
-
 	return cfg, nil
 }
 

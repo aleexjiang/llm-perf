@@ -41,7 +41,7 @@ type MultiturnRun struct {
 	NominalLastPrompt int `json:"nominal_last_prompt,omitempty"`
 
 	// TokenBudget user 场景的单请求总上下文预算（prompt + output）：
-	// `max_prompt_tokens` 语义修正后即该预算，剩余空间不足以容纳下一轮 prompt + max_tokens
+	// 由统一 context_budget_tokens 扣除安全余量得到，剩余空间不足以容纳下一轮 prompt + max_tokens
 	// 时提前止损，不再发出必然 400 的请求。0 = 未启用预算控制。
 	TokenBudget int `json:"token_budget,omitempty"`
 }
@@ -514,7 +514,8 @@ type Report struct {
 	KVCapacity *smetrics.KVCapacity `json:"kv_capacity,omitempty"`
 	// SourceCheck 两源一致性（10.1，仅并发场景计算）：客户端 vs 服务端生成吞吐。
 	SourceCheck *SourceCheck `json:"source_check,omitempty"`
-	// Throughput 场景级总吞吐与分层单流速度；user 也统一从这里看总吞吐。
+	// Throughput 场景级总吞吐与分层单流速度。user 不写此顶层摘要，
+	// user 的吞吐只保存在各个 user_levels[].throughput 中。
 	Throughput *ThroughputSummary `json:"throughput,omitempty"`
 
 	// 环境存档：几周后回看数据时"当时是什么引擎/什么配置跑的"必须有据可查。

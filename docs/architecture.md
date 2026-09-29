@@ -55,7 +55,7 @@ chunk 数、字符数、ITL、原始时间、回复文本和 reasoning 协议细
 ```
 
 每秒时间点的 `tps` 是该秒中点正在 decode 的请求的 `tokens_per_sec` 之和，
-`decode_requests` 是请求数。user 结果写在 `throughput.total_tps[]`，
+`decode_requests` 是请求数。user 结果写在各档位 `user_levels[].throughput.total_tps[]`，
 rps/concurrency 结果写在各档位 `total_tps[]`。
 
 场景每完成一个档位就通过 `RunOptions.Checkpoint` 通知 CLI，CLI 写累计 checkpoint JSON；

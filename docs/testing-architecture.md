@@ -29,7 +29,7 @@
 
 ## 负载
 
-- user：profile 提供 light/medium/heavy 的轮次和上下文形状，文本来自内置 corpus；assistant 回复使用被测模型真实输出，继续进入下一轮 history。
+- user：profile 提供单调的 light/medium/heavy workload 梯度：light 少轮次且每轮新增少，medium 居中，heavy 多轮次且每轮新增多；文本来自内置 corpus，assistant 回复使用被测模型真实输出并继续进入下一轮 history。
 - rps/concurrency：使用 ShareGPT 冻结请求集，保证输入形状和样本顺序可复现。
 - `seed_salt` 用于重跑隔离 prefix cache；重跑或切换 thinking 模式时递增。
 - thinking on/off 是独立测试变体，不把两种输出形状混成一个结论。
@@ -47,6 +47,7 @@
 
 - 需要比较服务端能力时固定模型、thinking、采样、输入形状和输出预算，只改变一个压力维度。
 - user 的动态 cache 和 rps/concurrency 的冻结 cache 分开解释。
+- user 档位不能只按轮数命名：`context_tokens` 必须随 light -> medium -> heavy 增长；heavy 在启用统一上下文预算时持续到预算安全边界，light/medium 按自身轮次结束，不为填满上下文强行增加轮次。
 - 性能容量测试与长时间稳定性测试分开运行；稳定性测试关注失败、正确性和指标漂移。
 - tool-call 只作为 probe 能力检查，不进入当前模型输出速度压测。
 

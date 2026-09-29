@@ -40,6 +40,10 @@ const assistantReplyCap = 32768
 // contextTag 合成 context 的包裹标记：拼在 user 消息内部（尾部注入，cache 安全）。
 const contextTag = "reference-context"
 
+// userContextSafetyMargin 为模型上下文上限预留模板、序列化和服务端实现差异空间。
+// 可用 prompt 上限 = max_model_len - max_tokens - safety margin。
+const userContextSafetyMargin = 2048
+
 func init() {
 	Register(funcScenario{"user", UserScenario})
 }
@@ -78,17 +82,11 @@ func UserScenario(ctx context.Context, cfg *config.Config, client *engine.Client
 	}
 	applySLO(e, rep)
 
-	scenarioStart := time.Now()
-	var allTurns []*engine.TurnMetrics
-
 	for _, model := range cfg.ActiveModels() {
 		if modelFilter != "" && !strings.Contains(model, modelFilter) {
 			continue
 		}
 		em, mc := forModel(e, cfg, model)
-		// TokenBudget 是当前模型生效的 max_prompt_tokens：单请求 prompt + output 总预算。
-		// 放在 forModel 之后计算，model_overrides 的上下文上限才真正生效。
-		tokenBudget := userTokenBudget(mc, prof, model)
 		th := mc.Thinking
 		if len(th.Variants()) == 0 {
 			log.Printf("  %s: 无匹配的思考变体，跳过", model)
@@ -100,6 +98,9 @@ func UserScenario(ctx context.Context, cfg *config.Config, client *engine.Client
 		}
 		for _, v := range th.Variants() {
 			for _, maxTok := range th.MaxTokensList(maxToks, v) {
+				// 每个 max_tokens 档位都重新计算可用 prompt 预算；输出预算越大，
+				// 留给 prompt 的空间越小。
+				tokenBudget := userTokenBudget(mc, prof, model, maxTok)
 				for _, users := range mc.User.Levels {
 					if interrupted(ctx) {
 						break
@@ -119,8 +120,6 @@ func UserScenario(ctx context.Context, cfg *config.Config, client *engine.Client
 						Throughput: report.BuildThroughputSummary(levelTurns, levelWall),
 					}
 					rep.UserLevels = append(rep.UserLevels, level)
-					allTurns = append(allTurns, levelTurns...)
-					rep.Throughput = report.BuildThroughputSummary(allTurns, time.Since(scenarioStart).Seconds())
 					if options.Checkpoint != nil {
 						options.Checkpoint(rep)
 					}
@@ -128,19 +127,33 @@ func UserScenario(ctx context.Context, cfg *config.Config, client *engine.Client
 			}
 		}
 	}
-	rep.Throughput = report.BuildThroughputSummary(allTurns, time.Since(scenarioStart).Seconds())
 	return rep, nil
 }
 
-func userTokenBudget(cfg *config.Config, prof *Profile, model string) int {
-	if cfg.MaxPromptTokens <= 0 {
+func userTokenBudget(cfg *config.Config, prof *Profile, model string, maxTok int) int {
+	if cfg.ContextBudgetTokens <= 0 {
 		return 0
 	}
-	if est := estMaxContext(prof); est > cfg.MaxPromptTokens {
-		log.Printf("⚠️ %s profile 形状预计最大上下文 ≈%dtk > token_budget=%d——长会话会在预算内提前止损；建议下调轮次/增量或调高 max_prompt_tokens",
-			model, est, cfg.MaxPromptTokens)
+	// 统一预算入口：配置值通常就是模型 max_model_len；这里先扣安全余量，
+	// runOneUserSession 再加上当前 maxTok 判断，实际 prompt 上限为
+	// context_budget_tokens - max_tokens - safety margin。
+	budget := cfg.ContextBudgetTokens - userContextSafetyMargin
+	if budget <= 0 {
+		log.Printf("⚠️ %s context_budget_tokens=%d 小于安全余量=%d——本档位会在首轮前止损",
+			model, cfg.ContextBudgetTokens, userContextSafetyMargin)
+		// 返回最小的 prompt+output 预算，保留预算止损路径；不能返回 0，
+		// 否则 runOneUserSession 会把它当成“未启用保护”。
+		return maxTok
 	}
-	return cfg.MaxPromptTokens
+	promptLimit := budget - maxTok
+	if promptLimit <= 0 {
+		log.Printf("⚠️ %s context_budget_tokens=%d、max_tokens=%d 和安全余量=%d 无法留下可用 prompt 空间——本档位会在首轮前止损",
+			model, cfg.ContextBudgetTokens, maxTok, userContextSafetyMargin)
+	} else if est := estMaxContext(prof); est > promptLimit {
+		log.Printf("⚠️ %s profile 形状预计最大上下文 ≈%dtk > 可用 prompt 上限=%dtk（context_budget_tokens=%d - max_tokens=%d - 安全余量=%d）——长会话会提前止损",
+			model, est, promptLimit, cfg.ContextBudgetTokens, maxTok, userContextSafetyMargin)
+	}
+	return budget
 }
 
 // runUserSessions 并行执行 users 条生成式会话（每用户一条，模型串行保证 e.cfg 不被并发改写）。
@@ -209,10 +222,14 @@ func runOneUserSession(ctx context.Context, e *env, prof *Profile, lang, model s
 	cpr := corpus.CharsPerToken(lang)
 
 	// 档位轮次：[lo,hi] 均匀采样；单元素 = 下限 + 运行时上限 32（review R1-H2 修正）。
-	// 不把 MaxPromptTokens（token 数）当轮次上限——上下文到顶由 ctxLimitHit 运行时止损。
+	// 不把 ContextBudgetTokens（token 数）当轮次上限——上下文到顶由 ctxLimitHit 运行时止损。
 	turnLo, turnHi := spec.turnBounds(0)
 	turns := turnLo
-	if turnHi > turnLo {
+	if spec.FillContext && tokenBudget > 0 {
+		// heavy 的目标是把上下文预算打满；预算保护负责在安全边界停止，
+		// 而不是让随机抽到的短轮次数提前结束。
+		turns = turnHi
+	} else if turnHi > turnLo {
 		turns = turnLo + rng.Intn(turnHi-turnLo+1)
 	}
 

@@ -71,13 +71,15 @@ total_tps(t) = Σ tokens_per_sec(request_i)
 ```
 
 `second` 从场景第一条有效 decode 区间开始计；`decode_requests` 和 `tps` 取该秒中点状态。
-user 场景放在 `throughput.total_tps[]`，rps/concurrency 放在各自的 `concurrent[].total_tps[]`。
+user 场景放在各自 `user_levels[].throughput.total_tps[]`，rps/concurrency 放在各自的
+`concurrent[].total_tps[]`；user 不再额外写顶层 `throughput` 摘要。
 
 总 TPS 不使用 session 平均 TPS、请求数乘单流平均值或其他二次估算。
 
 ## 3. 聚合摘要
 
-场景级 `throughput` 保留：
+每个场景的吞吐摘要保留：user 位于 `user_levels[].throughput`，rps/concurrency 位于场景级
+`throughput` 和各档位数据中：
 
 ```text
 wall_seconds
