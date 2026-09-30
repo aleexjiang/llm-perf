@@ -1,6 +1,6 @@
 ---
 name: llm-perf-report
-description: Use when generating or reviewing llm-perf performance reports from scenario JSON, including user/rps/concurrency comparisons, requested-shape summaries, metric tables, SVG charts, and saturation conclusions. Do not use for data collection or service tuning.
+description: Use when generating or reviewing llm-perf performance reports from scenario JSON, including requested-shape summaries, metric tables, SVG charts, and saturation conclusions. Do not use for data collection, test design, or service tuning.
 ---
 
 # llm-perf Report Generation
@@ -61,9 +61,8 @@ Generate one Markdown report with inline SVG. Use this order and do not omit sec
    - Inline SVG, no external dependencies.
    - Minimum set: bucket TPS time axis, throughput by ladder axis, TTFT P95 by ladder axis,
      TPS P5 by ladder axis, request-shape P50/P95 prompt and completion by ladder axis.
-   - For comparisons, overlay one line per tested variant and label it. Keep colors stable
-     across comparable reports.
-   - Do not put more than eight overlaid lines in one chart; split by workload if needed.
+   - Overlay one line per tested variant and label it. Keep colors stable across charts.
+   - Do not put more than eight overlaid lines in one chart; split by ladder axis if needed.
 
 5. **结论**
    - State saturation status and stop rule. Common rules are `TTFT P95 > 10s` or
@@ -74,21 +73,6 @@ Generate one Markdown report with inline SVG. Use this order and do not omit sec
      requests. Report numeric delta.
    - For rps/concurrency, report `source_check.deviation`.
    - List excluded samples and why. Never hide failures.
-
-## Comparison discipline
-
-Compare within a single mode only: user vs user, rps vs rps, concurrency vs concurrency.
-Never compare user to rps or concurrency directly.
-
-For a valid comparison, require identical: model, endpoint, thinking, max_tokens, sampling,
-seed salt policy, request-set shape, attachment probability, profile weights, and schema
-version. If one differs, place the rows under a separate "control changed" heading and mark
-the comparison directional, not exact.
-
-For user runs, group by `(weights, attachment_probability, users)`. For rps/concurrency
-shape tests, group by `(request-set label, shape metric, ladder axis)`. If the source JSON
-does not identify request-set variants, ask for the missing metadata before publishing a
-comparison.
 
 ## Saturation interpretation
 
