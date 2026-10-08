@@ -1,6 +1,6 @@
 # Field Map for Reports
 
-Use schema v14 paths. `...` means every matching row.
+Use schema v15 paths. `...` means every matching row.
 
 ## Common
 
@@ -51,10 +51,14 @@ rps/concurrency rows.
 | Meaning | Path |
 |---|---|
 | profile name | `workload.profile` |
-| profile weights | `workload.weights` |
-| attachment probability | `workload.attachment_probability` |
-| attachment token range | `workload.attachment_tokens` |
+| first-turn prompt range | `workload.first_turn_tokens` |
+| shared system base tokens | `workload.shared_base_tokens` |
+| tier weight | `workload.tiers.<tier>.weight` |
+| tier turns / user input / regular context | `workload.tiers.<tier>.turns_range`, `user_input_tokens`, `context_tokens` |
+| tier context-burst probability | `workload.tiers.<tier>.context_burst_probability` |
+| tier context-burst token range | `workload.tiers.<tier>.context_burst_tokens` |
 | context budget | `workload.context_budget_tokens` |
+| per-turn planned input | `sessions[].input_plan[]`, aligned with `sessions[].turns[]` |
 
 ## Server observation and integrity
 
@@ -65,7 +69,7 @@ rps/concurrency rows.
 | preemptions | `server_metrics.preemptions` |
 | running peak | `running_max` on rps/concurrency; `server_metrics.gauges.running.max` for user |
 | waiting peak | `waiting_max` on rps/concurrency; `server_metrics.gauges.waiting.max` for user |
-| client/server token deviation | `source_check.deviation` (rps/concurrency only) |
+| client/server token deviation | `source_check.deviation` (rps/concurrency only; valid only when `server_tokens > 0` and `note` is empty) |
 
 ## Raw samples
 

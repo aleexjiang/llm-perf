@@ -32,7 +32,7 @@ thinking:
 
 # ② user：agent 形状多轮（首轮 ≥35K；6:3:1 轻/中/重默认比例，可调）
 user:
-  profile_path: "profiles/agent-v1.json"   # 由 scripts/profile_build.py 提取；--preset controlled-agent 生成单调梯度
+  profile_path: "profiles/agent-v1.json"   # 由 scripts/profile_build.py 生成的受控单调梯度
   levels: [4, 8, 16, 32, 64]      # user 并行用户数阶梯
   max_tokens: 256
 

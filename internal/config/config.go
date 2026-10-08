@@ -373,7 +373,7 @@ func (c *Config) ActiveModels() []string {
 
 type Config struct {
 	// Raw 配置文件原文（Load 时填充）：随报告存档，保证几周后能复现"当时是什么配置跑的"。
-	// 注释、键序、书写习惯都只有原文能保留——结构化字段回放不出这些信息。
+	// 注释、键序、书写习惯都只有原文能保留——结构化字段无法还原这些信息。
 	Raw            string `yaml:"-"`
 	Endpoint       string `yaml:"endpoint"`
 	APIKeyLiteral  string `yaml:"api_key"`     // 字面量 key，直接写配置文件（该配置文件应避免入库）；环境变量 LLM_PERF_API_KEY 优先级更高
@@ -439,7 +439,7 @@ type Config struct {
 	ModelOverrides map[string]*ModelOverride `yaml:"model_overrides"`
 
 	// User user 模式（生成式多轮会话，profile 驱动）——见 docs/workload-refactor-plan.md 13。
-	// 形状来自外置 profile.json（trace 特征提炼），文本由经典书语料按 seed 生成，
+	// 形状来自外置受控 profile.json，文本由经典书语料按 seed 生成，
 	// assistant 使用被测模型真实回复（动态 prefix cache）。
 	User User `yaml:"user"`
 
@@ -518,6 +518,21 @@ type User struct {
 	// StaggerMS 会话启动错峰（毫秒，默认 0）：users>1 时第 N 个用户延迟 N×stagger_ms
 	// 启动，避免全部首轮同时 prefill 互抢（真机实测首轮 TTFT 差异达 1.7 倍、逐轮曲线双峰）。
 	StaggerMS int `yaml:"stagger_ms"`
+	// FirstTurnTokens 首轮总 prompt token 区间 [min,max]；配置后覆盖 profile.first_turn_tokens。
+	FirstTurnTokens []int `yaml:"first_turn_tokens"`
+	// SharedBaseTokens system 基座 token 数；未配置时使用默认 27000。
+	SharedBaseTokens int `yaml:"shared_base_tokens"`
+}
+
+// DefaultSharedBaseTokens 是未配置 user.shared_base_tokens 时的 system 基座大小。
+const DefaultSharedBaseTokens = 27000
+
+// GetSharedBaseTokens 返回生效的 system 基座 token 数。
+func (u User) GetSharedBaseTokens() int {
+	if u.SharedBaseTokens > 0 {
+		return u.SharedBaseTokens
+	}
+	return DefaultSharedBaseTokens
 }
 
 // GetStaggerMS 会话启动错峰毫秒数（0 = 同时启动）。
@@ -752,6 +767,15 @@ func Load(path string) (*Config, error) {
 			dedupedUsers = append(dedupedUsers, users)
 		}
 		cfg.User.Levels = dedupedUsers
+		if cfg.User.SharedBaseTokens < 0 {
+			return nil, fmt.Errorf("user.shared_base_tokens 不能为负数: %d", cfg.User.SharedBaseTokens)
+		}
+		if cfg.User.FirstTurnTokens != nil {
+			ft := cfg.User.FirstTurnTokens
+			if len(ft) != 2 || ft[0] < 0 || ft[1] < ft[0] {
+				return nil, fmt.Errorf("user.first_turn_tokens 必须是 [min,max] 且 0<=min<=max，得到 %v", ft)
+			}
+		}
 		if len(cfg.User.MaxTokens) == 0 {
 			cfg.User.MaxTokens = IntList{256}
 		}

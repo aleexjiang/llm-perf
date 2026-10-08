@@ -34,17 +34,19 @@ Generate one Markdown report with inline SVG. Use this order and do not omit sec
 
 1. **元信息**
    - endpoint, model ID, schema version, thinking mode, max_tokens, generated_at.
+   - for user, actual `workload.first_turn_tokens` and `workload.shared_base_tokens`.
    - service notes such as max_num_seqs if known from the test record.
    - exclude endpoints, API keys, hostnames, or customer-identifying paths.
 
 2. **请求形状**
    - One row per ladder point or profile combination. For user, include workload weights and
-     attachment settings from `workload`.
+     context-burst settings from `workload.tiers`; use `sessions[].input_plan[]` for burst-turn
+     counts and burst/non-burst latency splits.
    - Required fields: `request_shape.count`, prompt total/mean/P50/P95/min/max,
      completion total/mean/P50/P95/min/max, cached total.
    - State prompt semantics explicitly: user prompt is cumulative multi-turn context;
      rps/concurrency prompt is the full frozen request.
-   - Never mix profiles, attachment probabilities, or token shapes in one average without
+   - Never mix profiles, context-burst probabilities, or token shapes in one average without
      labeling them.
 
 3. **性能摘要**
@@ -67,11 +69,13 @@ Generate one Markdown report with inline SVG. Use this order and do not omit sec
 5. **结论**
    - State saturation status and stop rule. Common rules are `TTFT P95 > 10s` or
      `TPS P5 < 30`; report the actual rule used in the run.
-   - Explain the shape effect: prompt P95, completion P95, heavy share, and attachment
+   - Explain the shape effect: prompt P95, completion P95, heavy share, and context-burst
      probability usually explain throughput and latency changes better than ladder value alone.
    - Verify token conservation: `sum(bucket_tps[].tps) ≈ sum(completion_tokens)` for valid
      requests. Report numeric delta.
-   - For rps/concurrency, report `source_check.deviation`.
+   - For rps/concurrency, report `source_check.deviation` only when `server_tokens > 0` and
+     `note` is empty. Otherwise write that source check was unavailable; `deviation=0` is not a
+     successful reconciliation in that case.
    - List excluded samples and why. Never hide failures.
 
 ## Saturation interpretation

@@ -223,7 +223,7 @@ func TestBuildMetricsSummary(t *testing.T) {
 	if !strings.Contains(serialized, `"bucket_tps"`) ||
 		strings.Contains(serialized, `"metrics_tps_legacy_removed"`) ||
 		strings.Contains(serialized, `"weighted_tps"`) {
-		t.Fatalf("聚合 schema v13 字段错误: %s", serialized)
+		t.Fatalf("当前聚合 schema 字段错误: %s", serialized)
 	}
 }
 
@@ -287,7 +287,7 @@ func TestBuildTPSSeriesKeepsSub500MSShortOutput(t *testing.T) {
 	}
 }
 
-func TestSchemaV12RemovesDerivedAndDebugFields(t *testing.T) {
+func TestCurrentSchemaRemovesDerivedAndDebugFields(t *testing.T) {
 	m := &engine.TurnMetrics{
 		Model: "m", Stream: true, Thinking: true,
 		PromptTokens: 10, CompletionTokens: 8, ReasoningTokens: 3,
@@ -305,16 +305,16 @@ func TestSchemaV12RemovesDerivedAndDebugFields(t *testing.T) {
 		`"reasoning_field"`, `"new_tokens"`, `"server_counter_delta"`,
 	} {
 		if strings.Contains(s, removed) {
-			t.Fatalf("schema v13 不应落盘 %s: %s", removed, s)
+			t.Fatalf("当前 schema 不应落盘 %s: %s", removed, s)
 		}
 	}
 	for _, kept := range []string{`"prompt_tokens"`, `"completion_tokens"`, `"ttft_ms"`, `"think_ms"`, `"tpot_ms"`, `"tokens_per_sec"`} {
 		if !strings.Contains(s, kept) {
-			t.Fatalf("schema v13 应落盘 %s: %s", kept, s)
+			t.Fatalf("当前 schema 应落盘 %s: %s", kept, s)
 		}
 	}
-	if SchemaVersionCurrent != 14 {
-		t.Fatalf("schema version = %d, want 14", SchemaVersionCurrent)
+	if SchemaVersionCurrent != 15 {
+		t.Fatalf("schema version = %d, want 15", SchemaVersionCurrent)
 	}
 }
 

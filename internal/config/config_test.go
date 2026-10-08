@@ -401,6 +401,28 @@ user:
 	if len(cfg.User.Levels) != 1 || cfg.User.Levels[0] != 1 || !cfg.User.GetSharedBase() {
 		t.Fatalf("user 默认值错误: levels=%v shared=%v", cfg.User.Levels, cfg.User.GetSharedBase())
 	}
+	if cfg.User.GetSharedBaseTokens() != DefaultSharedBaseTokens {
+		t.Fatalf("shared_base_tokens 默认值=%d, want %d", cfg.User.GetSharedBaseTokens(), DefaultSharedBaseTokens)
+	}
+}
+
+func TestLoad_UserFirstTurnValidation(t *testing.T) {
+	for _, body := range []string{
+		"first_turn_tokens: [12000]",
+		"first_turn_tokens: [13000, 12000]",
+		"shared_base_tokens: -1",
+	} {
+		p := writeTemp(t, `
+endpoint: "http://x:1/v1"
+models: ["m1"]
+user:
+  profile_path: "profile.json"
+  `+body+`
+`)
+		if _, err := Load(p); err == nil {
+			t.Fatalf("非法 user 首轮配置应拒绝: %s", body)
+		}
+	}
 }
 
 // request_set 默认值与校验

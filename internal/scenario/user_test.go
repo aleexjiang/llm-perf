@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/aleexjiang/llm-perf/internal/config"
+	"github.com/aleexjiang/llm-perf/internal/contract"
 	"github.com/aleexjiang/llm-perf/internal/engine"
 )
 
@@ -19,11 +20,10 @@ const testProfileJSON = `{
   "source": "test",
   "first_turn_tokens": [35000, 40000],
   "profiles": {
-    "light":  {"weight": 0.6, "turns_range": [2, 4], "user_input_tokens": [20, 120], "context_tokens": [0, 0], "attachment_probability": 0.01, "attachment_tokens": [8000, 30000]},
-    "medium": {"weight": 0.3, "turns_range": [5, 8], "user_input_tokens": [30, 200], "context_tokens": [0, 0], "attachment_probability": 0.05, "attachment_tokens": [3000, 8000]},
-    "heavy":  {"weight": 0.1, "turns_range": [9],    "user_input_tokens": [30, 200], "context_tokens": [0, 0], "attachment_probability": 0.10, "attachment_tokens": [10000, 25000]}
-  },
-  "cleaning": {}
+    "light":  {"weight": 0.6, "turns_range": [2, 4], "user_input_tokens": [20, 120], "context_tokens": [0, 0], "context_burst_probability": 0.01, "context_burst_tokens": [8000, 30000]},
+    "medium": {"weight": 0.3, "turns_range": [5, 8], "user_input_tokens": [30, 200], "context_tokens": [0, 0], "context_burst_probability": 0.05, "context_burst_tokens": [3000, 8000]},
+    "heavy":  {"weight": 0.1, "turns_range": [9],    "user_input_tokens": [30, 200], "context_tokens": [0, 0], "context_burst_probability": 0.10, "context_burst_tokens": [10000, 25000]}
+  }
 }`
 
 func writeProfile(t *testing.T, content string) string {
@@ -45,15 +45,50 @@ func TestLoadProfile(t *testing.T) {
 		t.Fatalf("profile 解析错误: %+v", p)
 	}
 	bad := []string{
-		`{"version":1,"first_turn_tokens":[35000,40000],"profiles":{"light":{"weight":1,"turns_range":[1,2],"user_input_tokens":[1,2],"context_tokens":[1,2],"attachment_probability":0,"attachment_tokens":[1,2]}}}`,
-		`{"version":1,"first_turn_tokens":[35000,40000],"profiles":{"light":{"weight":1,"turns_range":[1,2],"user_input_tokens":[1,2],"context_tokens":[1,2],"attachment_probability":0,"attachment_tokens":[1,2]}}}`,
-		`{"version":1,"first_turn_tokens":[35000,40000],"profiles":{"light":{"weight":1,"turns_range":[2,3],"user_input_tokens":[1,2],"context_tokens":[0,0],"attachment_probability":1.5,"attachment_tokens":[1,2]}}}`,
+		`{"version":1,"first_turn_tokens":[35000,40000],"profiles":{"light":{"weight":1,"turns_range":[1,2],"user_input_tokens":[1,2],"context_tokens":[1,2],"context_burst_probability":0,"context_burst_tokens":[1,2]}}}`,
+		`{"version":1,"first_turn_tokens":[35000,40000],"profiles":{"light":{"weight":1,"turns_range":[2,3],"user_input_tokens":[1,2],"context_tokens":[0,0],"context_burst_probability":1.5,"context_burst_tokens":[1,2]}}}`,
+		`{"version":1,"first_turn_tokens":[35000,40000],"profiles":{"light":{"weight":1,"turns_range":[2,3],"user_input_tokens":[1,2],"context_tokens":[0,0],"attachment_probability":0.1,"attachment_tokens":[1,2]}}}`,
+		`{"version":1,"first_turn_tokens":[35000,40000],"profiles":{"light":{"weight":1,"turns_range":[2,3],"user_input_tokens":[1,2],"context_tokens":[0,0],"context_burst_probability":0}}} {}`,
 		`{"version":1,"first_turn_tokens":[35000,40000],"profiles":{}}`,
 	}
 	for i, b := range bad {
 		if _, err := LoadProfile(writeProfile(t, b)); err == nil {
 			t.Fatalf("非法 profile #%d 应被拒绝", i)
 		}
+	}
+	if err := applyFirstTurnConfig(p, []int{27000, 30000}, 27000); err == nil {
+		t.Fatal("首轮下限小于基座+最大用户输入时应拒绝")
+	}
+}
+
+func TestUserScenarioFirstTurnConfigOverridesProfile(t *testing.T) {
+	srv := sseStub(t, &stubState{})
+	cfg := testCfg(t, srv.URL)
+	cfg.User = config.User{
+		ProfilePath:      writeProfile(t, testProfileJSON),
+		Levels:           []int{1},
+		MaxTokens:        config.IntList{16},
+		FirstTurnTokens:  []int{12000, 12000},
+		SharedBaseTokens: 8000,
+	}
+
+	rep, err := UserScenario(context.Background(), cfg, engine.NewClient(srv.URL, "", 30*time.Second, true), "", RunOptions{})
+	if err != nil {
+		t.Fatalf("UserScenario: %v", err)
+	}
+	level := rep.UserLevels[0]
+	if got := level.Workload.FirstTurnTokens; len(got) != 2 || got[0] != 12000 || got[1] != 12000 {
+		t.Fatalf("workload first_turn_tokens=%v, want [12000 12000]", got)
+	}
+	if level.Workload.SharedBaseTokens != 8000 {
+		t.Fatalf("workload shared_base_tokens=%d, want 8000", level.Workload.SharedBaseTokens)
+	}
+	run := level.Sessions[0]
+	if first := run.Turns[0].PromptTokens; first < 11000 || first > 13500 {
+		t.Fatalf("首轮 prompt=%d，应接近配置的 12000", first)
+	}
+	if got := run.InputPlan[0]; got.ContextBurst || got.UserInputTokens+got.ContextTokens+8000 != 12000 {
+		t.Fatalf("首轮计划应补齐到 12000: %+v", got)
 	}
 }
 
@@ -93,8 +128,11 @@ func TestUserScenario(t *testing.T) {
 			t.Fatalf("profile=%s 轮次 %d 超出 [%d,%d]", run.Profile, len(run.Turns), want[0], want[1])
 		}
 		// fixture 基座 27K（stub usage=chars/4）；首轮不应固定填满 35K。
-		if first := run.Turns[0].PromptTokens; first < 26000 {
-			t.Fatalf("profile=%s 首轮 prompt %dtk 少于共享基座预期", run.Profile, first)
+		if first := run.Turns[0].PromptTokens; first < 34000 || first > 41000 {
+			t.Fatalf("profile=%s 首轮 prompt %dtk 不在 first_turn_tokens 约束附近", run.Profile, first)
+		}
+		if len(run.InputPlan) != len(run.Turns) || run.InputPlan[0].ContextBurst {
+			t.Fatalf("profile=%s input_plan 应与 turns 对齐且首轮不突增: %+v", run.Profile, run.InputPlan)
 		}
 		// 真实 assistant 回复进 history：turn2 的 prompt 必须大于 turn1
 		if len(run.Turns) > 1 {
@@ -106,6 +144,66 @@ func TestUserScenario(t *testing.T) {
 	}
 	if dist["light"] != 6 || dist["medium"] != 3 || dist["heavy"] != 1 {
 		t.Fatalf("6:3:1 分派错误: %v", dist)
+	}
+	w := rep.UserLevels[0].Workload
+	if w.Profile != "test" || len(w.FirstTurnTokens) != 2 || len(w.Tiers) != 3 {
+		t.Fatalf("workload 元数据不完整: %+v", w)
+	}
+	for name, want := range map[string]contract.UserWorkloadTier{
+		"light":  {Weight: 0.6, ContextBurstProbability: 0.01, ContextBurstTokens: []int{8000, 30000}},
+		"medium": {Weight: 0.3, ContextBurstProbability: 0.05, ContextBurstTokens: []int{3000, 8000}},
+		"heavy":  {Weight: 0.1, ContextBurstProbability: 0.10, ContextBurstTokens: []int{10000, 25000}},
+	} {
+		got := w.Tiers[name]
+		if got.Weight != want.Weight || got.ContextBurstProbability != want.ContextBurstProbability ||
+			len(got.ContextBurstTokens) != 2 || got.ContextBurstTokens[0] != want.ContextBurstTokens[0] ||
+			got.ContextBurstTokens[1] != want.ContextBurstTokens[1] {
+			t.Fatalf("workload tier %s = %+v, want %+v", name, got, want)
+		}
+	}
+}
+
+func TestUserScenarioContextBurstAddsToRegularIncrement(t *testing.T) {
+	srv := sseStub(t, &stubState{})
+	cfg := testCfg(t, srv.URL)
+	cfg.User = config.User{
+		ProfilePath: writeProfile(t, `{
+  "version": 1, "source": "burst-test", "first_turn_tokens": [35000, 35000],
+  "profiles": {"light": {"weight": 1, "turns_range": [3, 3], "user_input_tokens": [20, 20],
+    "context_tokens": [100, 100], "context_burst_probability": 1, "context_burst_tokens": [1000, 1000]}}
+}`),
+		Levels:    []int{1},
+		MaxTokens: config.IntList{16},
+	}
+
+	rep, err := UserScenario(context.Background(), cfg, engine.NewClient(srv.URL, "", 30*time.Second, true), "", RunOptions{})
+	if err != nil {
+		t.Fatalf("UserScenario: %v", err)
+	}
+	plan := rep.UserLevels[0].Sessions[0].InputPlan
+	if len(plan) != 3 {
+		t.Fatalf("input_plan 长度=%d，want 3: %+v", len(plan), plan)
+	}
+	if plan[0].ContextBurst || plan[0].ContextTokens != 35000-config.DefaultSharedBaseTokens-20 {
+		t.Fatalf("首轮应由 first_turn_tokens 决定且不突增: %+v", plan[0])
+	}
+	for _, p := range plan[1:] {
+		if !p.ContextBurst || p.ContextTokens != 100 || p.ContextBurstTokens != 1000 || p.PlannedIncrementTokens != 1120 {
+			t.Fatalf("突增应在常规增量之外追加: %+v", p)
+		}
+	}
+}
+
+func TestEstMaxContextIncludesContextBurst(t *testing.T) {
+	p := &Profile{
+		FirstTurnTokens: []int{35000, 40000},
+		Profiles: map[string]*ProfileSpec{"heavy": {
+			TurnsRange: []int{3, 3}, UserInputTokens: []int{10, 20}, ContextTokens: []int{0, 100},
+			ContextBurstProbability: 0.1, ContextBurstTokens: []int{1000, 5000},
+		}},
+	}
+	if got, want := estMaxContext(p), 40000+2*(20+100+5000); got != want {
+		t.Fatalf("estMaxContext=%d, want %d", got, want)
 	}
 }
 

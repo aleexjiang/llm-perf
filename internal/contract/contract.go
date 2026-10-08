@@ -28,22 +28,26 @@ type MultiturnRun struct {
 
 	Turns []*engine.TurnMetrics `json:"turns"`
 
-	// soak 时会话启动时刻相对档位开始的偏移（秒），供外部分析首末时段漂移。
-	StartOffsetS float64 `json:"start_offset_s,omitempty"`
-
-	// 12.3 multiturn 深度实测校验：
-	// LastPromptTokens 末轮（最后一个 usage.prompt_tokens>0 的成功轮）实测 prompt_tokens——
-	//   名义外推（turn_tokens×turns）系统性偏乐观 10–15%（filler 语料抽样去重/边界不足额），
-	//   落盘实测值供外部分析侧画像区对照，偏差 >10% 告警。
-	// NominalLastPrompt 名义末轮上下文（filler 口径：基座+轮数×每轮增量，×1.07 模板开销）；
-	//   0 = trace 模式（轮次来自回放会话，名义值无意义，实测深度即原会话深度）。
-	LastPromptTokens  int `json:"last_prompt_tokens,omitempty"`
-	NominalLastPrompt int `json:"nominal_last_prompt,omitempty"`
+	// LastPromptTokens 末轮（最后一个 usage.prompt_tokens>0 的成功轮）实测 prompt_tokens。
+	LastPromptTokens int `json:"last_prompt_tokens,omitempty"`
 
 	// TokenBudget user 场景的单请求总上下文预算（prompt + output）：
 	// 由统一 context_budget_tokens 扣除安全余量得到，剩余空间不足以容纳下一轮 prompt + max_tokens
 	// 时提前止损，不再发出必然 400 的请求。0 = 未启用预算控制。
 	TokenBudget int `json:"token_budget,omitempty"`
+
+	// InputPlan 与 Turns 同下标对应，记录生成器计划追加的输入形状。
+	InputPlan []UserTurnInput `json:"input_plan,omitempty"`
+}
+
+// UserTurnInput 是 user 生成器为单轮计划追加的 token 数；实际 prompt 仍以 usage 为准。
+type UserTurnInput struct {
+	Turn                   int  `json:"turn"`
+	UserInputTokens        int  `json:"user_input_tokens"`
+	ContextTokens          int  `json:"context_tokens"`
+	ContextBurst           bool `json:"context_burst"`
+	ContextBurstTokens     int  `json:"context_burst_tokens"`
+	PlannedIncrementTokens int  `json:"planned_increment_tokens"`
 }
 
 // UserLevel：user 模式的一个并行用户数档位。每个档位独立采集会话、总 TPS 和服务端观测。
@@ -60,11 +64,21 @@ type UserLevel struct {
 
 // UserWorkload 记录该档位实际生效的 profile 形状，报告不依赖 config_raw 反推。
 type UserWorkload struct {
-	Profile               string         `json:"profile"`
-	Weights               map[string]int `json:"weights,omitempty"`
-	AttachmentProbability float64        `json:"attachment_probability"`
-	AttachmentTokens      []int          `json:"attachment_tokens,omitempty"`
-	ContextBudgetTokens   int            `json:"context_budget_tokens,omitempty"`
+	Profile             string                      `json:"profile"`
+	FirstTurnTokens     []int                       `json:"first_turn_tokens"`
+	SharedBaseTokens    int                         `json:"shared_base_tokens"`
+	Tiers               map[string]UserWorkloadTier `json:"tiers"`
+	ContextBudgetTokens int                         `json:"context_budget_tokens,omitempty"`
+}
+
+// UserWorkloadTier 是 light/medium/heavy 的实际 profile 设置。
+type UserWorkloadTier struct {
+	Weight                  float64 `json:"weight"`
+	TurnsRange              []int   `json:"turns_range"`
+	UserInputTokens         []int   `json:"user_input_tokens"`
+	ContextTokens           []int   `json:"context_tokens"`
+	ContextBurstProbability float64 `json:"context_burst_probability"`
+	ContextBurstTokens      []int   `json:"context_burst_tokens,omitempty"`
 }
 
 // FillLastPromptTokens 12.3：从轮次数据回填末轮实测 prompt_tokens（倒序找第一个 >0 的成功轮，
@@ -79,8 +93,7 @@ func (r *MultiturnRun) FillLastPromptTokens() {
 }
 
 // ConcurrentLevel：一个模型在一个并发档位 × 思考模式下的结果。
-// Multiturn=false 时 Requests 为各虚拟用户的单轮请求；true 时 Sessions 为各虚拟用户的
-// 完整多轮会话（filler=合成模拟对话，trace 数据源为真实会话重放），逐 turn 计量。
+// Requests 为冻结请求集的单轮请求。
 // RequestRate>0 为开环到达率模式（Level=0，rate 为实际到达率）。
 type ConcurrentLevel struct {
 	Model             string                `json:"model"`
@@ -89,7 +102,6 @@ type ConcurrentLevel struct {
 	Level             int                   `json:"level"`
 	RequestRate       float64               `json:"request_rate,omitempty"` // 开环模式的到达率（req/s）
 	Requests          []*engine.TurnMetrics `json:"requests,omitempty"`
-	Sessions          []MultiturnRun        `json:"sessions,omitempty"`
 	WallSeconds       float64               `json:"wall_seconds"`
 	TPSSeries         []TPSBucket           `json:"bucket_tps,omitempty"`
 	CompletedRequests int                   `json:"completed_requests"`
@@ -666,7 +678,7 @@ var Version = "llm-perf/dev"
 // SchemaVersionCurrent 数据契约版本：JSON 结构变更时递增；本项目不保留旧字段兼容逻辑。
 // 契约唯一权威文档 docs/data-contract.md，与本值同步维护（2026-09-17 报告层剥离后，
 // 这份 JSON 契约就是工具的对外接口）。
-const SchemaVersionCurrent = 14
+const SchemaVersionCurrent = 15
 
 // Report 是一次场景执行的完整数据，整体落盘为单个 JSON 文件。
 type Report struct {

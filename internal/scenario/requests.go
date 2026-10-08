@@ -115,7 +115,7 @@ func finishLevel(e *env, lv *contract.ConcurrentLevel) {
 	lv.Metrics = contract.BuildMetricsSummary(lv.Requests, wall)
 }
 
-// newEnvSilent 构造不带 trace 的场景 env（请求快照模式不用 dataset/filler）。
+// newEnvSilent 构造请求快照模式的场景 env（不使用 user profile/filler）。
 func newEnvSilent(ctx context.Context, cfg *config.Config, client *engine.Client) (*env, error) {
 	e := &env{cfg: cfg, client: client}
 	if err := setupServerMetrics(ctx, e, cfg); err != nil {

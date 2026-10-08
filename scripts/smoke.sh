@@ -96,7 +96,7 @@ user = load_all("out-user")
 check(len(user) == 1, f"user 产物按模型落盘（{len(user)} 份）")
 rep = user[0]
 check(rep.get("scenario") == "user", "报告 scenario=user")
-check(rep.get("schema_version") == 14, "数据契约版本为 14")
+check(rep.get("schema_version") == 15, "数据契约版本为 15")
 levels = rep.get("user_levels") or []
 level_users = [level.get("users") for level in levels]
 check(level_users == [2], f"user levels 应有 users=2（{level_users}）")
@@ -110,8 +110,12 @@ for s in sessions:
     if len(ts) > 1 and ts[-1].get("prompt_tokens", 0) <= ts[0].get("prompt_tokens", 0):
         ok_growth = False
 check(ok_growth, "assistant 回复进 history：prompt 逐轮增长（动态 prefix cache）")
-first_ok = all((s.get("turns") or [{}])[0].get("prompt_tokens", 0) >= 26000 for s in sessions)
-check(first_ok, "共享 system 基座已进入首轮 prompt")
+first_ok = all((s.get("turns") or [{}])[0].get("prompt_tokens", 0) >= 34000 for s in sessions)
+check(first_ok, "首轮 prompt 遵守 first_turn_tokens")
+workload = levels[0].get("workload", {}) if levels else {}
+check(set((workload.get("tiers") or {}).keys()) == {"light", "medium", "heavy"}, "user workload 按三档完整落盘")
+check(all(len(s.get("input_plan") or []) == len(s.get("turns") or []) for s in sessions), "input_plan 与 turns 对齐")
+check(all(not (s.get("input_plan") or [{}])[0].get("context_burst") for s in sessions), "首轮不参与上下文突增")
 metrics_user = [t for s in sessions for t in (s.get("turns") or [])]
 check(metrics_user and all(m.get("phase") == "benchmark" for m in metrics_user), "主压测 TurnMetrics 标记 phase=benchmark")
 check(levels and levels[0].get("metrics", {}).get("bucket_tps"), "user level 落盘 bucket_tps 时间序列")

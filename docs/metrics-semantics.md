@@ -1,6 +1,6 @@
 # 指标口径
 
-本文定义 schema v14 的外部分析口径。Go 负责采集单轮数据和总 TPS 时间轴；外部分析工具负责
+本文定义 schema v15 的外部分析口径。Go 负责采集单轮数据和总 TPS 时间轴；外部分析工具负责
 分位、分层、可视化和容量判断。
 
 ## 单轮指标
@@ -77,6 +77,10 @@ P50 描述典型值，P95/P99 只表示高速侧分布。每个分层必须显�
 `request_shape` 是本次摘要包含的有效请求 token 形状：prompt/completion 的总数、均值、
 P50/P95 和 min/max，以及 cached tokens 总量。报告开头应先用它概述「每次请求的 token 分布」，
 避免把不同输入形状的结果混读。
+`cached_tokens` 来自客户端 usage；服务端未返回时为 0 或缺失，不能据此判断 prefix cache 未命中。
+
+user 报告还应读取 `workload` 和 `sessions[].input_plan[]`：前者说明实际首轮区间、共享基座和各档位
+突增参数，后者用于统计突增轮数，并把突增轮与普通轮的 TTFT 分开看。
 
 `thinking` 是思考时间分布；thinking=off 时所有值为 0，报告应写成「思考关闭（0ms）」，
 不能省略。
@@ -107,18 +111,23 @@ server_metrics.preemptions / histograms
 ```
 
 `source_check` 用客户端成功请求的 completion token 与服务端 generation token 对账。
-两者共享同一窗口结束快照。服务端数据只用于采集正确性和瓶颈归因，不改变客户端单轮指标
+两者共享同一窗口结束快照。只有 `server_tokens > 0` 且 `note` 为空时，`deviation` 才是有效对账；
+服务端观测不可用时的 `deviation=0` 只是占位值。服务端数据只用于采集正确性和瓶颈归因，不改变客户端单轮指标
 或总 TPS 主口径。
 
 ## 分层与诊断
 
-总 TPS 和单轮指标应按以下维度切片：`finish_reason`、prompt/completion 长度、
+总 TPS 和单轮指标应按以下维度切片：`finish_reason`、prompt/completion 长度、user 上下文突增、
 thinking/reasoning、prefix cache，以及客户端 decode 请求数与服务端 running/waiting。
 这些是解释维度，不是新的 TPS 定义。
 
-以下旧字段不属于 schema v14，不回填：
+以下旧字段不属于 schema v15，不回填：
 
 ```text
+attachment_probability / attachment_tokens
+workload.weights / workload.context_burst_probability / workload.context_burst_tokens
+concurrent[].sessions
+sessions[].nominal_last_prompt / sessions[].start_offset_s
 total_tokens
 metrics_tps_legacy_removed
 active_decode_tokens / active_decode_seconds / active_decode_tps

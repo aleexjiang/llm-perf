@@ -30,12 +30,10 @@ import (
 	"github.com/aleexjiang/llm-perf/internal/auth"
 )
 
-// Message 是一条对话消息。ToolCallID 仅 role=tool 时使用（OpenAI 协议必填，
-// full 回放时从 trace 透传；缺失会被服务端 400）。
+// Message 是一条对话消息。
 type Message struct {
-	Role       string `json:"role"`
-	Content    string `json:"content"`
-	ToolCallID string `json:"tool_call_id,omitempty"`
+	Role    string `json:"role"`
+	Content string `json:"content"`
 }
 
 // RetryPolicy 可选的连接层重试策略。压测语义下默认关闭（重试会掩盖服务端的不稳定），

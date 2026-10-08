@@ -2,7 +2,7 @@
 
 ## 项目边界
 
-llm-perf 只负责采集自部署 LLM 服务的性能原始数据，Go 二进制输出 schema v11 JSON。
+llm-perf 只负责采集自部署 LLM 服务的性能原始数据，Go 二进制输出 schema v15 JSON。
 报告、分位统计、容量判定和可视化在工具外完成。真机配置、端点、密钥、原始产物和
 分析记录只放 gitignored 的 `llm-perf-test/`。
 
@@ -32,6 +32,10 @@ llm-perf 只负责采集自部署 LLM 服务的性能原始数据，Go 二进制
 不要混表。真机运行先 `probe`，再跑目标场景；重跑或切换 thinking 变体时换
 `--seed-salt`。
 
+user profile 用 `scripts/profile_build.py` 生成受控梯度；trace 只用
+`scripts/trace_shape.py` 离线分析请求形状，不回放、不直接生成 profile。首轮大小梯度用
+YAML 的 `user.first_turn_tokens` 和 `user.shared_base_tokens`，不要复制多份只改首轮的 profile。
+
 ## 阶梯与负载纪律
 
 `user.levels`、`rps.rates`、`concurrency.levels` 都是 YAML 驱动的阶梯。先用较粗档位
@@ -40,8 +44,9 @@ TPOT 或服务端 `waiting` 明显恶化，则停止更高档位；已完成数�
 判定依据和未执行档位。
 
 user profile 的 workload 必须单调：`light` 少轮次且每轮新增少，`medium` 居中，
-`heavy` 多轮次且每轮新增多。heavy 在启用 `context_budget_tokens` 时跑到预算安全边界；
-light / medium 按自身轮次结束，不为填满上下文强行加轮。
+`heavy` 多轮次且每轮新增多。普通轮通常只有短输入；`@文件`、粘贴日志等大增量用
+`context_burst_probability` 和 `context_burst_tokens` 表达。所有档位按自身轮次结束，并由
+`context_budget_tokens` 统一止损，不为填满上下文强行加轮。
 
 ## 数据规则
 

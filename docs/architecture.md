@@ -10,10 +10,10 @@ YAML
   -> cmd/bench
   -> scenario
        probe: engine.Probe -> probe JSON
-       user: user.levels + profile + corpus -> 串行用户阶梯
+       user: user.levels + 受控 profile + corpus -> 串行用户阶梯
        rps/concurrency: frozen request set -> 调度请求
   -> engine.Client.Chat -> TurnMetrics
-  -> contract.Report -> schema v14 JSON
+  -> contract.Report -> schema v15 JSON
        + user_levels[].metrics / concurrent[].bucket_tps
        + server_metrics 场景或档位观测
        + source_check token 对账
@@ -31,6 +31,9 @@ YAML
 | `internal/scenario` | user/rps/concurrency 调度、SLO 和场景观测 |
 | `internal/smetrics` | `/metrics` counter、gauge、histogram 和 KV 画像 |
 | `internal/contract` | schema 结构、总 TPS 时间轴和 JSON 落盘 |
+
+离线脚本：`scripts/profile_build.py` 生成受控 profile；`scripts/trace_shape.py` 只输出 trace
+请求形状统计，不参与运行时。
 
 ## 单轮采集
 
@@ -54,7 +57,8 @@ counter、gauge、histogram 只写场景或档位级 `server_metrics`。rps/conc
 
 ## 场景与扩展
 
-- `user.go`：profile 分派、确定性 corpus、真实 assistant 回复进入 history。
+- `user.go`：profile 分派、首轮配置、上下文突增、`input_plan`、确定性 corpus、
+  真实 assistant 回复进入 history。
 - `requests.go`：rps 开环到达与 concurrency 固定在飞，共享冻结请求集。
 - `probe.go`：模型、usage、thinking、tool-call 和扩展 `/metrics` 能力探测。
 

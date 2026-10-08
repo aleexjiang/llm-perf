@@ -1,7 +1,7 @@
 # 数据契约：YAML 到 JSON
 
 工具采集 OpenAI 兼容 LLM 服务的原始性能数据。报告、分位统计和容量判断由外部完成。
-场景 JSON 当前为 **schema v14**，由 `contract.SchemaVersionCurrent` 写入；结构变化直接递增版本，
+场景 JSON 当前为 **schema v15**，由 `contract.SchemaVersionCurrent` 写入；结构变化直接递增版本，
 不保留旧字段兼容逻辑。
 
 ## 落盘结构
@@ -39,13 +39,25 @@ Report
 
 ```text
 model / thinking / users / max_tokens
-sessions[] -> MultiturnRun
+workload -> profile / first_turn_tokens / shared_base_tokens / tiers / context_budget_tokens
+sessions[] -> MultiturnRun（turns[] 与 input_plan[] 同下标对应）
 metrics -> bucket_tps[] 和单轮分布
 server_metrics -> 该档位的服务端窗口观测
 ```
 
-`workload` 记录该档位实际生效的 profile、比例、附件概率和上下文预算；报告从这里读取
-负载形状，不依赖 `config_raw` 反推。
+`workload.tiers.<light|medium|heavy>` 记录各档位实际生效的比例、轮次、用户输入、常规上下文、
+上下文突增概率和突增 token 区间。报告从这里读取负载形状，不依赖 `config_raw` 或目录名反推。
+
+`sessions[].input_plan[]` 是生成器的计划输入，不替代服务端 usage：
+
+```text
+turn / user_input_tokens / context_tokens
+context_burst / context_burst_tokens / planned_increment_tokens
+```
+
+`first_turn_tokens` 和 `shared_base_tokens` 是本档位实际生效值，已包含 YAML 覆盖。
+首轮由 `first_turn_tokens` 决定，`context_burst=false`。后续每轮独立抽样；命中突增时，
+`context_burst_tokens` 在常规 `context_tokens` 之外追加。
 
 `user.levels` 按配置顺序串行执行。`sessions[]` 只关联多轮上下文；主性能样本是其中的
 `turns[]`。user 的吞吐摘要只从各档位 `metrics` 读取，不再复制到顶层。
@@ -55,7 +67,7 @@ server_metrics -> 该档位的服务端窗口观测
 ```text
 model / thinking / max_tokens
 level / request_rate
-requests[] 或 sessions[]
+requests[]
 wall_seconds
 bucket_tps[]
 completed_requests / failed_requests / cancelled_requests / invalid_requests
@@ -152,6 +164,8 @@ observation_degraded / observation_note
 
 `source_check` 比较窗口内客户端成功请求的 completion token 与服务端 generation token；
 两者共享同一结束快照，不改变客户端单轮指标或总 TPS 主口径。
+`deviation` 只有在 `server_tokens > 0` 且 `note` 为空时才表示有效对账；服务端观测不可用时，
+JSON 仍保留 `deviation=0`，报告必须写成未对账。
 
 ## 样本规则
 
@@ -163,9 +177,14 @@ observation_degraded / observation_note
 
 ## 已移除字段
 
-以下字段不属于 schema v14，不回填、不兼容：
+以下字段不属于 schema v15，不回填、不兼容：
 
 ```text
+attachment_probability / attachment_tokens
+workload.weights / workload.context_burst_probability / workload.context_burst_tokens
+concurrent[].sessions
+sessions[].nominal_last_prompt / sessions[].start_offset_s
+profile.cleaning / profiles.*.trace_sessions / profiles.*.fill_context
 total_tokens
 metrics_tps_legacy_removed
 active_decode_tokens / active_decode_seconds / active_decode_tps

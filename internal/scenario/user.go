@@ -1,11 +1,11 @@
 // user.go：user 模式——生成式多轮用户会话（docs/workload-refactor-plan.md 13）。
 //
-// 会话形状来自外置 profile.json（trace 特征提炼），默认权重 6:3:1 可调；
+// 会话形状来自外置受控 profile.json，默认权重 6:3:1 可调；
 //   - 运行时文本（system 基座 / user 输入 / 合成 context）全部取自经典书语料库，
 //     窗口起点由 (session_seed, turn) 派生，内容确定可复现；
 //   - 每轮把**被测模型真实生成的 assistant 回复**追加进下一轮 history——
 //     prefix cache 反映当前模型真实回复形成的动态前缀（与冻结快照的本质差异）；
-//   - profile 决定每轮新增输入；附件轮按概率注入大 context。
+//   - first_turn_tokens 决定首轮总 prompt；后续轮少数按概率成为上下文突增轮。
 //
 // cache 安全双约束（13.4 复盘修正）：
 //  1. 合成 context 只能尾部注入（拼进当前 user 消息内），严禁进 system——
@@ -28,9 +28,6 @@ import (
 	"github.com/aleexjiang/llm-perf/internal/corpus"
 	"github.com/aleexjiang/llm-perf/internal/engine"
 )
-
-// firstTurnBaseTokens 共享 system 基座目标 token。基座一经生成本会话内冻结。
-const firstTurnBaseTokens = 27000
 
 // assistantReplyCap 真实 assistant 回复进 history 的截断上限（字符，rune 安全）。
 // 输出长度受 max_tokens 请求约束，此上限只是防御性护栏（如服务端不尊重 max_tokens）。
@@ -56,6 +53,9 @@ func UserScenario(ctx context.Context, cfg *config.Config, client *engine.Client
 	if err != nil {
 		return nil, err
 	}
+	if err := applyFirstTurnConfig(prof, cfg.User.FirstTurnTokens, cfg.User.GetSharedBaseTokens()); err != nil {
+		return nil, err
+	}
 	lang := cfg.CorpusLang
 	if lang == "" {
 		lang = "en"
@@ -75,9 +75,9 @@ func UserScenario(ctx context.Context, cfg *config.Config, client *engine.Client
 		GeneratedAt: time.Now(),
 		Test:        cfg.TestKind(),
 		Endpoint:    cfg.Endpoint,
-		Note: fmt.Sprintf("生成式多轮用户会话 levels=%v profile=%s（权重 %s）语料=%s shared_base=%v stream=%v thinking=%s；首轮≥%dtk；assistant=被测模型真实回复（动态 prefix cache）%s",
+		Note: fmt.Sprintf("生成式多轮用户会话 levels=%v profile=%s（权重 %s）语料=%s shared_base=%v stream=%v thinking=%s；首轮=%v tk，基座=%dtk；assistant=被测模型真实回复（动态 prefix cache）%s",
 			cfg.User.Levels, prof.Source, weightsDesc(prof), lang, cfg.User.GetSharedBase(),
-			cfg.StreamEnabled(), cfg.Thinking.Mode, prof.FirstTurnTokens[0], thinkingNoteSuffix(cfg)),
+			cfg.StreamEnabled(), cfg.Thinking.Mode, prof.FirstTurnTokens, cfg.User.GetSharedBaseTokens(), thinkingNoteSuffix(cfg)),
 	}
 	applySLO(e, rep)
 
@@ -115,6 +115,7 @@ func UserScenario(ctx context.Context, cfg *config.Config, client *engine.Client
 					}
 					level := contract.UserLevel{
 						Model: model, Thinking: v.Name, Users: users, MaxTokens: maxTok,
+						Workload: userWorkload(prof, tokenBudget, mc.User.GetSharedBaseTokens()),
 						Sessions: runs, Server: server,
 						Metrics: contract.BuildMetricsSummary(levelTurns, levelWall),
 					}
@@ -245,7 +246,8 @@ func runOneUserSession(ctx context.Context, e *env, prof *Profile, lang, model s
 		baseWindowSeed = baseSeed
 	}
 	baseMsg := engine.Message{Role: "system",
-		Content: baseBook.Window(int(firstTurnBaseTokens*cpr), baseWindowSeed)}
+		Content: baseBook.Window(int(float64(e.cfg.User.GetSharedBaseTokens())*cpr), baseWindowSeed)}
+	baseTokens := e.cfg.User.GetSharedBaseTokens()
 
 	sample := func(r []int) int {
 		if len(r) != 2 || r[1] <= r[0] {
@@ -255,6 +257,7 @@ func runOneUserSession(ctx context.Context, e *env, prof *Profile, lang, model s
 	}
 
 	msgs := []engine.Message{baseMsg}
+	firstTurnTokens := sample(prof.FirstTurnTokens)
 	// lastBaseline 是下一轮 prompt 的下限估计：上一轮实测 prompt + assistant 回复 token。
 	// usage 缺失时置 0，只保留原有的运行时兜底，不做错误截断。
 	lastBaseline := 0
@@ -269,21 +272,24 @@ func runOneUserSession(ctx context.Context, e *env, prof *Profile, lang, model s
 		question := book.Window(int(float64(userTk)*cpr), rng.Int63())
 		var content strings.Builder
 		// 合成 context：尾部注入（cache 约束 1）——拼进 user 消息内部，绝不进 system
-		ctxTk := 0
+		ctxTk, burstTk := 0, 0
+		burst := false
 		if turn == 0 {
-			ctxTk = sample(spec.ContextTokens)
-			if rng.Float64() < spec.AttachmentProbability {
-				ctxTk = sample(spec.AttachmentTokens)
+			ctxTk = firstTurnTokens - baseTokens - userTk
+			if ctxTk < 0 {
+				ctxTk = 0
 			}
 		} else {
 			ctxTk = sample(spec.ContextTokens)
-			if rng.Float64() < spec.AttachmentProbability {
-				ctxTk = sample(spec.AttachmentTokens)
+			if rng.Float64() < spec.ContextBurstProbability {
+				burst = true
+				burstTk = sample(spec.ContextBurstTokens)
 			}
 		}
-		if ctxTk > 0 {
+		totalCtxTk := ctxTk + burstTk
+		if totalCtxTk > 0 {
 			fmt.Fprintf(&content, "<%s>\n%s\n</%s>\n\n", contextTag,
-				book.Window(int(float64(ctxTk)*cpr), rng.Int63()), contextTag)
+				book.Window(int(float64(totalCtxTk)*cpr), rng.Int63()), contextTag)
 		}
 		content.WriteString(question)
 
@@ -292,10 +298,14 @@ func runOneUserSession(ctx context.Context, e *env, prof *Profile, lang, model s
 		// usage 缺失或估算不足时继续执行，让原有 ctxLimitHit 兜底。
 		// userTk/ctxTk 已经是 profile 定义的 token 数；cpr 只用于生成对应字符长度。
 		// 再除一次 cpr 会让英文预算低估约 4 倍，使保护逻辑放过必然超限的请求。
-		planIncrement := userTk + ctxTk
+		planIncrement := userTk + totalCtxTk
+		plan := contract.UserTurnInput{
+			Turn: turn + 1, UserInputTokens: userTk, ContextTokens: ctxTk,
+			ContextBurst: burst, ContextBurstTokens: burstTk, PlannedIncrementTokens: planIncrement,
+		}
 		nextPrompt := lastBaseline
 		if nextPrompt == 0 {
-			nextPrompt = firstTurnBaseTokens
+			nextPrompt = baseTokens
 		}
 		estimate := nextPrompt + planIncrement
 		if tokenBudget > 0 && estimate > 0 && estimate+maxTok > tokenBudget {
@@ -309,6 +319,7 @@ func runOneUserSession(ctx context.Context, e *env, prof *Profile, lang, model s
 			}
 			m.Finalize()
 			run.Turns = append(run.Turns, m)
+			run.InputPlan = append(run.InputPlan, plan)
 			log.Printf("    🛑 上下文预算不足（estimated_prompt=%d + max_tokens=%d > %d）——提前结束会话",
 				estimate, maxTok, tokenBudget)
 			break
@@ -329,6 +340,7 @@ func runOneUserSession(ctx context.Context, e *env, prof *Profile, lang, model s
 			}
 		}
 		run.Turns = append(run.Turns, m)
+		run.InputPlan = append(run.InputPlan, plan)
 		// 首轮实测深度校验（review R1-L1）：估算保证依赖 CharsPerToken 系数，
 		// 真实 tokenizer 偏差在此暴露（session 内只告警一次）
 		if turn == 0 && m.PromptTokens > 0 {
@@ -337,11 +349,11 @@ func runOneUserSession(ctx context.Context, e *env, prof *Profile, lang, model s
 					m.PromptTokens, prof.FirstTurnTokens[0])
 			} else if m.PromptTokens > prof.FirstTurnTokens[1] {
 				// 真机发现 2.3：档位增量下限与首轮上限冲突时静默超限——至少让超限可见
-				log.Printf("    ⚠️ 首轮实测 prompt %dtk > 约束上限 %dtk——档位 context_tokens 下限优先，宁可超首轮也不产生空转轮",
+				log.Printf("    ⚠️ 首轮实测 prompt %dtk > 约束上限 %dtk——语料换算比偏差或模板开销偏大",
 					m.PromptTokens, prof.FirstTurnTokens[1])
 			}
 		}
-		// 真实 assistant 回复进 history：动态 prefix cache 的核心（不能用 trace 旧回复）
+		// 真实 assistant 回复进 history：动态 prefix cache 的核心
 		if m.ReplyText != "" {
 			msgs = append(msgs, engine.Message{Role: "assistant",
 				Content: engine.TruncateRunes(m.ReplyText, assistantReplyCap)})
@@ -375,44 +387,55 @@ func runOneUserSession(ctx context.Context, e *env, prof *Profile, lang, model s
 	return run
 }
 
-// userWorkload 把 profile 的比例和稀疏附件设置作为一等 workload 元数据落盘。
-func userWorkload(prof *Profile, budget int) contract.UserWorkload {
+// userWorkload 把 profile 的比例和上下文突增设置作为一等 workload 元数据落盘。
+func userWorkload(prof *Profile, budget, baseTokens int) contract.UserWorkload {
 	w := contract.UserWorkload{
 		Profile:             prof.Source,
-		Weights:             map[string]int{},
-		AttachmentTokens:    []int{},
+		FirstTurnTokens:     append([]int(nil), prof.FirstTurnTokens...),
+		SharedBaseTokens:    baseTokens,
+		Tiers:               map[string]contract.UserWorkloadTier{},
 		ContextBudgetTokens: budget,
 	}
 	for name, spec := range prof.Profiles {
 		if spec == nil {
 			continue
 		}
-		w.Weights[name] = int(spec.Weight*100 + 0.5)
-		// 当前 profile 约定各档共用同一附件概率/大小；后续如需 per-profile 附件，
-		// 需改为 map 结构并同步报告格式。
-		w.AttachmentProbability = spec.AttachmentProbability
-		if spec.AttachmentProbability > 0 {
-			w.AttachmentTokens = append([]int(nil), spec.AttachmentTokens...)
+		tier := contract.UserWorkloadTier{
+			Weight:                  spec.Weight,
+			TurnsRange:              append([]int(nil), spec.TurnsRange...),
+			UserInputTokens:         append([]int(nil), spec.UserInputTokens...),
+			ContextTokens:           append([]int(nil), spec.ContextTokens...),
+			ContextBurstProbability: spec.ContextBurstProbability,
 		}
-		break
+		if spec.ContextBurstProbability > 0 {
+			tier.ContextBurstTokens = append([]int(nil), spec.ContextBurstTokens...)
+		}
+		w.Tiers[name] = tier
 	}
 	return w
 }
 
 // estMaxContext 按 profile 形状估算单个会话可滚到的最大 prompt token（保守上界：
-// 首轮上限 + 档位最大轮数 × (最大 user 输入 + 最大增量)）。用于启动时的组合上限预警。
+// 首轮上限 + 后续最大轮数 × (最大 user 输入 + 最大常规增量 + 可能的最大突增)）。
 func estMaxContext(prof *Profile) int {
 	mx := prof.FirstTurnTokens[1]
 	for _, spec := range prof.Profiles {
 		_, turnHi := spec.turnBounds(0)
-		ctxHi, userHi := 0, 0
+		ctxHi, userHi, burstHi := 0, 0, 0
 		if len(spec.ContextTokens) == 2 {
 			ctxHi = spec.ContextTokens[1]
 		}
 		if len(spec.UserInputTokens) == 2 {
 			userHi = spec.UserInputTokens[1]
 		}
-		if v := prof.FirstTurnTokens[1] + turnHi*(ctxHi+userHi); v > mx {
+		if spec.ContextBurstProbability > 0 && len(spec.ContextBurstTokens) == 2 {
+			burstHi = spec.ContextBurstTokens[1]
+		}
+		followingTurns := turnHi - 1
+		if followingTurns < 0 {
+			followingTurns = 0
+		}
+		if v := prof.FirstTurnTokens[1] + followingTurns*(ctxHi+userHi+burstHi); v > mx {
 			mx = v
 		}
 	}
